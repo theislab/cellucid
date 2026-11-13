@@ -237,7 +237,7 @@ export const INPUT_FORMATS = Object.freeze([
  * is and where it goes. The web app takes a library file dropped or chosen
  * in Open… › File… to My datasets' Import (`app/library/library-file.js`)
  * and loads a session file dropped or chosen there as Load… › Open a
- * session file… does, its dataset opened with it (bug hunt L25-8); Python
+ * session file… does, its dataset opened with it; Python
  * (`cellucid serve`) and R say the sentence when given one to serve.
  *
  * @typedef {Object} CellucidFile

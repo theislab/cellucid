@@ -78,6 +78,13 @@ class FakeNode {
     this.parentNode?.removeChild(this);
   }
 
+  replaceWith(node) {
+    const parent = this.parentNode;
+    if (parent === null) return;
+    parent.insertBefore(node, this);
+    parent.removeChild(this);
+  }
+
   replaceChildren(...nodes) {
     for (const child of [...this.children]) this.removeChild(child);
     this.append(...nodes);
@@ -186,12 +193,16 @@ class FakeDialog extends FakeNode {
     super('dialog');
     this.open = false;
     this.parts = new Map();
+    /** What a focus listener does when showModal() focuses the dialog. */
+    this.onFocusedWhileOpening = null;
   }
 
   showModal() {
     if (!this.isConnected) throw new Error('InvalidStateError: not connected');
     if (this.open) throw new Error('InvalidStateError: already open');
     this.open = true;
+    // Every engine focuses the dialog's first control before showModal() returns.
+    this.onFocusedWhileOpening?.();
   }
 
   close() {
@@ -223,12 +234,31 @@ class FakeDialog extends FakeNode {
 
 class FakeElement extends FakeNode {}
 
+/** The document's selection as a caret: where it is, or none (no range). */
+const fakeSelection = {
+  anchorNode: null,
+  anchorOffset: 0,
+  get rangeCount() {
+    return this.anchorNode === null ? 0 : 1;
+  },
+  collapse(node, offset = 0) {
+    this.anchorNode = node;
+    this.anchorOffset = offset;
+  },
+};
+
 const fakeDocument = {
   activeElement: null,
   documentElement: new FakeNode('html'),
   body: new FakeNode('body'),
   createElement(tag) {
     return tag === 'dialog' ? new FakeDialog() : new FakeElement(tag);
+  },
+  createComment() {
+    return new FakeNode('#comment');
+  },
+  getSelection() {
+    return fakeSelection;
   },
 };
 fakeDocument.documentElement.append(fakeDocument.body);
@@ -277,9 +307,31 @@ test('close() hands focus back to the opener at once; a native close settles the
   runQueuedTasks();
   assert.equal(closes, 2);
   assert.equal(fakeDocument.activeElement, button);
+
+  // A focus listener closes the dialog while showModal() focuses it.
+  dialog.onFocusedWhileOpening = () => owner.close();
+  owner.open(button, { focus: inside });
+  dialog.onFocusedWhileOpening = null;
+  assert.equal(dialog.open, false);
+  assert.equal(closes, 3, 'a close while the dialog opens settles before open() returns');
+  assert.equal(fakeDocument.activeElement, button, 'focus stays with the opener, not in the closed dialog');
+  runQueuedTasks();
+  assert.equal(closes, 3);
+  owner.open(button);
+  assert.equal(dialog.open, true, 'the dialog opens again');
+  owner.close();
+  assert.equal(closes, 4);
+
+  // A dialog showModal() refuses (not in the page) was never open: nothing to settle.
+  const loose = new FakeDialog();
+  let looseCloses = 0;
+  const looseOwner = wireAppDialog(loose, { onClose: () => { looseCloses += 1; } });
+  assert.throws(() => looseOwner.open(button), /not connected/);
+  looseOwner.close();
+  assert.equal(looseCloses, 0);
 });
 
-test('a close that settles a task later leaves focus where the person moved it meanwhile (F260)', () => {
+test('a close that settles a task later leaves focus where the person moved it meanwhile', () => {
   const dialog = connectedDialog();
   const owner = wireAppDialog(dialog);
   const button = opener('rename');
@@ -304,6 +356,27 @@ test('a close that settles a task later leaves focus where the person moved it m
   assert.equal(fakeDocument.activeElement, button, 'focus lost with the dialog goes back');
 });
 
+test('a caret left in the page behind moves to the dialog\'s start on open, where Tab coming back from the browser starts; one inside stays', () => {
+  const dialog = connectedDialog();
+  const owner = wireAppDialog(dialog);
+  const inside = new FakeNode('button');
+  const text = new FakeNode('p');
+  dialog.append(inside, text);
+  const behind = opener('renamed page tab');
+  fakeSelection.collapse(behind, 2);
+  owner.open(behind, { focus: inside });
+  assert.deepEqual([fakeSelection.anchorNode, fakeSelection.anchorOffset], [dialog, 0]);
+  owner.close();
+  fakeSelection.collapse(text, 1);
+  owner.open(behind, { focus: inside });
+  assert.deepEqual([fakeSelection.anchorNode, fakeSelection.anchorOffset], [text, 1], 'a selection inside the dialog is the person\'s own');
+  owner.close();
+  fakeSelection.anchorNode = null;
+  owner.open(behind, { focus: inside });
+  assert.equal(fakeSelection.rangeCount, 0, 'no selection: none is made');
+  owner.close();
+});
+
 test('a close event queued before the dialog opened again does not settle the new opening', () => {
   const dialog = connectedDialog();
   let closes = 0;
@@ -316,6 +389,23 @@ test('a close event queued before the dialog opened again does not settle the ne
   assert.equal(closes, 1);
   owner.close();
   assert.equal(closes, 2);
+
+  // Closed by Escape and opened again before its close event: the first
+  // opening settles (its `onClose`) as the second begins.
+  const first = opener('d');
+  const inside = new FakeNode('button');
+  dialog.append(inside);
+  owner.open(first, { focus: inside });
+  dialog.pressEscape();
+  const second = opener('e');
+  fakeDocument.activeElement = inside;
+  owner.open(second, { focus: inside });
+  assert.equal(closes, 3, 'the opening Escape closed has settled');
+  runQueuedTasks();
+  assert.equal(closes, 3);
+  owner.close();
+  assert.equal(closes, 4, 'the second opening settles on its own close');
+  assert.equal(fakeDocument.activeElement, second);
 });
 
 test('focus goes back to what a function names at close time, never to the body or a disabled control', () => {
@@ -359,7 +449,7 @@ test('the backdrop closes only on a press that began there; the close button clo
 });
 
 test('a dialog that is not dismissible stays open on Escape and the backdrop; close() closes it', () => {
-  // The graphics reset (F146): nothing behind it can be used meanwhile.
+  // The graphics reset: nothing behind it can be used meanwhile.
   const dialog = connectedDialog();
   const owner = wireAppDialog(dialog, { dismissible: false });
   owner.open(opener('g'));
@@ -409,11 +499,51 @@ test('what is kept above dialogs lives inside the topmost one and goes home afte
   assert.equal(release(), false);
 });
 
+test('what is kept above dialogs goes back to its place whatever its parent gains or loses meanwhile', () => {
+  // Kept while a dialog is open, as the last child of the page (the
+  // notification center made under the welcome): what the page gains
+  // meanwhile comes after it. Kept before a sibling that leaves while it is
+  // away: it goes back between the same neighbors still there.
+  for (const change of ['gains', 'loses']) {
+    const asker = opener(`home-${change}`);
+    const before = new FakeNode();
+    const cards = new FakeNode();
+    const sibling = new FakeNode();
+    const later = new FakeNode();
+    const dialog = connectedDialog();
+    const owner = wireAppDialog(dialog);
+    let release;
+    if (change === 'gains') {
+      owner.open(asker);
+      fakeDocument.body.append(before, cards);
+      release = keepAboveModals(cards);
+      fakeDocument.body.append(later);
+    } else {
+      fakeDocument.body.append(before, cards, sibling, later);
+      release = keepAboveModals(cards);
+      owner.open(asker);
+      sibling.remove();
+    }
+    assert.equal(cards.parentNode, dialog);
+    owner.close();
+    assert.deepEqual(
+      [cards.parentNode === fakeDocument.body, before.nextSibling === cards, cards.nextSibling === later],
+      [true, true, true],
+      `in its place (the page ${change} a sibling)`,
+    );
+    assert.equal(
+      fakeDocument.body.children.some(node => node.tagName === '#COMMENT'),
+      false,
+      'nothing is left where it lived',
+    );
+    release();
+    for (const node of [asker, before, cards, later, dialog]) node.remove();
+  }
+});
+
 test('two neighbors kept above dialogs go home in their own places, whichever goes first', () => {
-  // The notification center and the agents' dock stand side by side: each
-  // remembered the other as the sibling it stood before, the first to go home
-  // found it away and was put at the end of the page, and the two had
-  // swapped places (which is drawn over the other follows that order).
+  // The notification center and the agents' dock stand side by side, and
+  // which is drawn over the other follows their order.
   for (const releaseFirst of [null, 'first', 'second']) {
     const before = new FakeNode();
     const first = new FakeNode();

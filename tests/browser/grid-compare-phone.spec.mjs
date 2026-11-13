@@ -1,9 +1,9 @@
 /**
  * Grid compare keeps its panes a usable size on every screen shape.
  *
- * Found 2026-11-11 (round 9): two or three views always stood side by side,
- * so on a 390 px phone held upright three panes were about 120 px wide each.
- * The grid now takes the arrangement whose panes are largest along their
+ * Two or three views always side by side would leave three panes about 120 px
+ * wide on a 390 px phone held upright, so the grid takes the arrangement whose
+ * panes are largest along their
  * shorter side, in the area the sidebar leaves (`getPresentedGridColumns`,
  * `rendering/viewer/presented-view-layout.js`): stacked on an upright phone,
  * side by side once it is turned, and every pane is drawn where the layout

@@ -38,6 +38,7 @@ import { trackCellWork } from '../../data/open-cells-work.js';
 import { cancel, isCancellation } from '../../utils/abort.js';
 import { failureDetails, sayFailure } from '../../utils/errors.js';
 import { createListenerSet } from '../../utils/listener-set.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 /**
  * Read kinds a job owns (`ReadActivity.kind`): an analysis's gene reads, the
@@ -197,7 +198,9 @@ export class CancellableJob {
       : null;
     // A job works on the open cells: changing them in place waits for it
     // to end (`data/open-cells-work.js`).
-    trackCellWork(new Promise(resolve => { this._ended = resolve; }));
+    const work = promiseWithResolvers();
+    this._ended = work.resolve;
+    trackCellWork(work.promise);
   }
 
   /** Aborts when the job is cancelled: pass it to every read and task. */

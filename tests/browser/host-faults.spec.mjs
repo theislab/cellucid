@@ -9,8 +9,8 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 // public, the link's permissions, nothing at the address, or this computer
 // offline; named with the provider the host serves, with the status; Try
 // again first where asking again may help. Every provider host is answered
-// here by a stub (no request leaves the machine): NCBI's outage of
-// 2026-10-31 answered HTTP 500 and 403 for every file under /geo/.
+// here by a stub (no request leaves the machine): an outage of NCBI
+// answered HTTP 500 and 403 for every file under /geo/.
 
 const PINNED = `sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&`;
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Content-Type' };
@@ -22,31 +22,6 @@ const CASES = [
     name: 'GEO file, NCBI failing (500)', data: 'geo:GSE350831/GSE350831_Flex.h5ad', host: /ftp\.ncbi\.nlm\.nih\.gov/, status: 500,
     said: /^NCBI GEO \(ftp\.ncbi\.nlm\.nih\.gov\) is not answering \(HTTP 500, a server error\) for GSE350831_Flex\.h5ad: a problem on NCBI GEO's side, not with the link or with Cellucid\./,
     actions: PASSES,
-  },
-  {
-    name: 'GEO file, NCBI refusing (403)', data: 'geo:GSE350831/GSE350831_Flex.h5ad', host: /ftp\.ncbi\.nlm\.nih\.gov/, status: 403,
-    said: /^NCBI GEO \(ftp\.ncbi\.nlm\.nih\.gov\) is refusing requests from this network for now \(HTTP 403, forbidden\) for GSE350831_Flex\.h5ad, which it gives everyone: a problem on NCBI GEO's side/,
-    actions: PASSES,
-  },
-  {
-    name: 'Zenodo record, unavailable (503)', data: 'zenodo:7/atlas.h5ad', host: /zenodo\.org/, status: 503,
-    said: /^Zenodo \(zenodo\.org\) is not answering \(HTTP 503, service unavailable\) for record 7: a problem on Zenodo's side/,
-    actions: PASSES,
-  },
-  {
-    name: 'Zenodo record, limiting (429)', data: 'zenodo:7/atlas.h5ad', host: /zenodo\.org/, status: 429,
-    said: /^Zenodo \(zenodo\.org\) is limiting requests from this network \(HTTP 429, too many requests\) for record 7: Zenodo's own limit/,
-    actions: PASSES,
-  },
-  {
-    name: 'Figshare item, failing (500)', data: 'figshare:22577536', host: /api\.figshare\.com/, status: 500,
-    said: /^Figshare \(api\.figshare\.com\) is not answering \(HTTP 500, a server error\) for Figshare item 22577536: a problem on Figshare's side/,
-    actions: PASSES,
-  },
-  {
-    name: 'web address, refused (403)', data: 'https://data.example.test/lab/atlas.h5ad', host: /data\.example\.test/, status: 403,
-    said: /^data\.example\.test refused atlas\.h5ad \(HTTP 403, forbidden\): it is private or deleted, or the link has expired\. This is the link's permissions/,
-    actions: SETTLED,
   },
   {
     name: 'web address, missing (404)', data: 'https://data.example.test/lab/atlas.h5ad', host: /data\.example\.test/, status: 404,

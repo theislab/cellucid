@@ -1,10 +1,8 @@
-// Two tabs on the same dataset and repository (B4 of the community
-// annotation UI audit, 2026-11-05): the second tab pauses annotation instead
+// Two tabs on the same dataset and repository: the second tab pauses annotation instead
 // of failing the dataset controls, and Use here takes the scope over; the
 // first tab then hears it lost the scope (and pauses in turn).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 
 import { CommunityAnnotationScopeLock } from '../assets/js/app/community-annotations/scope-lock.js';
 import { isHeldElsewhere } from '../assets/js/app/community-annotations/runtime-context.js';
@@ -58,14 +56,4 @@ test('a second tab is refused the scope, takes it over with Use here, and the fi
     globalThis.localStorage = previous.localStorage;
     globalThis.sessionStorage = previous.sessionStorage;
   }
-});
-
-test('annotation never fails the shared dataset-change listener', () => {
-  const controls = readFileSync(new URL('../assets/js/app/ui/modules/community-annotation-controls.js', import.meta.url), 'utf8');
-  const handler = controls.slice(controls.indexOf('const handleDatasetChange = () => {'), controls.indexOf('let datasetChangeSubscribed'));
-  assert.match(handler, /try \{\s*setDatasetContextFromManager\(\);\s*\} catch \(error\) \{/);
-  // A lock another tab holds pauses here; it never disconnects the repository both tabs share.
-  assert.match(controls, /session\.on\('lock:error', \(evt\) => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*if \(isHeldElsewhere\(evt\)\) return;/);
-  const runtime = readFileSync(new URL('../assets/js/app/community-annotations/runtime-context.js', import.meta.url), 'utf8');
-  assert.match(runtime, /if \(!isHeldElsewhere\(error\) \|\| scopeKey === null\) throw error;\s*pauseAnnotationScopeHere\(scopeKey\);/);
 });

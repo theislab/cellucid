@@ -2,10 +2,10 @@
  * The short names embeddings are listed by (Data mapping's checklist, the
  * View N shows picker, view rows, the Dataset box): a MuData modality's
  * arrays are named as the dataset's own are, their modality after them
- * (R9M-10: they were listed by their raw keys, `rna:X_phate3`, beside
- * `UMAP` and `t-SNE`), and a Seurat key with dots is split at them. Two
- * arrays a menu would list the same way are named by their keys (R9U-6:
- * Garcia, He and Kanemaru listed `X_umap` and `X_umap_2d` both as "UMAP 2D").
+ * (never by their raw keys, `rna:X_phate3`, beside `UMAP` and `t-SNE`), and a
+ * Seurat key with dots is split at them. Two arrays a menu would list the
+ * same way are named by their keys (else Garcia, He and Kanemaru would list
+ * `X_umap` and `X_umap_2d` both as "UMAP 2D").
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -39,7 +39,7 @@ test('a Seurat reduction key with dots is split at them; the dataset\'s own keys
   );
 });
 
-test('arrays a menu would list the same way are named by their keys; ones the dimension tells apart are not (R9U-6)', () => {
+test('arrays a menu would list the same way are named by their keys; ones the dimension tells apart are not', () => {
   // The Garcia, He and Kanemaru samples' obsm.
   const arrays = [['scvi', 10], ['X_pca', 50], ['X_umap', 2], ['X_umap_1d', 1], ['X_umap_2d', 2], ['X_umap_3d', 3]]
     .map(([key, width]) => ({ key, width }));

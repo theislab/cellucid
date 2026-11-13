@@ -20,7 +20,7 @@
  *   row order by the cheaper of two reads (`GraphReadPlan`: the open rows
  *   alone, or the whole graph streamed), a slab at a time, each column its
  *   row's rank among the open rows, placed on the open cells by `relabel`:
- *   an opening grown to every cell of a 2.3M-cell atlas (102.9M entries) is
+ *   an opening grown to every cell of a multi-million-cell atlas is
  *   never held whole beside its edges;
  * - `placedGraphLines`, `readPlacedGraphRows`: a MuData modality's graph
  *   placed on the store's cells, read in its own rows;
@@ -147,9 +147,9 @@ export async function denseGraphLines(array, nCells, readOptions = {}) {
  * being in the stored order). A subsample opens its cells in priority order
  * (`subsample-plan.js`), so their rows are scattered through the graph;
  * read in that order, every slab of open cells spans the whole graph and
- * decodes its chunks again (a 2.5M-cell uniform share of a 5M-cell `.h5ad`:
- * 19.9 s for its edges against 2.0 s for every cell's). Read in the stored
- * order, each chunk is decoded once; the lines are their rows' ranks, in
+ * decodes its chunks again (an order of magnitude slower than every cell's
+ * edges: measured, 24_decisions_graph_edges_at_scale.md). Read in the
+ * stored order, each chunk is decoded once; the lines are their rows' ranks, in
  * order, placed on the open cells after the edges are built
  * (`ConnectivityLines` `relabel`).
  *
@@ -175,7 +175,8 @@ export function storedRowOrder(rows) {
  * `slabPointers`: how many were kept; `UNMAPPED` at a column of `-2` (a row
  * no cell is mapped to); `-e - 2` at entry `e` outside `[0, bound)`.
  * A function of its own, its loops typed by their
- * arguments: inline in the slab's callback it walked 23 ns an entry.
+ * arguments: inline in the slab's callback it is several times slower an
+ * entry (measured: 24_decisions_graph_edges_at_scale.md).
  */
 function keepOpen(rows, first, last, lo, from, pointers, indices, data, positions, bound, slabPointers, outIndices, outData) {
   let write = 0;
@@ -494,9 +495,10 @@ async function openRowLines(group, order, { k, nStored, positionOf, plan, stream
   }
   // Slabs read ahead while one is built: the next, and over a link as many
   // as keep `inFlightEntries` entries asked for (what fills every request
-  // the link runs at once, `AnnDataReader._graphReadAhead`: over S3's 7 × 6
-  // connections a slab at a time left most of them idle; from a disk one
-  // ahead keeps the decoders busy, and two held three times the ArrayBuffers).
+  // the link runs at once, `AnnDataReader._graphReadAhead`: over a host's
+  // many connections a slab at a time leaves most of them idle; from a disk
+  // one ahead keeps the decoders busy, and two hold three times the
+  // ArrayBuffers).
   async function* slabs() {
     let kept = 0;
     const queue = [];
@@ -557,7 +559,8 @@ async function openRowLines(group, order, { k, nStored, positionOf, plan, stream
  * @param {import('./views/cell-subset.js').CellRows} rows
  * @param {{mergeGapBytes: () => number, roundTripBytes?: () => number, readOptions?: Object, chunks?: Object|null,
  *   choose?: (target: {group: Object, rows: Uint32Array, nRows: number}) => Promise<GraphReadPlan>|GraphReadPlan,
- *   onShare?: (share: {kept: number, of: number}) => void}} options
+ *   onShare?: (share: {kept: number, of: number}) => void,
+ *   inFlightEntries?: number}} options
  * @returns {Promise<GraphLines>}
  */
 export async function inducedGraphLines(graph, rows, { mergeGapBytes, roundTripBytes = () => 0, readOptions = {}, chunks = null, choose = () => 'rows', onShare = () => {}, inFlightEntries = 0 }) {
@@ -668,7 +671,8 @@ export async function placedGraphLines(graph, nObs, { readOptions = {} } = {}) {
  * @param {Object} graph - A placed graph
  * @param {Uint32Array} cells
  * @param {{mergeGapBytes: () => number, readOptions?: Object, chunks?: Object|null,
- *   choose?: (target: {group: Object, rows: Uint32Array, nRows: number}) => Promise<GraphReadPlan>|GraphReadPlan}} options -
+ *   choose?: (target: {group: Object, rows: Uint32Array, nRows: number}) => Promise<GraphReadPlan>|GraphReadPlan,
+ *   inFlightEntries?: number}} options -
  *   `choose`: told the modality rows read, names how (`GraphReadPlan`)
  * @returns {Promise<{pointers: Float64Array, indices: Int32Array, data: Float32Array|Float64Array}>}
  */
@@ -837,7 +841,7 @@ export async function gatheredGraph(lines, label) {
  * @param {Object} graph - A `csr_matrix`/`csc_matrix` group, or a dense `n × n` array
  * @param {Uint32Array} lines
  * @param {number} nLines
- * @param {{mergeGapBytes: () => number, readOptions?: Object, chunks?: Object|null, plan?: GraphReadPlan}} options
+ * @param {{mergeGapBytes: () => number, readOptions?: Object, chunks?: Object|null, plan?: GraphReadPlan, inFlightEntries?: number}} options
  * @returns {Promise<{pointers: Float64Array, indices: ArrayLike<number|bigint>, data: ArrayLike<number|bigint>}>}
  */
 export async function readGraphRows(graph, lines, nLines, { mergeGapBytes, readOptions = {}, chunks = null, plan = 'rows', inFlightEntries = 0 }) {

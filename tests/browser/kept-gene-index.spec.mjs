@@ -21,25 +21,21 @@
  *
  * Both visits plan on the fixture's device (`helpers/device.mjs`): the link
  * and the decoding rate held, genes are read for every open cell in the
- * share's own order on each. Measured, a hosted macOS WebKit runner read
- * them for a sample on one visit only, twice: on the first (its gene shown
- * on 606 of the 1,000 cells, the rest NaN, Web contracts run 42180511574),
- * and on the later (811 of the 1,000, in the file's cell order of blocks of
- * 1,792, where the first visit had read every cell in the share's own
- * order, run 42202865024). Every value of both visits is its cell's (each
- * checked against the fixture's own formula); what differed is which cells
- * were read and where they stand, which the spec compares position by
- * position. A sample on the later visit also indexes the matrix again: an
+ * share's own order on each. A runner that answers late would read them for a
+ * sample on one visit only (measured: 38_decisions_testing_and_hosted_runners.md):
+ * every value of both visits is its cell's (each checked against the fixture's
+ * own formula), and what differs is which cells were read and where they
+ * stand, which the spec compares position by position. A sample on the later
+ * visit also indexes the matrix again: an
  * index kept under the share's own order is not looked for under a sample's
  * cell order.
  *
  * WebKit keeps a persistent context's origin storage outside its profile
  * folder (`helpers/test.mjs` `clearOriginStorage`), and two workers running
  * specs of `persistentStorage` at once lose what they kept: this spec and
- * `kept-parts.spec.mjs` failed 6 of 12 runs with two workers ("no gene
- * index is built again", "no byte downloaded again"), and in none of 120
- * with one, as CI runs them, was anything kept lost (2026-11-06). Run them
- * with `--workers=1`.
+ * `kept-parts.spec.mjs` then fail ("no gene index is built again", "no byte
+ * downloaded again"). Run them with `--workers=1`
+ * (measured: 38_decisions_testing_and_hosted_runners.md).
  */
 
 import { expect, test } from './helpers/test.mjs';

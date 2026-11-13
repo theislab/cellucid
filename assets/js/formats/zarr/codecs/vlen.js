@@ -16,9 +16,9 @@ const utf8 = new TextDecoder('utf-8', { fatal: true });
  * The UTF-8 text of `bytes[start, end)`, refusing invalid UTF-8. Short ASCII
  * strings (most labels and names) skip the decoder, whose per-call cost
  * dominates for them, and are made in one piece: a string built a character
- * at a time is a chain of as many pieces until it is first read whole (the
- * names of 1M cells of a 10M-cell Zarr store, 22 characters each, held
- * 391 MB of heap built so, 91 MB made whole).
+ * at a time is a chain of as many pieces until it is first read whole (a
+ * column of names held several times the heap built so; measured:
+ * 27_decisions_memory_model.md).
  */
 export function decodeUtf8(bytes, start, end, what) {
   const length = end - start;

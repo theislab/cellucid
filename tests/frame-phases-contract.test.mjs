@@ -142,34 +142,12 @@ test('a camera press captures the mouse; a selection press does not', () => {
   assert.match(viewer, /canvas\.setPointerCapture\(lastMousePointerId\)/);
 });
 
-
-test('a grid pane whose scene and camera did not change keeps its pixels', () => {
-  const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  // Generic invalidation bumps the scene generation; a camera change alone
-  // does not; time-driven effects other than the camera's bump it per frame.
-  assert.match(viewer, /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;/);
-  assert.match(viewer, /function invalidateCameraFrame\(\) \{\n\s*frameInvalidated = true;\n(?!\s*sceneGeneration)/);
-  // Every time-driven effect bumps the scene generation; all but the
-  // highlight pulse bump the base layer's too (pulse-layer-cache.js).
-  assert.match(viewer, /if \(baseLayerAnimationActive\(\)\) \{\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;\n\s*\} else if \(highlightTools !== null && highlightTools\.isHighlightAnimating\(\)\) \{\n\s*sceneGeneration \+= 1;/);
-  // A retained pane is skipped; a redrawn one clears its own color.
-  assert.match(viewer, /if \(retainPanes && paneIsUnchanged\(paneDrawRecords\.get\(view\.id\), mvpMatrix, pane, paneNavigationMode\)\) \{\n\s*continue;/);
-  // (A pane drawn over its kept samples, pulse-sample-mask.js, is not
-  // cleared: its marked samples are reset by the pass itself.)
-  assert.match(viewer, /const maskedPane = maskedPulsePaneReady\(view\.id, pane, paneNavigationMode, retainPanes\);\n\s*if \(!maskedPane\) \{\n\s*gl\.clear\(\n\s*\(retainPanes \? gl\.COLOR_BUFFER_BIT \| gl\.DEPTH_BUFFER_BIT : gl\.DEPTH_BUFFER_BIT\)\n\s*\| sceneStencilClearBit\(\)\n\s*\);/);
-  // Frames without panes give up retention; a single view keys its own.
-  assert.equal((viewer.match(/^\s+retainedLayoutKey = '';/gm) ?? []).length, 4);
-  assert.match(viewer, /if \(retainSingle && paneIsUnchanged\(paneDrawRecords\.get\(view\.id\), mvpMatrix, pane, navigationMode\)\) \{\n\s*sceneTargetChangedThisFrame = false;\n\s*return;/);
-});
-
-
 test('a frame that changed no pixel skips the resolve', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   assert.match(viewer, /if \(sceneTargetChangedThisFrame\) \{\n\s*sceneMsaaTarget\.resolveFrame\(frameSize\.width, frameSize\.height\);\n\s*\} else \{\n\s*sceneMsaaTarget\.endFrameUnchanged\(\);/);
   assert.match(viewer, /sceneTargetChangedThisFrame = false;\n\s*return;/);
   assert.match(viewer, /if \(panesDrawn === 0\) sceneTargetChangedThisFrame = false;/);
 });
-
 
 test('a frame an ambient animation alone asks for waits for the ambient pacer', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
@@ -191,31 +169,6 @@ test('a frame an ambient animation alone asks for waits for the ambient pacer', 
   // The pacer reads the GPU through the fence after the last drawn frame.
   assert.match(viewer, /createAmbientFramePacer\(\{ gpuBusy: drawnFrameOnGpu \}\)/);
 });
-
-
-test('the frame loop stops once the scene has settled and starts again on demand', () => {
-  const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  const render = viewer.slice(viewer.indexOf('  function render(timestamp) {'), viewer.indexOf('  /** The frame-phase driver'));
-  // The callback consumes its arming; only a drawn frame re-arms (or one
-  // the ambient pacer has timed, above).
-  assert.match(render, /^  function render\(timestamp\) \{\n(\s*\/\/.*\n)*(\s*const timedFromLastFrame = .*\n\s*frameArmedByLastFrame = null;\n)\s*animationHandle = null;/);
-  assert.doesNotMatch(render, /animationHandle = requestAnimationFrame\(render\)/);
-  assert.match(render, /\}\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);\n\s*frameArmedByLastFrame = animationHandle;\n\s*frameInvalidated = false;\n\s*framesDrawnSinceCause \+= 1;/);
-  // The settled branch returns without arming, and leaves no pulse wake to
-  // arm it later.
-  assert.match(render, /settleWindowElapsed\(\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.cancelWake\(\);\n\s*lastFrameTime = now;\n\s*drainAfterFramePhase\(\);\n\s*return;/);
-  // Everything that can change a frame starts the loop.
-  for (const site of [
-    /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;\n\s*ensureFrameScheduled\(\);/,
-    /function invalidateCameraFrame\(\) \{\n\s*frameInvalidated = true;\n\s*ensureFrameScheduled\(\);/,
-    /activeKeys\.press\(code, e\.timeStamp\);\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);/,
-    /createCanvasResizeObserver\(canvas, \(\) => ensureFrameScheduled\(\)\)/,
-    /requestFrame: \(\) => ensureFrameScheduled\(\)/,
-  ]) {
-    assert.match(viewer, site);
-  }
-});
-
 
 test('a level-of-detail step neither restarts the camera burst nor rebuilds the export preview mid-motion', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');

@@ -44,8 +44,8 @@
  *   a read of them soon after (the rest of a heap collection read in part,
  *   the next wave of a read through many chunks) is answered from it; once
  *   nothing has been fetched or waited for a while (`SURPLUS_IDLE_MS`) they
- *   are let go: a share's scattered reads held 65 MB of them after its gene
- *   index was built, where every cell's contiguous reads hold none. A kept
+ *   are let go: a share's scattered reads would otherwise hold them long
+ *   after its gene index was built. A kept
  *   request a read still running holds (`pins`) stays past `cacheBytes`
  *   until that read ends.
  * - **Metadata cache.** Reads marked `cache: true` (headers, B-tree nodes,
@@ -100,6 +100,7 @@ import { SharedWork, onAbort, abortReason, cancelled } from '../../utils/abort.j
 import { formatCountOf } from '../../utils/format-units.js';
 import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
 import { onNextMacrotask } from '../../utils/yield-macrotask.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 /**
  * How long the byte reader holds the surplus of its requests (gap bytes no
@@ -119,10 +120,9 @@ export const SURPLUS_IDLE_MS = 1000;
  * (`shapingConcurrency`: a host's own connections, and each mirror's, or its
  * streams once it is known to multiplex) when one
  * connection carries only part of the link. On Amazon S3 each connection
- * delivers a fraction of what 42 together do: the edges of the full HLCA
- * (703.5 MB) took 172 s as some 2,300 requests of 64-256 KB and 252-296 s
- * as 320-600 contiguous requests of several MB, which kept about 7 of the
- * 42 connections busy. A piece is never shorter than what one connection
+ * delivers a fraction of what all of them do, so a few long requests keep few
+ * connections busy (measured: 22_decisions_link_model_and_request_planning.md).
+ * A piece is never shorter than what one connection
  * moves in a round trip (`connectionRoundTripBytes`: shorter, its round trip
  * would outweigh its transfer), than the bytes one more request costs
  * (`mergeGapBytes`, which counts the host's request rate), or than a block;
@@ -372,19 +372,17 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * `cacheBytes` and past the idle second until that read ends: its gap
    * bytes are what its next reads ask for once the bytes before them are
    * decoded (a heap collection after the references that name it, read in
-   * 17-40 MB merged requests of reference chunks: dropped from a 64 MiB
-   * surplus 1.4-2.6 s before their references were decoded, 86 MB of a
-   * 10M-cell file's names were fetched twice, and a 1% share of a 1.2M
-   * category column read 126.3 MB against every cell's 124.5 MB). What is
+   * merged requests of reference chunks: dropped from the surplus before their
+   * references were decoded, their bytes would be fetched twice; measured:
+   * 22_decisions_link_model_and_request_planning.md). What is
    * held so is the running reads' own requests, counted (`heldBytes`) and
    * let go as each read ends (`ReadActivity.finished`), and bounded with
    * every other reader's in the realm by the memory model's budget for
    * fetched bytes when one is set (`configureByteReaders`): past it the
    * oldest held requests go first, since a long read (a cell export, a
    * gene index's build) asks for each region once, front to back, and held
-   * every request it had made until it ended (a 21,285-cell export of a
-   * 10M-cell file held 210 of its 216 fetched MB to its end; HLCA core's
-   * 808 MB export: 726 → 970 MB peak).
+   * every request it had made until it ended (measured:
+   * 27_decisions_memory_model.md).
    */
   const surplus = new Map();
   let surplusBytes = 0;
@@ -717,10 +715,10 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    */
   function enqueue(start, end) {
     const job = { start, end, wanted: end - start, leaveCarrier: null, waiters: 0, cancelled: false, fetched: false, activity: null, background: true, inFlight: true, readOnceOnly: undefined };
-    job.promise = new Promise((resolve, reject) => {
-      job.resolve = resolve;
-      job.reject = reject;
-    });
+    const settling = promiseWithResolvers();
+    job.promise = settling.promise;
+    job.resolve = settling.resolve;
+    job.reject = settling.reject;
     job.promise.catch(() => {});
     job.release = () => {
       job.waiters--;

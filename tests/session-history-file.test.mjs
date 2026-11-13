@@ -1,6 +1,6 @@
 /**
  * Session format 4 (`assets/js/app/session/history-file.js`): a history in
- * one file, in the History v2 shape (`app/session/README.md`, "The file").
+ * one file, in the history model's shape (`app/session/README.md`, "The file").
  *
  * - The golden history (every kind of record the model has) round-trips
  *   exactly through the writer and the reader, whole and in two stages.
@@ -292,7 +292,7 @@ test('the model\'s rules are the writer\'s and the reader\'s: a broken tree is r
   }
 });
 
-test('a file of another Cellucid is read part by part: a state part or a tracker this version lacks is left for the history to leave out (F164)', async () => {
+test('a file of another Cellucid is read part by part: a state part or a tracker this version lacks is left for the history to leave out', async () => {
   const session = await golden();
   const { manifest, chunks } = await chunksOf(await session.write());
   const { gzipDecompress } = await import('../assets/js/app/session/codecs/gzip.js');

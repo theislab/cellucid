@@ -1,7 +1,7 @@
 // A slow link that keeps moving is never cut by the community-annotation
-// Worker; only silence for a whole stall window is (repro r07 of the
-// 2026-11-05 backend audit: a 1,000,000-byte publish on a 500 kbit/s uplink
-// took 21 s and always hit the former 15 s total deadline). Time is virtual:
+// Worker; only silence for a whole stall window is (a 1,000,000-byte publish
+// on a 500 kbit/s uplink takes 21 s and must not meet a total deadline).
+// Time is virtual:
 // setTimeout runs on a clock the test advances, so no test waits for real.
 
 import assert from 'node:assert/strict';
@@ -131,7 +131,7 @@ function github(forwarded) {
   };
 }
 
-test('a 1,000,000-byte publish uploaded at 500 kbit/s (22 s) is published (repro r07)', async () => {
+test('a 1,000,000-byte publish uploaded at 500 kbit/s (22 s) is published', async () => {
   const bytes = publishBody();
   const upload = gatedStream(bytes, BYTES_PER_SECOND);
   const clock = installVirtualClock();

@@ -44,14 +44,14 @@ picks a decoder per codec family by measuring them on the pool, kept by
 | `hosts.js` | What this realm knows of each web host (by origin), shared across readers and tabs (`BroadcastChannel`). |
 | `mirrors.js`, `s3.js` | Other addresses of the same bytes (public S3 mirrors). |
 | `read-witness.js` | What was read, as checksums: when a host's validator moves, the bytes decide whether the file changed (a redeployed site gives every file new validators although its bytes are the same). Used by `byte-source.js` and `zarr/stores/http.js`. |
-| `kept-parts.js` | Bytes of remote files kept in the origin-private file system across visits, as journals filed under the file's identity and size; checked by `page-checks.js`, written through `sync-access.js`. Storage itself is `data/anndata/transcode/space.js`. |
+| `kept-parts.js` | Bytes of remote files kept in the origin-private file system across visits, as journals filed under the file's identity and size; checked by `page-checks.js`, written through `sync-access.js`. Storage itself is `data/anndata/transcode/space.js`; what a journal's files hold is `data/anndata/transcode/kept-format.js` and `kept-journal.js` (with `page-checks.js`, all that the code fingerprint of kept parts covers). |
 | `range-cache.js` | Worker side of the page's range cache (`data/byte-range-cache.js` is the page side). |
 | `activity.js` | `ReadActivity`: what one operation read (requests, bytes, chunks), for progress and the read activity log. |
 | `decode-pool.js`, `decode-worker.js`, `decoded-budget.js` | Decoding off the reader thread; one byte budget for decoded chunks of a store. |
 | `byte-cache.js` | The one least-recently-used cache of decoded pieces of a store (`ByteCache`): a Zarr store's decoded chunks and shard indexes, an HDF5 file's decoded chunks and global heap collections, charged to a `decoded-budget.js` budget. |
 | `decoder-choice.js`, `decoder-memory.js` | Measured decoder choice per family, kept in IndexedDB. |
 | `inflate.js`, `wasm-codecs.js`, `shuffle.js`, `lz-match.js`, `byte-order.js` | Codecs and byte-level primitives. |
-| `deflate-seek.js` | Random access into an unindexed DEFLATE stream (rapidgzip technique). Today imported only by `tests/text-matrix-stream-contract.test.mjs`; see the tidiness findings. |
+| `deflate-seek.js` | Random access into an unindexed DEFLATE stream (rapidgzip technique). Imported only by `tests/text-matrix-stream-contract.test.mjs` and `tests/per-cell-allocation-contract.test.mjs`. |
 | `host-fetch.js` | Requests to a notebook kernel through the widget's frame. |
 
 ## Link vocabulary

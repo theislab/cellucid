@@ -262,7 +262,7 @@ const QR_TOLERANCE = 1e-7;
  *   `pivot[k]` the original column at position k; `v`/`beta` the
  *   Householder reflections (H = I − beta·v·vᵀ); `r` the p × p upper triangle
  */
-export function householderQr(matrix, n, p) {
+function householderQr(matrix, n, p) {
   // Column-major working copy.
   const columns = Array.from({ length: p }, (_, j) => {
     const column = new Float64Array(n);
@@ -327,7 +327,7 @@ export function householderQr(matrix, n, p) {
 }
 
 /** Qᵀy in place (the "effects" of R's lm.fit). */
-export function applyQt(qr, y) {
+function applyQt(qr, y) {
   for (let k = 0; k < qr.v.length; k++) {
     const reflector = qr.v[k];
     if (reflector === null || qr.beta[k] === 0) continue;
@@ -497,7 +497,7 @@ function bsplineRow(knots, x, order, derivative) {
  * @param {number} df
  * @returns {{knots: number[], boundary: [number, number], row: (point: number) => Float64Array}}
  */
-export function naturalSplineBasis(x, df) {
+function naturalSplineBasis(x, df) {
   const sorted = Float64Array.from(x).sort();
   const boundary = [sorted[0], sorted[sorted.length - 1]];
   const interiorCount = Math.max(df - 2, 0);

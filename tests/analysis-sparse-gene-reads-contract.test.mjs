@@ -1,7 +1,7 @@
 /**
  * Analyses read a gene the views do not show as its entries, never as a
- * column of every open cell (lane P's scale check: a dense column per gene
- * held 20 GB for 50 genes at 100M cells):
+ * column of every open cell (a dense column per gene would hold 20 GB for 50
+ * genes at 100M cells):
  *
  * - a page's values of a gene (Detailed, Quick Insights, Correlation:
  *   `getDataForPages`) are gathered from the gene's entries

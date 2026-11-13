@@ -71,7 +71,7 @@
  *   permission kind `unseen-link`) when an agent names an address the person
  *   has not seen in this tab (`ui/modules/seen-addresses.js`), before
  *   anything is requested, so an agent misled by text it read cannot make
- *   the tab send what it read to any host (F121). False by default.
+ *   the tab send what it read to any host. False by default.
  * - `confirmAt`: when the person is asked: `start` (before the action runs,
  *   the default) or `handler` (its implementation asks, with
  *   `ctx.confirm(detail)`, once it knows what the cost is: a download's
@@ -84,7 +84,7 @@
  * - `keepsWhenStopped`: stopped while it runs (the person's Stop of an agent
  *   turn), it keeps what it did and records it, where any other change is put
  *   back (false by default): a film stopped stays at the frame it stopped on
- *   (F104, owner 2026-11-11: `camera-path.play`, whose camera stays where the
+ *   (`camera-path.play`, whose camera stays where the
  *   path stopped, as a pause and `camera-path.stop` leave it). Its
  *   implementation hears the signal, ends where it is and answers. Only for
  *   an action that records a step.
@@ -170,9 +170,9 @@ export const ACTION_EFFECTS = Object.freeze(['state', 'view', 'layout', 'read', 
  *
  * A control must be stepless: touching the domain of the work it stops, it
  * would wait in order behind that work and run only once there was nothing
- * left to stop (F96, 2026-11-11: `camera-path.stop`, a view change on the
- * camera, waited for the `camera-path.play` it was sent to stop, then was
- * refused "not playing").
+ * left to stop (`camera-path.stop`, a view change on the camera, would wait
+ * for the `camera-path.play` it was sent to stop, then be refused "not
+ * playing").
  *
  * @param {string} effect
  */
@@ -382,8 +382,8 @@ export function actionParamsShape(schema) {
 
 /**
  * Parameters recorded with version `from` of an action, brought to its
- * version now, one upgrader at a time (what a replay dispatches; History v2
- * §3.8), on a copy: the recorded parameters are never changed. The result is
+ * version now, one upgrader at a time (what a replay dispatches), on a
+ * copy: the recorded parameters are never changed. The result is
  * checked by the caller against the schema now, as any parameters are.
  * Throws `ParamsNotUpgradable` when an upgrader on the way is a
  * `valuesOnlyUpgrade`.

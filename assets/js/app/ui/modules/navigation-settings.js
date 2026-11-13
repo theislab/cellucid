@@ -144,12 +144,12 @@ export function wireNavigationSettings({ viewer, dom, listen, isDestroyed, owner
 
   // The viewer setters are cheap uniform writes, so each `input` applies at
   // once and the readout follows the thumb.
-  for (const [update, input] of [
+  for (const [update, input] of /** @type {const} */ ([
     [updateOrbitKeySpeed, dom.orbitKeySpeedInput],
     [updatePlanarPanSpeed, dom.planarPanSpeedInput],
     [updateLookSensitivity, dom.lookSensitivityInput],
     [updateMoveSpeed, dom.moveSpeedInput]
-  ]) {
+  ])) {
     update();
     listen(input, 'input', update);
   }
@@ -160,13 +160,13 @@ export function wireNavigationSettings({ viewer, dom, listen, isDestroyed, owner
     viewer.setInvertLookX(value);
   };
 
-  for (const [checkbox, apply] of [
+  for (const [checkbox, apply] of /** @type {const} */ ([
     [dom.orbitReverseCheckbox, value => viewer.setOrbitInvertRotation(value)],
     [dom.showOrbitAnchorCheckbox, value => viewer.setShowOrbitAnchor(value)],
     [dom.planarZoomToCursorCheckbox, value => viewer.setPlanarZoomToCursor(value)],
     [dom.planarInvertAxesCheckbox, value => viewer.setPlanarInvertAxes(value)],
     [dom.invertLookCheckbox, applyInvertLook]
-  ]) {
+  ])) {
     apply(checkbox.checked);
     listen(checkbox, 'change', () => {
       // A checkbox leaves the letters to the page (`utils/key-ownership.js`):

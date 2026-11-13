@@ -1,15 +1,14 @@
 /**
- * R9V-1 (bug hunt round 9): a field chosen while the overlay was turning on
- * left it "loading" for good. The field change took the operation over and
- * returned because a load was under way; the load, no longer the owner,
- * returned without clearing its loading state. Every way in (an agent's
- * `setting.set`, a session or history restore that switches the overlay on
- * and then picks the field) ended with the switch and the select grayed,
- * "the vector field is loading", and no particle.
+ * A field chosen while the overlay is turning on must not leave it "loading"
+ * for good: the field change takes the operation over, and the load, no
+ * longer the owner, must still clear its loading state. Every way in (an
+ * agent's `setting.set`, a session or history restore that switches the
+ * overlay on and then picks the field) would otherwise end with the switch
+ * and the select grayed, "the vector field is loading", and no particle.
  *
  * The newest operation owns the block: a field change, the switch turned off
  * or another embedding shown during a load takes the loading state over and
- * finishes it. R9V-4: the only field bound to the shown embedding is chosen;
+ * finishes it. The only field bound to the shown embedding is chosen;
  * among several none is guessed.
  */
 import assert from 'node:assert/strict';
@@ -219,7 +218,7 @@ test('another embedding shown during a load takes the load over', { timeout: 500
   assert.equal(dom.velocityFieldSelect.disabled, false);
 });
 
-test('the only field bound to the shown embedding is chosen; among several none is guessed (R9V-4)', t => {
+test('the only field bound to the shown embedding is chosen; among several none is guessed', t => {
   const { dom, controls, shown } = setup(t, { layout: 'X_tsne' });
   assert.equal(dom.velocityFieldSelect.value, 'velocity');
   assert.equal(dom.velocityEnabledCheckbox.disabled, false);
@@ -230,7 +229,7 @@ test('the only field bound to the shown embedding is chosen; among several none 
   assert.equal(dom.velocityEnabledCheckbox.title, SWITCH_UNAVAILABLE.noneSelected);
 });
 
-test('the switch names the embeddings to show as the picker does (R9V-3)', t => {
+test('the switch names the embeddings to show as the picker does', t => {
   const { dom } = setup(t, { layout: 'X_pca' });
   assert.equal(
     dom.velocityEnabledCheckbox.title,

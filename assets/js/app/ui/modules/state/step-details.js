@@ -1,6 +1,6 @@
 /**
- * @fileoverview The details a graph row opens with its `›` button (History
- * v2 §3.10): only the facts that apply, then the row's own actions.
+ * @fileoverview The details a graph row opens with its `›` button: only the
+ * facts that apply, then the row's own actions.
  *
  * - **A step:** who acted (the agent and its model, the turn ↗), when, how
  *   long it took, its branch; why it is stale or flagged (with Run again
@@ -132,7 +132,7 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
   when.push(`branch ${view.branch(step.branch)?.name ?? step.branch}`);
   out.push(fact(doc, 'When', when.join(' · ')));
   if (row.stale !== null) {
-    // Each input that changed with its own cause (F156), as history.stale and history.step say it.
+    // Each input that changed with its own cause, as history.stale and history.step say it.
     const box = doc.createElement('div');
     box.className = 'history-detail-warning';
     box.append(line(doc, `⚠ Stale: ${staleReasons(row.stale, { quote: text => `“${text}”` }).join(' ')}`));
@@ -172,7 +172,7 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
     out.push(fact(doc, 'Changed', step.reason ?? 'Nothing'));
   }
   if (step.bookmark) out.push(fact(doc, 'Bookmark', `★ ${step.bookmark}`));
-  // Its camera, as the step kept it, without moving the history (§3.15.5:
+  // Its camera, as the step kept it, without moving the history:
   // applied even while camera moves are not recorded, as it is asked for).
   if (ops.canShowView()) {
     out.push(fact(doc, 'View', button('Show this step’s view', () => ops.showView(step), {

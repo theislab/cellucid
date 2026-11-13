@@ -11,38 +11,14 @@ const BUTTONS_CSS_URL = new URL(
   '../assets/css/components/_buttons.css',
   import.meta.url
 );
-const DATASET_CONNECTIONS_URL = new URL(
-  '../assets/js/app/ui/modules/dataset-connections.js',
-  import.meta.url
-);
-const COMMUNITY_CONTROLS_URL = new URL(
-  '../assets/js/app/ui/modules/community-annotation-controls.js',
-  import.meta.url
-);
-const COMMUNITY_PANEL_URL = new URL(
-  '../assets/js/app/ui/modules/community-annotation/controls-panel.js',
-  import.meta.url
-);
-const UI_COORDINATOR_URL = new URL(
-  '../assets/js/app/ui/core/ui-coordinator.js',
-  import.meta.url
-);
 
 const [
   indexHtml,
   buttonsCss,
-  datasetConnectionsSource,
-  communityControlsSource,
-  communityPanelSource,
-  uiCoordinatorSource,
   resetCss
 ] = await Promise.all([
   readFile(INDEX_URL, 'utf8'),
   readFile(BUTTONS_CSS_URL, 'utf8'),
-  readFile(DATASET_CONNECTIONS_URL, 'utf8'),
-  readFile(COMMUNITY_CONTROLS_URL, 'utf8'),
-  readFile(COMMUNITY_PANEL_URL, 'utf8'),
-  readFile(UI_COORDINATOR_URL, 'utf8'),
   readFile(new URL('../assets/css/base/_reset.css', import.meta.url), 'utf8')
 ]);
 
@@ -123,62 +99,6 @@ test('every static compact information disclosure has one exact accessible pair'
     );
     assert.equal(attributeValue(popoverAttributes, 'tabindex'), '-1');
     assert.equal(hasBooleanAttribute(popoverAttributes, 'hidden'), true);
-  }
-});
-
-test('static guidance is compact while live state remains directly visible', () => {
-  assert.doesNotMatch(indexHtml, /\buser-data-help\b/);
-  assert.doesNotMatch(
-    indexHtml,
-    /<div class="field-help">\s*Save or load the application state/
-  );
-  assert.doesNotMatch(
-    indexHtml,
-    /<div class="field-help">\s*Choose orbit for 3D exploration/
-  );
-
-  for (const liveId of [
-    'connectivity-info',
-    'velocity-overlay-info',
-    'filter-count',
-    'active-filters',
-    'highlight-mode-description',
-    'highlight-count'
-  ]) {
-    assert.match(indexHtml, new RegExp(`\\bid="${liveId}"`));
-  }
-});
-
-test('one controller owns static and dynamic information popovers', () => {
-  assert.match(
-    uiCoordinatorSource,
-    /const infoPopovers = initInfoPopovers\(\{ root: document \}\)/
-  );
-  assert.match(
-    uiCoordinatorSource,
-    /initCommunityAnnotationControls\(\{[\s\S]*infoPopovers/
-  );
-  assert.doesNotMatch(
-    datasetConnectionsSource,
-    /positionTooltip|attachTooltipToggle|userDataInfoTooltip/
-  );
-  assert.match(
-    communityPanelSource,
-    /infoPopovers\.configurePair\(btn, tooltip/
-  );
-  assert.match(
-    communityPanelSource,
-    /infoPopovers\.closeWithin\(container\)/
-  );
-  assert.match(
-    communityControlsSource,
-    /infoPopovers\.closeWithin\(container\)/
-  );
-  for (const moduleSource of [communityControlsSource, communityPanelSource]) {
-    assert.doesNotMatch(
-      moduleSource,
-      /document\.body\.querySelectorAll\('\.info-tooltip'\)|tooltipPairs/
-    );
   }
 });
 

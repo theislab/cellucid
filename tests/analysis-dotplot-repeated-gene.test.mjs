@@ -2,9 +2,9 @@
  * A gene in two gene sets is a column in each, as in scanpy (`dotplot-ui.js`
  * builds one column per entry). The plot draws every layout (dots, matrix
  * cells, violins) at one numeric position per entry: a category axis keyed by
- * the gene's name folded the repeated gene into one column, so the plot showed
- * one column fewer than its genes and the second set's dots and bracket sat on
- * the wrong genes (lane-analyst L3-1).
+ * the gene's name would fold the repeated gene into one column, so the plot
+ * would show one column fewer than its genes and the second set's dots and
+ * bracket would sit on the wrong genes.
  */
 
 import assert from 'node:assert/strict';

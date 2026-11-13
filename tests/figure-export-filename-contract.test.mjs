@@ -1,7 +1,7 @@
 /**
  * An exported figure's filename names the dataset, the color field, the view
  * and the time. A view nobody renamed carries its color field as its label,
- * so the field used to appear twice: `Atlas_cell_type_cell_type_<ts>.png`.
+ * so the field must not appear twice: `Atlas_cell_type_cell_type_<ts>.png`.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -60,7 +60,7 @@ test('a renamed view, a grid, and a DPI tag keep their own segments', () => {
     }),
     'Atlas_multiview_20261018_120000.svg',
   );
-  // A view labeled with a filter of the colored field names the field once (found 2026-11-10:
+  // A view labeled with a filter of the colored field names the field once (not
   // "…Suo_cell_type_cell_type_cell_type_hiding_AXL…png").
   assert.equal(
     buildExportFilename({

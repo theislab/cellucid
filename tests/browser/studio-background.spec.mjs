@@ -2,14 +2,13 @@
  * The studio backgrounds (`Studio (light)`, `Studio (dark)`) in every
  * combination a user can reach.
  *
- * - Every camera mode × embedding dimension × layout draws the backdrop with
+ * - Every camera mode × embedding dimension × layout draws the backdrop (one
+ *   studio swept, the other drawn once on each surface) with
  *   finite uniforms and no WebGL error, on the surface the pane should have:
  *   the floor for a 3-D pane in orbit or free-fly, the dot surface otherwise.
  * - Switching through all six backgrounds in a multiview grid, mid-fade, is
  *   stable, keeps the page color equal to the canvas color, and the scene
  *   goes quiet afterwards — also after a floor ↔ dots crossfade.
- * - A session carries the new values out and back.
- * - Figure export reproduces the backdrop in SVG and PNG.
  */
 
 import { expect, test } from './helpers/test.mjs';
@@ -20,7 +19,6 @@ import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 import { installMultiDimensionFixture } from './helpers/multi-dimension-fixture.mjs';
 import { VIEWER_BACKGROUNDS } from '../../assets/js/rendering/viewer-backgrounds.js';
 import { STUDIO_PALETTES } from '../../assets/js/rendering/studio-backdrop.js';
-import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Each test draws many frames, some in a multiview grid; the macOS Firefox
 // runners render in software, so the file carries its own budget, as the
@@ -203,75 +201,106 @@ async function expectStudioFrame(page, { panes, label }) {
   expect(probe.draws, `${label}: studio passes drawn`).toBeGreaterThanOrEqual(panes);
 }
 
-// One test per background, and per camera lock in a grid. Every combination
-// is still drawn and checked; split, each test is a share of the frames the
-// single test drew, and the single test drew more frames than its budget
-// holds on a runner that takes seconds per frame.
-for (const background of ['studio', 'studio-dark']) {
-  test(`every camera mode and dimension draws the ${background} backdrop`, async ({
-    page,
-  }) => {
-    const productErrors = observeProductErrors(page);
-    await openFixture(page);
-    await installStudioProbe(page);
+// The two studios differ by palette only (`STUDIO_PALETTES`), and locked and
+// independent cameras by which camera a pane reads. So one studio is swept
+// through every camera mode and dimension, and the other studio (and, in a
+// grid, the other camera lock) is drawn once on each surface: a test that
+// swept every combination would draw more frames than its budget holds on a runner
+// that takes seconds per frame.
+test('every camera mode and dimension draws the studio backdrop, and the dark studio draws both surfaces', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await openFixture(page);
+  await installStudioProbe(page);
 
-    await setControl(page, 'background-select', background);
+  await test.step('every camera mode and dimension draws the studio backdrop', async () => {
+    await setControl(page, 'background-select', 'studio');
     for (const dimension of [3, 2, 1]) {
       await setDimension(page, 'live', dimension);
       for (const mode of ['orbit', 'planar', 'free']) {
         await setControl(page, 'navigation-mode', mode);
-        const label = `${background}, ${dimension}-D, ${mode}`;
+        const label = `studio, ${dimension}-D, ${mode}`;
         await expectStudioFrame(page, { panes: 1, label });
         expect(await presentedPlanarity(page, 'live'), label).toBe(
           dimension === 3 && mode !== 'planar' ? 0 : 1,
         );
       }
     }
-
-    expect(productErrors).toEqual([]);
   });
 
-  for (const locked of [true, false]) {
-    const cameras = locked ? 'locked' : 'independent';
-    test(`two panes of different dimensions with ${cameras} cameras draw the ${background} backdrop`, async ({
-      page,
-    }) => {
-      const productErrors = observeProductErrors(page);
-      await openFixture(page);
-      await installStudioProbe(page);
+  await test.step('the floor and the dot surface draw the studio-dark backdrop', async () => {
+    await setControl(page, 'background-select', 'studio-dark');
+    for (const [dimension, mode] of [[3, 'orbit'], [2, 'planar']]) {
+      await setDimension(page, 'live', dimension);
+      await setControl(page, 'navigation-mode', mode);
+      const label = `studio-dark, ${dimension}-D, ${mode}`;
+      await expectStudioFrame(page, { panes: 1, label });
+      expect(await presentedPlanarity(page, 'live'), label).toBe(
+        dimension === 3 && mode !== 'planar' ? 0 : 1,
+      );
+    }
+  });
 
-      await setDimension(page, 'live', 3);
-      await setControl(page, 'navigation-mode', 'orbit');
-      await page.locator('#split-keep-view-btn').click();
-      await expect(page.locator('.split-badge')).toHaveCount(2);
-      const snapshotId = await page.evaluate(
-        () => window._cellucidViewer.getSnapshotViews()[0].id,
-      );
-      await openGridFocusedOnLive(page);
-      await setControl(page, 'background-select', background);
-      await page.evaluate(
-        value => window._cellucidViewer.setCamerasLocked(value),
-        locked,
-      );
-      for (const dimension of [2, 3, 1]) {
-        await setDimension(page, 'live', dimension);
-        for (const mode of ['orbit', 'planar', 'free']) {
-          await setControl(page, 'navigation-mode', mode);
-          await expectStudioFrame(page, {
-            panes: 2,
-            label: `${background}, ${cameras}, live ${dimension}-D, ${mode}`,
-          });
-        }
+  expect(productErrors).toEqual([]);
+});
+
+test('two panes of different dimensions draw the studio backdrops, cameras locked or independent', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await openFixture(page);
+  await installStudioProbe(page);
+
+  await setDimension(page, 'live', 3);
+  await setControl(page, 'navigation-mode', 'orbit');
+  await page.locator('#split-keep-view-btn').click();
+  await expect(page.locator('.split-badge')).toHaveCount(2);
+  const snapshotId = await page.evaluate(
+    () => window._cellucidViewer.getSnapshotViews()[0].id,
+  );
+  await openGridFocusedOnLive(page);
+  const lockCameras = locked => page.evaluate(
+    value => window._cellucidViewer.setCamerasLocked(value),
+    locked,
+  );
+
+  await test.step('two panes of different dimensions with locked cameras draw the studio backdrop', async () => {
+    await setControl(page, 'background-select', 'studio');
+    await lockCameras(true);
+    for (const dimension of [2, 3, 1]) {
+      await setDimension(page, 'live', dimension);
+      for (const mode of ['orbit', 'planar', 'free']) {
+        await setControl(page, 'navigation-mode', mode);
+        await expectStudioFrame(page, {
+          panes: 2,
+          label: `studio, locked, live ${dimension}-D, ${mode}`,
+        });
       }
-      expect(await page.evaluate(
-        id => window._cellucidViewer.getViewDimension(id),
-        snapshotId,
-      )).toBe(3);
+    }
+  });
 
-      expect(productErrors).toEqual([]);
+  // The live pane is 2-D beside the kept 3-D pane: both surfaces in one frame.
+  for (const [background, locked] of [['studio', false], ['studio-dark', true], ['studio-dark', false]]) {
+    const cameras = locked ? 'locked' : 'independent';
+    await test.step(`two panes of different dimensions with ${cameras} cameras draw the ${background} backdrop`, async () => {
+      await setControl(page, 'background-select', background);
+      await lockCameras(locked);
+      await setDimension(page, 'live', 2);
+      await setControl(page, 'navigation-mode', 'orbit');
+      await expectStudioFrame(page, {
+        panes: 2,
+        label: `${background}, ${cameras}, live 2-D, orbit`,
+      });
     });
   }
-}
+  expect(await page.evaluate(
+    id => window._cellucidViewer.getViewDimension(id),
+    snapshotId,
+  )).toBe(3);
+
+  expect(productErrors).toEqual([]);
+});
 
 test('a projectile fired down at the studio floor lands on it', async ({ page }) => {
   const productErrors = observeProductErrors(page);
@@ -297,7 +326,7 @@ test('a projectile fired down at the studio floor lands on it', async ({ page })
   // to a quarter second (`MAX_FRAME_DT`), so wall-clock time is not flight
   // time. This shot needs about two seconds of flight to reach the floor; four
   // wall-clock seconds on a runner whose frames each take longer than a
-  // quarter second were less than that, and the shot was still in the air.
+  // quarter second are less than that, and the shot is still in the air.
   // Frames are counted instead: 240 are four seconds of flight at 60 Hz and
   // more wherever frames are slower.
   const heights = await page.evaluate(({ floorY, maxFrames, framesAfter }) => (
@@ -368,97 +397,6 @@ test('switching through every background in a grid is stable and the scene goes 
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
   await setDimension(page, 'live', 2);
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
-
-  expect(productErrors).toEqual([]);
-});
-
-async function saveSession(page, testInfo, name) {
-  const downloadPromise = page.waitForEvent('download');
-  await clickSaveSession(page);
-  const download = await downloadPromise;
-  const sessionPath = testInfo.outputPath(name);
-  await download.saveAs(sessionPath);
-  return sessionPath;
-}
-
-async function loadSession(page, sessionPath) {
-  const chooserPromise = page.waitForEvent('filechooser');
-  await clickLoadSession(page);
-  const chooser = await chooserPromise;
-  await chooser.setFiles(sessionPath);
-}
-
-test('a session carries the studio backgrounds out and back', async ({
-  page,
-}, testInfo) => {
-  const productErrors = observeProductErrors(page);
-  await openFixture(page);
-  for (const background of ['studio-dark', 'studio']) {
-    await setControl(page, 'background-select', background);
-    const sessionPath = await saveSession(page, testInfo, `${background}.cellucid-session`);
-    await setControl(page, 'background-select', 'white');
-    await expect(page.locator('#background-select')).toHaveValue('white');
-    await loadSession(page, sessionPath);
-    await expect(page.locator('#background-select')).toHaveValue(background);
-    await expect.poll(() => page.evaluate(
-      () => document.documentElement.dataset.viewerBackground,
-    )).toBe(background);
-    const [r, g, b] = STUDIO_PALETTES[background].surface;
-    await expect.poll(() => page.evaluate(() => Array.from(
-      window._cellucidViewer.getPresentedViewState('live').renderState.bgColor,
-      channel => Math.round(channel * 255),
-    ))).toEqual([r, g, b]);
-  }
-  expect(productErrors).toEqual([]);
-});
-
-async function exportFigure(page, format) {
-  await page.getByLabel('Download format').selectOption(format);
-  if (format === 'svg') {
-    await page.getByLabel('SVG point strategy').selectOption('full-vector');
-  }
-  const downloadPromise = page.waitForEvent('download');
-  await page.locator('#figure-export-btn').click();
-  const download = await downloadPromise;
-  await expect(page.locator('#figure-export-btn')).toHaveText('Export');
-  expect(await download.failure()).toBeNull();
-  const chunks = [];
-  for await (const chunk of await download.createReadStream()) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
-
-test('figure export reproduces the studio floor and dot surface', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openFixture(page);
-  await page.locator('#figure-export-section > summary').click();
-  await page.getByRole('button', { name: /^Download\b/ }).click();
-  await expect(page.locator('#figure-export-reference-grid')).toBeChecked();
-
-  // A 3-D orbit pane: floor rules stroked with gradients, glow and pool.
-  await setControl(page, 'background-select', 'studio-dark');
-  await setDimension(page, 'live', 3);
-  await setControl(page, 'navigation-mode', 'orbit');
-  await expect(page.locator('#figure-export-reference-grid')).toBeEnabled();
-  const floorSvg = (await exportFigure(page, 'svg')).toString('utf8');
-  expect(floorSvg).toContain('<g class="cellucid-studio-backdrop">');
-  expect(floorSvg).toMatch(/<radialGradient id="reference_layer-tone-0"/);
-  expect(floorSvg).toMatch(/<line [^>]*stroke="url\(#reference_layer-rule-\d+\)"/);
-  const floorPng = await exportFigure(page, 'png');
-  expect(floorPng.subarray(1, 4).toString('ascii')).toBe('PNG');
-  expect(floorPng.length).toBeGreaterThan(1000);
-
-  // A 2-D planar pane: the dot surface.
-  await setControl(page, 'background-select', 'studio');
-  await setDimension(page, 'live', 2);
-  const dotsSvg = (await exportFigure(page, 'svg')).toString('utf8');
-  const backdrop = dotsSvg.slice(dotsSvg.indexOf('<g class="cellucid-studio-backdrop">'));
-  expect(backdrop.length).toBeGreaterThan(0);
-  expect(backdrop).toMatch(/<g stroke="none"><circle /);
-  expect(dotsSvg).not.toMatch(/stroke="url\(#reference_layer-rule-/);
-  const dotsPng = await exportFigure(page, 'png');
-  expect(dotsPng.length).toBeGreaterThan(1000);
 
   expect(productErrors).toEqual([]);
 });

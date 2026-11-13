@@ -1,5 +1,5 @@
 /**
- * History v2 §3.5: the pool keeps only values something refers to. A
+ * The pool keeps only values something refers to. A
  * camera gesture merged into one step keeps one value, not one per change;
  * an action that changed nothing, one that failed and was put back, and the
  * changes made while paused keep none once nothing shows them; a value a

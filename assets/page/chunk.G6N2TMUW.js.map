@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": ["../js/utils/promise-resolvers.js"],
+  "mappings": "wCAeO,SAASA,GAAuB,CAErC,IAAIC,EAEAC,EAKJ,MAAO,CAAE,QAJkC,IAAI,QAAQ,CAACC,EAAQC,IAAS,CACvEH,EAAUE,EACVD,EAASE,CACX,CAAC,EACiB,QAAAH,EAAS,OAAAC,CAAO,CACpC,CAVgBG,EAAAL,EAAA",
+  "names": ["promiseWithResolvers", "resolve", "reject", "settle", "fail", "__name"]
+}

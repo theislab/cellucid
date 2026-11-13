@@ -285,8 +285,9 @@ export function createZipWriter(sink) {
     }
     paths.set(key, path);
     const run = queue.then(async () => {
-      const size = isBlob ? data.size : data.byteLength;
-      const checksum = crc ?? crc32(data);
+      const size = data instanceof Uint8Array ? data.byteLength : data.size;
+      // A Blob's checksum is its caller's (checked above); bytes are summed here when none was given.
+      const checksum = data instanceof Uint8Array ? crc ?? crc32(data) : crc;
       const at = offset;
       await write(localHeader(nameBytes, checksum, size));
       if (size > 0) await write(data);

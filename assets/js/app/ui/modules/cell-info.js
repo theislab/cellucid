@@ -254,7 +254,7 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     const run = () => {
       idleHandle = 0;
       // While the graphics context is lost the viewer refuses every change
-      // (a stale idle request threw there); it is asked again once restored.
+      // (a stale idle request would throw there); it is asked again once restored.
       if (!enabled || destroyed || viewer.isContextLost()) return;
       viewer.prepareCellPicking();
     };

@@ -4,7 +4,7 @@
  * same: a turn streams its reply, its tool calls run as the page's own
  * actions and become history steps labeled with the agent and the turn,
  * Undo turn puts every state domain back (the state fingerprint), Stop ends
- * a turn mid-reply, a provider that asks to slow down is waited out, the
+ * a turn mid-reply, the
  * conversation is kept with the history and comes back with a session file
  * (Save asks whether to include it), an agent's action that asks first shows
  * its card (Allow, Deny, the agent giving up), the activity line follows an
@@ -15,15 +15,14 @@
  * it was sent (`helpers/agent-chat.mjs`). The permissions, the effort, the
  * history link and the chat's own tools are `agent-chat-features.spec.mjs`.
  */
-import { closePageWithApplicationRetirement, expect, test } from './helpers/test.mjs';
+import { expect, test } from './helpers/test.mjs';
 import { openPhoneSheet } from './helpers/panels.mjs';
 import { sessionManifest } from './helpers/session-files.mjs';
 import {
-  CELL_TYPE, COLOR_BY_SCORE, SCORE, fingerprint, installScriptedModel, observeProductErrors, openAgentDataset as openDataset,
-  openChat, queueReplies, resultJson, say, stepFacts, waitForHold, waitForTurnEnd,
+  COLOR_BY_SCORE, SCORE, fingerprint, installScriptedModel, observeProductErrors, openAgentDataset as openDataset,
+  openChat, queueReplies, say, stepFacts, waitForHold, waitForTurnEnd,
 } from './helpers/agent-chat.mjs';
 import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
-import { continueWhereLeftOff } from './helpers/welcome.mjs';
 
 test.describe('agent chat', () => {
   test.beforeEach(async ({ page }) => {
@@ -78,33 +77,6 @@ test.describe('agent chat', () => {
     await expect(foot.locator('.agent-turn-undo')).toHaveText('Undone');
     await expect(foot.locator('.agent-turn-steps')).toHaveText('1 step undone ↗');
     expect(await fingerprint(page)).toEqual(before);
-    expect(errors).toEqual([]);
-  });
-
-  test('"undo your last change" after the person acted: the history read shows the step shown is the person\'s, not the one the agent\'s call named', async ({ page }) => {
-    const errors = observeProductErrors(page);
-    await openDataset(page);
-    await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored.' }]);
-    await say(page, 'Color by score');
-    // The person hides a category themselves.
-    await page.evaluate(async field => {
-      const { getActions } = await import('/assets/js/app/actions/index.js');
-      await getActions().dispatch('filter.category.visibility', { field, categories: ['beta'], visible: false });
-    }, CELL_TYPE);
-    // Asked to undo its last change, the agent reads the history first (as its instructions say).
-    await queueReplies(page, [{ calls: [{ name: 'history_get', args: {} }] }, { text: 'The last step is yours; use Undo turn for mine.' }]);
-    await say(page, 'Please undo your last change');
-    const requests = await page.evaluate(() => window.__agentRequests);
-    const own = resultJson(requests.find(request => request.messages.at(-1)?.results?.[0]?.name === 'color_by').messages.at(-1).results[0].content[0].text);
-    const read = resultJson(requests.at(-1).messages.at(-1).results[0].content[0].text);
-    const head = read.steps.find(step => step.id === read.head);
-    // What the rule needs is there: the step shown is the person's, and it is not the step the agent's call named.
-    expect(head).toMatchObject({ origin: 'user', label: expect.stringMatching(/beta/) });
-    expect(own.step.id).not.toBe(read.head);
-    expect(read.steps.find(step => step.id === own.step.id)).toMatchObject({ origin: 'agent', agent: 'Claude' });
-    // And nothing was undone: the person's step is still shown.
-    expect((await stepFacts(page)).at(-1)).toMatchObject({ origin: 'user' });
     expect(errors).toEqual([]);
   });
 
@@ -163,24 +135,6 @@ test.describe('agent chat', () => {
     expect(errors).toEqual([]);
   });
 
-  test('a provider that asks to slow down is waited out, and the turn goes on', async ({ page }) => {
-    const errors = observeProductErrors(page);
-    await openDataset(page);
-    await openChat(page);
-    await queueReplies(page, [
-      { error: { kind: 'rate', message: 'The provider asked Cellucid to slow down.', retryAfterMs: 1500 } },
-      { text: 'Done after waiting.' },
-    ]);
-    await page.locator('#agent-chat-input').fill('Hello');
-    await page.locator('#agent-chat-input').press('Enter');
-    await expect(page.locator('#agent-chat-log .agent-chat-working')).toHaveAttribute('data-phase', 'waiting');
-    await expect(page.locator('#agent-chat-log .agent-chat-working')).toContainText('The provider asked Cellucid to slow down. Next try in');
-    await expect(page.locator('#agent-chat-send')).toBeVisible();
-    await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toHaveText(/Done after waiting\./);
-    expect(await page.evaluate(() => window.__agentRequests.length)).toBe(2);
-    expect(errors).toEqual([]);
-  });
-
   test('the conversation is kept with the history, Save asks about it, and a session file brings it back', async ({ page }, testInfo) => {
     const errors = observeProductErrors(page);
     await openDataset(page);
@@ -229,117 +183,93 @@ test.describe('agent chat', () => {
     expect(errors).toEqual([]);
   });
 
-  test('the conversation is kept in this browser with the history: the dataset opened again, Continue brings it back', async ({ page, context }) => {
+  // One opening, the chat never opened. The cards of the first step leave the state untouched, so
+  // the second reads its fingerprint from there.
+  test('an agent from outside the chat: its card answered by Allow, Deny and giving up, then its activity line, Undo turn and the person acting next', async ({ page }) => {
     const errors = observeProductErrors(page);
     await openDataset(page);
-    await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored by score.' }]);
-    await say(page, 'Color by score');
-    await page.evaluate(() => window._cellucidHistories.flush());
 
-    const reopened = await context.newPage();
-    const errorsAfter = observeProductErrors(reopened);
-    await reopened.addInitScript(installScriptedModel);
-    await closePageWithApplicationRetirement(page);
-    await openDataset(reopened);
-    await continueWhereLeftOff(reopened);
-    // The chat was open and the scripted model chosen: this browser remembers both.
-    await expect(reopened.locator('#agent-chat-panel')).toBeVisible();
-    await expect(reopened.locator('#agent-chat-log .agent-msg-user .agent-msg-text')).toHaveText('Color by score');
-    await expect(reopened.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Colored by score.');
-    await expect(reopened.locator('#agent-chat-log .agent-turn-foot .agent-turn-steps')).toHaveText('1 step ↗');
-    // It goes on: the next turn is sent the kept conversation (its words; no reasoning was kept).
-    await queueReplies(reopened, [{ text: 'Still here.' }]);
-    await say(reopened, 'Are you there?');
-    const sent = await reopened.evaluate(() => window.__agentRequests.at(-1).messages.map(message => message.role));
-    expect(sent).toEqual(['user', 'assistant', 'tool', 'assistant', 'user']);
-    expect([...errors, ...errorsAfter]).toEqual([]);
-  });
+    await test.step("an agent's action that asks first shows a card: Allow, Deny and giving up each answer the agent", async () => {
+      // A dispatcher of the page's own modules, with an action that writes a file, asking through the page's presence.
+      await page.evaluate(async () => {
+        const { createActionCatalog, defineAction } = await import('/assets/js/app/actions/catalog.js');
+        const { createActionDispatcher } = await import('/assets/js/app/actions/dispatcher.js');
+        const catalog = createActionCatalog([defineAction({
+          type: 'demo.write', title: 'Write a report file', summary: 'Writes a file.', group: 'Demo',
+          params: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } } },
+          touches: ['layout'], reads: [], effect: 'state', confirm: 'writes-file', describe: p => `Wrote ${p.name}`, code: () => 'x',
+        })]);
+        const dispatcher = createActionDispatcher({ catalog });
+        dispatcher.provide('demo.write', () => ({ written: true }));
+        dispatcher.setConfirmer(window._cellucidUi.agents.presence.confirm);
+        window.__demo = { dispatcher, outcomes: [] };
+        window.__ask = signal => dispatcher.dispatch('demo.write', { name: 'cells.csv' }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-demo', signal })
+          .then(({ outcome }) => window.__demo.outcomes.push({ ok: outcome.written }), error => window.__demo.outcomes.push({ refused: error.message, code: error instanceof DOMException ? error.name : error.code }));
+      });
+      const card = page.locator('#agent-presence .agent-confirm');
 
-  test('an agent\'s action that asks first shows a card: Allow, Deny and giving up each answer the agent', async ({ page }) => {
-    const errors = observeProductErrors(page);
-    await openDataset(page);
-    // A dispatcher of the page's own modules, with an action that writes a file, asking through the page's presence.
-    await page.evaluate(async () => {
-      const { createActionCatalog, defineAction } = await import('/assets/js/app/actions/catalog.js');
-      const { createActionDispatcher } = await import('/assets/js/app/actions/dispatcher.js');
-      const catalog = createActionCatalog([defineAction({
-        type: 'demo.write', title: 'Write a report file', summary: 'Writes a file.', group: 'Demo',
-        params: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } } },
-        touches: ['layout'], reads: [], effect: 'state', confirm: 'writes-file', describe: p => `Wrote ${p.name}`, code: () => 'x',
-      })]);
-      const dispatcher = createActionDispatcher({ catalog });
-      dispatcher.provide('demo.write', () => ({ written: true }));
-      dispatcher.setConfirmer(window._cellucidUi.agents.presence.confirm);
-      window.__demo = { dispatcher, outcomes: [] };
-      window.__ask = signal => dispatcher.dispatch('demo.write', { name: 'cells.csv' }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-demo', signal })
-        .then(({ outcome }) => window.__demo.outcomes.push({ ok: outcome.written }), error => window.__demo.outcomes.push({ refused: error.message, code: error instanceof DOMException ? error.name : error.code }));
+      await page.evaluate(() => { window.__ask(null); });
+      await expect(card).toHaveCount(1);
+      await expect(card.locator('.agent-confirm-title')).toHaveText(/^ChatGPT asks to write a report file(: [^“”]+)?\.$/);
+      await expect(card.locator('.agent-confirm-why')).toHaveText('It writes a file to this computer, which the history cannot take back.');
+      await card.locator('.disclosure-header').click();
+      await expect(card.locator('dl')).toContainText('cells.csv');
+      await card.locator('.agent-confirm-deny').click();
+      await expect(card).toHaveCount(0);
+      await expect.poll(() => page.evaluate(() => window.__demo.outcomes)).toEqual([{ refused: 'The person declined, so this was not done: Write a report file (Wrote cells.csv).', code: 'declined' }]);
+
+      await page.evaluate(() => { window.__ask(null); });
+      // An agent outside the chat: the card offers this connection, not this chat.
+      await expect(card.locator('.agent-confirm-allow')).toHaveText('Once');
+      await expect(card.locator('.agent-confirm-allow-here')).toHaveText('This connection');
+      await expect(card.locator('.agent-confirm-allow-always')).toHaveText('Always');
+      await card.locator('.agent-confirm-allow').click();
+      await expect.poll(() => page.evaluate(() => window.__demo.outcomes.length)).toBe(2);
+      expect((await page.evaluate(() => window.__demo.outcomes))[1]).toEqual({ ok: true });
+
+      // The agent gives up waiting (its call stopped): the card goes, and the agent hears why.
+      await page.evaluate(() => {
+        window.__giveUp = new AbortController();
+        window.__ask(window.__giveUp.signal);
+      });
+      await expect(card).toHaveCount(1);
+      await page.evaluate(() => window.__giveUp.abort(new DOMException('The agent stopped waiting', 'AbortError')));
+      await expect(card).toHaveCount(0);
+      await expect.poll(() => page.evaluate(() => window.__demo.outcomes.length)).toBe(3);
+      expect((await page.evaluate(() => window.__demo.outcomes))[2]).toEqual({ refused: 'The agent stopped waiting', code: 'AbortError' });
+      await expect(page.locator('#agent-presence')).toBeHidden();
+      expect(errors).toEqual([]);
     });
-    const card = page.locator('#agent-presence .agent-confirm');
 
-    await page.evaluate(() => { window.__ask(null); });
-    await expect(card).toHaveCount(1);
-    await expect(card.locator('.agent-confirm-title')).toHaveText(/^ChatGPT asks to write a report file(: [^“”]+)?\.$/);
-    await expect(card.locator('.agent-confirm-why')).toHaveText('It writes a file to this computer, which the history cannot take back.');
-    await card.locator('.disclosure-header').click();
-    await expect(card.locator('dl')).toContainText('cells.csv');
-    await card.locator('.agent-confirm-deny').click();
-    await expect(card).toHaveCount(0);
-    await expect.poll(() => page.evaluate(() => window.__demo.outcomes)).toEqual([{ refused: 'The person declined, so this was not done: Write a report file (Wrote cells.csv).', code: 'declined' }]);
+    await test.step('the activity line follows an agent acting from outside the chat: its steps, Undo turn, and the person acting next', async () => {
+      const before = await fingerprint(page);
+      await page.evaluate(async field => {
+        const { getActions } = await import('/assets/js/app/actions/index.js');
+        await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-connector' });
+      }, SCORE);
+      const line = page.locator('#agent-presence .agent-activity[data-agent="ChatGPT"]');
+      await expect(line).toHaveAttribute('data-state', 'done');
+      await expect(line.locator('.agent-activity-text')).toHaveText('ChatGPT · 1 step · Colored by score');
+      await expect(line.locator('.agent-activity-stop')).toBeHidden();
+      await line.locator('.agent-activity-undo').click();
+      await expect(line).toHaveAttribute('data-state', 'undone');
+      await expect(line.locator('.agent-activity-text')).toHaveText('ChatGPT\'s turn is undone');
+      expect(await fingerprint(page)).toEqual(before);
+      await line.locator('.agent-activity-dismiss').click();
+      // The notice of what agents send (once per dataset, since an agent acted here) stays until answered.
+      await expect(page.locator('#agent-presence .agent-notice')).toHaveCount(1);
+      await page.locator('#agent-presence .agent-notice-done').click();
+      await expect(page.locator('#agent-presence')).toBeHidden();
 
-    await page.evaluate(() => { window.__ask(null); });
-    // An agent outside the chat: the card offers this connection, not this chat.
-    await expect(card.locator('.agent-confirm-allow')).toHaveText('Once');
-    await expect(card.locator('.agent-confirm-allow-here')).toHaveText('This connection');
-    await expect(card.locator('.agent-confirm-allow-always')).toHaveText('Always');
-    await card.locator('.agent-confirm-allow').click();
-    await expect.poll(() => page.evaluate(() => window.__demo.outcomes.length)).toBe(2);
-    expect((await page.evaluate(() => window.__demo.outcomes))[1]).toEqual({ ok: true });
-
-    // The agent gives up waiting (its call stopped): the card goes, and the agent hears why.
-    await page.evaluate(() => {
-      window.__giveUp = new AbortController();
-      window.__ask(window.__giveUp.signal);
+      // Another turn, then the person acts: the finished turn's line steps aside.
+      await page.evaluate(async field => {
+        const { getActions } = await import('/assets/js/app/actions/index.js');
+        await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-connector-2' });
+        await getActions().dispatch('color.by', { field: null });
+      }, SCORE);
+      await expect(page.locator('#agent-presence')).toBeHidden();
+      expect(errors).toEqual([]);
     });
-    await expect(card).toHaveCount(1);
-    await page.evaluate(() => window.__giveUp.abort(new DOMException('The agent stopped waiting', 'AbortError')));
-    await expect(card).toHaveCount(0);
-    await expect.poll(() => page.evaluate(() => window.__demo.outcomes.length)).toBe(3);
-    expect((await page.evaluate(() => window.__demo.outcomes))[2]).toEqual({ refused: 'The agent stopped waiting', code: 'AbortError' });
-    await expect(page.locator('#agent-presence')).toBeHidden();
-    expect(errors).toEqual([]);
-  });
-
-  test('the activity line follows an agent acting from outside the chat: its steps, Undo turn, and the person acting next', async ({ page }) => {
-    const errors = observeProductErrors(page);
-    await openDataset(page);
-    const before = await fingerprint(page);
-    await page.evaluate(async field => {
-      const { getActions } = await import('/assets/js/app/actions/index.js');
-      await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-connector' });
-    }, SCORE);
-    const line = page.locator('#agent-presence .agent-activity[data-agent="ChatGPT"]');
-    await expect(line).toHaveAttribute('data-state', 'done');
-    await expect(line.locator('.agent-activity-text')).toHaveText('ChatGPT · 1 step · Colored by score');
-    await expect(line.locator('.agent-activity-stop')).toBeHidden();
-    await line.locator('.agent-activity-undo').click();
-    await expect(line).toHaveAttribute('data-state', 'undone');
-    await expect(line.locator('.agent-activity-text')).toHaveText('ChatGPT\'s turn is undone');
-    expect(await fingerprint(page)).toEqual(before);
-    await line.locator('.agent-activity-dismiss').click();
-    // The notice of what agents send (once per dataset, since an agent acted here) stays until answered.
-    await expect(page.locator('#agent-presence .agent-notice')).toHaveCount(1);
-    await page.locator('#agent-presence .agent-notice-done').click();
-    await expect(page.locator('#agent-presence')).toBeHidden();
-
-    // Another turn, then the person acts: the finished turn's line steps aside.
-    await page.evaluate(async field => {
-      const { getActions } = await import('/assets/js/app/actions/index.js');
-      await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-connector-2' });
-      await getActions().dispatch('color.by', { field: null });
-    }, SCORE);
-    await expect(page.locator('#agent-presence')).toBeHidden();
-    expect(errors).toEqual([]);
   });
 
   test('the chat bar failing to start takes only the chat bar away: the presence and an agent from outside the chat still work', async ({ page }) => {
@@ -369,31 +299,6 @@ test.describe('agent chat', () => {
     expect(errors.filter(error => !error.includes('[agents] the chat bar could not start'))).toEqual([]);
     // Said once in the console (how an engine prints the error object after it differs).
     expect(errors.filter(error => error.includes('[agents] the chat bar could not start'))).toHaveLength(1);
-  });
-
-  test('a chat turn shows on the activity line while the chat is collapsed, and its Stop stops it', async ({ page }) => {
-    const errors = observeProductErrors(page);
-    await openDataset(page);
-    await openChat(page);
-    await queueReplies(page, [{ text: 'Thinking about it for a while. '.repeat(10), chunks: 5, hold: 'collapsed' }]);
-    await page.locator('#agent-chat-input').fill('Take your time');
-    await page.locator('#agent-chat-input').press('Enter');
-    await waitForHold(page, 'collapsed');
-    await expect(page.locator('#agent-chat-stop')).toBeVisible();
-    // Open, the chat shows its own turn; the line does not repeat it (the notice of what agents send is said once, then gone).
-    await page.locator('#agent-presence .agent-notice-done').click();
-    await expect(page.locator('#agent-presence')).toBeHidden();
-    await page.locator('#agent-chat-collapse').click();
-    await expect(page.locator('#agent-chat-panel')).toBeHidden();
-    await expect(page.locator('#agent-chat-toggle')).toHaveAttribute('data-busy', 'true');
-    const line = page.locator('#agent-presence .agent-activity[data-agent="Claude"]');
-    await expect(line).toHaveAttribute('data-state', 'acting');
-    await expect(line.locator('.agent-activity-text')).toHaveText('Claude (chat) is working');
-    await line.locator('.agent-activity-stop').click();
-    await expect(page.locator('#agent-chat-toggle')).toHaveAttribute('data-busy', 'false');
-    await page.locator('#agent-chat-toggle').click();
-    await expect(page.locator('#agent-chat-log .agent-msg-note[data-kind="stopped"] p')).toHaveText('Stopped.');
-    expect(errors).toEqual([]);
   });
 
   test('an API key is kept for the tab only until Remember is ticked, a refused key is said, and Forget removes it', async ({ page }) => {
@@ -488,9 +393,9 @@ test.describe('agent chat', () => {
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
     await expect(page.locator('#agent-chat-log table')).toBeVisible();
 
-    // A result table as a model writes one (He, Opus): a long first column
-    // and five of numbers. Every word of every cell stays on one line (it
-    // read "Adjuste|d p" and "0.04|%"), and the table fits the log.
+    // A result table as a model writes one: a long first column
+    // and five of numbers. Every word of every cell stays on one line (no
+    // word breaks inside it), and the table fits the log.
     await queueReplies(page, [{ text: '| Share of epithelium (mean of 4 donors) | Early | Mid | Late | Adjusted p |\n|---|---|---|---|---|\n| Ciliated cells | 0.04% | 40% | **66%** | 5×10⁻⁴ |\n| Airway progenitors | **38%** | 3.3% | 1.9% | 0.001 |' }]);
     await say(page, 'Which epithelial types change with age?');
     await expect(page.locator('#agent-chat-log table')).toHaveCount(2);

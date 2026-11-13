@@ -4,14 +4,16 @@ Draws what the page state hands it. Knows positions, colors (with the alpha
 byte naming a cell's layer), sizes and visibility; never reads files.
 Developer doc 07 (rendering pipeline) is the long-form reference.
 
-Layer: L3. Imports `utils/` and a few `data/` contracts. Known wrong-way
-imports to remove, not copy: `gl-errors.js` → `app/notification-center.js`,
-`read-cell-layer.js` → `app/state/core/constants.js` (listed in
-`cellucid-private/plans/audit-2026-10-28/tidiness-2026-10-30.md`).
+Layer: L3. Imports `utils/` and a few `data/` contracts (`cell-priority.js`,
+`palettes.js`). Wrong-way imports to remove, not copy: `app/notification-center.js`
+(`gl-errors.js`, `high-perf-renderer.js`, `highlight-renderer.js`,
+`overlays/velocity/velocity-overlay.js`, `smoke-cloud/smoke-renderer.js`),
+`app/utils/cell-set.js` (`highlight-renderer.js`, `selection-gesture-queries.js`) and
+`app/state/core/constants.js` (`read-cell-layer.js`).
 
 | Module / folder | Owns |
 | --- | --- |
-| `viewer.js` | `createViewer`: the viewer object (camera, panes and kept views, input, frame loop, labels, overlays). One closure of about 11,000 lines; it is split by stage 5f of the reorganization plan, so keep new concerns in their own module and pass them in. |
+| `viewer.js` | `createViewer`: the viewer object (camera, panes and kept views, input, frame loop, labels, overlays). One closure of some 11,000 lines: keep new concerns in their own module and pass them in. |
 | `viewer/` | What the viewer's public boundary enforces (`viewer-contracts.js`), the renderer facade it hands out (`renderer-facade.js`), presented layout and field of view. |
 | `high-perf-renderer.js` | `HighPerfRenderer`: the point renderer (LOD, frustum culling, GPU stores, passes, read-cell draw). |
 | `high-perf/` | Its parts: spatial tree and index (`spatial-tree.js`, `spatial-index.js`, built off thread by `spatial-tree-worker.js`), draw order and LOD ladder (`draw-order.js`, `lod-levels.js`), segmented GPU stores (`point-store-segments.js`, `store-order.js`, `gpu-permute.js`), the read cells at every level (`read-cell-index.js`), input contracts. |
@@ -26,6 +28,7 @@ imports to remove, not copy: `gl-errors.js` → `app/notification-center.js`,
 | `gl-errors.js`, `gl-state-shadow.js`, `gl-utils.js`, `linear-texture.js`, `scene-msaa-target.js` | WebGL plumbing: the one error boundary, state shadow, textures past engine limits, MSAA. |
 | `full-detail-frame-cost.js`, `frame-phases.js`, `ambient-frame-pacing.js`, `pulse-*.js` | Frame cost and pacing. |
 | `navigation-keys.js` | The camera keys by movement (`NAVIGATION_KEYS`, the modes each answers) and the held-key ledger (`createHeldKeys`): a key moves the camera for the share of each frame it was held. The shortcut table lists these keys. |
+| `presented-camera-settlement.js` | The boundary between a camera that is changing and one that has settled, by frames and time without change. |
 | `camera-state-contract.js`, `point-size-scale.js`, `shader-quality.js`, `viewer-backgrounds.js`, `position-layout.js`, `unplaced-positions.js`, `viewport-center.js` | Small shared contracts. |
 
 ## Invariants

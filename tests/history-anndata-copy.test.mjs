@@ -234,7 +234,7 @@ test('the provenance records the step\'s expression values, never applied; null 
 });
 
 test('a column\'s colors go with it as the packages write them: a field\'s palette, none for another column, carried by a rename and a merge', async () => {
-  // F139: the rule of cellucid-python's write_columns and cellucid-r's .colors_state, case for case.
+  // The rule of cellucid-python's write_columns and cellucid-r's .colors_state, case for case.
   const { session, valueOf } = await golden();
   const choice = chooseStep(session.trackers, { activeTracker: session.activeTracker });
   const n = expected.dataset.n_obs;
@@ -270,7 +270,7 @@ test('a column\'s colors go with it as the packages write them: a field\'s palet
     'leiden_colors': null,
     'cluster_colors': ['#111111', '#222222', '#333333', '#444444', '#555555', '#666666'],
     // Every category, used or not; a field without a palette: Cellucid's own
-    // colors (F239); a column of no categories (a highlight) takes none.
+    // colors; a column of no categories (a highlight) takes none.
     'annotation_colors': ['#dc2626', '#2563eb'],
     'plain_colors': ['#ff9900'],
     'cellucid_highlight__QC__Gate_colors': null,
@@ -300,12 +300,12 @@ test('a column\'s colors go with it as the packages write them: a field\'s palet
 });
 
 test('a field\'s colors are the ones the view in focus shows, as the packages write them', async () => {
-  // L26-8: the colors a person or an agent gave a field's categories reach
+  // The colors a person or an agent gave a field's categories reach
   // uns['<key>_colors']: in the view in focus at the step, each category
   // recolored there, the rest in the colors it opens with -- its palette,
   // else Cellucid's own colors by position. Another view's colors stay how
   // the data was shown; a dataset column recolored in the view in focus
-  // takes its colors too (RCC-1).
+  // takes its colors too.
   const { session, valueOf } = await golden();
   // A step whose colors differ from the tracker's opening (a color map), so the plan has a colors row.
   const choice = chooseStep(session.trackers, { activeTracker: session.activeTracker, step: 's14' });
@@ -333,7 +333,7 @@ test('a field\'s colors are the ones the view in focus shows, as the packages wr
   });
   const kept1 = await plan(1);
   assert.deepEqual(kept1.changes.uns, {
-    // The dataset column recolored in the view in focus (RCC-1).
+    // The dataset column recolored in the view in focus.
     cell_type_colors: ['#000000', '#0077c8', '#ad50e0'],
     stage_colors: ['#808080', '#0077c8', '#008080'], fate_colors: ['#dc2626', '#ffd700'],
   });
@@ -392,7 +392,7 @@ async function smallPlan(state, given, targetOverrides = {}) {
 const datasetRecolor = (key, ...pairs) => ({ field: { source: 'obs', key }, colors: pairs.map(([category, color]) => ({ category, color })) });
 
 test('a recolored dataset column is written with the colors it is shown in, as the packages write it', async () => {
-  // RCC-1, cellucid-python's test of the same name, input for input: the
+  // cellucid-python's test of the same name, input for input: the
   // categories recolored, the rest in the colors the column opens with --
   // Scanpy's colors for it, as drawn (#rgb widened, alpha dropped), else
   // Cellucid's own by position. Applied again: unchanged.

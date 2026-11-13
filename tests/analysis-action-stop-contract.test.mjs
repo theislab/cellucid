@@ -1,16 +1,15 @@
 /**
  * An analysis action stopped while the work it set off runs ends promptly as
- * a cancellation, and that work stops with it (bug hunt F147).
+ * a cancellation, and that work stops with it.
  *
  * The dispatcher waits for a stopped action to end before it puts back what
- * the action changed (LB-1: never a half-made change), so an action that
- * waits on work not tied to its signal holds every later history move and
- * every action on its domains for as long as that work runs. The analyses'
+ * the action changed (never a half-made change), so an action that waits on
+ * work not tied to its signal holds every later history move and every
+ * action on its domains for as long as that work runs. The analyses'
  * changes wait for what they set off (`whenSettled`: a redraw, an update
  * after its delay, a run reading thousands of genes) so that the step holds
- * it; `analysis.run` waited for the open cells and the gene sample to settle
- * before its job existed, so a Stop then found no job to cancel and the run
- * went on to its end. Now:
+ * it; `analysis.run` waits for the open cells and the gene sample to settle
+ * before its job exists, and a Stop then still reaches the run:
  *
  * - `whenSettled({signal})` / `whenWindowSettled(id, {signal})`: stopped,
  *   the analysis's work is stopped (its request invalidated: its job

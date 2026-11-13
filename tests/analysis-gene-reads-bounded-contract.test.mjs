@@ -258,7 +258,7 @@ test('over a route, a run over some cells delivers each read\'s blocks to the wo
     },
     async deliverGeneColumns() { throw new Error('a run over some cells reads blocks, not columns'); },
   };
-  // Measured 100 B a gene, a budget whose buffered share holds 6 genes.
+  // 100 B a gene, a budget whose buffered share holds 6 genes.
   const tuner = createRunTuner({ poolSize: 2, cellCount: cells.length, bytesPerCell: CELL_SUBSET_ENTRY_BYTES, budgetBytes: () => 2000 });
   tuner.observeRead({ bytes: 100, ms: 1 });
   const tasks = [];
@@ -279,8 +279,8 @@ test('over a route, a run over some cells delivers each read\'s blocks to the wo
 
 test('a run over some cells reads half the gate at a time, never a read a task', async () => {
   // A read over some cells costs its cells whatever its genes; started as
-  // each task left the gate, a 10M-cell differential expression of 1.9M
-  // cells made a read every task (15,000 reads, 54 s against 4 s).
+  // each task left the gate, a differential expression of millions of cells
+  // would make a read every task (measured: 23_decisions_partial_reading.md).
   const geneCount = 400;
   const cells = Uint32Array.from({ length: 50 }, (_, k) => k);
   const requests = [];
@@ -304,7 +304,7 @@ test('a run over some cells reads half the gate at a time, never a read a task',
     },
     async deliverGeneColumns() { throw new Error('a run over some cells reads blocks, not columns'); },
   };
-  // Measured 100 B a gene, a gate of 60 genes (one a task).
+  // 100 B a gene, a gate of 60 genes (one a task).
   const tuner = createRunTuner({ poolSize: 2, cellCount: cells.length, bytesPerCell: CELL_SUBSET_ENTRY_BYTES, budgetBytes: () => 20000 });
   tuner.observeRead({ bytes: 100, ms: 1 });
   const gate = tuner.bufferedTasks() * tuner.genesPerTask();
@@ -325,10 +325,11 @@ test('a run over some cells reads half the gate at a time, never a read a task',
 });
 
 test('genes per task follow the genes\' bytes as read: a sparse run is a few large tasks, not a task a gene', async t => {
-  // Held at each gene's densest form (8 B a cell of 1.9M) against what the
-  // run's context leaves of the share, a 10M-cell differential expression
-  // went one gene a task: 30,000 tasks, reads and page messages where the
-  // pushed tree sent 128 (CSR every cell 1.2x its time).
+  // Held at each gene's densest form (8 B a cell) against what the run's
+  // context leaves of the share, a differential expression over millions of
+  // cells would go one gene a task: tens of thousands of tasks, reads and page
+  // messages where the pushed tree sends a few hundred
+  // (measured: 23_decisions_partial_reading.md).
   const budget = holdAnalysisShareTo(t, 400 * 2 ** 20);
   const geneCount = 30_000;
   const poolSize = 8;
@@ -611,9 +612,4 @@ test('analyses read cell subsets and many genes only through the gene stream', (
       }
     }
   }
-  // The one-request reader of a two-group subset is gone, and signature
-  // scores read through the batched pass.
-  const mva = readFileSync(path.join(analysis, 'stats/multi-variable-analysis.js'), 'utf8');
-  assert.doesNotMatch(mva, /runSubsetRuns/);
-
 });

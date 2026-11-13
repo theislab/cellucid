@@ -1,13 +1,11 @@
 /**
- * L24-2 (live pass 6, 2026-11-11): a panel title wider than its column was
- * cut off at the panel's edge.
+ * A panel title wider than its column is not cut off at the panel's edge.
  *
- * An agent's Figure 2 (Pancreas, seven named views, 24 px text, three
- * columns, a frame cropping the cells' band) came out with "C. Neurog3
- * (endocrine pro": the grid sized a column by its plots, axis margins and
- * legends, never by its panel title, and both renderers clip the title to the
- * panel. Now the title is part of the composition: one function makes it
- * (`panelTitle`), the layout measures it and both renderers draw it.
+ * The grid sizes a column by its plots, axis margins and legends and by its
+ * panel title, because both renderers clip the title to the panel (seven named
+ * views at 24 px text in three columns would read "C. Neurog3 (endocrine
+ * pro"). One function makes the title (`panelTitle`), the layout measures it
+ * and both renderers draw it.
  */
 
 import assert from 'node:assert/strict';

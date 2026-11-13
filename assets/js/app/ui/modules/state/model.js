@@ -5,7 +5,7 @@
  * guided tour. Pure (importable in Node); the panel's modules draw from it.
  * The rows themselves are `graph-layout.js`'s.
  *
- * Steps are History v2 records (`app/history/model.js`): who took one is its
+ * Steps are history records (`app/history/model.js`): who took one is its
  * `by` (`{origin, agent, model, host, person, turn}`).
  *
  * @module ui/modules/state/model
@@ -23,8 +23,8 @@ const DAY = 24 * HOUR;
 /**
  * What a saved state is, in the words every list of them uses (Load…,
  * Stored, My datasets): a save by its name, an autosave by its latest step.
- * Autosaves were "History kept in this browser" or "Autosave" alike in two
- * of the three, so eight of them read the same (bug hunt L10-10).
+ * An autosave is named by its latest step, never "History kept in this
+ * browser" or "Autosave" alike, which would make eight of them read the same.
  *
  * @param {{kind: 'autosave'|'named', name: string|null, lastStep?: string|null}} entry
  * @returns {string}
@@ -249,7 +249,7 @@ export function describeRow(row, { view, now }) {
     case 'group': {
       const count = formatCountOf(row.count, 'step');
       const span = row.first === null ? '' : `${formatStepTime(row.first, now)}–${formatStepTime(row.last, now)}`;
-      // The head inside the group, by its place among the group's steps (§3.15.2 "▣ QC · at 4 of 7").
+      // The head inside the group, by its place among the group's steps ("▣ QC · at 4 of 7").
       const at = row.headAt === null ? null : `at ${formatCount(row.headAt.index)} of ${formatCount(row.headAt.count)}`;
       const starts = `${formatCountOf(row.forksInside, 'branch', 'branches')} ${row.forksInside === 1 ? 'starts' : 'start'} inside`;
       const name = [`Group “${row.group.name}”`, count, at, row.forksInside > 0 ? starts : null, row.expanded ? null : 'collapsed'].filter(Boolean).join(', ');

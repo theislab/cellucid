@@ -1,18 +1,16 @@
 /**
  * The expanded overlay must show the analysis the sidebar shows.
  *
- * Reproduced in Chromium before the fix: with the Gene Signature overlay open,
- * changing the gene list re-ran the analysis and moved the sidebar preview to
- * mean 1.448292, while the overlay went on showing mean 3.966388 under a title
- * still naming the previous gene set. Two surfaces, two different scientific
- * results, no indication which was current.
+ * With the Gene Signature overlay open, changing the gene list re-runs the
+ * analysis and moves the sidebar preview to the new result, and the overlay
+ * follows it, its title naming the new gene set: two surfaces never show two
+ * different scientific results.
  *
- * The cause was that the overlay was bound to whichever result was current when
- * it opened and nothing re-drew it afterwards, while each form-based mode
- * published its result by assigning `_lastResult` inline — five separate
- * assignments, so there was nowhere for a refresh to live. Detailed analysis
- * already refreshed its open modal (`detailed-analysis-ui.js` `_updateModal`),
- * which is why only the form-based family was affected.
+ * Every form-based mode publishes its result through one owner, which
+ * refreshes the open overlay; were each mode to assign `_lastResult` inline,
+ * the overlay would stay bound to the result current when it opened and there
+ * would be nowhere for a refresh to live. Detailed analysis refreshes its open
+ * modal itself (`detailed-analysis-ui.js` `_updateModal`).
  */
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
@@ -22,6 +20,10 @@ import test from 'node:test';
 import {
   FormBasedAnalysisUI,
 } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
+import { DetailedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js';
+import { closeModal } from '../assets/js/app/analysis/ui/components/modal.js';
+import { PlotRegistry } from '../assets/js/app/analysis/shared/plot-registry-utils.js';
+import { settleMicrotasks, waitFor, withControlledTimers, withFakeDOM } from './helpers/fake-analysis-modal-dom.mjs';
 
 const ANALYSIS_TYPES_DIR = new URL(
   '../assets/js/app/analysis/ui/analysis-types/',
@@ -131,8 +133,209 @@ test('a failed overlay refresh closes the overlay rather than leaving it stale',
   assert.match(errors[0], /injected overlay render failure/);
 });
 
+test('a newer result published during the first draw owns the overlay; the superseded draw does not close it', { concurrency: false }, async () => {
+  await withControlledTimers(async ({ runAllTimers }) => {
+    await withFakeDOM(async () => {
+      const ui = publisher();
+      ui._lastResult = RESULT_A;
+      ui._notifications = { error() {}, success() {} };
+      const drawn = [];
+      const busyDuringDraw = [];
+      ui._renderExpandedViewContent = FormBasedAnalysisUI.prototype._renderExpandedViewContent;
+      ui._drawExpandedViewContent = async (modal, result) => {
+        busyDuringDraw.push(modal._body.getAttribute('aria-busy'));
+        if (result === RESULT_A) {
+          await ui._publishAnalysisResult(RESULT_B);
+          return false;
+        }
+        modal._title.textContent = result.subtitle;
+        drawn.push(result.subtitle);
+        return true;
+      };
+
+      // Timers run on demand, so a close the open itself waits for cannot stall it.
+      const opening = ui._openExpandedView();
+      await settleMicrotasks();
+      runAllTimers();
+      await opening;
+      const modal = ui._modal;
+
+      assert.equal(modal === null, false, 'the overlay stays open');
+      assert.equal(modal.isConnected, true);
+      assert.deepEqual(busyDuringDraw, ['true', 'true'], 'each draw runs while the overlay is busy');
+      assert.deepEqual(drawn, [RESULT_B.subtitle], 'only the newer result is drawn');
+      assert.equal(modal._title.textContent, RESULT_B.subtitle);
+      assert.equal(modal._body.getAttribute('aria-busy'), null, 'the overlay is not left busy');
+
+      const closing = closeModal(modal);
+      await settleMicrotasks();
+      runAllTimers();
+      await closing;
+    });
+  });
+});
+
+test('a result discarded during the draw closes the overlay it was drawing', { concurrency: false }, async () => {
+  await withControlledTimers(async ({ runAllTimers }) => {
+    await withFakeDOM(async () => {
+      const ui = publisher();
+      ui._lastResult = RESULT_A;
+      ui._renderExpandedViewContent = async () => {
+        ui._lastResult = null;
+        return false;
+      };
+
+      const opening = ui._openExpandedView();
+      await settleMicrotasks();
+      runAllTimers();
+      await opening;
+      await settleMicrotasks();
+      runAllTimers();
+
+      const left = ui._modal;
+      if (left !== null) {
+        // Closed here so a failure does not leave the dialog's timers running.
+        const closing = closeModal(left);
+        await waitFor(() => left._cleanupDone, 'the overlay cleanup');
+        runAllTimers();
+        await closing;
+      }
+      assert.equal(left === null, true, 'the overlay of a discarded result is closed');
+    });
+  });
+});
+
+test('Detailed analysis draws its expanded view from the committed snapshot, not the config being edited', { concurrency: false }, async () => {
+  await withControlledTimers(async ({ runAllTimers }) => {
+    await withFakeDOM(async () => {
+      const ui = new DetailedAnalysisUI({ comparisonModule: {}, dataLayer: {} });
+      const committedConfig = {
+        dataSource: { type: 'categorical_obs', variable: 'cell_type' },
+        pages: ['page-a'],
+        plotType: 'barplot',
+        plotOptions: {},
+      };
+      const committedData = [{ pageId: 'page-a', variableInfo: { name: 'cell_type' } }];
+      ui._committedView = Object.freeze({ config: committedConfig, pageData: committedData, layoutEngine: {} });
+      // A control change moves `_currentConfig` before its debounced fetch commits matching data.
+      ui._currentConfig = {
+        dataSource: { type: 'continuous_obs', variable: 'score' },
+        pages: ['page-1'],
+        plotType: 'histogram',
+        plotOptions: {},
+      };
+      // The plot options panel is not what is checked: the heading is drawn without it.
+      const renderHeading = ui._renderModalHeading.bind(ui);
+      ui._renderModalHeading = (modal, config, pageData) => renderHeading({ _title: modal._title }, config, pageData);
+      let drawnWith = null;
+      ui._drawExpandedView = async (modal, committed) => {
+        drawnWith = {
+          busy: modal._body.getAttribute('aria-busy'),
+          sameConfig: committed.config === committedConfig,
+          sameData: committed.pageData === committedData,
+        };
+      };
+
+      await ui._openExpandedView();
+      const modal = ui._modal;
+
+      assert.deepEqual(drawnWith, { busy: 'true', sameConfig: true, sameData: true });
+      assert.equal(modal._title.textContent, 'Comparing: cell_type');
+      assert.equal(modal._body.getAttribute('aria-busy'), null);
+
+      const closing = closeModal(modal);
+      await settleMicrotasks();
+      runAllTimers();
+      await closing;
+    });
+  });
+});
+
+test('an overlay closed while it opens draws nothing into the dialog its close took the plot owner of', { concurrency: false }, async () => {
+  await withControlledTimers(async ({ runAllTimers }) => {
+    await withFakeDOM(async ({ document }) => {
+      // A focus listener closes the dialog as showModal() focuses it.
+      const closedWhileOpening = [];
+      document.onDialogFocusedWhileOpening = dialog => {
+        closedWhileOpening.push(dialog);
+        dialog.close();
+      };
+      const settleClose = async () => {
+        await settleMicrotasks();
+        runAllTimers();
+        await settleMicrotasks();
+      };
+
+      const form = publisher();
+      form._lastResult = RESULT_A;
+      form._notifications = { error() {}, success() {} };
+      const opening = form._openExpandedView();
+      await settleClose();
+      await opening;
+      await settleClose();
+      assert.deepEqual(form.renders, [], 'a form-based mode draws nothing into it');
+      assert.equal(form._modal, null);
+
+      const detailed = new DetailedAnalysisUI({ comparisonModule: {}, dataLayer: {} });
+      detailed._committedView = Object.freeze({
+        config: { dataSource: { type: 'categorical_obs', variable: 'cell_type' }, pages: ['page-a'], plotType: 'barplot', plotOptions: {} },
+        pageData: [{ pageId: 'page-a', variableInfo: { name: 'cell_type' } }],
+        layoutEngine: {},
+      });
+      detailed._renderModalHeading = () => {};
+      const draws = [];
+      detailed._drawExpandedView = async modal => { draws.push(modal); };
+      const detailedOpening = detailed._openExpandedView();
+      await settleClose();
+      await detailedOpening;
+      await settleClose();
+      assert.deepEqual(draws, [], 'Detailed analysis draws nothing into it');
+      assert.equal(detailed._modal, null);
+
+      assert.equal(closedWhileOpening.length, 2);
+      for (const dialog of closedWhileOpening) assert.equal(dialog.isConnected, false, 'each closed dialog is removed');
+    });
+  });
+});
+
+test('Detailed analysis makes no plot in an overlay closed while Plotly loaded', { concurrency: false }, async t => {
+  const plotType = 'closed-while-loading';
+  assert.equal(PlotRegistry.register({ id: plotType, name: 'A plot', supportedTypes: ['categorical_obs'], render: () => {} }), true);
+  t.after(() => PlotRegistry.unregister(plotType));
+  // What loading Plotly asks of the page (`plotly-hints.js`): Plotly itself is the fake DOM's.
+  const hadMutationObserver = 'MutationObserver' in globalThis;
+  const mutationObserver = globalThis.MutationObserver;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  t.after(() => {
+    if (hadMutationObserver) globalThis.MutationObserver = mutationObserver;
+    else delete globalThis.MutationObserver;
+  });
+  await withControlledTimers(async () => {
+    await withFakeDOM(async ({ document }) => {
+      document.head = document.createElement('head');
+      document.getElementById = () => null;
+      const ui = new DetailedAnalysisUI({ comparisonModule: {}, dataLayer: {} });
+      const modal = { _plotContainer: document.createElement('div'), _analysisPlotSlot: null };
+      const committed = Object.freeze({
+        config: { dataSource: { type: 'categorical_obs', variable: 'cell_type' }, pages: ['page-a'], plotType, plotOptions: {} },
+        pageData: [{ pageId: 'page-a', variableInfo: { name: 'cell_type' } }],
+        layoutEngine: {},
+      });
+      const slotsMade = [];
+      ui._ensureModalPlotSlot = target => {
+        slotsMade.push(target);
+        throw new Error('a plot slot was made');
+      };
+      // The overlay's close ran its `beforeClose` while Plotly loaded: it no longer owns the UI.
+      ui._modal = null;
+      await ui._drawExpandedView(modal, committed, ui._modalRenderGeneration);
+      assert.deepEqual(slotsMade, [], 'no plot slot is made in it');
+    });
+  });
+});
+
 test('every form-based mode publishes through the one result owner', async () => {
-  // The defect existed because the publication step was copied into each mode.
+  // The publication step is not copied into each mode.
   // Nothing outside the owner may assign `_lastResult`, or the overlay refresh
   // silently stops happening for that mode.
   const owner = 'base/form-based-analysis.js';
@@ -165,9 +368,9 @@ test('every form-based mode publishes through the one result owner', async () =>
 });
 
 test('a preview\'s Expand opens only its published result: disabled while the result is drawn, enabled once published', async t => {
-  // Found 2026-11-10 on Suo (DE of 562k cells): the preview and its Expand were drawn, the result
-  // was published after the rest of the drawing, and Expand clicked in between said "Expanded
-  // analysis view requires a completed analysis result".
+  // The preview and its Expand are drawn before the result is published (DE of a large dataset),
+  // and an Expand clicked in between would say "Expanded analysis view requires a completed
+  // analysis result".
   // The few DOM calls `_renderPreviewExpandAction` makes, on plain objects (this suite runs without a DOM).
   const element = tag => {
     const el = { tagName: tag, children: [], disabled: false, title: '', className: '', parentElement: null,
@@ -197,9 +400,9 @@ test('a preview\'s Expand opens only its published result: disabled while the re
 });
 
 test('every mode draws its preview from the result itself, so its Expand opens once that result is published', async () => {
-  // Found 2026-11-10: composition drew its preview from a copy (`{...result, options}`, to leave the
-  // legend out), so the Expand drawn for the copy never matched the published result and stayed
-  // disabled ("Opens once the result is drawn"). Other plot options go in `plotOptions`.
+  // A preview drawn from a copy of the result (`{...result, options}`, to leave the legend out)
+  // would never match the published result, and its Expand would stay disabled ("Opens once the
+  // result is drawn"). Other plot options go in `plotOptions`.
   const offenders = [];
   const walk = async (directory, prefix) => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {

@@ -5,10 +5,10 @@
  * Playwright drives WebKit through its Web Inspector, and the inspector's
  * network agent runs on the page's main thread for every chunk of every
  * response, a worker's included (WebKit carries a worker's loads through
- * its page). On the Linux CI runners that work held the page's main thread
- * for 50 to 64 ms during one 15 MB read, which the same WebKit build without
- * the inspector carried in 20 ms or less (`analysis-no-long-tasks.spec.mjs`
- * gives the measurements). A spec that bounds how long the page's main
+ * its page). On the Linux CI runners that work holds the page's main thread
+ * for several times longer during one 15 MB read than the same WebKit build
+ * without the inspector does (`analysis-no-long-tasks.spec.mjs` gives the
+ * measurements). A spec that bounds how long the page's main
  * thread is held measures WebKit here, so the bound is the browser's and
  * not the harness's.
  *

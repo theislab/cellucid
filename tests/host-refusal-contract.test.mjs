@@ -86,8 +86,8 @@ test('a host that refuses after answering this site before is refusing this netw
 });
 
 test('a sign-in asked for (401) is the link\'s permissions, even from a host that answered this site before', async t => {
-  // Round 9 sources lane (R9S-2): a lab server serving one public and one
-  // private folder was said to refuse "this network for now, which it gives
+  // A lab server serving one public and one
+  // private folder must not be said to refuse "this network for now, which it gives
   // everyone" for the private file. No host blocks a network with a 401.
   let signIn = false;
   serve(t, (url, init) => {
@@ -108,10 +108,10 @@ test('a sign-in asked for (401) is the link\'s permissions, even from a host tha
   assert.equal(error.details.hostFault.kind, 'refused');
 });
 
-test('a host that lets this site read one file and not another says so; one that stopped answering every file is refusing (R9S-3)', async t => {
+test('a host that lets this site read one file and not another says so; one that stopped answering every file is refusing', async t => {
   // A lab server whose public folder sends CORS headers and whose other
-  // folder does not was said to refuse "this network for now, which it gives
-  // everyone" for the second file, since the host had answered before.
+  // folder does not must not be said to refuse "this network for now, which it gives
+  // everyone" for the second file, though the host had answered before.
   let blocked = false;
   const asked = serve(t, (url, init) => {
     if (init.mode === 'no-cors') return new Response(null, { status: 200 });
@@ -189,8 +189,8 @@ test('a host that answered before and gives no answer while this computer is off
   t.after(() => Object.defineProperty(globalThis, 'navigator', navigator));
   await describe('https://catalog.example/first.zarr.zip');
   offline = true;
-  // Measured in a browser test: a dataset switched to after going offline
-  // was said to be refused "for now, as hosts do … after many requests".
+  // A dataset switched to after going offline is not said to be refused
+  // "for now, as hosts do … after many requests".
   const error = await refusalOf('https://catalog.example/second.zarr.zip');
   assert.equal(error.code, 'NETWORK_ERROR');
   assert.equal(error.message, 'This computer is offline, so second.zarr.zip cannot be read from catalog.example: the ' +
@@ -198,13 +198,13 @@ test('a host that answered before and gives no answer while this computer is off
   assert.equal(error.details.hostFault.kind, 'offline');
 });
 
-test('a store folder whose first read gets no readable answer is said as a file is, also across the reader worker (R9S-5)', async t => {
-  // A Zarr folder on a host without CORS headers said "The linked data could
-  // not be opened. Try again; if it keeps failing, check the address" with
-  // the byte layer's sentence under Details; a file on the same host said
-  // "does not let other websites read its files". The store's error crossed
-  // the reader worker as a plain Error named ByteSourceError, which
-  // `isUnanswered` did not know.
+test('a store folder whose first read gets no readable answer is said as a file is, also across the reader worker', async t => {
+  // A Zarr folder on a host without CORS headers is said as a file on the same
+  // host is ("does not let other websites read its files"), not "The linked
+  // data could not be opened. Try again; if it keeps failing, check the
+  // address" with the byte layer's sentence under Details. The store's error
+  // crosses the reader worker as a plain Error named ByteSourceError, which
+  // `isUnanswered` must know.
   const { ByteSourceError, BYTE_SOURCE_FAILURES, isUnanswered } = await import('../assets/js/formats/io/byte-source.js');
   const { toWire, fromWire } = await import('../assets/js/utils/error-wire.js');
   const { unreadableAtHost } = await import('../assets/js/data/sources/remote-file.js');
@@ -225,7 +225,7 @@ test('a store folder whose first read gets no readable answer is said as a file 
     'Download the folder and open it from your computer (Open… › Folder…).');
 });
 
-test('a host that stops sending, or never answers, within the read\'s patience is said to stall, not to refuse CORS (R9S-11)', async () => {
+test('a host that stops sending, or never answers, within the read\'s patience is said to stall, not to refuse CORS', async () => {
   const { ByteSourceError, BYTE_SOURCE_FAILURES } = await import('../assets/js/formats/io/byte-source.js');
   const { unreadableAtHost } = await import('../assets/js/data/sources/remote-file.js');
   const url = 'https://slow.example/atlas.h5ad';

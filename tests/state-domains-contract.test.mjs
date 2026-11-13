@@ -30,6 +30,7 @@ import { createCellsDomain, openCellsKey, openCellsValueOf, requestOfOpenCellsVa
 import { createCameraPathDomain } from '../assets/js/app/state/domains/camera-path.js';
 import { createAnalysisDomain } from '../assets/js/app/state/domains/analysis.js';
 import { createViewsDomain } from '../assets/js/app/state/domains/views.js';
+import { createAnalysisWindowLayout } from '../assets/js/app/state/domains/layout.js';
 import { createCameraDomain } from '../assets/js/app/state/domains/camera.js';
 import { controlDomainOf, createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
 import { differingDomains, fingerprintOf } from '../assets/js/app/state/domains/fingerprint.js';
@@ -179,7 +180,7 @@ test('every state domain has exactly one owner module, and installing provides e
     const sidebar = { querySelectorAll: () => [] };
     const uninstall = installStateDomains({
       domains, state, viewer, sidebar, refreshUi: () => {}, cinematicCamera: null, figureExport: null,
-      analysis: async () => null, getDockable: () => null, openCells: fakeOpenCells().openCells,
+      analysis: () => null, analysisArrived: async () => null, getDockable: () => null, openCells: fakeOpenCells().openCells,
       sidebarLayout: { isSidebarShown: () => true, showSidebar() {}, setSidebarWidth() {} },
     });
     assert.deepEqual(domains.missing(), []);
@@ -191,7 +192,7 @@ test('every state domain has exactly one owner module, and installing provides e
       sidebarLayout: { isSidebarShown: () => true, showSidebar() {}, setSidebarWidth() {} },
     }), /need analysis\(\)/);
     assert.throws(() => installStateDomains({
-      domains, state, viewer, sidebar, refreshUi: () => {}, analysis: async () => null, getDockable: () => null,
+      domains, state, viewer, sidebar, refreshUi: () => {}, analysis: () => null, analysisArrived: async () => null, getDockable: () => null,
     }), /need the page's openCells/);
   } finally {
     globalThis.document = previousDocument;
@@ -509,8 +510,8 @@ test('field overlays: a user field a view shows as itself takes a definition wit
   assert.equal(edited.key, 'cell_type (edited)');
   assert.equal(state.getUserDefinedFieldsRegistry().getField(edited._userDefinedId), edited, 'the view shows the template itself');
   // [T, NK, unassigned]: NK keeps its #ad50e0, the palette color of Unassigned's place, so
-  // Unassigned takes the first palette color told apart from T's red and NK's (F111: it
-  // was NK's color, two categories in one).
+  // Unassigned takes the first palette color told apart from T's red and NK's (not
+  // NK's color: two categories in one).
   assert.deepEqual([...edited.categories], ['T', 'NK', 'unassigned']);
   assert.deepEqual([...edited._categoryColors], [255, 0, 0, 0xad, 0x50, 0xe0, 0xff, 0x99, 0x00]);
   const once = overlays.capture();
@@ -582,7 +583,7 @@ test('analyses: results kept by reference, settings copied, restored only when t
     },
     analysisWindowManager: { exportSessionWindows: () => [] },
   };
-  const analysis = createAnalysisDomain({ analysis: async () => refs });
+  const analysis = createAnalysisDomain({ analysis: () => refs, analysisArrived: async () => refs });
   const value = await analysis.capture();
   assert.equal(value.docked.modes.markers.result.payload.scores, result.payload.scores);
   assert.notEqual(value.docked.modes.markers.settings, docked.modes.markers.settings);
@@ -590,9 +591,49 @@ test('analyses: results kept by reference, settings copied, restored only when t
   assert.equal(imported.length, 0);
   await analysis.restore({ ...value, docked: { ...value.docked, modes: { markers: { settings: { k: 9 }, result: null } } } });
   assert.deepEqual(imported[0].modes.markers.settings, { k: 9 });
-  const none = createAnalysisDomain({ analysis: async () => null });
+  const none = createAnalysisDomain({ analysis: () => null, analysisArrived: async () => null });
   assert.deepEqual(await none.capture(), { windows: [], docked: null });
   await assert.rejects(none.restore(value), /could not load on this page/);
+});
+
+test('analyses while their code loads: captured without waiting as nothing opened, the same value its arrival gives; a restore that shows analyses waits for it', async () => {
+  let shown = null;
+  let arrive;
+  const arrived = new Promise(resolve => { arrive = resolve; });
+  const imported = [];
+  const refs = {
+    comparisonModule: {
+      exportSessionState: () => ({ openMode: null, modes: {} }),
+      importSessionState: async state => { imported.push(state); },
+    },
+    analysisWindowManager: {
+      exportSessionWindows: () => [],
+      exportWindowPlaces: () => [],
+      exportViewSizes: () => ({ window: {}, expandedView: {} }),
+    },
+  };
+  const analysis = createAnalysisDomain({ analysis: () => shown, analysisArrived: () => arrived });
+  const layout = createAnalysisWindowLayout(() => shown, () => arrived);
+  const NEVER = Symbol('waited');
+  const now = promise => Promise.race([promise, new Promise(resolve => setImmediate(() => resolve(NEVER)))]);
+  const loading = await now(analysis.capture());
+  const loadingLayout = await now(layout.capture());
+  assert.deepEqual(loading, { windows: [], docked: null });
+  assert.deepEqual(loadingLayout, { windows: [], sizes: null });
+  assert.equal(await now(analysis.restore(loading)), undefined, 'putting back nothing opened needs no code');
+
+  const docked = { openMode: 'markers', modes: { markers: { settings: { k: 5 }, result: null } } };
+  const restoring = analysis.restore({ windows: [], docked });
+  assert.equal(await now(restoring), NEVER, 'analyses to show wait for their code');
+  shown = refs;
+  arrive(refs);
+  await restoring;
+  assert.deepEqual(imported, [docked]);
+  imported.length = 0;
+  assert.deepEqual(await analysis.capture(), loading, 'the code\'s arrival changes nothing captured');
+  assert.deepEqual(await layout.capture(), loadingLayout);
+  await analysis.restore({ windows: [], docked: { openMode: null, modes: {} } });
+  assert.deepEqual(imported, [], 'nothing docked is no docked analysis');
 });
 
 test('views and cameras: by position; a per-view value that does not fit the views is refused', () => {

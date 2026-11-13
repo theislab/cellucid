@@ -34,7 +34,11 @@ export async function waitForDatasetReady(page, cells, { timeout } = {}) {
  * `rendering/full-detail-frame-cost.js`), and every presented view drawn
  * from its final geometry (`isPresentedGeometrySettled`: no tree still to
  * land, no draw order still to adopt), with the sidebar not sliding (the
- * panes take their final centers when it stops). What a spec does after it lands on a
+ * panes take their final centers when it stops) and the State panel, while it
+ * is open, showing the history the dataset opened with (it is drawn a frame
+ * after the history starts and moves every row below it down: a click aimed
+ * at a row while it moves is retried by Playwright with the row scrolled to
+ * the foot of the sidebar). What a spec does after it lands on a
  * page that changes nothing by itself until something asks; a poll that
  * times out names what was still under way. A pulsing highlight (the `full`
  * quality's ring) keeps the loop drawing by itself and changes nothing else:
@@ -49,9 +53,8 @@ export async function waitForPageAtRest(page, { timeout } = {}) {
   // (`app/startup-phase.js`, `main.js`), but only once `main.js` has reached
   // its first network step, after the viewer exists: a page asked right after
   // `domcontentloaded` may not have published one yet. A look at the
-  // attribute that skipped the wait when it was absent then read a viewer not
-  // made yet (CI run 42872892254, WebKit, `notification-stack-under-pointer`:
-  // "viewer.getFrameScheduleState" of undefined, startup at `health`).
+  // attribute that skipped the wait when it was absent would read a viewer
+  // not made yet.
   await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', timeout === undefined ? undefined : { timeout });
   await page.evaluate(() => window._cellucidState?.whenGenesListed?.());
   await expect.poll(() => page.evaluate(() => {
@@ -64,10 +67,14 @@ export async function waitForPageAtRest(page, { timeout } = {}) {
     // The sidebar's slide counts as shown: the area beside it, and so each
     // pane's center, is published once it has stopped
     // (`sidebar-controls.js`). Until then a view is drawn, and picked, around
-    // the center it had before (found 2026-11-12: Firefox answered a hide,
-    // five actions and a pick inside the 200 ms slide, and the pick at the
-    // canvas center missed a cell drawn 145 px beside it).
+    // the center it had before, so a pick at the canvas center inside the
+    // slide misses a cell drawn beside it (measured: 38_decisions_testing_and_hosted_runners.md).
     if ((document.getElementById('sidebar')?.getAnimations().length ?? 0) > 0) return 'the sidebar is sliding';
+    // The State panel draws its graph only while no closed section holds it (`visibility-gate.js`).
+    const graph = document.getElementById('history-graph');
+    const graphShown = graph !== null && graph.closest('details:not([open])') === null
+      && !(document.getElementById('sidebar')?.classList.contains('hidden') ?? false);
+    if (window._cellucidHistories?.current()?.active != null && graphShown && graph.hidden) return 'the State panel has not drawn the history yet';
     return 'at rest';
   }), timeout === undefined ? undefined : { timeout }).toBe('at rest');
 }
@@ -98,8 +105,8 @@ export async function whenActionsDone(page) {
  * history begins, the choice is then applied as an action, and the legend is
  * built anew by each (and once more as the field's counts arrive): a list
  * read or scrolled before the last of them is a list the next draw replaces,
- * detached, so the scroll is lost (WebKit and Firefox on CI, runs 43106620008
- * and 43120770230; measured: a third draw 130 ms after the list showed). So:
+ * detached, so the scroll is lost (a third draw can follow the list by over
+ * 100 ms; measured: 38_decisions_testing_and_hosted_runners.md). So:
  * the file's history has begun, the choice is made, and every action is done.
  *
  * @param {import('@playwright/test').Page} page
@@ -124,8 +131,8 @@ export async function chooseCategoricalField(page, datasetName, label) {
  * so its new row moves each control below it. A spec that clicks again in
  * the sidebar right after a step (Save position, twice) clicks once the page
  * shows that step, or the press and the release land on either side of the
- * row (`split-clicks.mjs`; measured on macOS WebKit: a Camera Path step's row
- * one to two frames after its click returned).
+ * row (`split-clicks.mjs`); the row can come a frame or two after the click
+ * returns (measured: 38_decisions_testing_and_hosted_runners.md).
  *
  * @param {import('@playwright/test').Page} page
  */

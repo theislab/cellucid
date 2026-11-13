@@ -1,7 +1,7 @@
 /**
  * What a categorical field reads as, from its name (`app/utils/field-roles.js`),
  * and the coloring a dataset opens with when nothing chose one
- * (`app/first-coloring.js`; bug hunt F21, owner 2026-11-10).
+ * (`app/first-coloring.js`).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

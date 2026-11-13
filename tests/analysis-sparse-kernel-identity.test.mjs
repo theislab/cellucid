@@ -1,11 +1,11 @@
 /**
  * The analysis kernels walk a gene's non-zero entries only. Their answers must
  * be the answers a walk over every cell gives, so each is pinned here against
- * a dense reference built from the shared definitions in math-utils — the
- * same comparisons the dense kernels made before — with `Object.is`: the same
- * IEEE-754 doubles, not merely close ones. Where the numbers are not defined
- * by one summation order (Welch's sums of squares, whose zeros' terms are one
- * product: audit NS-2; the one-vs-rest Welch moments), the bound is stated.
+ * a dense reference built from the shared definitions in math-utils, with
+ * `Object.is`: the same IEEE-754 doubles, not merely close ones. Where the
+ * numbers are not defined by one summation order (Welch's sums of squares,
+ * whose zeros' terms are one product; the one-vs-rest Welch moments), the
+ * bound is stated.
  *
  * The inputs are expression-shaped (mostly zeros, few distinct values) and
  * also carry every edge the kernels have to get right: negative values, -0,
@@ -118,7 +118,7 @@ function rowOf(batch, k) {
 /**
  * The same numbers: means, counts, fold change and every rank-test number
  * exactly; Welch's t within 1e-12 relative (its sums of squares add the
- * zeros' terms in one product, not one by one: audit NS-2) and its p within
+ * zeros' terms in one product, not one by one) and its p within
  * 1e-9 (the incomplete beta's continued fraction stops within 1e-10).
  */
 function assertSameDifferential(actual, expected, label) {

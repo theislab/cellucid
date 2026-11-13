@@ -349,7 +349,6 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
     if (count === 0) return allocate(0);
     const { list, outStrides } = chunksOf(selection);
     const tally = { chunks: 0, bytes: 0 };
-    const signal = options.signal ?? null;
 
     // One chunk that is exactly the selection, stored in C order: its
     // decoded values are the result, with no copy.

@@ -5,8 +5,9 @@
  * The map of an opening (positions, codes: a few bytes a cell) and a gene of
  * a matrix stored cell by cell (CSR, or dense in row chunks: the cell's whole
  * row read once) cost per cell on scales thousands apart, so one count can
- * not serve both: a CSR atlas over a link used to open as the few thousand
- * cells whose first gene read within the target. Now:
+ * not serve both (a count fitted to the first gene's read would open a CSR
+ * atlas over a link as the few thousand cells whose first gene reads within
+ * the target). So:
  *
  * - the map opens every cell the device holds (memory alone), in a priority
  *   order whose prefixes are samples: a file in its own order in its
@@ -150,7 +151,7 @@ test('every cell opens in its default subsample\'s order only when the sample br
   // sample of 9.84M of 10M cells over a local web host (first gene priced
   // at about 4 s, the sample 64 ms sooner) against an order that cost the
   // opening about 150 ms: every cell opens in file order, its genes read
-  // for every cell (as before samples).
+  // for every cell.
   assert.equal(orderPays({ neededMs: 4000, sampleMs: 3936 }, 150), false);
   assert.equal(orderPays({ neededMs: 8000, sampleMs: 1000 }, 150), true);
   assert.equal(orderPays({ neededMs: Infinity, sampleMs: 1000 }, 150), false);
@@ -470,11 +471,11 @@ test('a share in its cell order is read again, and grows by its first cells, in 
 });
 
 test('a share lowered and raised back reads genes for the sample the same cells were read for, in their order: never every cell unless a person read them', async () => {
-  // The raise (Apply 100%, `{mode: 'all'}`) names no sample: before, it was
-  // fitted again over the link as measured then -- a 50M-cell store's sample
-  // of 4.49M became every cell after a round trip (markers 15.4 → 62.3 s, a
-  // reader worker of 8.7 GB), a 2M-cell `.h5ad` over an emulated 40 MB/s
-  // link 1,690,543 → 352,680 cells in another block order.
+  // The raise (Apply 100%, `{mode: 'all'}`) names no sample: it is not
+  // fitted again over the link as measured then, which turns a 50M-cell
+  // store's sample of 4.49M into every cell after a round trip, and a
+  // 2M-cell `.h5ad` over a 40 MB/s link 1,690,543 cells into 352,680 in
+  // another block order (measured: 23_decisions_partial_reading.md).
   const { tree } = atlas();
   const root = await openZarr(countingStore(tree).store, { decodedChunkCacheBytes: 0 });
   const open = async (cellSubset, carry = null, link = slowLink()) => {
@@ -501,8 +502,8 @@ test('a share lowered and raised back reads genes for the sample the same cells 
   assert.deepEqual(Array.from(raised.cellSubset.openOrder), Array.from(first.cellSubset.openOrder));
 
   // A link measured faster than the opening's fits more: the sample is fitted
-  // again, never to fewer cells than were read (E-ANND-5: an opening sample
-  // of 68 cells, sized on the link's first small reads, came back as 68).
+  // again, never to fewer cells than were read (an opening sample
+  // of 68 cells, sized on the link's first small reads, is not read back as 68).
   const lowered68 = await open({ mode: 'subsample', method: 'uniform', seed: 0, k: 600, strict: true }, first);
   const refitted = await open({ mode: 'all' }, lowered68, slowLink(8));
   assert.ok(refitted.geneSample.cells > fitted.cells && refitted.geneSample.cells < N_OBS, String(refitted.geneSample.cells));
@@ -708,9 +709,10 @@ test('a raw CSR matrix over a slow link has a gene sample, said before any gene 
   // its rows' bytes, priced per element) whose stored chunks hold every
   // cell: the page holds none of them at open. Its held-chunk predicate
   // (`heldChunkBands`) names stored chunks; read as elements, every element
-  // past the first chunk's index looked held, the first gene was priced at
-  // a few bytes, and the atlas opened with no sample (the first gene then
-  // read every cell's row over the slow link).
+  // (`heldChunkBands`) names stored chunks; read as elements, every element
+  // past the first chunk's index would look held, the first gene would be
+  // priced at a few bytes, and the atlas would open with no sample (the
+  // first gene then reads every cell's row over the slow link).
   await import('./helpers/anndata-reader-in-process.mjs');
   const { anndataZarrZip } = await import('./browser/helpers/anndata-zarr-zip.mjs');
   const { AnnDataFileSource } = await import('../assets/js/data/anndata-file-source.js');
@@ -1051,9 +1053,8 @@ test('a later visit over a link nothing has measured nor remembered reads its fi
   };
   // Nothing measured: the kept cells, exactly, in the same order; the
   // first gene priced at nothing and fetching nothing. Priced as free, the
-  // sample was every open cell (the gene index's memory alone bounding it):
-  // an HLCA core revisit read 575 MB for its first gene where the first
-  // visit read 9.4 MB.
+  // sample would be every open cell (the gene index's memory alone bounding
+  // it; measured: 23_decisions_partial_reading.md).
   {
     const { disk, first } = await firstVisit();
     const again = await keptVisit(disk, tree, values, unmeasuredLink());
@@ -1117,7 +1118,7 @@ test('over a link nothing has measured, a first gene with nothing kept reads the
  * A link whose opening measured only small reads, each mostly its round trip
  * (`policy`'s prior; 3 ms and 30 bytes a read): its rate is a lower bound,
  * nothing having kept it full (`bandwidthMeasured` false). A loopback host's
- * opening of a 10M-cell store in Chromium: 45 MB/s from 0.9 MB of metadata.
+ * opening of a 10M-cell store measures such a rate (measured: 23_decisions_partial_reading.md).
  */
 function openingMeasuredLink(policy, reads = Array.from({ length: 8 }, () => ({ bytes: 30, ms: 3 }))) {
   let now = 0;
@@ -1184,15 +1185,15 @@ test('a store on this machine (a loopback host, a local file) reads its first ge
 });
 
 /**
- * Openings measured while this machine was busy (another browser starting,
- * a run ending beside it), as a 10M-cell store on a loopback host in
- * Chromium measured them in 5 of 6 openings under load: `slowRead`, the
+ * Openings measured while this machine is busy (another browser starting,
+ * a run ending beside it): `slowRead`, the
  * opening's small reads and then one slowed past three round trips, so it
- * counts as transfer and its rate as the link's (`bandwidthMeasured`;
- * 100-13,000 B/ms measured); `slowTurns`, small reads of which most waited
- * (a round trip under load of 863 ms where 1.5-7 ms is usual, its first
- * gene's many waves of requests priced at 45.7 s; this fixture's first gene
- * is one wave, so its round trip under load is taken past the gene time).
+ * counts as transfer and its rate as the link's (`bandwidthMeasured`);
+ * `slowTurns`, small reads of which most waited
+ * (a round trip under load far above the usual, its first
+ * gene's many waves of requests priced past the gene time; this fixture's
+ * first gene is one wave, so its round trip under load is taken past the gene
+ * time; measured: 23_decisions_partial_reading.md).
  */
 const CONTENDED_OPENINGS = {
   slowRead: [...Array.from({ length: 8 }, () => ({ bytes: 30, ms: 3 })), { bytes: 300, ms: 30 }],
@@ -1479,9 +1480,8 @@ test('while the matrix answers for cells newly open, the gene sample is the open
   // are read for no cell until the share arrives. Each time the open cells
   // change (the opening, every progressive step), the matrix's own answer
   // (`geneSampleOf`, a round trip to the reader worker) comes later; meanwhile
-  // the page said null -- every cell read -- and a gene picked then was
-  // refused as having no value in any cell (Web contracts run 42280096732,
-  // Linux Firefox, `text-matrix-stream.spec.mjs`).
+  // the page must not say null (every cell read): a gene picked then would be
+  // refused as having no value in any cell (`text-matrix-stream.spec.mjs`).
   const { DataState } = await import('../assets/js/app/state/core/data-state.js');
   const state = new DataState(null, null);
   state._varFieldDescriptors = [{ key: 'g0', path: 'var/0' }];
@@ -1538,4 +1538,68 @@ test('a var loader set before its gene list is read: the opening\'s gene sample 
   answers.shift()({ cells: 0, of: 500 });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual({ cells: state.getGeneSample().cells, of: state.getGeneSample().of }, { cells: 0, of: 500 });
+});
+
+test('a share read again takes the gene index segments its first opening built, and grows in store order from them: every open cell\'s values, the carried rows not read again', async () => {
+  // Rows of many entries, so a growth's first segment is a part of the
+  // rows it adds, and stored chunks of many rows, so the share's rows lie
+  // in every one: the growth is indexed in store order.
+  const nObs = 8000;
+  const nVars = 400;
+  const valueOf = (cell, gene) => ((cell + gene) % 4 === 0 ? 0 : 1 + ((cell * 7 + gene * 13) % 9));
+  const indptr = new Int32Array(nObs + 1);
+  for (let cell = 0; cell < nObs; cell++) {
+    let row = 0;
+    for (let gene = 0; gene < nVars; gene++) if (valueOf(cell, gene) !== 0) row++;
+    indptr[cell + 1] = indptr[cell] + row;
+  }
+  const indices = new Int32Array(indptr[nObs]);
+  const data = new Float32Array(indptr[nObs]);
+  for (let cell = 0, at = 0; cell < nObs; cell++) {
+    for (let gene = 0; gene < nVars; gene++) {
+      const value = valueOf(cell, gene);
+      if (value === 0) continue;
+      indices[at] = gene;
+      data[at++] = value;
+    }
+  }
+  const X = sparse({ data, indices, indptr, shape: [nObs, nVars], compressed: true });
+  X.children.data.chunks = [1 << 17];
+  X.children.indices.chunks = [1 << 17];
+  X.children.indptr.chunks = [1024];
+  const tree = annData({
+    obs: dataFrame({ _index: strings(Array.from({ length: nObs }, (_, i) => `c${i}`), { chunks: [1000] }) }),
+    var: dataFrame({ _index: strings(Array.from({ length: nVars }, (_, g) => `g${g}`)) }),
+    obsm: mapping({ X_umap: dense(new Float32Array(nObs * 2), [nObs, 2], { chunks: [1000, 2] }) }),
+    X,
+  });
+  const counting = countingStore(tree);
+  const root = await openZarr(counting.store, { decodedChunkCacheBytes: 0 });
+  // A share in its own order (a fast link) whose genes are read for a stated sample.
+  const cellSubset = { mode: 'subsample', method: 'uniform', k: 4000, seed: 3, strict: true, genes: 200 };
+  const open = async (request, carry = null) => {
+    const reader = new AnnDataReader();
+    await reader.open(root, { format: ZARR_FORMAT, name: 'rows.zarr', link: slowLink(1e6), cellSubset: request, ...(carry === null ? {} : { carry }) });
+    return reader;
+  };
+  const first = await open(cellSubset);
+  assert.equal(first.geneSample.cells, 200);
+  await first.getMatrixColumn('X', 3);
+  // The same cells opened again in place (a session restored on them, Apply).
+  const again = await open(requestOfOpenCells(first.cellSubset), first);
+  first.releaseStore();
+  first.close();
+  assert.equal(again.geneSample.cells, 200);
+  const fetchedBefore = counting.fetched.length;
+  assert.equal(await again.getMatrixColumn('X', 3).then(column => column.length), 4000);
+  assert.equal(counting.fetched.length, fetchedBefore, 'the carried segment answers its gene: nothing read');
+  assert.equal(await again.growGeneSample('X', 4000, { gene: 3 }), null, 'every open cell\'s genes are read');
+  const grownKeys = new Set(counting.fetched.slice(fetchedBefore).filter(key => key.startsWith('X/indices/')));
+  assert.ok(grownKeys.size > 0, 'the growth reads the rows it adds');
+  const cells = await openCells(again);
+  for (const gene of [3, 11, 399]) {
+    const column = await again.getMatrixColumn('X', gene);
+    for (let i = 0; i < cells.length; i++) assert.equal(column[i], valueOf(cells[i], gene), `gene ${gene}, open cell ${i}`);
+  }
+  again.close();
 });

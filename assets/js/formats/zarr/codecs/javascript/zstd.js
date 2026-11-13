@@ -195,7 +195,7 @@ function readFseTable(src, start, end, maxSymbol, maxAccuracyLog) {
  * set bit and ends at the first byte's lowest. `position` counts the bits
  * still unread; reading past the start yields zeros and leaves it negative.
  */
-export class BackwardBits {
+class BackwardBits {
   constructor(src, start, end) {
     if (end <= start) throw corrupt('a bit stream is empty');
     const last = src[end - 1];

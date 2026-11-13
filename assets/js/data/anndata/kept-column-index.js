@@ -42,8 +42,9 @@
  *
  * **What a run is checked against before it is used** (`findKeptRuns`):
  *
- * - its manifest is whole (`space.js`: revision `KEPT_INDEX_REVISION`,
- *   identity digest, every file at its size) and well formed;
+ * - its manifest is whole (`space.js`: stamped with the code fingerprint
+ *   of gene indexes, so written by this code; identity digest; every file
+ *   at its size) and well formed;
  * - its file rows equal the opening's at the same open positions;
  * - its row pointers equal the file's for those rows, read now (else the
  *   file changed: the run is removed);
@@ -62,6 +63,16 @@
  * for together in one range per run of neighboring genes, never a read per
  * gene. A run priced slower to read than to build again is not used.
  *
+ * **Which code a kept run is of.** A run's manifest is stamped with the
+ * code fingerprint of gene indexes (`transcode/kept-code-fingerprints.js`,
+ * written by the build): a digest of the code that decides what a run
+ * holds: this module, the index and its runs (`sparse-column-index.js`,
+ * `prefix-column-index.js`), the matrix reads and conversions it is built
+ * from, the layouts a file is presented through, and the readers that
+ * decode its chunks (`scripts/kept-code-fingerprints.mjs` names them). A
+ * run stamped by other code is removed, never read, and the index is built
+ * and kept again: a change to any of that code needs nothing else.
+ *
  * **What a gene read checks.** Each gene's stored piece of every
  * per-gene array (entry positions, rows, values) carries a CRC-32 written
  * when the run was kept, checked the first time the piece is served
@@ -75,7 +86,8 @@
  */
 
 import { PieceChecksums, checksumOf, matchesChecksum } from '../../formats/io/page-checks.js';
-import { OPTIONAL_COPY_RANK, findKeptStores, forgetKeptCopy, identityDigest, keptAbout, makeRoomForRetry, openTranscodeSpace } from './transcode/space.js';
+import { OPTIONAL_COPY_RANK, findKeptStores, forgetKeptCopy, makeRoomForRetry, openTranscodeSpace } from './transcode/space.js';
+import { identityDigest, keptAbout } from './transcode/kept-format.js';
 import { allocateTypedArray, copyTypedArray } from '../sparse-column-index.js';
 
 /** Element types of a kept array, by its manifest's name. */

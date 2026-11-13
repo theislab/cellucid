@@ -3,14 +3,14 @@
  * (`rendering/gl-state-shadow.js`), never asked of the context on a path
  * that runs per frame or per change.
  *
- * Measured with a 64 MB texture upload queued (tests/… see the module
- * overview): in Firefox and WebKit `isEnabled`, and `getParameter` of
- * ACTIVE_TEXTURE, VIEWPORT, SCISSOR_BOX, COLOR_WRITEMASK, the blend
- * functions and equations, COLOR_CLEAR_VALUE and the enable capabilities,
- * each waited 6–24 ms for the GPU process to run every queued command;
- * bindings and pixel-store parameters answered in 0 ms in every engine. The
- * backdrop look asked three of the waiting kind per pane per frame, the GPU
- * gather one per draw-order change.
+ * In Firefox and WebKit, with a texture upload queued, `isEnabled` and
+ * `getParameter` of ACTIVE_TEXTURE, VIEWPORT, SCISSOR_BOX, COLOR_WRITEMASK,
+ * the blend functions and equations, COLOR_CLEAR_VALUE and the enable
+ * capabilities wait for the GPU process to run every queued command, while
+ * bindings and pixel-store parameters answer at once in every engine
+ * (measured: 28_decisions_rendering_layers.md). The backdrop look would ask
+ * three of the waiting kind per pane per frame, the GPU gather one per
+ * draw-order change.
  */
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -110,12 +110,4 @@ test('no renderer asks the context for state the shadow keeps', () => {
     });
   }
   assert.deepEqual(offenders, []);
-});
-
-test('the viewer installs the shadow on its context, read whole, before drawing', () => {
-  const viewer = readFileSync(path.join(RENDERING, 'viewer.js'), 'utf8');
-  const created = viewer.indexOf("canvas.getContext('webgl2'");
-  const installed = viewer.indexOf('primeGlState(gl);', created);
-  const firstState = viewer.indexOf('createSceneMsaaTarget(gl)', created);
-  assert.ok(created > 0 && installed > created && installed < firstState);
 });

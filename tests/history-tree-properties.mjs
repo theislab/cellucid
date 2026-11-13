@@ -1,5 +1,5 @@
 /**
- * History v2 §6 test 1 (the shared body; `history-tree-properties-*.test.mjs` run its seeds in shards): seeded random sequences of every operation on the
+ * The first property test of the history (the shared body; `history-tree-properties-*.test.mjs` run its seeds in shards): seeded random sequences of every operation on the
  * history (actions, undo, redo, jumps, branch here, switch, rename, archive,
  * main, lock, delete a step, delete a branch in both modes, squash, groups,
  * notes, bookmarks, the journal's undo and emptying, trackers started, used

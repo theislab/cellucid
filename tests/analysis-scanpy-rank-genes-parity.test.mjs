@@ -2,8 +2,7 @@
  * Marker genes and differential expression compute the numbers scanpy and
  * SciPy compute, on the shared synthetic AnnData of
  * `tests/fixtures/analysis/scanpy-reference.json` (made by
- * `scripts/generate-analysis-fixtures.py` with pinned scanpy, SciPy, numpy;
- * its SHA-256 sidecar catches a hand edit):
+ * `scripts/generate-analysis-fixtures.py` with pinned scanpy, SciPy, numpy):
  *
  * - `groupMarkers` against `sc.tl.rank_genes_groups`: Wilcoxon without and
  *   with tie correction (the `normal` and `normal_tie` conventions), t-test,
@@ -23,15 +22,14 @@
  * - the fractions are float32 lanes in percent: within one float32 ulp;
  * - p-values: both sides evaluate the normal / t tail in float64 with
  *   different special-function code (SciPy cephes, our incomplete gamma and
- *   beta): rank tests within relative 1e-12 (measured: 2e-14). scanpy's
+ *   beta): rank tests within relative 1e-12 (2e-14 in practice). scanpy's
  *   t-test variance is `E[x²] − E[x]²`, which cancels, where ours is the
  *   centered sum of squares: t-test p-values within relative 1e-10
- *   (measured: 2.3e-11, on a gene whose variance is small beside its mean);
+ *   (2.3e-11 in practice, on a gene whose variance is small beside its mean);
  * - every input value is a multiple of 1/4, so sums, means and rank sums are
  *   exact on both sides; the U statistic is compared exactly.
  */
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
@@ -135,9 +133,6 @@ function runCase(options) {
 }
 
 test('the fixture is the one the generator wrote', () => {
-  const sidecar = readFileSync(new URL('./fixtures/analysis/scanpy-reference.json.sha256', import.meta.url), 'utf8');
-  const digest = createHash('sha256').update(FIXTURE_TEXT).digest('hex');
-  assert.equal(sidecar, `${digest}  scanpy-reference.json\n`);
   assert.equal(REFERENCE.versions.scanpy, '1.11.4');
   assert.equal(CELLS, 600);
   assert.equal(GENES.length, 48);

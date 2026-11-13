@@ -480,7 +480,7 @@ test('category builder previews exact membership and rejects invalid draft label
     builder._getPageLabelValidationError(),
     /^Page 1: " A " cannot be a category label: it starts or ends with a space; give it without\.$/,
   );
-  // One line: a line break is refused here as the action refuses it (R9A-8).
+  // One line: a line break is refused here as the action refuses it.
   builder._droppedPages[0].label = 'A\nB';
   assert.match(
     builder._getPageLabelValidationError(),
@@ -1176,7 +1176,7 @@ test('highlight-page fields require exact labels and serialize the valid current
     { pageId: 'activated', label: 'Activated' },
     { pageId: 'resting', label: 'Resting' },
   ]);
-  // Each page's category opens in its page's color (F124: one color for one
+  // Each page's category opens in its page's color (one color for one
   // page, as the builder previews it); the cells on no page take the category
   // palette's color of their place. A session keeps them.
   const hex = rgb => `#${rgb.map(channel => Math.round(channel * 255).toString(16).padStart(2, '0')).join('')}`;

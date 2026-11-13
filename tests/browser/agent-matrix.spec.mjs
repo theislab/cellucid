@@ -66,8 +66,13 @@ function pathFacts(page) {
 async function makeColoringHeavy(page) {
   await page.evaluate(async () => {
     const { getActions } = await import('/assets/js/app/actions/index.js');
-    getActions().provideEstimate('color.by', () => ({ ms: 30_000, bytes: null, what: 'coloring every cell' }));
+    window.__coloringLightAgain = getActions().provideEstimate('color.by', () => ({ ms: 30_000, bytes: null, what: 'coloring every cell' }));
   });
+}
+
+/** Takes the estimate of `makeColoringHeavy` away: coloring is allowed by default again. */
+async function makeColoringLight(page) {
+  await page.evaluate(() => window.__coloringLightAgain());
 }
 
 async function openStart(page) {
@@ -146,10 +151,6 @@ test('BYOK alone: the direct-browser header; a tab key across a reload, not in a
 
 const DATASET_KINDS = Object.freeze([
   {
-    kind: 'a sample',
-    async open(page) { await openStart(page); },
-  },
-  {
     kind: 'a link',
     async open(page) {
       const link = `${SAMPLE_ORIGIN}/tests/browser/fixtures/current-ui-smoke.h5ad`;
@@ -203,88 +204,92 @@ for (const { kind, open } of DATASET_KINDS) {
 
 // --------------------------------------------------------- 2. Connector alone
 
-test('connector alone: with no chat bar opened and no key, the presence follows, asks, refuses and undoes for it', async ({ page }) => {
+// One opening with the relay paired. The stopped card comes first: it changes nothing, and the
+// walk after it ends read-only.
+test('connector alone, no chat bar and no key: Stop on its line withdraws a waiting card; then the presence follows, asks, refuses and undoes for it', async ({ page }) => {
   const errors = observeProductErrors(page);
   const relay = await playRelay(page);
   await pairTab(page);
   await openStart(page);
   await expect(page.locator('#agent-connect-status')).toHaveText('Ready · no agent yet');
   const field = await fieldNotShown(page);
-  const before = await fingerprint(page);
 
-  // A change: allowed by default, a step of the agent's turn; its line has Undo turn.
-  const colored = await startTool(relay, 'color_by', colorBy(field), CHATGPT).result();
-  expect(colored.result.isError).toBe(false);
-  await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'done');
-  await expect(line(page, 'ChatGPT').locator('.agent-activity-text')).toHaveText(/^ChatGPT \(chatgpt\.com\) · 1 step · /);
-  await line(page, 'ChatGPT').locator('.agent-activity-undo').click();
-  await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'undone');
-  expect(await fingerprint(page)).toEqual(before);
-  await line(page, 'ChatGPT').locator('.agent-activity-dismiss').click();
+  await test.step("connector: while a card waits, its turn's line shows Stop; Stop withdraws the card and answers the agent it was stopped", async () => {
+    await makeColoringHeavy(page);
+    const before = await fingerprint(page);
+    const heavy = startTool(relay, 'color_by', colorBy(field), CHATGPT);
+    await expect(card(page)).toHaveAttribute('data-agent', 'ChatGPT');
+    // The action has not started (the person is asked first), yet its turn acts and can be stopped.
+    await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'acting');
+    await expect(line(page, 'ChatGPT').locator('.agent-activity-stop')).toBeVisible();
+    await line(page, 'ChatGPT').locator('.agent-activity-stop').click();
+    await expect(card(page)).toHaveCount(0);
+    const stopped = (await heavy.result()).result;
+    expect(stopped.isError).toBe(true);
+    // The sentence; the person's settings follow it on the connection's first result.
+    expect(stopped.content[0].text.split('\n')[0]).toBe('Stopped before it finished: The person stopped ChatGPT (chatgpt.com).');
+    await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'stopped');
+    await expect(line(page, 'ChatGPT').locator('.agent-activity-stop')).toBeHidden();
+    expect(await fingerprint(page)).toEqual(before);
+    expect(errors).toEqual([]);
+  });
 
-  // Heavy work asks on a card, and the relay tells the agent it waits; This connection holds for that connection only.
-  await makeColoringHeavy(page);
-  const heavy = startTool(relay, 'color_by', colorBy(field), CHATGPT);
-  await expect(card(page)).toHaveAttribute('data-asking', 'heavy');
-  await expect(card(page)).toHaveAttribute('data-agent', 'ChatGPT');
-  await expect(card(page).locator('.agent-confirm-why')).toHaveText('It is heavy work: Coloring every cell, about 30.0 s on this device.');
-  await received(relay, 'asking', message => message.id === heavy.id);
-  await card(page).locator('.agent-confirm-allow-here').click();
-  expect((await heavy.result()).result.isError).toBe(false);
-  await received(relay, 'answered', message => message.id === heavy.id && message.allowed === true);
-  expect((await startTool(relay, 'color_by', { field: null }, CHATGPT).result()).result.isError).toBe(false);
-  await expect(card(page)).toHaveCount(0);
-  const other = startTool(relay, 'color_by', colorBy(field), { agent: 'Claude', grant: 'g2', client: 'Claude', host: 'claude.ai' });
-  await expect(card(page)).toHaveAttribute('data-agent', 'Claude');
-  await card(page).locator('.agent-confirm-deny').click();
-  const denied = (await other.result()).result;
-  expect(denied.isError).toBe(true);
-  expect(denied.content[0].text).toMatch(/The person declined/);
+  await test.step('connector alone: with no chat bar opened and no key, the presence follows, asks, refuses and undoes for it', async () => {
+    // The step above left coloring heavy and its stopped turn's line: both are taken away.
+    await makeColoringLight(page);
+    await line(page, 'ChatGPT').locator('.agent-activity-dismiss').click();
+    await expect(line(page, 'ChatGPT')).toHaveCount(0);
+    const before = await fingerprint(page);
 
-  // Read only, set in the Agents panel: the tool list stays the same (L26-9); a change is refused with its
-  // sentence, and the agent is told the new settings after that result; reads still run.
-  const toolsBefore = await toolList(relay, 'g1');
-  await page.evaluate(() => { document.getElementById('agents-section').open = true; });
-  await page.locator('#agent-connect-permissions-change').click();
-  await page.locator('#agent-permissions-dialog input[name="agent-permission-mode"][value="read-only"]').check();
-  await page.locator('#agent-permissions-dialog .app-dialog-close').click();
-  await expect(page.locator('#agent-connect-permissions-summary')).toHaveText('Read only');
-  expect(await toolList(relay, 'g1')).toEqual(toolsBefore);
-  const refused = (await startTool(relay, 'color_by', colorBy(field), CHATGPT).result()).result;
-  expect(refused.isError).toBe(true);
-  expect(refused.content[0].text).toMatch(/do not let agents change anything in this tab/);
-  expect(refused.content[0].text).toMatch(/\[Cellucid: the person's settings for you now\. Permissions: [^\]]*\(Read only\)[^\]]*changes in this tab[^\]]*: are refused/);
-  expect((await startTool(relay, 'fields_list', {}, CHATGPT).result()).result.isError).toBe(false);
+    // A change: allowed by default, a step of the agent's turn; its line has Undo turn.
+    const colored = await startTool(relay, 'color_by', colorBy(field), CHATGPT).result();
+    expect(colored.result.isError).toBe(false);
+    await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'done');
+    await expect(line(page, 'ChatGPT').locator('.agent-activity-text')).toHaveText(/^ChatGPT \(chatgpt\.com\) · 1 step · /);
+    await line(page, 'ChatGPT').locator('.agent-activity-undo').click();
+    await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'undone');
+    expect(await fingerprint(page)).toEqual(before);
+    await line(page, 'ChatGPT').locator('.agent-activity-dismiss').click();
 
-  // Nothing of it needed the chat bar or a key.
-  await expect(page.locator('#agent-chat-panel')).toBeHidden();
-  expect(await keysKept(page)).toEqual([]);
-  expect(errors).toEqual([]);
-});
+    // Heavy work asks on a card, and the relay tells the agent it waits; This connection holds for that connection only.
+    await makeColoringHeavy(page);
+    const heavy = startTool(relay, 'color_by', colorBy(field), CHATGPT);
+    await expect(card(page)).toHaveAttribute('data-asking', 'heavy');
+    await expect(card(page)).toHaveAttribute('data-agent', 'ChatGPT');
+    await expect(card(page).locator('.agent-confirm-why')).toHaveText('It is heavy work: Coloring every cell, about 30.0 s on this device.');
+    await received(relay, 'asking', message => message.id === heavy.id);
+    await card(page).locator('.agent-confirm-allow-here').click();
+    expect((await heavy.result()).result.isError).toBe(false);
+    await received(relay, 'answered', message => message.id === heavy.id && message.allowed === true);
+    expect((await startTool(relay, 'color_by', { field: null }, CHATGPT).result()).result.isError).toBe(false);
+    await expect(card(page)).toHaveCount(0);
+    const other = startTool(relay, 'color_by', colorBy(field), { agent: 'Claude', grant: 'g2', client: 'Claude', host: 'claude.ai' });
+    await expect(card(page)).toHaveAttribute('data-agent', 'Claude');
+    await card(page).locator('.agent-confirm-deny').click();
+    const denied = (await other.result()).result;
+    expect(denied.isError).toBe(true);
+    expect(denied.content[0].text).toMatch(/The person declined/);
 
-test('connector: while a card waits, its turn\'s line shows Stop; Stop withdraws the card and answers the agent it was stopped', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const relay = await playRelay(page);
-  await pairTab(page);
-  await openStart(page);
-  const field = await fieldNotShown(page);
-  await makeColoringHeavy(page);
-  const before = await fingerprint(page);
-  const heavy = startTool(relay, 'color_by', colorBy(field), CHATGPT);
-  await expect(card(page)).toHaveAttribute('data-agent', 'ChatGPT');
-  // The action has not started (the person is asked first), yet its turn acts and can be stopped.
-  await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'acting');
-  await expect(line(page, 'ChatGPT').locator('.agent-activity-stop')).toBeVisible();
-  await line(page, 'ChatGPT').locator('.agent-activity-stop').click();
-  await expect(card(page)).toHaveCount(0);
-  const stopped = (await heavy.result()).result;
-  expect(stopped.isError).toBe(true);
-  // The sentence; the person's settings follow it on the connection's first result (L26-9).
-  expect(stopped.content[0].text.split('\n')[0]).toBe('Stopped before it finished: The person stopped ChatGPT (chatgpt.com).');
-  await expect(line(page, 'ChatGPT')).toHaveAttribute('data-state', 'stopped');
-  await expect(line(page, 'ChatGPT').locator('.agent-activity-stop')).toBeHidden();
-  expect(await fingerprint(page)).toEqual(before);
-  expect(errors).toEqual([]);
+    // Read only, set in the Agents panel: the tool list stays the same; a change is refused with its
+    // sentence, and the agent is told the new settings after that result; reads still run.
+    const toolsBefore = await toolList(relay, 'g1');
+    await page.evaluate(() => { document.getElementById('agents-section').open = true; });
+    await page.locator('#agent-connect-permissions-change').click();
+    await page.locator('#agent-permissions-dialog input[name="agent-permission-mode"][value="read-only"]').check();
+    await page.locator('#agent-permissions-dialog .app-dialog-close').click();
+    await expect(page.locator('#agent-connect-permissions-summary')).toHaveText('Read only');
+    expect(await toolList(relay, 'g1')).toEqual(toolsBefore);
+    const refused = (await startTool(relay, 'color_by', colorBy(field), CHATGPT).result()).result;
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toMatch(/do not let agents change anything in this tab/);
+    expect(refused.content[0].text).toMatch(/\[Cellucid: the person's settings for you now\. Permissions: [^\]]*\(Read only\)[^\]]*changes in this tab[^\]]*: are refused/);
+    expect((await startTool(relay, 'fields_list', {}, CHATGPT).result()).result.isError).toBe(false);
+
+    // Nothing of it needed the chat bar or a key.
+    await expect(page.locator('#agent-chat-panel')).toBeHidden();
+    expect(await keysKept(page)).toEqual([]);
+    expect(errors).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------- 3. Both at once

@@ -4,10 +4,10 @@
  * A figure draws the active highlight page's cells over the coloring in the
  * highlight's color (`HIGHLIGHT_COLOR`), as the screen does: a reader of the
  * figure who never saw the app cannot tell that color from the coloring's
- * (L24-15: the cyan highlight of the germ cells over a gene's viridis was read
- * as "the cells with high NANOS3"). So wherever the figure draws highlighted
+ * (a cyan highlight over a gene's viridis reads as the cells of high
+ * expression). So wherever the figure draws highlighted
  * cells its legend carries an entry for them: a swatch of the highlight's
- * color, the page's name and its highlighted cell count (F158). The entry
+ * color, the page's name and its highlighted cell count. The entry
  * follows the legend (Legend off, no entry) and the cells drawn: a panel that
  * draws none of them carries none.
  *

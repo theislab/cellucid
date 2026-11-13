@@ -13,8 +13,10 @@
  *
  * Needs CELLUCID_PYTHON set to an interpreter that has cellucid's
  * dependencies; without it the file is skipped, as the other live-server specs
- * are. The server runs the cellucid-python checkout beside this repository (or
- * CELLUCID_PYTHON_ROOT), never whichever `cellucid` the interpreter has.
+ * are, and CELLUCID_REQUIRE_VIEWERS=1 (set by the CI job that runs this spec)
+ * makes that a failure. The server runs the cellucid-python checkout beside
+ * this repository (or CELLUCID_PYTHON_ROOT), never whichever `cellucid` the
+ * interpreter has.
  */
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -22,8 +24,9 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
+import { viewerInterpreter } from './helpers/viewer-interpreters.mjs';
 
-const PYTHON = process.env.CELLUCID_PYTHON ?? null;
+const PYTHON = viewerInterpreter('CELLUCID_PYTHON');
 const PYTHON_SOURCE = path.join(
   process.env.CELLUCID_PYTHON_ROOT
     ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'cellucid-python'),

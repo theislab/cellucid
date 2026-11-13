@@ -67,6 +67,7 @@ import { installFieldActions } from '../../state/actions/field-actions.js';
 import { getActions } from '../../actions/index.js';
 import { openCellsKey } from '../../state/domains/cells.js';
 import { visitingViews } from '../../state/domains/view-list.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /**
  * Build one terminal cleanup owner whose Promise identity is stable even when
@@ -103,12 +104,8 @@ export function createStableTerminalDestroy({
   return function destroy() {
     if (terminalPromise !== null) return terminalPromise;
 
-    let resolveTerminal;
-    let rejectTerminal;
-    terminalPromise = new Promise((resolve, reject) => {
-      resolveTerminal = resolve;
-      rejectTerminal = reject;
-    });
+    const { promise, resolve: resolveTerminal, reject: rejectTerminal } = promiseWithResolvers();
+    terminalPromise = promise;
 
     const failures = [];
     const pending = [];
@@ -454,11 +451,11 @@ export function initUI({
    * The single publication of "the active field changed".
    *
    * Every surface that draws the active field is refreshed here, and only here.
-   * A second, partial copy of this list is how the sidebar came to disagree
+   * A second, partial copy of this list would leave the sidebar disagreeing
    * with itself: a state-driven activation (a dataset's advertised starting
-   * state, Load State, a viewer host command) refreshed the legend and the
+   * state, Load State, a viewer host command) would refresh the legend and the
    * selectors but not the rest, and a switch to a kept view — which restores
-   * that view's own active field — refreshed a third, shorter set.
+   * that view's own active field — would refresh a third, shorter set.
    *
    * The statistics line is not in this list. It follows `visibility:changed`
    * instead (see `publishStatsLine`), which reaches paths that never call this.
@@ -478,9 +475,9 @@ export function initUI({
   /**
    * The surfaces that describe whichever view is active.
    *
-   * Two callers need exactly this sequence and used to carry their own copy of
-   * it, differing by a single line. The comment above `handleActiveFieldChanged`
-   * records what a second, partial copy of a refresh list already cost once.
+   * Two callers need exactly this sequence, so it has one copy: a second,
+   * partial copy of a refresh list leaves a surface stale (see the comment
+   * above `handleActiveFieldChanged`).
    *
    * The view id is a parameter because the two callers know it differently: the
    * view-controls callback is told which view it activated, while an outside

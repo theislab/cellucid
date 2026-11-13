@@ -3,7 +3,7 @@
 // is a hold, and the spline never overshoots its keyframes (closer to the data
 // than either keyframe, or tilted past one, over a pole) nor jolts its speed
 // at a keyframe whose transitions have different times
-// (`interpolation-engine.js`, lane-director L2-4).
+// (`interpolation-engine.js`).
 import assert from 'node:assert/strict';
 import test from 'node:test';
 

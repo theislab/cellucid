@@ -6,9 +6,8 @@
  * A file URL's `pathname` is no path on Windows (`/D:/a/...`, which
  * `path.join()` and `path.resolve()` turn into `D:\D:\a\...`), and
  * `path.relative()` separates with `\` there, so a contract that compared a
- * module's name with `'app/...'` failed on every Windows job (CI run
- * 43106620008: seven contracts). `tests/windows-paths-contract.test.mjs`
- * keeps the first out of every test.
+ * module's name with `'app/...'` would fail on every Windows job.
+ * `tests/windows-paths-contract.test.mjs` keeps the first out of every test.
  */
 import { readdirSync } from 'node:fs';
 import path from 'node:path';

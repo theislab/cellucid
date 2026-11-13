@@ -37,6 +37,7 @@ export class DataStateLatentSpaceMethods {
   /**
    * Every obs field list a view holds: the focused view's (on the state) and
    * each other view's own copy.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _everyObsFieldList() {
@@ -54,6 +55,7 @@ export class DataStateLatentSpaceMethods {
    * Nothing is read: fields whose outlier filter is in use get their new
    * quantiles after the commit, each as a job with progress and Cancel.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{outlierPathFor: (fieldIndex: number) => string|null}} latent -
    *   The outlier route of each categorical field in the new latent space
    *   (null for none).
@@ -133,7 +135,7 @@ export class DataStateLatentSpaceMethods {
    * Recolor every view colored by a categorical obs field, so its outlier
    * filter reads the quantiles it now has. Focus returns to the view that
    * had it.
-   * @private
+   * @this {import('../core/data-state.js').DataState}
    */
   _recolorCategoricalViews() {
     const focused = this.activeViewId;

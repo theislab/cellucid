@@ -1,7 +1,7 @@
 /**
  * Encoding a Zarr v2 chunk on a decode worker (`formats/io/decode-pool.js`,
- * `runOnDecodeWorker`): deflate is the slow part of writing a store (about
- * 25 MB/s of float values on one core), so a copy's chunks are encoded on
+ * `runOnDecodeWorker`): deflate is the slow part of writing a store (measured:
+ * 25_decisions_exports.md), so a copy's chunks are encoded on
  * every core while the reader thread reads the next ones
  * (`data/anndata/write/pool-encoder.js`). It depends on nothing a worker
  * cannot load.

@@ -3,11 +3,11 @@
 // only person misinformed is the one using a screen reader, and nothing on
 // screen contradicts it.
 //
-// It fell behind because it was republished from refresh lists rather than from
-// a signal, and the lists drifted. Two kept views can carry two different
-// active fields — `setActiveView` saves and restores each view's own
-// `activeFieldIndex` — so switching between them is an active-field change, and
-// the switch path published the legend without publishing the line beside it.
+// It is published from a signal, not from refresh lists, which drift. Two
+// kept views can carry two different active fields — `setActiveView` saves and
+// restores each view's own `activeFieldIndex` — so switching between them is an
+// active-field change, and a switch path that publishes the legend without
+// publishing the line beside it leaves the line behind.
 //
 // This walks the real path: color a view, keep it, color the live view with a
 // different field, and switch back. The line must name the field of the view
@@ -71,7 +71,7 @@ test('the statistics line names the active field of the view being shown', async
   await expect(stats).toHaveText('120 cells • Field: score (continuous)');
 
   // Switching back must re-announce the kept view's own field. Publishing the
-  // legend without the line beside it is what left this reading "score" over a
+  // legend without the line beside it is what leaves this reading "score" over a
   // plot colored by cell type.
   await page.locator('.split-badge').nth(1).click();
   await expect.poll(() => activeViewId(page)).toBe('snap_1');

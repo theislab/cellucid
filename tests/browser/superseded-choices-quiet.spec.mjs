@@ -2,16 +2,16 @@
  * A choice superseded by a newer one ends as a quiet cancellation, never a
  * page error and never an error notification.
  *
- * Found 2026-11-11 (round 9, close-b): opening a link right after the start
- * page logged `pageerror: Field interaction was superseded by a newer
- * intent.`: a dataset's UI refresh cleared the gene choice and waited for
- * nobody (`dataset-controls.js` refreshDatasetUI), and the new dataset's
- * first coloring superseded that clear, whose rejection reached no handler.
+ * A dataset's UI refresh clears the gene choice and waits for nobody
+ * (`dataset-controls.js` refreshDatasetUI), and the new dataset's first
+ * coloring supersedes that clear, whose rejection reaches no handler: opening a
+ * link right after the start page must not log `pageerror: Field interaction
+ * was superseded by a newer intent.`
  * The class: work nobody waits for settles in the background
  * (`settleInBackground`: a cancellation quiet, a failure reported), and a
  * cancellation that still reaches no handler is not a page error
  * (`quietUnhandledCancellations`, installed by the page). An analysis's gene
- * link superseded by a newer choice said "Coloring by … failed".
+ * link superseded by a newer choice says nothing, never "Coloring by … failed".
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';

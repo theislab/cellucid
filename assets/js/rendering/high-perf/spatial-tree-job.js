@@ -42,8 +42,9 @@ export function buildSpatialTreeJob(request, { releasePositions = false } = {}) 
 /**
  * Move every leaf's ids into one shared buffer (each leaf keeps a view of
  * its range), so a tree crosses to the main thread as one transferred
- * buffer instead of one per leaf: tens of thousands of transfers made the
- * receiving task cost about 50 ms at 10M points.
+ * buffer instead of one per leaf: tens of thousands of transfers make the
+ * receiving task cost tens of milliseconds at 10M points (measured:
+ * 28_decisions_rendering_layers.md).
  *
  * @param {{root: object}} tree
  * @param {number} pointCount

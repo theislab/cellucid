@@ -53,7 +53,7 @@ export function categoryCellLimitAt(field, category) {
  * Check one limit: a non-negative integer count and a uint32 seed.
  * @param {{count: number, seed: number}} limit
  */
-export function requireCellLimit(limit) {
+function requireCellLimit(limit) {
   if (limit === null || typeof limit !== 'object') throw new TypeError('A cell limit is {count, seed}.');
   if (!Number.isSafeInteger(limit.count) || limit.count < 0) {
     throw new RangeError('A category keeps a whole number of cells, 0 or more.');

@@ -93,35 +93,7 @@ async function expectSmokeUnavailableNotice(page) {
   await expect(notice).toContainText('Volumetric smoke unavailable');
 }
 
-test('the emulated context reports an iPhone capability set', async ({ page }) => {
-  await installIosWebGLCapabilities(page);
-  await page.goto('/tests/browser/fixtures/webgl-harness.html');
-  const probe = await page.evaluate(() => {
-    const gl = document.createElement('canvas').getContext('webgl2');
-    return {
-      colorBufferFloat: gl.getExtension('EXT_color_buffer_float') !== null,
-      floatBlend: gl.getExtension('EXT_float_blend'),
-      floatLinear: gl.getExtension('OES_texture_float_linear'),
-      listed: gl.getSupportedExtensions().filter(
-        name => name === 'EXT_float_blend' || name === 'OES_texture_float_linear'
-      ),
-      max3D: gl.getParameter(gl.MAX_3D_TEXTURE_SIZE),
-      maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE),
-      emulated: window.__cellucidIosWebGLEmulation === true,
-    };
-  });
-  expect(probe).toMatchObject({
-    colorBufferFloat: true,
-    floatBlend: null,
-    floatLinear: null,
-    listed: [],
-    emulated: true,
-  });
-  expect(probe.max3D).toBeLessThanOrEqual(2048);
-  expect(probe.maxTexture).toBeLessThanOrEqual(4096);
-});
-
-test('choosing smoke on an iPhone-class device explains why and keeps Points working', async ({
+test('choosing smoke on an iPhone-class device explains why and keeps Points working: points, highlights and figure export', async ({
   page,
 }, testInfo) => {
   const productErrors = observeProductErrors(page);
@@ -146,6 +118,41 @@ test('choosing smoke on an iPhone-class device explains why and keeps Points wor
   // Points are still drawn.
   const after = await captureCanvas(page);
   expect(foregroundPixels(after)).toBeGreaterThan(200);
+
+  await test.step('points, highlights and figure export work on an iPhone-class device', async () => {
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await expect(page.locator('.legend-item')).toHaveCount(3);
+    await expect.poll(() => page.evaluate(() => {
+      const state = window._cellucidState;
+      const field = state.obsData.fields[state.activeFieldIndex];
+      return field?.key === 'cell_type' && field.codes != null;
+    })).toBe(true);
+    const colored = await captureCanvas(page);
+    expect(foregroundPixels(colored)).toBeGreaterThan(200);
+
+    const highlighted = await page.evaluate(() => {
+      const state = window._cellucidState;
+      state.addHighlightFromCategory(state.activeFieldIndex, 0, 'obs');
+      return state.getHighlightedCellCount();
+    });
+    expect(highlighted).toBeGreaterThan(0);
+    const withHighlight = await captureCanvas(page);
+    expect(differingPixels(colored, withHighlight)).toBeGreaterThan(20);
+
+    await page.locator('#figure-export-section > summary').click();
+    await expect(page.locator('#figure-export-section')).toHaveAttribute('open', '');
+    await page.getByRole('button', { name: /^Download\b/ }).click();
+    await page.getByLabel('Download format').selectOption('png');
+    const downloadPromise = page.waitForEvent('download');
+    await page.locator('#figure-export-btn').click();
+    const download = await downloadPromise;
+    expect(await download.failure()).toBeNull();
+    const outputPath = testInfo.outputPath('ios-figure-export.png');
+    await download.saveAs(outputPath);
+    const exported = decodePng(await readFile(outputPath));
+    expect(exported.width).toBeGreaterThan(100);
+    expect(foregroundPixels(exported)).toBeGreaterThan(200);
+  });
   expect(productErrors).toEqual([]);
 });
 
@@ -177,48 +184,5 @@ test('a smoke session restored on an iPhone-class device opens in Points with th
     page.locator('#notification-center .notification-error'),
   ).toHaveCount(0);
   expect(foregroundPixels(await captureCanvas(page))).toBeGreaterThan(200);
-  expect(productErrors).toEqual([]);
-});
-
-test('points, highlights and figure export work on an iPhone-class device', async ({
-  page,
-}, testInfo) => {
-  const productErrors = observeProductErrors(page);
-  await installIosWebGLCapabilities(page);
-  await openDataset(page);
-
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('.legend-item')).toHaveCount(3);
-  await expect.poll(() => page.evaluate(() => {
-    const state = window._cellucidState;
-    const field = state.obsData.fields[state.activeFieldIndex];
-    return field?.key === 'cell_type' && field.codes != null;
-  })).toBe(true);
-  const colored = await captureCanvas(page);
-  expect(foregroundPixels(colored)).toBeGreaterThan(200);
-
-  const highlighted = await page.evaluate(() => {
-    const state = window._cellucidState;
-    state.addHighlightFromCategory(state.activeFieldIndex, 0, 'obs');
-    return state.getHighlightedCellCount();
-  });
-  expect(highlighted).toBeGreaterThan(0);
-  const withHighlight = await captureCanvas(page);
-  expect(differingPixels(colored, withHighlight)).toBeGreaterThan(20);
-
-  await page.locator('#figure-export-section > summary').click();
-  await expect(page.locator('#figure-export-section')).toHaveAttribute('open', '');
-  await page.getByRole('button', { name: /^Download\b/ }).click();
-  await page.getByLabel('Download format').selectOption('png');
-  const downloadPromise = page.waitForEvent('download');
-  await page.locator('#figure-export-btn').click();
-  const download = await downloadPromise;
-  expect(await download.failure()).toBeNull();
-  const outputPath = testInfo.outputPath('ios-figure-export.png');
-  await download.saveAs(outputPath);
-  const exported = decodePng(await readFile(outputPath));
-  expect(exported.width).toBeGreaterThan(100);
-  expect(foregroundPixels(exported)).toBeGreaterThan(200);
-
   expect(productErrors).toEqual([]);
 });

@@ -374,7 +374,7 @@ test('a DE run reports the family it corrected over: untested genes are not in i
   assert.deepEqual(result.summary.lowN, ['A', 'B'], 'groups under the minimum of 10 are flagged, not refused');
 });
 
-test('genes tied on p (p = 0 at 10M cells) are ranked by |score|, then |log2FC|, untested last (NS-12)', async () => {
+test('genes tied on p (p = 0 at 10M cells) are ranked by |score|, then |log2FC|, untested last', async () => {
   const { compareDifferentialResults } = await import('../assets/js/app/analysis/stats/multi-variable-analysis.js');
   const rows = [
     { gene: 'first-in-file', pValue: 0, score: 41, log2FoldChange: 0.5 },

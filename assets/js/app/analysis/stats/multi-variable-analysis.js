@@ -37,6 +37,7 @@ import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { registerResidentHolder } from '../../../data/memory-budget.js';
 import { abortReason, cancel } from '../../../utils/abort.js';
 import { geneValueLabel } from '../../../data/expression-transform.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 function requireCurrentPredicate(value, label) {
   if (value === undefined) return () => true;
@@ -172,8 +173,8 @@ export function twoGroupSubset(cellsA, cellsB) {
 let ucellLease = Promise.resolve();
 async function acquireUcellLease(signal) {
   const previous = ucellLease;
-  let release;
-  ucellLease = new Promise(resolve => { release = resolve; });
+  const { promise: lease, resolve: release } = promiseWithResolvers();
+  ucellLease = lease;
   await previous;
   if (signal?.aborted) {
     release();

@@ -4,12 +4,11 @@ Reads files as **containers**, with no knowledge of AnnData or of Cellucid's
 features. Everything above (the AnnData reader in `data/anndata/`) is written
 once against the store model in `store.js`.
 
-Layer: L1. Imports `utils/`, `workers/` and other `formats/` modules. The
-edges into `data/` that exist today (`data/sources/identity.js`,
-`data/sources/link-credentials.js`, `data/anndata/transcode/space.js`,
-`allocateTypedArray` from `data/sparse-column-index.js`) are known wrong-way
-imports, listed in `cellucid-private/plans/audit-2026-10-28/tidiness-2026-10-30.md`;
-do not add more.
+Layer: L1. Imports `utils/`, `workers/` and other `formats/` modules. Its edges into
+`data/` are wrong-way imports; do not add more: `data/sources/identity.js`,
+`data/sources/link-credentials.js`, `data/sources/link-text.js`,
+`data/anndata/transcode/space.js`, `kept-format.js` and `kept-journal.js`, and
+`allocateTypedArray` from `data/sparse-column-index.js`.
 
 | Folder / file | Owns | Entry points |
 | --- | --- | --- |
@@ -23,9 +22,11 @@ do not add more.
 | `text/` | MatrixMarket coordinate files and text lines, parsed from bytes as they stream. | `matrix-market.js` `readMatrixMarket`, `lines.js` |
 
 The writers (`zip/writer.js`, `zarr/format-v2.js`, `zarr/writer.js`) are imported by their own
-path, never re-exported from an `index.js`: the readers' entry points are in
-the kept-index revision guard's sources (`tests/kept-column-index-contract.test.mjs`),
-and a writer is not code that decides what an index holds. Their users are
+path, never re-exported from an `index.js`: the readers' entry points are
+entries of the code fingerprint of kept gene indexes
+(`scripts/kept-code-fingerprints.mjs`), which follows their imports, and a
+writer is not code that decides what an index holds (a change to one would
+make every browser build its kept indexes again). Their users are
 `data/anndata/write/` (a copy of the open dataset), the transcoders
 (`data/anndata/transcode/zarr-writer.js`) and the figure export's batch
 archive.

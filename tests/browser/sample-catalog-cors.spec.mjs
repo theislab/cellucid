@@ -1,6 +1,13 @@
+import { fileURLToPath } from 'node:url';
+
 import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
 import { expectWelcomeShown } from './helpers/welcome.mjs';
+
+const TRUNCATED_CATALOG = fileURLToPath(new URL(
+  './fixtures/broken-catalogs/truncated-catalog/datasets.json',
+  import.meta.url,
+));
 
 const CORS_SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/catalog/');
 const CORS_SAMPLE_SELECTION =
@@ -94,60 +101,146 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
   expect(browserErrors).toEqual([]);
 });
 
-test('a failed direct CORS catalog is explained inline and stays recoverable', async ({ page }) => {
-  const missingRoot = sampleUrl('/tests/browser/fixtures/missing-catalog/');
-  const catalogRequests = [];
-  page.on('request', request => {
-    if (request.url() === `${missingRoot}datasets.json`) {
-      catalogRequests.push(request.url());
-    }
+/**
+ * Each of these is a different thing going wrong with a catalog, and the
+ * loader knows which: a `DataSourceError` code, or the HTTP status the server
+ * answered with. The first is the answer of the catalog's own server; the
+ * others are given for the same address, each after Try again.
+ */
+const LATER_CATALOG_FAILURES = Object.freeze([
+  Object.freeze({
+    label: 'permission-denied',
+    answer: { status: 403, contentType: 'text/plain', body: 'no' },
+    expect: /refused datasets\.json \(HTTP 403, forbidden\): .* the link's permissions/,
+    forbid: /Check your network/,
+  }),
+  Object.freeze({
+    label: 'server-error',
+    answer: { status: 500, contentType: 'text/plain', body: 'no' },
+    expect: /is not answering \(HTTP 500, a server error\) for datasets\.json: a problem on [^ ]+'s side, not with the link or with Cellucid/,
+    forbid: /Check your network/,
+  }),
+  Object.freeze({
+    // A body that is not a dataset list and a dropped connection arrive at the
+    // UI as the same error, so they honestly share one sentence naming both.
+    label: 'not-a-dataset-list',
+    answer: { status: 200, contentType: 'application/json', path: TRUNCATED_CATALOG },
+    expect: /may not hold Cellucid data/,
+    forbid: /not found|refused access/,
+  }),
+]);
+
+test('a failed direct CORS catalog names its own cause, whatever the cause, and stays recoverable', async ({ page }, testInfo) => {
+  const noticeText = () => page.locator('#dataset-notice .dataset-notice-message').first().innerText();
+  const seenCatalogSentences = new Map();
+  /** What every catalog failure's notice holds, whatever went wrong. */
+  const expectCatalogNotice = async failure => {
+    await expect.poll(noticeText).toMatch(failure.expect);
+    const message = await noticeText();
+    await testInfo.attach(`catalog-notice-${failure.label}.txt`, {
+      body: message,
+      contentType: 'text/plain',
+    });
+    expect(message).toMatch(/^Sample datasets could not be loaded/);
+    expect(message).not.toMatch(failure.forbid);
+    // The notice speaks to a bench scientist: whose problem it is, with
+    // the host's status (`describeHostFault`), never a URL or a transport term.
+    expect(message).not.toMatch(/https?:|CORS|gzip|JSON/);
+
+    // Every failure keeps the notice's persistent retry.
+    await expect(page.locator('#dataset-notice button')).toHaveText('Try again');
+    await expect(page.locator('#dataset-notice button')).toBeEnabled();
+
+    // No two of these read the same.
+    expect(
+      seenCatalogSentences.has(message)
+        ? seenCatalogSentences.get(message)
+        : failure.label,
+    ).toBe(failure.label);
+    seenCatalogSentences.set(message, failure.label);
+  };
+  let datasetSelect;
+  let notice;
+  let retry;
+  let missingRoot;
+
+  await test.step('a failed direct CORS catalog is explained inline and stays recoverable', async () => {
+    missingRoot = sampleUrl('/tests/browser/fixtures/missing-catalog/');
+    const catalogRequests = [];
+    page.on('request', request => {
+      if (request.url() === `${missingRoot}datasets.json`) {
+        catalogRequests.push(request.url());
+      }
+    });
+
+    await page.goto(
+      launchUrl(missingRoot, 'sample-cors-failure'),
+      { waitUntil: 'domcontentloaded' },
+    );
+    await expectWelcomeShown(page);
+    await page.getByRole('button', { name: /Start exploring/ }).click();
+    await expect(page.locator('#welcome-modal')).toBeHidden();
+
+    // One unreachable sample catalog is that catalog's failure. The selector
+    // stays usable so a dataset opened from disk still needs no network at all.
+    datasetSelect = page.locator('#dataset-select');
+    await expect(datasetSelect).toBeEnabled();
+    await expect(datasetSelect.locator('option')).toHaveText([
+      'None',
+      'No datasets found',
+    ]);
+
+    notice = page.locator('#dataset-notice');
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText(/Sample datasets could not be (loaded|opened)/);
+    // This root is absent rather than blocked, and the notice says so: the 404
+    // the loader reported reaches the user as an address to check, not as a
+    // network problem to wait out.
+    await expect(notice).toContainText(
+      /datasets\.json was not found at [^ ]+ \(HTTP 404, not found\): the link or record does not exist, or it moved\. Check the link/,
+    );
+    await expect(notice).not.toContainText(/Check your network/);
+    // A transport diagnostic is never put in front of a biologist.
+    await expect(notice).not.toContainText(/Resource not found/i);
+    retry = notice.getByRole('button', { name: 'Try again' });
+    await expect(retry).toBeEnabled();
+
+    await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
+    await expect(page.locator('#stats')).toHaveText('0 cells • Field: None');
+    await expect(page.locator('iframe')).toHaveCount(0);
+    expect(
+      await page.evaluate(() => window._cellucidViewer.getPointCount()),
+    ).toBe(0);
+    expect(catalogRequests).toHaveLength(1);
+
+    // A cached probe failure is never re-fetched implicitly, so the second
+    // request proves the retry cleared it. Recovery costs no page reload.
+    await retry.click();
+    await expect.poll(() => catalogRequests.length).toBe(2);
+    await expect(notice).toBeVisible();
+    await expect(retry).toBeEnabled();
+    await expect(datasetSelect).toBeEnabled();
   });
 
-  await page.goto(
-    launchUrl(missingRoot, 'sample-cors-failure'),
-    { waitUntil: 'domcontentloaded' },
-  );
-  await expectWelcomeShown(page);
-  await page.getByRole('button', { name: /Start exploring/ }).click();
-  await expect(page.locator('#welcome-modal')).toBeHidden();
+  await test.step('a wrong-address catalog is reported as wrong-address, not as a network problem', async () => {
+    await expectCatalogNotice({
+      label: 'wrong-address',
+      expect: /datasets\.json was not found at [^ ]+ \(HTTP 404, not found\): the link or record does not exist/,
+      forbid: /Check your network/,
+    });
+  });
 
-  // One unreachable sample catalog is that catalog's failure. The selector
-  // stays usable so a dataset opened from disk still needs no network at all.
-  const datasetSelect = page.locator('#dataset-select');
-  await expect(datasetSelect).toBeEnabled();
-  await expect(datasetSelect.locator('option')).toHaveText([
-    'None',
-    'No datasets found',
-  ]);
-
-  const notice = page.locator('#dataset-notice');
-  await expect(notice).toBeVisible();
-  await expect(notice).toContainText(/Sample datasets could not be (loaded|opened)/);
-  // This root is absent rather than blocked, and the notice says so: the 404
-  // the loader reported reaches the user as an address to check, not as a
-  // network problem to wait out.
-  await expect(notice).toContainText(
-    /datasets\.json was not found at [^ ]+ \(HTTP 404, not found\): the link or record does not exist, or it moved\. Check the link/,
-  );
-  await expect(notice).not.toContainText(/Check your network/);
-  // A transport diagnostic is never put in front of a biologist.
-  await expect(notice).not.toContainText(/Resource not found/i);
-  const retry = notice.getByRole('button', { name: 'Try again' });
-  await expect(retry).toBeEnabled();
-
-  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
-  await expect(page.locator('#stats')).toHaveText('0 cells • Field: None');
-  await expect(page.locator('iframe')).toHaveCount(0);
-  expect(
-    await page.evaluate(() => window._cellucidViewer.getPointCount()),
-  ).toBe(0);
-  expect(catalogRequests).toHaveLength(1);
-
-  // A cached probe failure is never re-fetched implicitly, so the second
-  // request proves the retry cleared it. Recovery costs no page reload.
-  await retry.click();
-  await expect.poll(() => catalogRequests.length).toBe(2);
-  await expect(notice).toBeVisible();
-  await expect(retry).toBeEnabled();
-  await expect(datasetSelect).toBeEnabled();
+  for (const failure of LATER_CATALOG_FAILURES) {
+    await test.step(`a ${failure.label} catalog is reported as ${failure.label}, not as a network problem`, async () => {
+      await page.unrouteAll({ behavior: 'wait' });
+      // The answer of another origin: readable by the page only with the header.
+      await page.route(`${missingRoot}datasets.json`, route => route.fulfill({
+        ...failure.answer,
+        headers: { 'access-control-allow-origin': '*' },
+      }));
+      await retry.click();
+      await expectCatalogNotice(failure);
+      await expect(datasetSelect).toBeEnabled();
+    });
+  }
 });

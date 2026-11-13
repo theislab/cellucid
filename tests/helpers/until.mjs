@@ -6,9 +6,8 @@
  * on a thread of its own, a chain of reads the code under test starts on
  * its own -- ends after no fixed time: later on a loaded runner, and later
  * still on Windows, whose timers fire on a 15.6 ms tick and whose message
- * delivery is slower. A test that paused a fixed time for it passed where
- * the work was quick and failed where it was not (`formats-io-contract`,
- * `memory-census-contract`, Windows CI, 2026-11-01). So a test waits for
+ * delivery is slower. A test that pauses a fixed time for it passes where
+ * the work is quick and fails where it is not. So a test waits for
  * what proves the work happened: an event the code exposes, a promise it
  * returns, or else the state it changes, asked again until it holds.
  *

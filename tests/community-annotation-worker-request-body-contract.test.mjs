@@ -5,6 +5,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import worker from '../assets/js/app/community-annotations/_worker-code.js';
+import { getGitHubWorkerOrigin } from '../assets/js/app/community-annotations/github-auth.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
 import { withMockedFetch } from './helpers/worker-fetch.mjs';
 
@@ -305,13 +306,10 @@ test('Wrangler enables only the exact incoming Request.signal flag and sets no p
   assert.equal(config.workers_dev, false);
   assert.deepEqual(config.routes, [{ pattern: 'api.cellucid.com', custom_domain: true }]);
   // The app talks to the Worker this configuration deploys.
-  const githubAuth = readFileSync(
-    new URL('../assets/js/app/community-annotations/github-auth.js', import.meta.url),
-    'utf8'
-  );
-  assert.ok(
-    githubAuth.includes(`const DEFAULT_WORKER_ORIGIN = 'https://${config.routes[0].pattern}';`),
-    'DEFAULT_WORKER_ORIGIN is the Worker\'s custom domain'
+  assert.equal(
+    getGitHubWorkerOrigin(),
+    `https://${config.routes[0].pattern}`,
+    'the default worker origin is the Worker\'s custom domain'
   );
 });
 
@@ -351,7 +349,6 @@ test('Worker bundle validation pins Wrangler and runs only on Node 24 in CI', ()
     new URL('../docs/github-oauth-cloudflare-setup.md', import.meta.url),
     'utf8'
   );
-  assert.doesNotMatch(guide, /\bnpx\s+wrangler(?:\s|$)/);
   assert.ok(
     (guide.match(/\bwrangler@4\.115\.0\b/g) ?? []).length >= 6,
     'every direct Wrangler command must retain the exact audited release'

@@ -1,14 +1,13 @@
 /**
- * F127: `Show overlay` refused a `setting.set` with "switched off by another
- * setting" on a 2-D dataset that has no vector field (the lifecycle probe's
- * synthetic-cell-types-2d: obsm X_islands and X_marker_scores only). No
- * setting had switched it off. The switch now says why it is off (its
- * `title`: the tooltip on the dimmed control), and a refusal of a disabled
- * control repeats the reason its owner gave (ui/core/control-availability.js,
- * ui-controls.js).
+ * On a 2-D dataset that has no vector field (the lifecycle probe's
+ * synthetic-cell-types-2d: obsm X_islands and X_marker_scores only), `Show
+ * overlay` must not refuse a `setting.set` with "switched off by another
+ * setting", for no setting has switched it off. The switch says why it is off
+ * (its `title`: the tooltip on the dimmed control), and a refusal of a
+ * disabled control repeats the reason its owner gave
+ * (ui/core/control-availability.js, ui-controls.js).
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -193,7 +192,7 @@ test('a field bound to another embedding, or none chosen: each says its cause; a
     viewer: makeViewer(),
   });
   assert.equal(dom.velocityEnabledCheckbox.disabled, true);
-  // The embeddings named as the View N shows picker names them (R9V-3).
+  // The embeddings named as the View N shows picker names them.
   assert.equal(dom.velocityEnabledCheckbox.title, SWITCH_UNAVAILABLE.notShown('UMAP · 2D'));
   assert.match(dom.velocityInfo.textContent, /^Vector fields are bound to UMAP · 2D\. /);
   layout = 'X_umap';
@@ -205,12 +204,3 @@ test('a field bound to another embedding, or none chosen: each says its cause; a
   assert.equal(dom.velocityEnabledCheckbox.title, '');
   controls.destroy();
 }));
-
-test('a refused setting.set of a disabled control gives the reason its owner put on it', () => {
-  const source = readFileSync(new URL('../assets/js/app/state-serializer/ui-controls.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /switched off by another setting/);
-  assert.match(source, /const reason = unavailableReasonOf\(element\) \?\? 'it is not ready yet';/);
-  const controls = readFileSync(new URL('../assets/js/app/ui/modules/velocity-overlay-controls.js', import.meta.url), 'utf8');
-  // Every way the switch and the field select are turned off says why.
-  assert.doesNotMatch(controls, /(enabledCheckbox|fieldSelect)\.disabled =/);
-});

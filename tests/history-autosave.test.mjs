@@ -1,7 +1,6 @@
 /**
  * The history kept in this browser (`assets/js/app/history/autosave.js`,
- * `autosave-store.js`, `dataset-history.js`), History v2 §3.6, §3.7, §3.15.1
- * and §6 test 6:
+ * `autosave-store.js`, `dataset-history.js`):
  *
  * - a write costs what changed: a step writes its records and the tracker's
  *   own, never the history again; a delete writes what it changed and
@@ -75,7 +74,7 @@ test('a history that only opened is not kept; a step, a note or a conversation i
   assert.equal(state.steps, 0);
 });
 
-test('a conversation that made no step is kept and offered to continue (bug hunt: lost on reload)', async () => {
+test('a conversation that made no step is kept and offered to continue', async () => {
   const database = memoryDatabase();
   const before = await tab({ database });
   before.history.chat('c1', [{ role: 'user', text: 'What is in this dataset?' }, { role: 'assistant', parts: [{ type: 'text', text: '1000 cells' }] }]);
@@ -217,7 +216,7 @@ test('two tabs continuing one saved state: the second opens a copy (Web Locks)',
   assert.deepEqual((await readBack(b.store, b.autosave.entryId)).history, b.history.snapshot());
 });
 
-test('two tabs continuing one saved state without Web Locks never mix their steps (bug hunt P1)', async () => {
+test('two tabs continuing one saved state without Web Locks never mix their steps', async () => {
   const database = memoryDatabase();
   const noLocks = null;
   const origin = await tab({ database, locks: noLocks });
@@ -250,7 +249,7 @@ test('two tabs continuing one saved state without Web Locks never mix their step
   assert.deepEqual((await readBack(a.store, a.autosave.entryId)).history, a.history.snapshot());
 });
 
-test('a write is the history at one moment: a step taken while it is written waits for the next (bug hunt: a page closed mid-write)', async () => {
+test('a write is the history at one moment: a step taken while it is written waits for the next', async () => {
   const database = memoryDatabase();
   const store = createHistoryStore(database);
   let gated = false;
@@ -282,7 +281,7 @@ test('a write is the history at one moment: a step taken while it is written wai
   assert.deepEqual(kept, atWrite);
 });
 
-test('any removal of saved states resumes an autosave paused for room (bug hunt P8)', async () => {
+test('any removal of saved states resumes an autosave paused for room', async () => {
   const database = memoryDatabase();
   let said = 0;
   const page = await tab({ database, onQuotaExceeded: () => { said++; } });
@@ -420,7 +419,7 @@ test('a value collected by a removal elsewhere, then shown again, is written aga
   assert.deepEqual(kept, history.snapshot());
 });
 
-test('opening a named saved state keeps the work the page had in its own saved state (review B2)', async () => {
+test('opening a named saved state keeps the work the page had in its own saved state', async () => {
   const store = createHistoryStore(memoryDatabase());
   const { history, autosave, writes } = await autosaveOver(store);
   await history.step({ colors: { by: 'named' } });
@@ -440,7 +439,7 @@ test('opening a named saved state keeps the work the page had in its own saved s
   assert.equal(states.find(state => state.id === autosave.entryId)?.steps, 1);
 });
 
-test('a saved state\'s size is what a walk of all of it counts, after steps are added and removed (review S3, §6 test 6)', async () => {
+test('a saved state\'s size is what a walk of all of it counts, after steps are added and removed', async () => {
   const store = createHistoryStore(memoryDatabase());
   const { history, autosave, writes } = await autosaveOver(store);
   const walked = async () => (await keepAsSavedState({
@@ -464,7 +463,7 @@ test('a saved state\'s size is what a walk of all of it counts, after steps are 
   assert.equal(await size(), await walked());
 });
 
-test('a saved state continued in another tab is never written over by a whole write here (review: owner on whole writes)', async () => {
+test('a saved state continued in another tab is never written over by a whole write here', async () => {
   const database = memoryDatabase();
   const origin = await tab({ database, locks: null });
   await origin.history.step({ colors: { by: 'first' } });

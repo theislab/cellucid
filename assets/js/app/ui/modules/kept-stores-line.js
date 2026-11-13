@@ -34,7 +34,7 @@ import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
  * and the bytes all of it takes ("2 datasets · 540 MB kept"); the rest --
  * saved states of histories, hosts whose connection speed is remembered --
  * are named in the title and listed by Manage… (a count of unlike things,
- * "· 23 more", said nothing and ran under Manage…: found 2026-11-10); with
+ * "· 23 more", says nothing and would run under Manage…); with
  * no dataset, the one kind kept ("1 connection speed") or how many items
  * ("3 items"). The title names each ("2 datasets · 540 MB · 2 saved states
  * · 1 connection speed").

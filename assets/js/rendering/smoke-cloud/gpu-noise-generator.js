@@ -24,6 +24,7 @@ import {
 } from '../shaders/noise-shaders.js';
 import { requireKeys } from '../../utils/exact-record.js';
 import { cancelled } from '../../utils/abort.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 function asError(value, defaultMessage) {
   return value instanceof Error ? value : new Error(defaultMessage);
@@ -889,12 +890,11 @@ class GPUCloudNoiseGenerationTransaction {
     this._settled = false;
     this._taskDurations = [];
     this._taskTimings = [];
-    this._resolveCompletion = null;
-    this._rejectCompletion = null;
-    this.completion = new Promise((resolve, reject) => {
-      this._resolveCompletion = resolve;
-      this._rejectCompletion = reject;
-    });
+    /** @type {ReturnType<typeof promiseWithResolvers<GPUCloudNoiseGenerationTransaction>>} */
+    const completion = promiseWithResolvers();
+    this.completion = completion.promise;
+    this._resolveCompletion = completion.resolve;
+    this._rejectCompletion = completion.reject;
   }
 
   get cancelled() {
@@ -1028,10 +1028,10 @@ class GPUCloudNoiseGenerationTransaction {
    * Advance as many phases as one turn allows.
    *
    * Most phases are a few GL calls: a uniform setup, a framebuffer deletion,
-   * a program handed to the compiler. Giving each a turn of its own made a
+   * a program handed to the compiler. Giving each a turn of its own would make a
    * generation some twenty-five animation frames long, and where a frame
-   * takes seconds (a software renderer) that alone was well over a minute
-   * for a 32-cubed volume. A turn now runs its first phase and then keeps
+   * takes seconds (a software renderer) that alone would be well over a minute
+   * for a 32-cubed volume. A turn runs its first phase and then keeps
    * going while the phases after it fit in `batchBudgetMs`. The first phase
    * is not counted against that budget: its error check waits for the GPU to
    * finish the frame queued ahead of it, which is the renderer's time, not

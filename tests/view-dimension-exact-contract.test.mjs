@@ -708,10 +708,10 @@ test('a vector field is refused for a representation it is not bound to', async 
 });
 
 /**
- * Bug hunt round 9, vector-field lane. R9V-6: a field whose every vector is
- * zero turned on silently and drew nothing, though the read knows its longest
- * vector. R9V-7: a field that could not be read said its failure twice (the
- * loading notice failed with it, and the overlay's caller said it again).
+ * A field whose every vector is zero does not turn on silently and draw
+ * nothing, since the read knows its longest vector. A field that cannot be
+ * read says its failure once (the loading notice fails with it, and the
+ * overlay's caller does not say it again).
  */
 function vectorNoticeScene(t, loadField) {
   const said = [];
@@ -745,7 +745,7 @@ const vectorPayload = maxMagnitude => ({
   vectors: new Float32Array(4), components: 2, cellCount: 2, maxMagnitude, unplacedCount: 0, unplacedNames: [],
 });
 
-test('a field with no motion at all says so when it is read (R9V-6)', async t => {
+test('a field with no motion at all says so when it is read', async t => {
   const { state, said, runtime } = vectorNoticeScene(t, async () => vectorPayload(0));
   assert.equal(await state.ensureVectorField('velocity', '2d', { silent: false }), true);
   assert.equal(runtime.calls.vectorPublications.length, 1);
@@ -766,7 +766,7 @@ test('a moving field says nothing beyond its read', async t => {
   assert.deepEqual(said.map(([method]) => method), ['loading', 'complete']);
 });
 
-test('a field that cannot be read leaves saying so to its caller, once (R9V-7)', async t => {
+test('a field that cannot be read leaves saying so to its caller, once', async t => {
   const failure = new RangeError("Vector field 'velocity_umap' cannot be drawn: every cell's vector is missing (NaN or infinite).");
   const { state, said } = vectorNoticeScene(t, async () => { throw failure; });
   await assert.rejects(state.ensureVectorField('velocity', '2d', { silent: false }), failure);

@@ -7,8 +7,7 @@
  * visibility (the view's transparency alone): opaque, the no-value gray's
  * `BENEATH_ALPHA_BYTE`, drawn beneath the colored cells, or, for a gene
  * sample's cells not read, `UNREAD_ALPHA_BYTE`, drawn faded beneath every
- * cell read (`rendering/read-cell-layer.js`). The per-cell
- * sampler call and three `Math.round`s are gone.
+ * cell read (`rendering/read-cell-layer.js`).
  *
  * A column is either dense (`Float32Array`/`Float64Array`, one value a cell)
  * or sparse (`{length, indices: Uint32Array, values: Float32Array|Float64Array,

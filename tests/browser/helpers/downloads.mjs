@@ -8,8 +8,8 @@
  * name, so a spec that compares it with the app's name is testing the
  * engine's file-name rules, not the app.
  *
- * Measured, Web contracts run 42293355104 (Playwright 1.65.0, WebKit r2388,
- * ubuntu-26.04): Linux WebKit saves `My report.html` as `My_report.html`.
+ * Linux WebKit (Playwright 1.65.0, WebKit r2388, ubuntu-26.04) saves
+ * `My report.html` as `My_report.html`.
  * Not Playwright (its server passes the engine's name through) and not
  * WebKit's own rules (macOS WebKit keeps the space, as Safari does): the WPE
  * and GTK ports sanitize an `<a download>` name by parsing it as a
@@ -110,25 +110,20 @@ export async function askedDownload(download) {
  * NSInternalInconsistencyException ("Cannot remove an observer … for the key
  * path configuration.enforcesChildRestrictions"; Apple FB21537703, WebKit bug
  * 303024 made the queue serial, which does not order it against the main
- * thread). Nothing catches it, so the process aborts. Seen in Web contracts
- * run 42368649946 (macOS 26.7.2, WebKit r2388): this helper's probe page,
- * then navigated to the app's origin, was closed 7 ms after its navigation
- * returned, and the browser aborted in that close (crash report
- * `Playwright-2026-11-07-114944.ips`: `-[WKScreenTimeConfigurationObserver
- * stopObserving]` under `-[WKWebView dealloc]`, 11:49:01.47 UTC). The test
- * then read its own, finished download and got "download.path: Target page,
- * context or browser has been closed": the disconnect had closed the context
- * and disposed every artifact of it. Neither the probe's download nor its
- * cancel touches another download (reproduced both ways, 30 of 30 kept).
+ * thread). Nothing catches it, so the process aborts: a probe page navigated
+ * to the app's origin and closed moments later ends the browser in that
+ * close (`-[WKScreenTimeConfigurationObserver stopObserving]` under
+ * `-[WKWebView dealloc]`), the disconnect closes the context and disposes
+ * every artifact of it, and a test then reading its own, finished download
+ * gets "download.path: Target page, context or browser has been closed".
+ * Neither the probe's download nor its cancel touches another download.
  *
  * On `about:blank` the observer never starts, so closing the probe races
- * nothing. Measured on macOS 26.7 WebKit r2388: each page that committed an
- * http address opened a connection to `com.apple.ScreenTimeAgent` 22 to 26
- * ms later; 20 `about:blank` pages, each with a download, opened none. The
- * saved name is the same there, since a Blob the probe page makes is
- * same-origin to it: names with a space, a comma, two spaces, no extension,
- * `/ : ?` and non-ASCII letters were each saved exactly as a page of the
- * app's origin saves them, in Chromium, Firefox and WebKit.
+ * nothing. The saved name is the same there, since a Blob the probe page
+ * makes is same-origin to it: a name with a space, a comma, two spaces, no
+ * extension, `/ : ?` or non-ASCII letters is saved exactly as a page of the
+ * app's origin saves it, in Chromium, Firefox and WebKit
+ * (measured: 38_decisions_testing_and_hosted_runners.md).
  *
  * @param {import('@playwright/test').Page} page a page of the application
  * @param {string} name

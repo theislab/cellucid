@@ -1,5 +1,5 @@
 /**
- * History v2 §3.13, §3.15.1, §5 #19: replaying steps of this dataset. A
+ * Replaying steps of this dataset. A
  * replayed revert reverts the step the replay made of the one it names (a
  * step the replay did not make is flagged, with the reason); a squashed
  * step (paused, merged, cleared) and an outside change put their values

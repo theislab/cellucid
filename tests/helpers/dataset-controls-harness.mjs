@@ -4,7 +4,7 @@
  * gives the controls everything `initDatasetControls` takes, and records
  * what they said (`statuses`) and did.
  *
- * Copied from `tests/dataset-controls-exact-contract.test.mjs` (2026-11-01),
+ * Copied from `tests/dataset-controls-exact-contract.test.mjs`,
  * which keeps its own copy until it imports this one.
  */
 import assert from 'node:assert/strict';

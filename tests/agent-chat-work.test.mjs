@@ -1,8 +1,8 @@
 /**
  * A turn's work as the chat shows it (`app/agent/chat/work.js`): every
  * action of the catalog named by its arguments, and the folding rules of a
- * long turn (bug hunt L5-13: a research answer was buried under 30–90 rows
- * that all said the action's title).
+ * long turn (a research answer is not buried under 30–90 rows that all say
+ * the action's title).
  */
 
 import test from 'node:test';
@@ -63,7 +63,7 @@ test('every action of the catalogue gets a row name from its arguments: what it 
   assert.ok(checked >= ACTION_DEFINITIONS.length);
 });
 
-test('a read row says what was read, the way the scientist lane asked (L5-13)', () => {
+test('a read row says what was read, the way a scientist asks it', () => {
   const index = toolIndexOf(createActionCatalog(ACTION_DEFINITIONS));
   const label = (name, args, result = READ) => toolRowText(namedCall({ name, args }, index.get(name)), result).label;
   assert.equal(label('field_categories', { field: { source: 'obs', key: 'cell_type' } }), 'Read the categories of cell_type');
@@ -206,8 +206,8 @@ test('the exported chat keeps every call, each named as its row is', () => {
 });
 
 test('the exported chat calls only a read a read: a file written is done, a stop is a stop, a change already so is none', () => {
-  // Live (L11-2): `analysis_export` and `history_note_add` were listed as "read", the person's
-  // Stop of a playing path as "refused", a color already shown as "read".
+  // `analysis_export` and `history_note_add` are not listed as "read", the person's
+  // Stop of a playing path not as "refused", a color already shown not as "read".
   const index = toolIndexOf(createActionCatalog(ACTION_DEFINITIONS));
   const chat = createConversation({ id: 'c', now: 1 });
   appendMessage(chat, { role: 'user', text: 'Export it, color by organ, play the path', turn: 't', at: 1 });

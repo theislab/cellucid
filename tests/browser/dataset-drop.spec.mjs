@@ -16,14 +16,10 @@ import {
   H5AD_PATH,
   START,
   ZARR_FOLDER,
-  expectNeverPublished,
-  expectNoFailureAnnounced,
   expectSettledOn,
   observePage,
   openStarted,
-  openWithHeldStart,
   readRecord,
-  releaseAndDrain,
   startUrl,
 } from './helpers/dataset-loading.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -36,93 +32,91 @@ import {
 
 const OVERLAY = '#dataset-drop-overlay';
 
-test('a dropped .h5ad file opens like a picked one', async ({ page }) => {
+test('what can be dropped opens, what cannot is refused', async ({ page }) => {
   const productErrors = await openStarted(page);
-  const drag = await createDrag(page, { files: [await filePayload(H5AD_PATH)] });
-  const outcome = await dragAndDrop(page, drag);
-  expect(outcome.over.every(event => event.defaultPrevented)).toBe(true);
-  expect(outcome.dropTargetReady).toBe(true);
-  expect(outcome.overlayShown).toBe(true);
-  expect(outcome.dropped.defaultPrevented).toBe(true);
-  await expect(page.locator(OVERLAY)).toBeHidden();
-  await expectSettledOn(page, H5AD);
-  const { notifications } = await readRecord(page);
-  expect(
-    notifications.filter(entry => /Opened .+: 120 cells/.test(entry.text)),
-  ).toHaveLength(1);
-  await expectNoFailureAnnounced(page);
-  expect(productErrors).toEqual([]);
-});
 
-test('a dropped Zarr store folder opens like a picked one', async ({ page }) => {
-  const productErrors = await openStarted(page);
-  // Every file of the store, its hidden metadata files (`.zgroup`,
-  // `.zattrs`, `.zmetadata`) with the rest, as a real folder drop lists them.
-  const files = await folderPayload(ZARR_FOLDER.path);
-  expect(files.some(file => file.path.endsWith('/.zmetadata'))).toBe(true);
-  const drag = await createDrag(page, {
-    folder: { name: path.basename(ZARR_FOLDER.path), files },
-  });
-  await dragAndDrop(page, drag);
-  await expectSettledOn(page, ZARR_FOLDER);
-  await expectNoFailureAnnounced(page);
-  expect(productErrors).toEqual([]);
-});
-
-test('a file dropped while the startup dataset loads replaces it', async ({ page }) => {
-  const { held, productErrors } = await openWithHeldStart(page);
-  const drag = await createDrag(page, { files: [await filePayload(H5AD_PATH)] });
-  await dragAndDrop(page, drag);
-  await expectSettledOn(page, H5AD);
-  await releaseAndDrain(page, held);
-  await expectSettledOn(page, H5AD);
-  await expectNeverPublished(page, START.name);
-  expect(productErrors).toEqual([]);
-});
-
-for (const { title, payload, message } of [
-  {
-    title: 'a file that is not a dataset',
-    payload: async () => ({
-      files: [{ name: 'notes.txt', base64: Buffer.from('hello').toString('base64') }],
-    }),
-    message: /"notes\.txt" is not a file Cellucid can open/,
-  },
-  {
-    title: 'two files at once',
-    payload: async () => ({
-      files: [
-        await filePayload(H5AD_PATH),
-        await filePayload(H5AD_PATH, 'second.h5ad'),
-      ],
-    }),
-    message: /2 items were dropped; Cellucid opens one at a time/,
-  },
-]) {
-  test(`${title} is refused with a message and nothing changes`, async ({ page }) => {
-    const productErrors = await openStarted(page);
-    const drag = await createDrag(page, await payload());
-    const outcome = await dragAndDrop(page, drag);
-    expect(outcome.dropped.defaultPrevented).toBe(true);
-    await expect(
-      page.locator('#notification-center .notification[data-type="error"]')
-        .filter({ hasText: message }),
-    ).toHaveCount(1);
+  await test.step('the overlay leaves when the drag does', async () => {
+    const drag = await createDrag(page, { files: [await filePayload(H5AD_PATH)] });
+    const outcome = await dragAndDrop(page, drag, { drop: false });
+    expect(outcome.overlayShown).toBe(true);
+    await expect(page.locator(OVERLAY)).toBeVisible();
+    // No more dragover: the pointer left the window or the drag was abandoned.
     await expect(page.locator(OVERLAY)).toBeHidden();
     await expectSettledOn(page, START);
+  });
+
+  for (const { title, payload, message } of [
+    {
+      title: 'a file that is not a dataset',
+      payload: async () => ({
+        files: [{ name: 'notes.txt', base64: Buffer.from('hello').toString('base64') }],
+      }),
+      message: /"notes\.txt" is not a file Cellucid can open/,
+    },
+    {
+      title: 'two files at once',
+      payload: async () => ({
+        files: [
+          await filePayload(H5AD_PATH),
+          await filePayload(H5AD_PATH, 'second.h5ad'),
+        ],
+      }),
+      message: /2 items were dropped; Cellucid opens one at a time/,
+    },
+  ]) {
+    await test.step(`${title} is refused with a message and nothing changes`, async () => {
+      const drag = await createDrag(page, await payload());
+      const outcome = await dragAndDrop(page, drag);
+      expect(outcome.dropped.defaultPrevented).toBe(true);
+      const refusal = page.locator('#notification-center .notification[data-type="error"]')
+        .filter({ hasText: message });
+      await expect(refusal).toHaveCount(1);
+      await expect(page.locator(OVERLAY)).toBeHidden();
+      await expectSettledOn(page, START);
+      expect(productErrors).toEqual([]);
+      // Read and dismissed: no failure is on screen when a dataset is dropped next.
+      await refusal.locator('.notification-dismiss').click();
+      await expect(refusal).toHaveCount(0);
+    });
+  }
+
+  // Every failure announced so far is one of the two refusals above: an
+  // opening adds none.
+  const failuresAnnounced = async () => (await readRecord(page)).notifications
+    .filter(entry => entry.type === 'error');
+  const refusals = await failuresAnnounced();
+  expect(refusals).toHaveLength(2);
+
+  await test.step('a dropped .h5ad file opens like a picked one', async () => {
+    const drag = await createDrag(page, { files: [await filePayload(H5AD_PATH)] });
+    const outcome = await dragAndDrop(page, drag);
+    expect(outcome.over.every(event => event.defaultPrevented)).toBe(true);
+    expect(outcome.dropTargetReady).toBe(true);
+    expect(outcome.overlayShown).toBe(true);
+    expect(outcome.dropped.defaultPrevented).toBe(true);
+    await expect(page.locator(OVERLAY)).toBeHidden();
+    await expectSettledOn(page, H5AD);
+    const { notifications } = await readRecord(page);
+    expect(
+      notifications.filter(entry => /Opened .+: 120 cells/.test(entry.text)),
+    ).toHaveLength(1);
+    expect(await failuresAnnounced()).toEqual(refusals);
     expect(productErrors).toEqual([]);
   });
-}
 
-test('the overlay leaves when the drag does', async ({ page }) => {
-  await openStarted(page);
-  const drag = await createDrag(page, { files: [await filePayload(H5AD_PATH)] });
-  const outcome = await dragAndDrop(page, drag, { drop: false });
-  expect(outcome.overlayShown).toBe(true);
-  await expect(page.locator(OVERLAY)).toBeVisible();
-  // No more dragover: the pointer left the window or the drag was abandoned.
-  await expect(page.locator(OVERLAY)).toBeHidden();
-  await expectSettledOn(page, START);
+  await test.step('a dropped Zarr store folder opens like a picked one', async () => {
+    // Every file of the store, its hidden metadata files (`.zgroup`,
+    // `.zattrs`, `.zmetadata`) with the rest, as a real folder drop lists them.
+    const files = await folderPayload(ZARR_FOLDER.path);
+    expect(files.some(file => file.path.endsWith('/.zmetadata'))).toBe(true);
+    const drag = await createDrag(page, {
+      folder: { name: path.basename(ZARR_FOLDER.path), files },
+    });
+    await dragAndDrop(page, drag);
+    await expectSettledOn(page, ZARR_FOLDER);
+    expect(await failuresAnnounced()).toEqual(refusals);
+    expect(productErrors).toEqual([]);
+  });
 });
 
 test('before the data controls exist a dropped file is refused and never navigates', async ({

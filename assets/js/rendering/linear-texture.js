@@ -2,11 +2,11 @@
  * Linear textures: one texel per item of a per-cell (or per-word) array,
  * addressable at any size an engine can allocate.
  *
- * A per-item array used to go into one 2D texture, `MAX_TEXTURE_SIZE` texels
- * a row, which caps it at `MAX_TEXTURE_SIZE^2` items: 67,108,864 where the
- * engine reports 8192 (Firefox on macOS, some mobile GPUs), so a 3-D
- * position gather (three words a point) failed above 22.4M points there and
- * every per-cell texture above 67.1M cells. A linear texture is a
+ * One 2D texture, `MAX_TEXTURE_SIZE` texels a row, caps a per-item array at
+ * `MAX_TEXTURE_SIZE^2` items: 67,108,864 where the engine reports 8192
+ * (Firefox on macOS, some mobile GPUs), so a 3-D position gather (three words
+ * a point) would fail above 22.4M points there and every per-cell texture
+ * above 67.1M cells. A linear texture is a
  * `TEXTURE_2D_ARRAY`: rows of a power-of-two width, stacked into as many
  * layers as the count needs (`MAX_ARRAY_TEXTURE_LAYERS` is at least 256, so
  * the capacity is at least 2^34 items even at 8192).

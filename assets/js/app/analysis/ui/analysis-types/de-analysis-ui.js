@@ -15,7 +15,6 @@
 import { PLACES, placePath } from '../../../ui/place-names.js';
 import { countNoun, formatCount, formatCountOf, formatPercent, formatPValue } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { geneNameColumns, toCSVCell } from '../../compute/csv-export.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
@@ -43,7 +42,7 @@ const P_CONVENTION_NAMES = Object.freeze(Object.fromEntries(
 const FOLD_CHANGE_NAMES = Object.freeze({ log1p: 'Undo log1p', stored: 'As stored', log2cpm: 'Group coefficient of log2-CPM (limma)' });
 const FOLD_CHANGE_ABOUT = Object.freeze({
   log1p: 'of the means after undoing log1p',
-  // F159: a ratio of means of log-scale values is not an "X-fold" change; the result says so to whoever reads it.
+  // A ratio of means of log-scale values is not an "X-fold" change; the result says so to whoever reads it.
   stored: 'of the means as stored (log2 of their ratio; of log-scale values, such as log1p, a ratio of means is no fold change of expression)',
   log2cpm: 'the group coefficient of the samples\' log2-CPM (limma; paired: within donors)'
 });
@@ -725,8 +724,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * How the result was tested, as its expanded view's header and Statistics
    * say it: the two groups and their cells (samples with replicates), the
    * test, the correction, the matrix (counts said so) and its values, and
-   * how many genes pass the shown cutoffs. An agent read the rows alone and
-   * had to guess the group sizes and that the values were raw counts.
+   * how many genes pass the shown cutoffs, so the rows alone need no guess at
+   * the group sizes or at the values being raw counts.
    */
   _resultAbout(result, top) {
     const summary = result?.full?.summary;
@@ -762,7 +761,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       significant_up_in_a: up,
       significant_up_in_b: down,
       significance: this._significanceWords(this._options),
-      // `top` counts each direction: an agent asked for 40 each way read top 3,753 first (L14-5).
+      // `top` counts each direction, not the rows' total: the wording says so.
       rows: `the top ${formatCountOf(top, 'gene')} by score up in A, then the top ${formatCount(top)} up in B: top counts each direction`
     };
   }

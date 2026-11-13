@@ -93,91 +93,93 @@ function revealResults() {
   document.getElementById('bn-fps').textContent = '42';
 }
 
-for (const theme of ['light', 'dark']) {
-  test(`the performance verdict panel is legible and emoji-free in ${theme}`, async ({
-    page
-  }) => {
-    const productErrors = [];
-    page.on('console', message => {
-      if (message.type() === 'error') productErrors.push(`console: ${message.text()}`);
-    });
-    page.on('pageerror', error => {
-      productErrors.push(`page: ${error.stack || error.message}`);
-    });
+test('the performance verdict panel is legible and emoji-free in light and in dark', async ({
+  page
+}) => {
+  const productErrors = [];
+  page.on('console', message => {
+    if (message.type() === 'error') productErrors.push(`console: ${message.text()}`);
+  });
+  page.on('pageerror', error => {
+    productErrors.push(`page: ${error.stack || error.message}`);
+  });
 
-    await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-    await dismissWelcome(page);
-    await openCollapsedPanels(page);
-    await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI fixture'
-    );
-    await page.locator('#theme-select').selectOption(theme);
-    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
-    // themes/_base.css transitions every element during a theme change, so
-    // computed colors are in flight until that class is gone.
-    await expect(page.locator('html')).not.toHaveClass(/theme-transition/);
-    await settleStyleTransitions(page);
-
-    await page.evaluate(installProbe);
-    await page.evaluate(revealResults);
-
-    const failures = [];
-    for (const status of STATUSES) {
-      await page.evaluate((value) => {
-        document.getElementById('bn-verdict-box').dataset.status = value;
-        document.getElementById('bn-fps').dataset.status = value;
-      }, status);
+  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI fixture'
+  );
+  for (const theme of ['light', 'dark']) {
+    await test.step(`the performance verdict panel is legible and emoji-free in ${theme}`, async () => {
+      await page.locator('#theme-select').selectOption(theme);
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      // themes/_base.css transitions every element during a theme change, so
+      // computed colors are in flight until that class is gone.
+      await expect(page.locator('html')).not.toHaveClass(/theme-transition/);
       await settleStyleTransitions(page);
 
-      // Exactly one status glyph is shown, and it strokes with the verdict
-      // color rather than an emoji's fixed rendering.
-      const shown = await page.locator('.bn-verdict-glyph:visible').evaluateAll(
-        glyphs => glyphs.map(glyph => glyph.dataset.status)
-      );
-      expect(shown, `${theme}/${status} glyph`).toEqual([status]);
-      const stroke = await page
-        .locator(`.bn-verdict-glyph[data-status="${status}"]`)
-        .evaluate(glyph => getComputedStyle(glyph).stroke);
-      const verdictColor = await page
-        .locator('#bn-verdict-box')
-        .evaluate(box => getComputedStyle(box).color);
-      expect(stroke, `${theme}/${status} stroke tracks currentColor`).toBe(
-        verdictColor
-      );
+      await page.evaluate(installProbe);
+      await page.evaluate(revealResults);
 
-      for (const selector of [
-        '#bn-verdict-title',
-        '#bn-verdict-detail',
-        '#bn-fps',
-        '.bn-fps-label',
-        '.bn-fps-suffix',
-        '#bn-problems > .section-title',
-        '#bn-fixes > .section-title'
-      ]) {
-        const cell = await page.evaluate(
-          target => window.__measureContrast(target),
-          selector
+      const failures = [];
+      for (const status of STATUSES) {
+        await page.evaluate((value) => {
+          document.getElementById('bn-verdict-box').dataset.status = value;
+          document.getElementById('bn-fps').dataset.status = value;
+        }, status);
+        await settleStyleTransitions(page);
+
+        // Exactly one status glyph is shown, and it strokes with the verdict
+        // color rather than an emoji's fixed rendering.
+        const shown = await page.locator('.bn-verdict-glyph:visible').evaluateAll(
+          glyphs => glyphs.map(glyph => glyph.dataset.status)
         );
-        const minimum = requiredRatio(cell.fontSize, cell.fontWeight);
-        if (cell.ratio < minimum) {
-          failures.push(
-            `${theme}/${status} ${selector}: ${cell.ratio}:1 < ${minimum}:1`
-            + ` (${cell.foreground} on ${cell.background}, ${cell.fontSize}/${cell.fontWeight})`
+        expect(shown, `${theme}/${status} glyph`).toEqual([status]);
+        const stroke = await page
+          .locator(`.bn-verdict-glyph[data-status="${status}"]`)
+          .evaluate(glyph => getComputedStyle(glyph).stroke);
+        const verdictColor = await page
+          .locator('#bn-verdict-box')
+          .evaluate(box => getComputedStyle(box).color);
+        expect(stroke, `${theme}/${status} stroke tracks currentColor`).toBe(
+          verdictColor
+        );
+
+        for (const selector of [
+          '#bn-verdict-title',
+          '#bn-verdict-detail',
+          '#bn-fps',
+          '.bn-fps-label',
+          '.bn-fps-suffix',
+          '#bn-problems > .section-title',
+          '#bn-fixes > .section-title'
+        ]) {
+          const cell = await page.evaluate(
+            target => window.__measureContrast(target),
+            selector
           );
+          const minimum = requiredRatio(cell.fontSize, cell.fontWeight);
+          if (cell.ratio < minimum) {
+            failures.push(
+              `${theme}/${status} ${selector}: ${cell.ratio}:1 < ${minimum}:1`
+              + ` (${cell.foreground} on ${cell.background}, ${cell.fontSize}/${cell.fontWeight})`
+            );
+          }
         }
       }
-    }
-    expect(failures, failures.join('\n')).toEqual([]);
+      expect(failures, failures.join('\n')).toEqual([]);
 
-    // No emoji anywhere in the panel: a screen reader announces them by name
-    // and they ignore the theme's color.
-    const emoji = await page.locator('#bottleneck-results').evaluate(
-      root => (root.textContent || '').match(
-        /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu
-      ) || []
-    );
-    expect(emoji).toEqual([]);
+      // No emoji anywhere in the panel: a screen reader announces them by name
+      // and they ignore the theme's color.
+      const emoji = await page.locator('#bottleneck-results').evaluate(
+        root => (root.textContent || '').match(
+          /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu
+        ) || []
+      );
+      expect(emoji).toEqual([]);
+    });
+  }
 
-    expect(productErrors).toEqual([]);
-  });
-}
+  expect(productErrors).toEqual([]);
+});

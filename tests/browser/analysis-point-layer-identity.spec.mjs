@@ -34,8 +34,10 @@ test('the point layer draws every point where Plotly puts it, with the same hove
       )),
       continuous: Float32Array.from({ length: 5000 }, () => Math.fround(normal() * 3 + 1)),
       constant: new Float32Array(300).fill(2),
-      // Large enough for the violin's precomputed calc (typed points).
-      large: Float32Array.from({ length: 120000 }, () => (
+      // The fewest values that take the violin's precomputed calc (typed
+      // points): a page of at least `WORKER_MIN_VALUES` finite values
+      // (`plots/types/violinplot.js`), every one of these.
+      large: Float32Array.from({ length: 20000 }, () => (
         random() < 0.7 ? 0 : Math.fround(Math.exp(normal() * 0.8))
       )),
     };

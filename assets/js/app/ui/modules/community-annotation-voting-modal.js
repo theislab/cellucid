@@ -35,7 +35,7 @@ import { failureDetails, failureSentence, sayFailure } from '../../../utils/erro
 /**
  * A text box's length while it holds text, nothing while it is empty: no
  * comment or label has a length limit, so "0 characters" under every card
- * said nothing (bug hunt R9A-7).
+ * would say nothing.
  */
 function charCountText(length) {
   return length === 0 ? '' : formatCountOf(length, 'character');
@@ -1338,7 +1338,8 @@ function showModal({
     document.body.appendChild(dialog);
     owner.open(returnFocusTarget(prevFocus, returnFocusResolver), { focus: closeBtn });
     modalReference = { close, overlay: dialog, modal, content };
-    activeVotingModal = modalReference;
+    // Closed while it opened (`wireAppDialog`): its onClose has run already.
+    if (dialog.open) activeVotingModal = modalReference;
     return modalReference;
   } catch (error) {
     const errors = [error];
@@ -1857,6 +1858,9 @@ function showSecondaryModal({
   try {
     document.body.appendChild(dialog);
     owner.open(returnFocus, { focus: closeBtn });
+    // Closed while it opened (`wireAppDialog`): its onClose has run already,
+    // and a subscription taken now would outlive it.
+    if (!dialog.open) return { close, overlay: dialog, modal, content };
     activeSecondaryModal = { close, overlay: dialog, lifecycle: modalLifecycle };
 
     if (session && typeof session.on === 'function') {

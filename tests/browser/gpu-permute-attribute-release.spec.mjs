@@ -3,14 +3,14 @@
  * store again and again, and a failed pass is never silent.
  *
  * A gather of more points than one chunk reads each target range's current
- * words through attribute 1 of its own vertex array. That attribute used to
- * be let go of by pointing it at no buffer, which Chromium never sends to its
- * GPU process: the vertex array kept the last range read (the store's last
- * segment), so the next gather writing that segment with the vertex array
- * bound drew INVALID_OPERATION ("A transform feedback buffer that would be
- * written to is also bound to a non-transform-feedback target") and wrote
- * nothing. A kept view's recolor above one segment (16.7M cells) failed that
- * way. This runs the call sequence that hit it -- a store gathered, drawn
+ * words through attribute 1 of its own vertex array. Letting go of that
+ * attribute by pointing it at no buffer does not work: Chromium never sends that
+ * to its GPU process, so the vertex array keeps the last range read (the store's
+ * last segment) and the next gather writing that segment with the vertex array
+ * bound draws INVALID_OPERATION ("A transform feedback buffer that would be
+ * written to is also bound to a non-transform-feedback target") and writes
+ * nothing, as a kept view's recolor above one segment (16.7M cells) does.
+ * This runs the call sequence that hits it -- a store gathered, drawn
  * through its vertex arrays, gathered again, positions gathered in place from
  * the GPU -- with every write read back against the CPU gather, and checks
  * that a pass that does fail throws an error naming its call and segment.

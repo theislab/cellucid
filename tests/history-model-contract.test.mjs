@@ -5,7 +5,7 @@
  * tracker keeps (groups, the recording switch), what a session's scope says
  * it holds, the name rule, the constructors, the sentences, and the JSON
  * Schema document Python and R build their reading model from, which must
- * say what the validators check. No step holds a picture (§3.15.7).
+ * say what the validators check. No step holds a picture.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

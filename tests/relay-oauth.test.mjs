@@ -541,7 +541,7 @@ test('a code claimed by one browser cannot be decided by another, and an unclaim
   assert.equal(unknown.error.code, 'unknown');
 });
 
-test('R9Z-1: a connect link or code started in another browser attaches nothing: the claim needs the approver cookie of the browser that shows the page', async () => {
+test('a connect link or code started in another browser attaches nothing: the claim needs the approver cookie of the browser that shows the page', async () => {
   const env = freshEnv();
   const clientId = await register(worker, env);
   const { challenge } = await pkce();
@@ -636,7 +636,7 @@ test('a local relay (http://127.0.0.1) sets the same __Host- cookie, which loopb
   assert.equal(claimed.status, 200);
 });
 
-test('F122: an app the relay cannot vouch for that calls itself "Claude" is named by its host on the page, in the approval, the connections and its calls', async () => {
+test('an app the relay cannot vouch for that calls itself "Claude" is named by its host on the page, in the approval, the connections and its calls', async () => {
   const env = freshEnv();
   const fake = await register(worker, env, { redirectUris: ['https://evil.example/callback'], name: 'Claude' });
   const { challenge } = await pkce();

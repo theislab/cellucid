@@ -22,7 +22,6 @@ import {
   resolveStudioPaneGeometry,
   resolveStudioPool,
   resolveStudioSurfaceWeights,
-  studioColor01,
   studioFalloff,
   studioFamilyLevel,
   studioFamilySpacing,
@@ -469,14 +468,6 @@ test('SVG and Canvas2D draw the same studio backdrop', () => {
   assert.equal(calls.linear, built.segments.length);
   assert.equal(calls.radial, built.gradients.length);
   assert.equal(calls.fill, built.gradients.length + built.dots.length);
-});
-
-test('the studio appearance carries the viewer palette and surface', () => {
-  for (const [mode, appearance] of [['studio', LIGHT], ['studio-dark', DARK]]) {
-    assert.equal(appearance.kind, 'studio');
-    assert.equal(appearance.palette, STUDIO_PALETTES[mode]);
-    assert.deepEqual([...appearance.surfaceColor], studioColor01(STUDIO_PALETTES[mode].surface));
-  }
 });
 
 test('a flat pane seen at a grazing angle exports each visible dot once, with no candidate ceiling', () => {

@@ -14,7 +14,7 @@
  * rule: Play continues from the viewpoint the transport shows; from the end it
  * starts again. Only the transport's Stop (back to the first keyframe) and a
  * change of the path (another path: the position meant the old one) put it
- * back to 0 (R9R-7, 2026-11-11: after a stop the bar read 0:00 while the camera
+ * back to 0 (otherwise after a stop the bar would read 0:00 while the camera
  * stayed mid-path).
  *
  * Under `prefers-reduced-motion: reduce` the loop never runs: the path
@@ -43,7 +43,7 @@ const PAUSED = 'PAUSED';
 /**
  * @param {Object} options
  * @param {Object} options.viewer             Viewer API (getCameraState, setCameraState).
- * @param {import('./keyframe-store.js').ReturnType<typeof import('./keyframe-store.js').createKeyframeStore>} options.keyframeStore
+ * @param {ReturnType<typeof import('./keyframe-store.js').createKeyframeStore>} options.keyframeStore
  * @param {() => Object} options.getInterpolationOptions  Returns { positionMethod, rotationMethod, easing, loop }.
  */
 export function createPlaybackController({ viewer, keyframeStore, getInterpolationOptions }) {

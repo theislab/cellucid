@@ -1,7 +1,7 @@
 // Every way a GitHub sign-in through the community-annotation Worker can end
-// has a defined outcome the person sees. Repros r01 (token-endpoint errors
-// under HTTP 200), r05 (the install-time authorization redirect without
-// `state`) and r08 (a long return address) of the 2026-11-05 backend audit.
+// has a defined outcome the person sees, among them token-endpoint errors
+// under HTTP 200, the install-time authorization redirect without `state`
+// and a long return address.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -56,7 +56,7 @@ for (const [error, description] of [
   ['incorrect_client_credentials', 'The client_id and/or client_secret passed are incorrect.'],
   ['invalid_grant', 'The code_verifier does not match the code_challenge supplied in the authorization request for PKCE.'],
 ]) {
-  test(`a token exchange GitHub refuses under HTTP 200 (${error}) shows GitHub's reason and logs its code (repro r01)`, async () => {
+  test(`a token exchange GitHub refuses under HTTP 200 (${error}) shows GitHub's reason and logs its code`, async () => {
     const { state, cookie } = await beginLogin();
     let response;
     const logged = await withConsoleErrors(() => withMockedFetch(
@@ -112,7 +112,7 @@ for (const [action, title] of [
   ['update', 'The Cellucid GitHub App installation is updated'],
   ['request', 'Your request to install the Cellucid GitHub App was sent'],
 ]) {
-  test(`GitHub's install-time redirect without state (setup_action=${action}) ends on a page that says what to do (repro r05)`, async () => {
+  test(`GitHub's install-time redirect without state (setup_action=${action}) ends on a page that says what to do`, async () => {
     const calls = [];
     await withMockedFetch(async (url) => {
       calls.push(String(url));
@@ -150,7 +150,7 @@ test('a callback without state is otherwise refused as before', async () => {
   }
 });
 
-test('a long, percent-heavy return address signs in up to the cookie limit, and past it comes back with the reason (repro r08)', async () => {
+test('a long, percent-heavy return address signs in up to the cookie limit, and past it comes back with the reason', async () => {
   // A Cellucid link to a presigned object: its query is percent-encoded once
   // in the page address and once more in return_to.
   const make = length =>
@@ -159,8 +159,8 @@ test('a long, percent-heavy return address signs in up to the cookie limit, and 
       'https://s3.example/bucket/key?' +
         'X-Amz-Signature=%2F%2B'.repeat(Math.ceil(length / 22)).slice(0, length)
     );
-  // The former encoding (encodeURIComponent of a JSON document) held only
-  // addresses up to its own, shorter, limit.
+  // An encodeURIComponent of a JSON document would hold only addresses up
+  // to its own, shorter, limit: this measures that length for comparison.
   const formerSerializedLength = returnTo => {
     const value = encodeURIComponent(JSON.stringify({ return_to: returnTo, code_verifier: 'a'.repeat(64) }));
     return `cellucid_gh_oauth_owner_${'a'.repeat(64)}=${value}; Path=/auth/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax`.length;

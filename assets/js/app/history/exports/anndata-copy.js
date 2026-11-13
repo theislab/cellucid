@@ -6,7 +6,7 @@
  * writes for them (`data/anndata/write/copy.js` `CopyChanges`). Pure: no
  * page, no reader; what it reads of the dataset comes through `target`.
  *
- * The rules are the packages' (History v2 §3.14 and the H4 notes), pinned by
+ * The rules are the packages', pinned by
  * the shared expected plan `history-golden.expected.json`
  * (`expected.apply.sequence`, `tests/history-anndata-copy.test.mjs`):
  *
@@ -104,7 +104,7 @@ export const GENE_SET_PREFIX = 'cellucid_gene_set__';
 export const HISTORY_APPLIED_KEY = 'history_applied';
 export const GENE_SETS_KEY = 'gene_sets';
 /** Where the gene sets of a browser copy were pulled from: the viewer itself, as a live pull says. */
-export const PULLED_FROM_VIEWER = 'viewer';
+const PULLED_FROM_VIEWER = 'viewer';
 
 export const GENE_NAME_NOTE = 'A gene\'s display name is recorded, never applied to the object.';
 export const GENE_CATEGORY_NOTE = 'A gene has no categories.';
@@ -134,13 +134,13 @@ const NOT_A_WORD = /[^A-Za-z0-9]+/g;
  * letters and digits one underscore, none at either end; `identifier` when
  * nothing is left.
  */
-export function columnPart(text, identifier) {
+function columnPart(text, identifier) {
   const part = text.replace(NOT_A_WORD, '_').replace(/^_+|_+$/g, '');
   return part === '' ? identifier : part;
 }
 
 /** `name`, or `name_2`, `name_3`… -- the first not in `taken` -- added to `taken`. */
-export function uniqueColumn(name, taken) {
+function uniqueColumn(name, taken) {
   let candidate = name;
   for (let number = 2; taken.has(candidate); number++) candidate = `${name}_${number}`;
   taken.add(candidate);
@@ -210,7 +210,7 @@ export function chooseStep(trackers, { activeTracker = null, tracker = null, bra
  * colors by or filters on, or a highlight group is bound to, by the key
  * the dataset gives it (fields the session made are not listed).
  */
-export function requiredFields(valueOf) {
+function requiredFields(valueOf) {
   const required = { obs: new Set(), var: new Set() };
   const add = ref => {
     if (ref !== null && typeof ref === 'object' && typeof ref.key === 'string' && Object.hasOwn(required, ref.source)) required[ref.source].add(ref.key);
@@ -292,7 +292,7 @@ const sameArray = (a, b) => {
  * Whether the dataset's column holds exactly the planned one (the same kind,
  * dtype and values; a categorical its categories in order and its codes).
  */
-export function sameColumn(existing, planned) {
+function sameColumn(existing, planned) {
   if (existing === null || existing.kind !== planned.kind) return false;
   switch (planned.kind) {
     case 'categorical':
@@ -875,13 +875,13 @@ export function historyApplied(record) {
 /**
  * The expression values a step's state holds, as the provenance records them
  * (the model's `ExpressionValues`): `{normalize, log1p}`, or null when the
- * session holds no `expression` value (a session from before them).
+ * session holds no `expression` value (a session that never recorded one).
  *
  * @param {unknown} value - The step's `expression` value
  * @param {string} step
  * @returns {{normalize: boolean, log1p: boolean}|null}
  */
-export function expressionValuesOf(value, step) {
+function expressionValuesOf(value, step) {
   if (value === undefined || value === null) return null;
   const asked = requireExpressionTransform(value, `The expression values at step ${step}`);
   return { normalize: asked.normalize, log1p: asked.log1p };

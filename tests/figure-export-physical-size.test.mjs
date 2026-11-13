@@ -1,5 +1,5 @@
 /**
- * A figure's physical size (F271, live-7 L25-10): the person (and
+ * A figure's physical size: the person (and
  * `figure-export.set`) gives the figure's width in millimetres or as a
  * journal column, and the figure fills it exactly at its own height; text is
  * set in points and keeps its printed size; the SVG states millimetres, a
@@ -43,7 +43,7 @@ test('one unit model: millimetres and points to figure pixels (1/96 inch), a PNG
   assert.deepEqual(FIGURE_WIDTH_PRESETS, { 'single-column': 89, 'one-and-half-column': 120, 'double-column': 183 });
   assert.equal(figureWidthPxOf(183), 692);
   assert.equal(figureWidthPxOf(89), 336);
-  // 180 mm is 680 figure pixels, not the 1800 an agent once set (L25-10).
+  // 180 mm is 680 figure pixels, not 1800.
   assert.equal(figureWidthPxOf(180), 680);
   assert.ok(Math.abs(mmOfFigurePx(680) - 179.92) < 0.01);
   // 7 pt is 9 1/3 figure pixels: never rounded to whole pixels.

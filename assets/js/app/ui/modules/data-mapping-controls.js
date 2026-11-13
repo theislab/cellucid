@@ -38,7 +38,7 @@ import {
 } from '../../../data/data-mapping.js';
 import { EmbeddingLoadError, MappingLoadError, obsmWidth } from '../../../data/data-mapping-candidates.js';
 import { LOG1P_AS_STORED, describeLog1pRefuted, log1pChoiceOf, withLog1pChoice } from '../../../data/dataset-mapping.js';
-import { formatBytes, formatCount, formatCountOf, formatRemaining } from '../../../utils/format-units.js';
+import { formatBytes, formatCountOf, formatRemaining } from '../../../utils/format-units.js';
 import { revealInSidebar } from './sidebar-controls.js';
 import { expandSessionSection } from './session-sections.js';
 import {
@@ -516,7 +516,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
    * shows none of becomes its default. A dimension the mapping already
    * shows with none named stays so: its first enabled embedding in the
    * mapping's order is shown first (`shownDefault`), and an edit of another
-   * row never writes a default nobody chose (R9M-5).
+   * row never writes a default nobody chose.
    */
   function settleDefaults() {
     const applied = state.getDataMapping()?.embeddings.enabled ?? [];
@@ -1083,7 +1083,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
       if (openSidebar) panel.disclosure.header.focus({ preventScroll: true });
     };
     // The sidebar first, then the sections and the focus (while hidden it is
-    // inert): the one order of `revealInSidebar` (R9K-2).
+    // inert): the one order of `revealInSidebar`.
     if (openSidebar) void revealInSidebar(ownerDocument, bringIntoView);
     else bringIntoView();
   }

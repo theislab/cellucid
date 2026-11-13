@@ -1,7 +1,7 @@
 // One gesture is one press of a start/stop or commit button (`assets/js/app/ui/core/press-guard.js`):
 // the further clicks of a double click and a held Enter never press such a button again, wherever
-// the next click lands. Round 9 R9W-1: a double click on Export started the figure export and
-// canceled it at once, silently (the button had become "Cancel export").
+// the next click lands. A second click of a double click on Export would otherwise cancel the
+// figure export it just started, silently (the button has become "Cancel export").
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

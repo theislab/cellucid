@@ -22,11 +22,11 @@ const FLOAT_MIN_WIDTH_PX = 220;
  * `--z-layer` is read back off the panels themselves rather than tracked in a
  * counter here. A counter is a private copy of "what is currently on top", and
  * the DOM is the thing that actually holds that: a restore floats panels
- * through this module but a counter that only ever counted this module's own
- * calls once came back from a session restore (which wrote `--z-layer` itself)
- * believing the stack was empty. Every panel torn off after that got a layer
- * below the restored ones and could never be clicked to the front again,
- * because clicking raised it by one from the same stale base.
+ * through this module but a counter that only counts this module's own
+ * calls would believe, after a session restore (which writes `--z-layer`
+ * itself), that the stack was empty. Every panel torn off after that would
+ * get a layer below the restored ones and could never be clicked to the
+ * front again, because clicking raises it by one from the same stale base.
  */
 const FLOAT_BASE_LAYER = 90;
 
@@ -98,9 +98,9 @@ function panelActions(frame) {
  * The frame's class is the owner. The stylesheet keys the entire floating
  * presentation off it, and the `layout` state domain reads it as the truth
  * about what is in the floating root (`app/state/domains/layout.js`). A
- * `state.isFloating` field beside it was a second copy of the same fact, and
- * `unregister()` could drop the record while the class stayed on the element —
- * leaving a panel that was visibly floating and that `dock()` refused to bring
+ * `state.isFloating` field beside it would be a second copy of the same fact:
+ * `unregister()` could drop the record while the class stayed on the element,
+ * leaving a panel that is visibly floating and that `dock()` refuses to bring
  * back, because the copy it consulted had been replaced with a default.
  *
  * @param {HTMLElement} details
@@ -116,8 +116,8 @@ function isFloating(details) {
  *
  * `animationend` bubbles, and the card inside the frame runs a shadow
  * animation of its own, so only an event whose target is the frame itself
- * ends it; a `{ once: true }` listener took whichever event came first, a
- * descendant's included. A canceled animation (a dock replacing the lift)
+ * ends it (a `{ once: true }` listener would take whichever event came first, a
+ * descendant's included). A canceled animation
  * ends it as well, so the class never outlives the motion it stands for.
  *
  * @param {HTMLElement} frame
@@ -224,9 +224,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
    * window, less the panel's bar while it shows (a phone with its panel
    * closed) and the strip of the sidebar's toggle while it shows. No window
    * is put over either, so neither is ever covered; a phone's window sheets
-   * stand on the bar (`--phone-bar-space`). (Found 2026-11-10: on a phone, a
-   * floated Coloring & filtering panel as tall as the screen covered the open
-   * panel's close button.)
+   * stand on the bar (`--phone-bar-space`); a floated panel as tall as the
+   * screen would otherwise cover the open panel's close button.
    *
    * Its height is the visible one: the visual viewport while the page is not
    * zoomed (a phone's on-screen keyboard shortens it, not the window, and a
@@ -254,12 +253,12 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
 
   /**
    * The area's height for the windows' CSS height caps (`_accordion.css`),
-   * the one measure the clamp places them by. A window placed under the
-   * sidebar's toggle was capped at the viewport's height less the margins, so
-   * after the window shrank it ran past the screen's foot by the toggle's
-   * height (bug hunt S2); and a cap of `100dvh` less the area's edges took the
-   * screen's height from the stylesheet and the edges from here, two
-   * measures that part on a phone (its keyboard, F126).
+   * the one measure the clamp places them by. A cap of the viewport's height
+   * less the margins would let a window placed under the sidebar's toggle run
+   * past the screen's foot by the toggle's height once it shrank; and a cap of
+   * `100dvh` less the area's edges would take the screen's height from the
+   * stylesheet and the edges from here, two measures that part on a phone (its
+   * keyboard).
    */
   function publishFloatingArea({ viewportHeight, viewportTop }) {
     StyleManager.setVariable(floatingRoot, '--floating-area-height', `${Math.max(0, viewportHeight - viewportTop)}px`);
@@ -345,12 +344,9 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
   // ═══════════════════════════════════════════════════════════════════════════
   // Undock / dock buttons
   //
-  // Tearing a panel off used to be reachable only by dragging its header with a
-  // mouse, while putting it back was a button — so the affordance existed in
-  // one direction and not the other, and the direction that was missing was the
-  // one you needed first. Both directions are buttons now. That is what makes
-  // the feature reachable by keyboard, by touch, and by anyone who never
-  // discovers that a header can be dragged at all.
+  // Both directions are buttons, tearing a panel off as well as putting it
+  // back: that makes the feature reachable by keyboard, by touch, and by
+  // anyone who never discovers that a header can be dragged.
   //
   // A panel is either docked or floating, so its current state already names
   // the only place it can go: this is the degenerate case of the shared
@@ -464,8 +460,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
   // Dock all
   //
   // With its sections undocked the sidebar stays a column holding the logo and
-  // the footer, and the way back was each window's own dock button, wherever
-  // the window stood (bug hunt F126). While any section floats, the sidebar
+  // the footer, and the way back would be each window's own dock button,
+  // wherever the window stands. While any section floats, the sidebar
   // shows one control where its sections begin — the place the emptied column
   // shows — that docks every one of them (`layout.panel.dock-all`: one step,
   // through `dock`, the path each window's Dock button takes). It is hidden
@@ -542,10 +538,10 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     // back to: a docked accordion is a child of the sidebar, and a window built
     // straight into the floating root never had one. Reading that instead of
     // being told it by the caller is what lets a session-restored panel dock
-    // back into the position it was torn from — the restore path floats a
+    // back into the position it was torn from: the restore path floats a
     // panel that is standing in the sidebar, and passing "no placeholder"
     // because that path happens to share an entry point with analysis windows
-    // dropped the panel at the end of the sidebar the first time it was docked.
+    // would drop the panel at the end of the sidebar the first time it was docked.
     const dockHome = frame.parentElement;
     const hasDockHome = dockHome !== null && dockHome !== floatingRoot;
 
@@ -806,11 +802,11 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
 
     // One controller per registration owns every listener and every element
     // this module attaches to the panel, so `unregister()` is a real teardown
-    // rather than a note that one happened. Before, unregistering dropped the
-    // state record and left the handlers installed: the next pointer press on
-    // a closing analysis window ran the drag handler, which rebuilt the state
-    // record it had just dropped, and the panel stayed draggable — and the
-    // rebuilt record held the removed element in this map for good.
+    // rather than a note that one happened. Otherwise unregistering would drop the
+    // state record and leave the handlers installed: the next pointer press on
+    // a closing analysis window would run the drag handler, which rebuilds the state
+    // record just dropped, and the panel would stay draggable, with the
+    // rebuilt record holding the removed element in this map for good.
     if (state.controller === null) {
       state.controller = new AbortController();
       const { signal } = state.controller;
@@ -821,7 +817,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
         if (!s) return;
         // A suppression armed by the previous gesture belongs to that gesture.
         // A canceled pointer produces no click to consume it, so without this
-        // it survived to swallow the user's next real click on the header.
+        // it would survive to swallow the user's next real click on the header.
         s.suppressNextClick = false;
         if (!isFloating(details)) return;
         raiseToTop(frame);
@@ -1006,8 +1002,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
   // the window smaller and it can end up entirely outside the new one, with its
   // header - and so the drag handle, the dock button and the close button - out
   // of reach, leaving no way to recover it but clearing the saved layout. A
-  // restore already clamps; a live resize did not, so the same panel was
-  // recoverable by reloading and not by resizing back.
+  // restore clamps, and so does a live resize, so the same panel is
+  // recoverable by resizing back, not only by reloading.
   //
   // Panels are re-clamped rather than restored to where they were: the user may
   // have wanted them at an edge, and moving them back on a later resize would
@@ -1033,7 +1029,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
         const state = details === null ? undefined : stateByDetails.get(details);
         if (!state) continue;
         // Its laid-out size, not its drawn box: a window still in its lift
-        // animation (scaled) measured short and was left past the new foot.
+        // animation (scaled) would measure short and be left past the new foot.
         measured.push({ frame, state, rect: { width: frame.offsetWidth, height: frame.offsetHeight } });
       }
       for (const { frame, state, rect } of measured) {

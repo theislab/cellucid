@@ -7,7 +7,7 @@
  *   the first pass runs on derived "sample" pages, so it shares no cache entry
  *   with the full pass, and a page's sample is its cells in the priority
  *   prefix.
- * - The first pass is taken only when the measured cost says it pays.
+ * - The first pass is taken only when the recorded cost says it pays.
  * - A form analysis draws the first pass, says which cells it used, refines
  *   in place, keeps the first pass (saying so) when the refinement is
  *   canceled, and skips a first pass the sample cannot carry.
@@ -124,14 +124,14 @@ test('the cost model fits its last two passes and survives broken storage', () =
   assert.deepEqual(fragile.cost('DE'), { fixedMs: 0, perCellMs: 0.1 });
 });
 
-test('a cost is known only for the genes it was measured with: a 6-gene run says nothing of a 3,691-gene one (L25-1)', () => {
+test('a cost is known only for the genes it was measured with: a 6-gene run says nothing of a 3,691-gene one', () => {
   const stored = new Map();
   const storage = { getItem: key => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value) };
   const model = new AnalysisCostModel({ storage });
   // The live-agents fixture: 6 genes, 120 cells, 546 ms (a run's start and its first reads, nearly all of it).
   model.record('Differential expression · local-demo', 120, 546, 6);
   assert.deepEqual(model.cost('Differential expression · local-demo', 6), { fixedMs: 0, perCellMs: 546 / 120 });
-  // Kanemaru next (3,691 genes): nothing measured for that work; it was "about 102 h" scaled per gene.
+  // A 3,691-gene run next: nothing recorded for that work, so no estimate scaled per gene (not "about 102 h").
   assert.equal(model.cost('Differential expression · local-demo', 3_691), null);
   assert.equal(model.measuredCells('Differential expression · local-demo', 3_691), null);
   // Its own runs fit its own line; the fixture's pass is kept for the fixture.
@@ -150,13 +150,13 @@ test('a cost is known only for the genes it was measured with: a 6-gene run says
   assert.equal(model.cost('Differential expression · local-user', 3_691), null);
 });
 
-test('a run is estimated from runs over its genes, never grown from one smaller run (L25-1)', () => {
+test('a run is estimated from runs over its genes, never grown from one smaller run', () => {
   const n = 131_636;
-  const ui = createHarness('Estimate L25-1', n, async () => ({ data: { cells: n } }));
+  const ui = createHarness('Estimate progressive', n, async () => ({ data: { cells: n } }));
   ui.dataLayer.state.varData = { fields: Array.from({ length: 3_691 }, (_, i) => ({ key: `g${i}` })) };
   ui._getRunUnits = () => 3_691;
   ui._options = {};
-  const kind = 'Estimate L25-1';
+  const kind = 'Estimate progressive';
   // Nothing measured: no estimate (the agent's permission card says no time).
   assert.equal(ui.estimateRun(), null);
   // Another work's pass (6 genes): still nothing for this one.
@@ -170,8 +170,8 @@ test('a run is estimated from runs over its genes, never grown from one smaller 
   assert.equal(Math.round(ui.estimateRun().ms), 1_009);
   assert.match(ui.estimateRun().what, /on 131,636 open cells/);
   // One pass alone on as many cells as are open (or more) says its time.
-  ui.title = 'Estimate L25-1 single';
-  getAnalysisCostModel().record('Estimate L25-1 single', n, 1_200, 3_691);
+  ui.title = 'Estimate progressive single';
+  getAnalysisCostModel().record('Estimate progressive single', n, 1_200, 3_691);
   assert.equal(Math.round(ui.estimateRun().ms), 1_200);
 });
 
@@ -316,7 +316,7 @@ test('a form analysis draws its first pass, says so, and refines in place to eve
     passes.push(sample);
     return { data: { cells: sample === null ? n : sample.m } };
   });
-  await ui._runAnalysis();
+  await ui._runForm();
   assert.equal(passes.length, 2);
   const m = Math.floor(FIRST_ANSWER_TARGET_MS / (2_000 / n));
   assert.equal(passes[0].m, m);
@@ -339,21 +339,21 @@ test('a refinement that is cancelled leaves the first pass on screen, saying it 
     }
     return { data: { cells: sample.m } };
   });
-  await ui._runAnalysis();
+  await ui._runForm();
   assert.equal(ui.renders.length, 1);
   assert.match(ui.used.at(-1), /Stopped before every cell/);
   assert.equal(ui._cellsUsedLine.root.dataset.cellsUsed, 'sample');
 });
 
-// The walk of 2026-10-31: differential expression on a CELLxGENE atlas whose
-// genes were read for 6,320 of its 584,944 cells said "Every cell: computed
-// on all cells of its groups" above "Genes read for 6,320 of 584,944 cells",
-// while it compared 108 vs 94 cells.
+// Differential expression on an atlas whose genes were read for 6,320 of its
+// 584,944 cells does not say "Every cell: computed on all cells of its
+// groups" above "Genes read for 6,320 of 584,944 cells" while it compares
+// 108 vs 94 cells.
 test('a result read on a gene sample says it used each group\'s cells among it, never every cell', async () => {
   const n = 584_944;
   const genes = { cells: 6_320, of: n, groups: [{ name: 'A', used: 108, of: 10_234 }, { name: 'B', used: 94, of: 9_503 }] };
   const ui = createHarness('Gene sample line', n, async () => ({ data: { cells: n, geneSample: genes } }));
-  await ui._runAnalysis();
+  await ui._runForm();
   // The line says nothing (the gene sample's own line, linked to Genes read
   // for, says it: `describeGeneSampleUse`), and never "every cell".
   assert.equal(ui._cellsUsedLine.root.hidden, true);

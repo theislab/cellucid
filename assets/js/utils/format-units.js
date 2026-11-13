@@ -15,10 +15,10 @@ const BYTE_UNITS = Object.freeze(['B', 'KB', 'MB', 'GB', 'TB', 'PB']);
 
 /**
  * Built once: `Number#toLocaleString` constructs a formatter per call, which
- * made a 5,000-category legend spend a quarter of a second formatting its
- * counts on every filter change. Grouping is independent of the browser
- * locale: the copy is English, and "1.234 cells" beside "1,234 cells" read as
- * two different numbers.
+ * is slow for a legend of thousands of categories formatting its counts on
+ * every filter change (measured: 35_decisions_interface.md). Grouping is
+ * independent of the browser locale: the copy is English, and "1.234 cells"
+ * beside "1,234 cells" would read as two different numbers.
  */
 const GROUPED_INTEGER = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0
@@ -96,7 +96,7 @@ export function formatCells(value) {
  * picker. The noun agrees with the count it follows last.
  *
  * @param {number} open - The open cells
- * @param {number|null|undefined} total - Every cell of the dataset (`cellIdentity.nOriginal`); none, or
+ * @param {number|null} [total] - Every cell of the dataset (`cellIdentity.nOriginal`); none, or
  *   `open`, when every cell is open
  * @param {(value: number) => string} [format] - How each number is written (`formatCount`, or a
  *   compact form)
@@ -230,8 +230,7 @@ export function formatSignificant(value, figures = 3) {
  * many significant figures, trailing zeros dropped (`formatPercent(2.5,
  * {figures: 6})` → `"2.5%"`: a share a person typed, written as typed).
  * Every percent a person reads is written here or by `formatShare`, never
- * as `${n}%` or `${n} %` (`tests/percent-format-contract.test.mjs`): the
- * app wrote both "50%" and "50%" (round 9, R9U-3).
+ * as `${n}%` or `${n} %` (`tests/percent-format-contract.test.mjs`).
  *
  * @param {number} value
  * @param {number|{figures: number}} [digits=0] - Decimal places, or significant figures
@@ -281,9 +280,8 @@ const SMALLEST_P_SHOWN = 1e-300;
 /**
  * A p-value as every analysis, hover card, table and agent summary shows it:
  * two significant figures (`0.032`, `4.1e-8`), "< 1e-300" where the double
- * underflowed, "—" when there is none. Five rules wrote p-values before round 9
- * (`toFixed(4)` with "< 0.0001", `toExponential(2|3)`, `toPrecision(2)`); one
- * now (`tests/one-implementation-contract.test.mjs`). A CSV keeps the full
+ * underflowed, "—" when there is none. One rule writes p-values, not several
+ * (`tests/one-implementation-contract.test.mjs`). A CSV keeps the full
  * number: it is data, not text.
  *
  * @param {number|null|undefined} p

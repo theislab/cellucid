@@ -1,5 +1,5 @@
 /**
- * @fileoverview Search and filter the history (History v2 §3.13): 🔍 in the
+ * @fileoverview Search and filter the history: 🔍 in the
  * History header opens a box; its words match each step's label, notes,
  * parameters and bookmark (any case), and Filter narrows by who acted
  * (you, an agent, Python, R, a replay), the kind of change (the analysis,
@@ -21,7 +21,7 @@ import { searchWords, stepMatches } from '../../../history/search.js';
 import { debounce } from '../../../../utils/debounce.js';
 
 /** The Filter menu's choices: each a key of the query and its value. */
-export const SEARCH_FILTERS = Object.freeze([
+const SEARCH_FILTERS = Object.freeze([
   { key: 'by', value: 'person', label: 'By you' },
   { key: 'by', value: 'agent', label: 'By an agent' },
   { key: 'by', value: 'python', label: 'From Python' },
@@ -45,7 +45,7 @@ const EMPTY_QUERY = Object.freeze({ text: '', by: null, kind: null, domain: null
  * @param {{text?: string, by?: string|null, kind?: string|null, domain?: string|null, day?: number|null,
  *   hasNote?: boolean, bookmarked?: boolean, flagged?: boolean}} query
  */
-export function isSearching(query) {
+function isSearching(query) {
   return (query.text ?? '').trim() !== '' || Boolean(query.by) || Boolean(query.kind) || Boolean(query.domain)
     || Number.isFinite(query.day) || query.hasNote === true || query.bookmarked === true || query.flagged === true;
 }

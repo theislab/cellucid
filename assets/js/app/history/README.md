@@ -3,15 +3,14 @@
 **Owns:** the history's records (`model.js`: tracker, branch, group, step of each kind, squash,
 note, turn, journal entry, with their exact fields, rules, constructors, validators and the names
 rule; `historyModelDocument` is what `history_model.schema.json`, Python's and R's reading model, is
-generated from), and the history's core (History v2, H1):
+generated from), and the history's core:
 - `tree.js`: a tracker held live (the model's records by id in Maps) with the indexes that keep
   reads and moves from growing with the history: each step's depth, so a common ancestor, "is A on
   B's path", a jump's path and redo cost the steps between, never the depth; walks are loops, never
   recursion. `valuesAt` is the plain reading (from the root) every other is checked against;
   `valuesFrom` moves values from one step to another through their common ancestor.
 - `history.js`: the controller. The dispatcher's recorder (one step per action that changed
-  something, on the branch the head is on, with who acted, how long, the version of its parameters,
-  its pseudocode and the hashes of its result inputs; coalescing only into the step just recorded;
+  something, on the branch the head is on, as the `Step` record of `model.js` says; coalescing only into the step just recorded;
   a domain that follows another, `DERIVED_DOMAINS`, captured with it; an observed change read as
   its effects settle when another change of its domains followed it, else at its turn), moves
   (undo, redo, jump, switch), the recording switch and the detail switches, replays (a squashed
@@ -28,8 +27,8 @@ generated from), and the history's core (History v2, H1):
   comes back before the scratch tracker goes; if it cannot, that tracker stays in use and says so,
   so what is shown and the tracker in use always agree. `api.active` is the live tracker,
   read-only for every reader.
-- `actions.js`: the history's own catalog actions (every `history.*` but share, save and the
-  saved-states list, which persistence provides), each resolving its names and answering its
+- `actions.js`: the history's own catalog actions (every `history.*` but methods, pseudocode,
+  share, save and the saved-states list, which `persistence-actions.js` provides), each resolving its names and answering its
   result schema, and the estimates of the long ones; `delete-restore.js`: deleting steps (only the
   steps whose touched domains, or whose inputs but for generated ids, changed are applied again)
   and restoring from Recently deleted. Both take the history's context (`h`: its operations, and
@@ -75,8 +74,8 @@ new `.zarr.zip` of the dataset by the apply plan Python and R follow, `exports/a
 a new file from the save dialog, or a spool downloaded whole; aborted, never closed, and the
 spool removed on a failure or a cancel).
 
-**The History v2 model** (`model.js`; History v2 §3.2, §3.8, §3.15), what the core (H1), the
-persistence (H2) and the panel (H3) build on, each record checked whole by its validator:
+**The model** (`model.js`), what the core, the persistence and the panel build on, each record
+checked whole by its validator:
 - **Steps of four kinds** (`Step.kind`): the `root`; an `action`, which records the version of its
   parameters (`Step.v`, the definition's `version`: a replay brings older parameters up with
   `upgradeParams`, `app/actions/catalog.js`, or puts a values-only version's step back by its values
@@ -103,8 +102,8 @@ persistence (H2) and the panel (H3) build on, each record checked whole by its v
   referenced: never pruned). Pausing records nothing; resuming (or a move, a save, a share while
   paused) adds one squashed step (`cause: 'paused'`) for what differs; a file keeps `draft: null`.
   The detail switches of History settings (camera, layout) are a preference of this browser, never
-  in the model (§3.15.5).
-- **No stored pictures** (§3.15.7): no step, chunk or scope holds one; the report draws them from
+  in the model.
+- **No stored pictures**: no step, chunk or scope holds one; the report draws them from
   the live view (`history-settings.js` `reportPictures`), an agent reads `view.picture`.
 - **Scope** of a file (`Scope.content`: `history`, `state`, `steps`; `results`: `include`,
   `recompute`) and what it leaves out are checked against what the file holds (`validateSession`).
@@ -116,28 +115,27 @@ persistence (H2) and the panel (H3) build on, each record checked whole by its v
 
 **Invariants:**
 - A load (`load`, `importTrackers`: Continue, a saved state, a session file) restores part by
-  part (F155): a domain whose owner refuses its value keeps what is shown and is returned in
+  part: a domain whose owner refuses its value keeps what is shown and is returned in
   `unrestored`; a tracker whose records this version cannot read is left out (the one shown: its
   head kept as a new tracker with its conversations); the domains left as shown become one step,
   "Not restored from the saved state: …" (`unrestoredLabel`), so the head and what is shown agree.
   Only a broken structure, a cancellation or a replaced dataset ends a load whole. A move
   (undo, jump) stays whole: one refusal puts back what was shown.
 - Staleness (`provenance.js`) names each changed input with its own cause, and compares an input
-  held per view at the view the step acted in (the owner's `readPart`, F156). A step that changed
-  some views of several, not all, names them in its label (`labelWithViews`, F157).
-- The value of domain D at step S is the after-value of the nearest step on the path root → S
-  that touched D, or the root's; showing a step restores only the domains whose value differs.
+  held per view at the view the step acted in (the owner's `readPart`). A step that changed
+  some views of several, not all, names them in its label (`labelWithViews`).
+- The value of a domain at a step is read from the path root → step (`valuesAt`); showing a step
+  restores only the domains whose value differs.
 - A step is never dropped: one that no longer applies is kept with `status: 'unapplicable'` and
   the reason.
 - A replay (`history.replay`, "run my workflow on my next sample") starts a new tracker on the state
   shown whose start names where its steps come from (`start.kind 'replay'`, a `Link`; its report
   and name mapping kept), and dispatches each step again by name (origin `replay`, the step it
-  replays in `replayOf`, its parameters brought to this catalog's version) while the person's
-  actions wait at the gate. A step that does not apply here changes nothing and is kept, flagged
-  with the reason; a step flagged where it was recorded is kept flagged; a step of an unknown
-  action, or recorded with a newer version, is kept flagged ("Recorded with a newer Cellucid"); a
-  squashed step is values only, flagged; a change made outside the steps is skipped; a stop keeps
-  the steps applied before it. The source's domain values are never put back.
+  replays in `replayOf`) while the person's actions wait at the gate. A step that does not apply
+  here changes nothing and is kept, flagged with the reason; the source's domain values are never
+  put back. What each kind of step does and the report's shape: developer doc 29, "Replay on
+  another dataset"
+  (`cellucid-python/docs/user_guide/web_app/p_developer_docs/29_action_layer_domains_and_history.md`).
 - Paused (`Tracker.paused`): changes apply and make no step; the draft of what differs from the
   head is kept on the tracker (`recording` events when it changes); resuming, a move (the person's
   choice: keep, the default, or discard) and Save, Share or a load (`settlePaused`) make it one
@@ -168,7 +166,7 @@ persistence (H2) and the panel (H3) build on, each record checked whole by its v
 **Tests:** `tests/history-anndata-copy.test.mjs` (the apply plan against the golden's), `tests/history-anndata-copy-save.test.mjs` (where the bytes go), `tests/history-v2-core.test.mjs`, `tests/history-tree-properties-*.test.mjs` (2,100
 seeded random operation sequences in three shards, `history-tree-properties.mjs`: every invariant
 after each operation, older restores, interleaved turns, two writers at once, loads beside, each
-step's before-values its parent's, no loose value in the pool), the review's regressions by area
+step's before-values its parent's, no loose value in the pool), regressions by area
 (`tests/history-v2-concurrency`, `-restore`, `-turns`, `-paused`, `-replay-steps`, `-pool`,
 `-canonical`, `-derived-domains`, `-stale` `.test.mjs`, over `tests/history-fake-page.mjs`),
 `tests/session-selection-tool-contract.test.mjs` (page chrome), `tests/history-catalog-contract.test.mjs`,

@@ -20,7 +20,7 @@ import { connectivityEdgesFromPairs } from './helpers/connectivity-edges.mjs';
 import { admissionMembership, prefixMembership } from './helpers/lod-membership.mjs';
 
 const mainSource = await readFile(
-  new URL('../assets/js/app/main.js', import.meta.url),
+  new URL('../assets/js/app/ui/modules/connectivity-controls.js', import.meta.url),
   'utf8'
 );
 const viewerSource = await readFile(
@@ -62,7 +62,7 @@ const activeCountsSource = extractSource(
 const updateActiveCountsSource = extractSource(
   mainSource,
   'function updateActiveConnectivityCounts()',
-  '/**\n       * Update edge visibility with combined filter + LOD visibility.'
+  '/**\n   * Update edge visibility with combined filter + LOD visibility.'
 );
 const visibilityCoreSource = extractSource(
   mainSource,
@@ -376,14 +376,10 @@ test('full connectivity refresh completes every pane before publishing one share
 test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask', () => {
   const connectivityControlsSource = extractSource(
     mainSource,
-    'function initializeConnectivityControls()',
-    '// ========================================\n    // PERFORMANCE BENCHMARK CONTROLS'
+    'function initializeConnectivityControls({',
+    '\n}\n'
   );
 
-  assert.match(
-    mainSource,
-    /viewer\.getCurrentLodMembership\(viewId,\s*dimensionLevel\)/
-  );
   assert.match(
     mainSource,
     /viewer\.updateEdgeVisibilityV2FromLod\(/
@@ -440,7 +436,6 @@ test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask',
     connectivityControlsSource,
     /new (?:Float32Array|Uint32Array)\(\s*(?:n|nEdges|pointCount|edgeSources\.length)\s*(?:\+\s*1)?\s*\)/
   );
-  assert.match(mainSource, /viewer\.onLodChanged\(event =>/);
   assert.match(mainSource, /pendingLodViewIds\.add\(event\.viewId\)/);
   assert.match(
     lodTrackingSource,

@@ -44,7 +44,7 @@ import { isHexColor, rgb01OfHex } from '../../utils/hex-color.js';
  * apart from the pages' and the ones before it, else the next palette color
  * that can (`distinct-colors.js`). A category's color depends only on the
  * pages and the categories before it. Create categorical's preview draws the
- * same colors (F124).
+ * same colors.
  *
  * @param {ReadonlyArray<string>} pageColors - Each page's `#rrggbb`, in the field's page order
  * @param {number} categoryCount - The field's categories, the pages' first
@@ -433,8 +433,8 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
    * @param {Record<string, string>} options.intersectionLabels - intersection key (`intersectionKey`) -> label when overlapStrategy='intersections'
    * @param {{categories: string[], codes: ArrayLike<number>, missing: number}|null} options.rest - a
    *   categorical field whose category the cells on no page keep (its labels, its code of each open
-   *   cell, its missing code); null: they take `uncoveredLabel` (bug hunt L25-3: relabelling the
-   *   cells of a page inside an existing annotation cost an agent 101 calls)
+   *   cell, its missing code); null: they take `uncoveredLabel` (so relabelling the
+   *   cells of a page inside an existing annotation is one call)
    * @param {object} state - DataState
    * @returns {{id: string, field: object, conflicts: number, uncoveredCount: number}}
    */

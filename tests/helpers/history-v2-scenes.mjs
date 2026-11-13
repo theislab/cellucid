@@ -1,5 +1,5 @@
 /**
- * The histories the State panel's specs draw (History v2 records, built with
+ * The histories the State panel's specs draw (history records, built with
  * `history-v2-builder.mjs`), by name: a spec installs one in the page with
  * `installScene(name)` (the page's policy runs no code made from text, so a
  * scene is a function of this module, never a string).

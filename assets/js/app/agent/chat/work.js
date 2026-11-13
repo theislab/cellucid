@@ -47,7 +47,7 @@ const LISTED_NAMES = 3;
 const RUN_ANALYSIS = toolNameOf('analysis.run');
 
 /** States of a call that did not do what was asked: shown even when its turn is folded. */
-export const FAILED_STATES = Object.freeze(['refused', 'stopped', 'interrupted']);
+const FAILED_STATES = Object.freeze(['refused', 'stopped', 'interrupted']);
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);

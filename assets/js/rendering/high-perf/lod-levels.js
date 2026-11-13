@@ -37,8 +37,7 @@ export const ADAPTIVE_LOD_MAXIMUM_REDUCTION = 8;
 
 /**
  * The reduction the farthest camera asks for (distance at or past 3x the
- * data's size), and that point sizes stop growing at: the coarsest level the
- * earlier fixed ladder of 18 reductions had.
+ * data's size), and that point sizes stop growing at.
  */
 const FARTHEST_REDUCTION = 44;
 

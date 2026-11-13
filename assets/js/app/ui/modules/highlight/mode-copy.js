@@ -35,9 +35,9 @@ export const COMBINE_SELECT_MODE_COPY =
 /**
  * The step line's help on combining, as HTML: both sentences, the one that
  * holds shown. Which holds follows the Select mode switch at once, without a
- * new gesture (`components/_highlight.css`: the section with its switch on
- * hides the keys, else the Select mode line). R9F-13: the step line said the
- * Alt keys while Select mode chose the combine.
+ * new gesture (`components/_filters.css`: the section with its switch on
+ * hides the keys, else the Select mode line), so the step line never says the
+ * Alt keys while Select mode chooses the combine.
  *
  * @param {{categorical?: boolean}} [options] - an annotation step on a
  *   categorical field replaces with plain Alt

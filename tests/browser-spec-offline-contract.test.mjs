@@ -5,10 +5,9 @@
  * A page that is still loading something of its own when the connection
  * goes reports that failure too: the analysis tools it imports as it
  * starts, a read of the opening still under way. Where a machine is fast
- * those are long over; on a hosted runner they were not (Web contracts run
- * 42180485733, Linux WebKit, `community-annotation-startup-lifecycle`). The
- * helper waits for both on every page of the context, so the wait cannot be
- * left out of a spec.
+ * those are long over; on a slow runner they are not. The helper waits for
+ * both on every page of the context, so the wait cannot be left out of a
+ * spec.
  */
 
 import assert from 'node:assert/strict';

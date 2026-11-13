@@ -128,84 +128,85 @@ async function run(panel) {
   await expect(panel.locator('.js-plotly-plot')).toBeVisible();
 }
 
-test('typing and pasting never run; Run scores the found genes and names the rest', async ({ page }) => {
+// One opening and one page of cells: the second step gives the analysis its own gene sets.
+test('gene signature: typing and pasting never run and Run names what it lacks; then two sets with the module score and UCell', async ({ page }) => {
   const errors = observeProductErrors(page);
   const panel = await openSignature(page);
   const pageId = await pageOfAandB(page);
-  await page.evaluate(id => window._comparisonModule.openAnalysis('signature', { selectedPages: [id] }), pageId);
-  const run_ = panel.getByRole('button', { name: 'Run gene signature' });
-  await expect(run_).toBeDisabled();
-  await expect(panel.locator('.analysis-run-reason')).toHaveText('Add genes to a set');
 
-  const input = panel.getByRole('combobox', { name: 'Add genes to Set 1' });
-  await input.fill('g0');
-  await input.press('Enter');
-  // A pasted list: newlines and commas, a gene the dataset lacks.
-  await input.evaluate(element => {
-    // A paste as the browser delivers it. The clipboard text is given to the
-    // event directly: Firefox leaves a script-made DataTransfer empty.
-    const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
-    Object.defineProperty(event, 'clipboardData', {
-      value: { getData: type => (type === 'text/plain' ? 'G1,\nNOPE1\n' : '') },
+  await test.step('typing and pasting never run; Run scores the found genes and names the rest', async () => {
+    await page.evaluate(id => window._comparisonModule.openAnalysis('signature', { selectedPages: [id] }), pageId);
+    const run_ = panel.getByRole('button', { name: 'Run gene signature' });
+    await expect(run_).toBeDisabled();
+    await expect(panel.locator('.analysis-run-reason')).toHaveText('Add genes to a set');
+
+    const input = panel.getByRole('combobox', { name: 'Add genes to Set 1' });
+    await input.fill('g0');
+    await input.press('Enter');
+    // A pasted list: newlines and commas, a gene the dataset lacks.
+    await input.evaluate(element => {
+      // A paste as the browser delivers it. The clipboard text is given to the
+      // event directly: Firefox leaves a script-made DataTransfer empty.
+      const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'clipboardData', {
+        value: { getData: type => (type === 'text/plain' ? 'G1,\nNOPE1\n' : '') },
+      });
+      element.dispatchEvent(event);
     });
-    element.dispatchEvent(event);
+    await expect(panel.locator('.gene-chip')).toHaveCount(3);
+    await expect(panel.locator('.gene-chip-missing')).toHaveText(/NOPE1/);
+    expect(await page.evaluate(() => window._comparisonModule.getUI('signature')._lastResult)).toBeNull();
+
+    await run(panel);
+    const raw = await lastRaw(page);
+    expect(raw.sets).toHaveLength(1);
+    expect(raw.sets[0].genes).toEqual(['G0', 'G1']);
+    expect(raw.sets[0].unmatched).toEqual(['NOPE1']);
+    expect(raw.sets[0].cells).toBe(220);
+    // G0 and G1 mark A: the A cells score higher.
+    expect(raw.sets[0].meanA).toBeGreaterThan(raw.sets[0].meanB);
+    await expect(panel.locator('.analysis-result-header .analysis-chip', { hasText: '1 not found' })).toBeVisible();
+
+    // Editing the genes leaves the result stale; nothing runs.
+    await input.fill('G2');
+    await input.press('Enter');
+    await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
+    expect((await lastRaw(page)).sets[0].genes).toEqual(['G0', 'G1']);
+    expect(errors).toEqual([]);
   });
-  await expect(panel.locator('.gene-chip')).toHaveCount(3);
-  await expect(panel.locator('.gene-chip-missing')).toHaveText(/NOPE1/);
-  expect(await page.evaluate(() => window._comparisonModule.getUI('signature')._lastResult)).toBeNull();
 
-  await run(panel);
-  const raw = await lastRaw(page);
-  expect(raw.sets).toHaveLength(1);
-  expect(raw.sets[0].genes).toEqual(['G0', 'G1']);
-  expect(raw.sets[0].unmatched).toEqual(['NOPE1']);
-  expect(raw.sets[0].cells).toBe(220);
-  // G0 and G1 mark A: the A cells score higher.
-  expect(raw.sets[0].meanA).toBeGreaterThan(raw.sets[0].meanB);
-  await expect(panel.locator('.analysis-result-header .analysis-chip', { hasText: '1 not found' })).toBeVisible();
+  await test.step('two sets with the module score, then UCell', async () => {
+    await page.evaluate(id => window._comparisonModule.openAnalysis('signature', {
+      selectedPages: [id],
+      options: {
+        geneSets: [{ name: 'A genes', genes: ['G0', 'G1'] }, { name: 'B genes', genes: ['G2', 'G3'] }],
+        method: 'module',
+        controlSize: 4,
+        bins: 3,
+      },
+    }), pageId);
+    await run(panel);
+    let raw = await lastRaw(page);
+    expect(raw.method).toBe('module');
+    expect(raw.sets.map(set => set.name)).toEqual(['A genes', 'B genes']);
+    expect(raw.sets.every(set => set.controls > 0)).toBe(true);
+    expect(raw.sets[0].meanA).toBeGreaterThan(raw.sets[0].meanB);
+    expect(raw.sets[1].meanB).toBeGreaterThan(raw.sets[1].meanA);
 
-  // Editing the genes leaves the result stale; nothing runs.
-  await input.fill('G2');
-  await input.press('Enter');
-  await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
-  expect((await lastRaw(page)).sets[0].genes).toEqual(['G0', 'G1']);
-  expect(errors).toEqual([]);
-});
-
-test('two sets with the module score, then UCell', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openSignature(page);
-  const pageId = await pageOfAandB(page);
-  await page.evaluate(id => window._comparisonModule.openAnalysis('signature', {
-    selectedPages: [id],
-    options: {
-      geneSets: [{ name: 'A genes', genes: ['G0', 'G1'] }, { name: 'B genes', genes: ['G2', 'G3'] }],
-      method: 'module',
-      controlSize: 4,
-      bins: 3,
-    },
-  }), pageId);
-  await run(panel);
-  let raw = await lastRaw(page);
-  expect(raw.method).toBe('module');
-  expect(raw.sets.map(set => set.name)).toEqual(['A genes', 'B genes']);
-  expect(raw.sets.every(set => set.controls > 0)).toBe(true);
-  expect(raw.sets[0].meanA).toBeGreaterThan(raw.sets[0].meanB);
-  expect(raw.sets[1].meanB).toBeGreaterThan(raw.sets[1].meanA);
-
-  await page.evaluate(() => {
-    const ui = window._comparisonModule.getUI('signature');
-    ui._setOptions({ ...ui._options, method: 'ucell', maxRank: 6 });
+    await page.evaluate(() => {
+      const ui = window._comparisonModule.getUI('signature');
+      ui._setOptions({ ...ui._options, method: 'ucell', maxRank: 6 });
+    });
+    await run(panel);
+    raw = await lastRaw(page);
+    expect(raw.method).toBe('ucell');
+    for (const set of raw.sets) {
+      expect(set.min).toBeGreaterThanOrEqual(0);
+      expect(set.max).toBeLessThanOrEqual(1);
+    }
+    expect(raw.sets[0].meanA).toBeGreaterThan(raw.sets[0].meanB);
+    expect(errors).toEqual([]);
   });
-  await run(panel);
-  raw = await lastRaw(page);
-  expect(raw.method).toBe('ucell');
-  for (const set of raw.sets) {
-    expect(set.min).toBeGreaterThanOrEqual(0);
-    expect(set.max).toBeLessThanOrEqual(1);
-  }
-  expect(raw.sets[0].meanA).toBeGreaterThan(raw.sets[0].meanB);
-  expect(errors).toEqual([]);
 });
 
 test.describe('on a phone', () => {

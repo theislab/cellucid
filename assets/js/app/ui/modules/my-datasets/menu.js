@@ -22,7 +22,7 @@ import { describeMenuItem } from './model.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 
 /** What the button says while the dataset open now is not one of the list. */
-export const CHOOSE_LABEL = 'Choose a dataset…';
+const CHOOSE_LABEL = 'Choose a dataset…';
 
 /**
  * @param {{root: HTMLElement, button: HTMLButtonElement, menu: HTMLElement, status: HTMLElement}} dom

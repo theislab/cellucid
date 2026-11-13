@@ -38,9 +38,9 @@ export const SORT_BLOCK_ENTRIES = 1 << 22;
 
 /**
  * Entries staged before one write to a payload (a scheduling choice,
- * measured): an origin-private file takes a megabyte a write at 2.6 times
- * the rate of 64 KB writes in Chromium (670 against 260 MB/s; Firefox 1.7
- * against 1.2 GB/s).
+ * measured): an origin-private file takes a megabyte a write at a
+ * several times higher rate than 64 KB writes (measured:
+ * 23_decisions_partial_reading.md).
  */
 const STAGE_ENTRIES = 1 << 18;
 
@@ -454,6 +454,7 @@ export async function byFeature(matrix, context, { blockEntries = SORT_BLOCK_ENT
   const pointers = copyTypedArray(Float64Array, await partSlice(matrix.indptr, 0, indptrLength, readRegion), 'Matrix pointers');
   const count = pointers[nMajor];
   const dataType = matrix.data.values !== undefined ? matrix.data.values.constructor : PART_TYPES[matrix.data.dtype.slice(1)];
+  /** @type {import('../../../utils/large-arrays.js').TypedArrayConstructor<Float32Array|Float64Array>} */
   const Values = dataType === Float32Array ? Float32Array : Float64Array;
   const valueDtype = Values === Float64Array ? '<f8' : '<f4';
   const featureCounts = allocateTypedArray(Float64Array, nFeatures, 'Entries per feature');
@@ -611,6 +612,7 @@ export async function majorInOrder(matrix, context, { order, position, minor = n
   const pointers = copyTypedArray(Float64Array, await partSlice(matrix.indptr, 0, indptrLength, readRegion), 'Matrix pointers');
   const count = pointers[nMajor];
   const dataType = matrix.data.values !== undefined ? matrix.data.values.constructor : PART_TYPES[matrix.data.dtype.slice(1)];
+  /** @type {import('../../../utils/large-arrays.js').TypedArrayConstructor<Float32Array|Float64Array>} */
   const Values = dataType === Float32Array ? Float32Array : Float64Array;
   const valueDtype = Values === Float64Array ? '<f8' : '<f4';
   const lineCounts = allocateTypedArray(Float64Array, nMajor, 'Entries per line');

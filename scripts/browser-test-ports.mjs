@@ -2,8 +2,7 @@
 //
 // The Playwright config and the static server it launches resolve their
 // addresses here, so a run can be moved to a free port in one place. The
-// defaults are unchanged from when the ports were literals, so a run that sets
-// nothing behaves exactly as before.
+// defaults are used by a run that sets nothing.
 //
 // The specs resolve their addresses here too, through
 // `tests/browser/helpers/origins.mjs`, which wraps this module for the two

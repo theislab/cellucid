@@ -1,6 +1,6 @@
 /**
- * A file or folder opened from this computer reopens with one click (audit
- * ST-19): where the browser hands the page a handle (Chromium, a page not in
+ * A file or folder opened from this computer reopens with one click:
+ * where the browser hands the page a handle (Chromium, a page not in
  * a frame), it is kept in IndexedDB under its dataset's id with what it held
  * (a file's size and modification time, a folder's digest of every file's);
  * a reopen asks the browser for leave to read it unless given, and refuses,
@@ -174,11 +174,11 @@ test('a file gone or changed since is not reopened under its dataset\'s name, an
   assert.equal(await keptLocalFile('id', store), null);
 });
 
-test('a file that cannot be read now, or whose leave was withdrawn, is said so and kept for the next try (R9S-8)', async () => {
-  // Any failure to read a kept handle was "no longer where it was opened
-  // from (moved, renamed or deleted)" and forgot the handle: a file in use,
-  // or in a cloud folder and not downloaded (NotReadableError), lost its
-  // place in My datasets for good.
+test('a file that cannot be read now, or whose leave was withdrawn, is said so and kept for the next try', async () => {
+  // A failure to read a kept handle is not always "no longer where it was opened
+  // from (moved, renamed or deleted)": a file in use,
+  // or in a cloud folder and not downloaded (NotReadableError), keeps its
+  // place in My datasets.
   const store = mapStore();
   let failure = null;
   const file = fileOf('cells.h5ad', 3);

@@ -1,10 +1,11 @@
 /**
- * L18-8 (live pass 5): coloring by a Loom `ClusterID` (integer categories, as
- * velocyto writes it) failed — "Could not load the field: [CommunityAnnotationSession]
- * category at index 0 must be nonblank" — in every dataset, connected to a
- * repository or not: the legend handed the annotation session the numbers.
- * The repository keys categories by their text, as the legend shows them; a
- * field whose categories it cannot key is not open to it and is still shown.
+ * Coloring by a Loom `ClusterID` (integer categories, as velocyto writes it)
+ * works in every dataset, connected to a repository or not: a legend that
+ * handed the annotation session the numbers would fail with "Could not load
+ * the field: [CommunityAnnotationSession] category at index 0 must be
+ * nonblank". The repository keys categories by their text, as the legend
+ * shows them; a field whose categories it cannot key is not open to it and is
+ * still shown.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

@@ -42,12 +42,11 @@ hold); `exportLibrary`, `importLibrary`, `readLibraryFile` (`library-file.js`); 
   (`lasting` false) and says so; a window that keeps nothing for a later visit keeps it until it
   closes (`keptStoragePlace`) and says so.
 - Records are read back checked (`readRecord`): a record of another layout is not listed.
-- A library file is untrusted input. Its import checks all of it before it adds anything, adds
-  only datasets the list does not hold (`library.add` never replaces one), and keeps each history
-  as a named saved state "<name> (imported)" beside the others: nothing kept is replaced, and two
-  imports keep two copies. A session file given to the importer is refused saying it is one, and
-  a library file given to Load (`SESSION_FILE_NOT_A_LIBRARY_MESSAGE`,
-  `LIBRARY_FILE_NOT_A_SESSION_MESSAGE`).
+- A library file is untrusted input: its import checks all of it before it adds anything and
+  replaces nothing kept (`library.add` never replaces a dataset); a session file given to the
+  importer, and a library file given to Load, are refused saying what they are. The import's
+  steps are developer doc 10, "The library file"
+  (`cellucid-python/docs/user_guide/web_app/p_developer_docs/10_sessions_persistence_and_serialization.md`).
 - A saved state's paused draft (changes made while recording was paused, not yet a step) cannot
   be in a session file: the export leaves it out, keeps the tracker paused, and says so.
 

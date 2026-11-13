@@ -17,7 +17,7 @@
  *   priors and measures nothing. **Written** on each decision, merged into
  *   the record of the same version.
  * - A browser that keeps nothing (no IndexedDB, a private window that
- *   refuses it, an error) measures on every visit, as before: keeping is a
+ *   refuses it, an error) measures on every visit: keeping is a
  *   convenience, never required. The Stored dialog's Remove all forgets
  *   the record (`forgetDecoderDecisions`).
  *
@@ -30,8 +30,8 @@ import { reportedCores } from '../../utils/machine.js';
 import { DECODERS } from './decoder-choice.js';
 
 /** The database the record is kept in, and its object store. */
-export const DECODER_MEMORY_DATABASE = 'cellucid-decoders';
-export const DECODER_MEMORY_STORE = 'decisions';
+const DECODER_MEMORY_DATABASE = 'cellucid-decoders';
+const DECODER_MEMORY_STORE = 'decisions';
 /** The record's key in its store. */
 export const DECODER_MEMORY_KEY = 'decided';
 

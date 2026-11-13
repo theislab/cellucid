@@ -8,7 +8,7 @@
  * - `src/cellucid/action_catalog.json` in cellucid-python,
  * - `inst/action_catalog.json` in cellucid-r,
  *
- * byte for byte the same, each pinned by SHA-256 in its repository's tests
+ * byte for byte the same, compared by `tests/shared-files-contract.test.mjs` and held
  * (`tests/action-catalog-document-contract.test.mjs`, cellucid-python's
  * `tests/test_action_catalog.py`, cellucid-r's
  * `tests/testthat/test-actions.R`).
@@ -27,10 +27,10 @@
  *
  * The sibling repositories are found next to this one, or where
  * `CELLUCID_PYTHON_ROOT` and `CELLUCID_R_ROOT` say; one that is not there is
- * named and skipped. After writing, regenerate what the two packages build
- * from it -- `python scripts/generate_actions.py` (cellucid-python) and
- * `Rscript tools/generate-actions.R` (cellucid-r) -- and put the printed
- * digest in the three tests.
+ * named and skipped (`scripts/shared-files.mjs` lists the copies). After
+ * writing, regenerate what the two packages build from it:
+ * `python scripts/generate_actions.py` (cellucid-python) and
+ * `Rscript tools/generate-actions.R` (cellucid-r).
  *
  * Canonical: object keys sorted, two-space indent, one trailing newline, so
  * the bytes depend on the catalog alone, never on the order a definition
@@ -38,7 +38,6 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,15 +45,11 @@ import { fileURLToPath } from 'node:url';
 import { catalogDocument, createActionCatalog } from '../assets/js/app/actions/catalog.js';
 import { ACTION_DEFINITIONS } from '../assets/js/app/actions/definitions/index.js';
 import { mcpToolsDocument } from '../assets/js/app/agent/bridge/local-agents.js';
+import { copyPaths, sharedFile } from './shared-files.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const ACTION_CATALOG_PATH = path.join(ROOT, 'tests', 'fixtures', 'action-catalog.json');
 
-/** Where each package keeps its copy, relative to its repository. */
-export const ACTION_CATALOG_MIRRORS = Object.freeze([
-  Object.freeze({ repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', file: 'src/cellucid/action_catalog.json' }),
-  Object.freeze({ repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', file: 'inst/action_catalog.json' }),
-]);
 
 /** `value` with every object's keys sorted (arrays keep their order). */
 export function sortedKeys(value) {
@@ -71,18 +66,13 @@ export function renderActionCatalog() {
   return `${JSON.stringify(sortedKeys(document), null, 2)}\n`;
 }
 
-/** The SHA-256 of the canonical text (what the three tests pin). */
+/** The SHA-256 of the canonical text: the `catalogDigest` the agents' tools document names its catalog by. */
 export function actionCatalogDigest(text = renderActionCatalog()) {
   return createHash('sha256').update(text).digest('hex');
 }
 
 export const MCP_TOOLS_PATH = path.join(ROOT, 'tests', 'fixtures', 'mcp-tools.json');
 
-/** Where each package keeps its copy of the local agent tools, relative to its repository. */
-export const MCP_TOOLS_MIRRORS = Object.freeze([
-  Object.freeze({ repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', file: 'src/cellucid/mcp_tools.json' }),
-  Object.freeze({ repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', file: 'inst/mcp_tools.json' }),
-]);
 
 /**
  * The local agent tools document's canonical text, made from a catalog's
@@ -94,14 +84,6 @@ export function renderMcpTools(catalogText = renderActionCatalog()) {
   return `${JSON.stringify(sortedKeys(document), null, 2)}\n`;
 }
 
-/** Each mirror's absolute path, or null when its repository is not there. */
-export function actionCatalogMirrorPaths(env = process.env, mirrors = ACTION_CATALOG_MIRRORS) {
-  return mirrors.map(mirror => {
-    const root = env[mirror.env] ?? path.join(ROOT, '..', mirror.repository);
-    const target = path.join(root, mirror.file);
-    return { ...mirror, path: existsSync(path.dirname(target)) ? target : null };
-  });
-}
 
 async function readOrNull(file) {
   try {
@@ -120,9 +102,9 @@ async function main() {
   const tools = renderMcpTools(text);
   const targets = [
     { repository: 'cellucid', path: ACTION_CATALOG_PATH, text },
-    ...actionCatalogMirrorPaths().map(target => ({ ...target, text })),
+    ...copyPaths(sharedFile('tests/fixtures/action-catalog.json')).map(target => ({ ...target, text })),
     { repository: 'cellucid', path: MCP_TOOLS_PATH, text: tools },
-    ...actionCatalogMirrorPaths(process.env, MCP_TOOLS_MIRRORS).map(target => ({ ...target, text: tools })),
+    ...copyPaths(sharedFile('tests/fixtures/mcp-tools.json')).map(target => ({ ...target, text: tools })),
   ];
   let stale = 0;
   for (const target of targets) {
@@ -143,10 +125,8 @@ async function main() {
     await writeFile(target.path, target.text);
     console.log(`wrote   ${path.relative(path.join(ROOT, '..'), target.path)}`);
   }
-  console.log(`sha256  ${actionCatalogDigest(text)}  action-catalog.json`);
-  console.log(`sha256  ${actionCatalogDigest(tools)}  mcp-tools.json`);
   if (stale > 0) {
-    console.log('Run node scripts/generate-action-catalog.mjs, regenerate the packages\' methods, and pin the digests above.');
+    console.log('Run node scripts/generate-action-catalog.mjs and regenerate the packages\' methods.');
     process.exitCode = 1;
   }
 }

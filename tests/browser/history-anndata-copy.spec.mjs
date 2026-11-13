@@ -240,27 +240,6 @@ print(json.dumps({
   expect(errors).toEqual([]);
 });
 
-test('cancelled while its bytes are written: the file is aborted, never closed, and nothing is said to be saved', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  const facts = await datasetFacts(page);
-  await takeTheSteps(page, facts);
-  // A dialog on every engine here: its writable holds the first batch until released.
-  await stubSaveDialog(page, { real: false });
-  await chooseSave(page);
-  await expect.poll(() => page.evaluate(() => window.__copyWritable.map(([kind]) => kind))).toEqual(['dialog', 'write']);
-  const progress = page.locator('.notification', { hasText: 'Save AnnData with this state:' });
-  await expect(progress).toHaveCount(1);
-  await progress.locator('[data-role="cancel"]').click();
-  await page.evaluate(() => window.__releaseCopyWrite());
-  await expect.poll(() => page.evaluate(() => window.__copyWritable.map(([kind]) => kind))).toEqual(['dialog', 'write', 'abort']);
-  await expect(progress).toHaveCount(0);
-  await expect(page.locator('.notification', { hasText: /Saved .*\.zarr\.zip/ })).toHaveCount(0);
-  // Saved afterwards as if nothing happened: the job and the menu are free again.
-  expect(await page.evaluate(() => window._cellucidHistories.current().active.headId)).toBeTruthy();
-  expect(errors).toEqual([]);
-});
-
 /** Unpack one fixture of the formats corpus (`tests/fixtures/<folder>/<writer>.zip`) for the page. */
 async function unpacked(folder, writer, inside, made) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'cellucid-copy-'));

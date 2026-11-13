@@ -1,8 +1,7 @@
 /**
  * @fileoverview The one guard before the dataset shown is replaced, and
- * before the page is left, while work on it is not kept (bug hunt R9W-2:
- * with Autosave off, opening another dataset dropped every step without a
- * word).
+ * before the page is left, while work on it is not kept (with Autosave off,
+ * opening another dataset would drop every step without a word).
  *
  * The work is not kept when the history shown holds steps (notes,
  * conversations, changes while paused) made since it was last saved and this
@@ -12,7 +11,8 @@
  * - **Opening another dataset** (the sample list, My datasets, a file, a
  *   link, a server, a catalog, a saved state or session file of another
  *   dataset, None, the benchmark, an agent's `dataset.open`) asks first, from
- *   the one place every replacement passes (`app/main.js`): **Save…** (the
+ *   the one place every replacement passes (`app/dataset/reload.js`, the
+ *   benchmark's `benchmark-controls.js`): **Save…** (the
  *   history's Save file dialog; the opening waits for you to open it again),
  *   **Open anyway** or **Cancel**. Declined, the opening ends as cancelled and
  *   the dataset shown stays.

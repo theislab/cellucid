@@ -9,12 +9,12 @@
  */
 
 import {
-  DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
   explainedFailure,
   resolveUrl,
 } from './data-source.js';
+import { DATA_CONFIG } from './sample-catalog-config.js';
 import {
   AnnDataCatalog,
   CATALOG_FILENAME,
@@ -150,7 +150,7 @@ export class LocalDemoDataSource {
   async _loadCatalog(owner = this._captureCatalogGeneration()) {
     this._assertCatalogGeneration(owner);
     if (this.configurationError !== null) {
-      // The link's `sampleCatalog` (R9E-2) is said as the link's, settled;
+      // The link's `sampleCatalog` is said as the link's, settled;
       // the page's own meta element is a deployment's error.
       const sentence = this.configurationError.sentence;
       throw typeof sentence === 'string'
@@ -258,6 +258,18 @@ export class LocalDemoDataSource {
     } finally {
       if (this._datasetsInFlight === inFlight) this._datasetsInFlight = null;
     }
+  }
+
+  /**
+   * Settles once the listing under way (`listDatasets`) has ended, listed or
+   * failed; at once when none is. It starts none. The listing reads the
+   * samples' files in a reader worker of its own after startup's dataset has
+   * settled, so it is still under way when the page is otherwise at rest.
+   * @returns {Promise<void>}
+   */
+  whenListed() {
+    const inFlight = this._datasetsInFlight;
+    return inFlight === null ? Promise.resolve() : inFlight.promise.then(() => {}, () => {});
   }
 
   /**

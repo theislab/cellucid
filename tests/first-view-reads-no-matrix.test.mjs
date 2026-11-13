@@ -9,9 +9,9 @@
  * Why it matters: a served store (`cellucid serve`, `cellucid_serve`, a
  * notebook widget) lays an object's or a file's matrices out gene-major in
  * the background, and a link pays a request for each read: a matrix probe
- * on the opening's path made the first picture wait for a whole layout
- * (`cellucid serve` of a 1M-cell CSR `.h5ad`: 4.4 s against 1.5 s), and a
- * remote file wait one more round trip.
+ * on the opening's path makes the first picture wait for a whole layout
+ * (measured: 26_decisions_served_store_and_widgets.md), and a remote file
+ * wait one more round trip.
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';

@@ -370,11 +370,11 @@ test('a blocker that cannot read its control says so instead of advising a toggl
  * in it. So a raster `s` times the on-screen viewport reproduces the screen
  * exactly when the point diameter is multiplied by `s` and by nothing else.
  *
- * The PNG renderer used to floor that product at one, and the hybrid-SVG
- * renderer did not, so one view exported twice disagreed with itself. The floor
- * also inflates: the viewer's default point size is 0.75 and the default export
- * is half the viewport, so a 150-DPI PNG asked for 0.586 and drew 1 — every
- * cell 1.7x too large, and 5.1x at the smallest point size the slider offers.
+ * A floor of one on that product would inflate: the viewer's default point size
+ * is 0.75 and the default export is half the viewport, so a 150-DPI PNG asks
+ * for 0.586 and a floor draws 1 — every cell 1.7x too large, and 5.1x at the
+ * smallest point size the slider offers. The PNG and the hybrid-SVG renderers
+ * apply no floor, so one view exported twice agrees with itself.
  *
  * The minimum that genuinely keeps a point visible is the shaders'
  * `clamp(gl_PointSize, 0.5, 128.0)`, applied to the rendered size.
@@ -412,10 +412,10 @@ test('the raster point diameter is the exact scaled diameter', () => {
 });
 
 test('both renderers resolve every raster point size through that one helper', async () => {
-  // The two renderers disagreeing about point size is the defect this replaces,
-  // so the check is that neither carries its own arithmetic: every point size
-  // handed to the rasterizer must be a call to the shared resolver. Reading the
-  // argument rather than searching for a floor is what makes this survive a
+  // The two renderers must not disagree about point size, so the check is
+  // that neither carries its own arithmetic: every point size handed to the
+  // rasterizer must be a call to the shared resolver. Reading the argument
+  // rather than searching for a floor is what makes this survive a
   // differently-spelled clamp.
   const root = new URL(
     '../assets/js/app/ui/modules/figure-export/renderers/',
@@ -443,7 +443,7 @@ test('an export blocked only by layers a switch turns off names the switch, so t
     documentRef: documentWith({ 'velocity-overlay-enabled': { checked: true } }),
     connectivityVisible: true,
   });
-  // The vector field is drawn (arrows on a grid, R9V-10): only the edges block.
+  // The vector field is drawn (arrows on a grid): only the edges block.
   assert.deepEqual(edges.map(warning => warning.fix), [
     { label: 'edges', controlId: 'toggle-connectivity' },
   ]);

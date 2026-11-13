@@ -9,18 +9,13 @@
  */
 
 import { BaseManager } from '../core/base-manager.js';
+import { applyMixin } from '../../../utils/apply-mixin.js';
 import { FieldOverlayPublicMethods } from './field/overlay-public.js';
 import { FieldOverlayInternalMethods } from './field/overlay-internals.js';
 import { FieldCategoryOpsMethods } from './field/category-ops.js';
 import { FieldLoadingMethods } from './field/loading.js';
 import { FieldSummaryMethods } from './field/summary.js';
 import { FieldGeneSampleMethods } from './field/gene-sample.js';
-
-function applyMixin(targetProto, mixinProto) {
-  const descriptors = Object.getOwnPropertyDescriptors(mixinProto);
-  delete descriptors.constructor;
-  Object.defineProperties(targetProto, descriptors);
-}
 
 export class DataStateFieldMethods {}
 

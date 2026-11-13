@@ -106,7 +106,7 @@ export function confirmTextOf({ definition, params, meta, estimate = null, detai
 
 /**
  * One sentence for an activity line; ⏸ first while the history's recording
- * is paused (History v2 §3.15.1: the agent's changes make no step meanwhile).
+ * is paused (the agent's changes make no step meanwhile).
  * @param {object} line
  * @param {{paused?: boolean}} [options]
  */
@@ -302,7 +302,7 @@ export function initAgentPresence({
    * While a question waits, the dock it is in is kept over every modal dialog
    * (`app-dialog.js` `keepAboveModals`): an agent asking while a dialog is
    * open (a confirmation, a settings window) is answered there, never left
-   * waiting under an inert page (R9H-16). Released when no question waits.
+   * waiting under an inert page. Released when no question waits.
    */
   let releaseAboveModals = null;
   function keepQuestionsReachable() {
@@ -446,7 +446,7 @@ export function initAgentPresence({
   async function confirm({ definition, params, meta, signal = meta.signal, estimate = null, confirm: kind = null, detail = null, stage = 'start', started = null, asking = () => {} }) {
     if (destroyed) throw new ActionRefused('Cellucid cannot ask the person now; try again.', { code: 'closed', type: definition.type });
     let ruling = decide({ meta, estimate, confirm: kind, stage, started }, permissions.get(), grants);
-    // Recording is paused (History v2 §3.15.1): an agent's change makes no step, so it cannot be undone
+    // Recording is paused: an agent's change makes no step, so it cannot be undone
     // on its own; the person is asked whatever the settings allow.
     if (stage === 'start' && ['state', 'view', 'layout'].includes(definition.effect) && history.current()?.active?.paused) {
       if (ruling.decision === 'allow') ruling = { ...ruling, decision: 'ask', asking: ruling.kinds };

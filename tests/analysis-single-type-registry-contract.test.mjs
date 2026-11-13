@@ -4,16 +4,15 @@
  * The modes the application offers are registered at runtime by
  * `ComparisonModule._registerAnalysisTypes()` into `AnalysisUIManager`, which
  * also owns the page-count predicates (`getAvailableTypes`, `isTypeAvailable`).
- * A second, hand-written `ANALYSIS_TYPES` table used to sit in the
- * `analysis-types` barrel alongside its own copies of those predicates. Nothing
- * ever read it, so nothing ever failed when it drifted — and it did drift, in
- * both directions at once: it named the modes `Quick Insights`,
- * `Correlation Explorer` and `Gene Signature Score` where the application shows
- * `Quick`, `Correlation` and `Gene Signature`, and it declared Differential
- * Expression as `minPages: 2, maxPages: 2` where the live registration accepts
- * one page and lets the user pick the two groups to compare inside the form.
+ * A second, hand-written `ANALYSIS_TYPES` table in the `analysis-types`
+ * barrel, with its own copies of those predicates, would never be read, so
+ * nothing would fail when it drifted: it would name the modes differently
+ * from the application (`Quick Insights` where the application shows
+ * `Quick`) and declare Differential Expression as `minPages: 2, maxPages: 2`
+ * where the live registration accepts one page and lets the user pick the two
+ * groups to compare inside the form.
  *
- * A reader who found the dead table first would have believed both. This sweep
+ * A reader who found such a dead table first would believe both. This sweep
  * keeps the duplicate from coming back.
  */
 import assert from 'node:assert/strict';

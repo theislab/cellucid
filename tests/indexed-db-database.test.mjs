@@ -5,9 +5,9 @@
  * The browser commits a transaction once it has no request left to run. A
  * page that goes away while its work awaits a request never makes the next
  * one, so writes awaited one after another were committed as far as they had
- * got (Firefox, a tab closed mid-write: 98 and 252 of 400 writes kept; a
- * saved state with a conversation's count and not its messages, Web contracts
- * run 42202865024). So every write of a transaction is made in the task its
+ * got (Firefox, a tab closed mid-write kept a part of the writes: a saved state
+ * with a conversation's count and not its messages;
+ * 33_decisions_actions_domains_and_history.md). So every write of a transaction is made in the task its
  * last read was answered in, none waiting for another, a read after a write
  * is refused, and the transaction is told to commit.
  *

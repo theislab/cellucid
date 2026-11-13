@@ -20,7 +20,7 @@ import { zscoreRows, log1pTransform } from '../shared/matrix-utils.js';
  * @param {string} groupId - The synthetic handle, for the error message only.
  * @returns {string}
  */
-export function encodeGroupName(groupName, groupId) {
+function encodeGroupName(groupName, groupId) {
   if (typeof groupName === 'string') {
     if (groupName.length === 0 || groupName.trim().length === 0) {
       throw new TypeError(`Group "${groupId}" name must not be empty`);
@@ -38,7 +38,7 @@ export function encodeGroupName(groupName, groupId) {
 }
 
 /** Apply a heatmap transform to row-major means. */
-export function transformMatrix(rawValues, nRows, nCols, transform) {
+function transformMatrix(rawValues, nRows, nCols, transform) {
   if (transform === 'zscore') return zscoreRows(rawValues, nRows, nCols);
   if (transform === 'log1p') return log1pTransform(rawValues);
   if (transform === 'none') return rawValues;
@@ -74,21 +74,6 @@ export function markerMatrix(stats, { genes, groupIndices, transform }) {
     rawValues: transform === 'none' ? null : rawValues,
     nRows,
     nCols,
-    transform
-  };
-}
-
-/**
- * The same matrix under another transform.
- * @param {import('./constants.js').ExpressionMatrix} matrix
- * @param {'none'|'zscore'|'log1p'} transform
- */
-export function retransformMatrix(matrix, transform) {
-  const rawValues = matrix.rawValues ?? matrix.values;
-  return {
-    ...matrix,
-    values: transformMatrix(rawValues, matrix.nRows, matrix.nCols, transform),
-    rawValues: transform === 'none' ? null : rawValues,
     transform
   };
 }

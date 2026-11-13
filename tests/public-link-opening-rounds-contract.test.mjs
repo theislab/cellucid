@@ -4,10 +4,9 @@
  * arrived is one round later) and requests. Each is the floor of that
  * source's layout -- what the source must be asked to name the file, its
  * size and its version -- and a change that adds a round or a request to a
- * source shows here. Measured on the real hosts (efficiency-floor plan,
- * "Public-link sources at the floor"): a round trip is 0.15-0.7 s from
- * Europe to these hosts, a request one of a rate-limited host's budget
- * (Zenodo: 133 a minute).
+ * source shows here. A round trip is costly and a request spends a
+ * rate-limited host's budget (measured:
+ * 22_decisions_link_model_and_request_planning.md).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -81,9 +80,9 @@ const SOURCES = [
   {
     // A first visit: the release list names the build the file is probed
     // in (a later visit probes the release it read last beside the list).
-    // Probing a release shipped with the app beside the list was measured
-    // and not adopted: two cold connections at once ended the probe 0.2 s
-    // later in Node than the list's warm connection reused.
+    // Probing a release shipped with the app beside the list is not done:
+    // two cold connections at once end the probe later than the list's warm
+    // connection reused (measured: 22_decisions_link_model_and_request_planning.md).
     name: 'CELLxGENE dataset id',
     open: () => cellxgene.open(ID),
     routes: (url, init) => (url.endsWith('/release.json') ? census : url.endsWith(`${ID}.h5ad`) ? file(1 << 20)(url, init) : null),

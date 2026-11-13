@@ -47,7 +47,7 @@ const compositionBarsDefinition = {
   },
 
   buildTraces(composition, options) {
-    if (showsStrips(composition, options)) return compositionStrips.buildTraces(composition.strips, options);
+    if (showsStrips(composition, options)) return compositionStrips.buildTraces(composition.strips);
     const data = composition.bars;
     const barCount = data.bars.length;
     if (barCount === 0 || data.types.length === 0) return [];
@@ -74,7 +74,7 @@ const compositionBarsDefinition = {
   },
 
   buildLayout(composition, options) {
-    if (showsStrips(composition, options)) return compositionStrips.buildLayout(composition.strips, options);
+    if (showsStrips(composition, options)) return compositionStrips.buildLayout(composition.strips);
     const data = composition.bars;
     const theme = getPlotTheme();
     const layout = BasePlot.createLayout({ showLegend: true });

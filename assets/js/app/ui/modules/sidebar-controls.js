@@ -19,7 +19,7 @@
  * (`layout.sidebar.show`, `layout.sidebar.width`, provided here): the toggle
  * dispatches, and a resize drag is recorded when it ends.
  *
- * The phone sheet is page chrome, not state (History v2 §3.3.8): on the
+ * The phone sheet is page chrome, not state: on the
  * phone layout the toggle, the peek bar and the H key open and close the
  * sheet and record nothing, and the sidebar shown or hidden (the `layout`
  * state, `isShownChosen`) is not the sheet. An action, an undo or a session
@@ -51,16 +51,16 @@ let pendingReveal = null;
  * The toggle asks through an action (`layout.sidebar.show`), so the sidebar
  * opens after this returns, and until it does it is `inert`: a control in it
  * cannot take focus. The promise resolves once the sidebar is shown, and the
- * caller focuses then (found 2026-11-11, lens-a11y: `?` pressed with the
- * sidebar hidden opened the shortcuts but focus never reached them; Genes
- * read for and Data mapping's focus had the same gap). A refused action
+ * caller focuses then: a `?` pressed with the sidebar hidden would open the
+ * shortcuts with focus never reaching them, and Genes read for and Data
+ * mapping's focus would have the same gap. A refused action
  * leaves the sidebar hidden and the promise pending: there is nothing to
  * focus. One reveal waits at a time; a second call shares it.
  *
  * Open the sections to show (a panel, a Session section) once it resolves,
  * not before: a section opened in the same moment reaches the history (its
  * `toggle`, recorded as `layout.section.open`) while the sidebar's action is
- * starting, which keeps it as a change made outside the history (R9K-2).
+ * starting, which keeps it as a change made outside the history.
  *
  * @param {Document} ownerDocument
  * @returns {Promise<void>}
@@ -75,7 +75,7 @@ export function revealSidebar(ownerDocument) {
  * then `open` (the panels and sections to open, the control to focus) once
  * it is. Every way to a control inside the sidebar from outside it takes
  * this path (Genes read for, Data mapping, `?`), so none opens a section in
- * the moment the sidebar's action starts (R9K-2). Resolves with what `open`
+ * the moment the sidebar's action starts. Resolves with what `open`
  * returns; a refused show leaves it pending, as `revealSidebar`.
  *
  * @template T
@@ -209,9 +209,9 @@ export function initSidebarControls({ dom, onViewportOcclusionChange, actions })
     // Taken while the sidebar slides (a toggle, or a window turned from a
     // phone's width to a desktop's, whose hidden sidebar slides to its new
     // place), the area beside it is published again once it has stopped:
-    // the slide counts as shown, and a hidden sidebar left the panes beside
-    // a gap where it had been (found 2026-11-11: a phone turned sideways kept
-    // three panes in 574 of its 844 px, a 270 px empty band at the left).
+    // the slide counts as shown, and a hidden sidebar would leave the panes
+    // beside a gap where it had been (a phone turned sideways would keep its
+    // panes in part of its width, an empty band at the left).
     if (transitionFrame === 0 && isSidebarTransitionRunning()) {
       transitionFrame = ownerWindow.requestAnimationFrame(awaitSidebarTransitionEnd);
     }

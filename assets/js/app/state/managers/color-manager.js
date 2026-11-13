@@ -46,8 +46,8 @@ import { isColumnForm } from '../../../data/column-forms.js';
  * One range scan per continuous values array.
  *
  * `ensureContinuousMetadata` runs from coloring, filtering, the legend and the
- * color domain, several times per field switch, and each run used to scan
- * every value: at 5,000,000 cells that was most of a switch's main-thread time.
+ * color domain, several times per field switch, and a scan of every value
+ * on each run is most of a switch's main-thread time on a large dataset.
  * A field's values are never written in place — loading new values produces a
  * new array — so the scan is a pure function of the array and is kept for as
  * long as the array is. An undrawable scan is kept too, so every caller gets
@@ -247,6 +247,7 @@ function computeContinuousDomain(field, meta, useLog) {
 const ACTIVATION_SLICE_MS = 8;
 
 export class DataStateColorMethods {
+  /** @this {import('../core/data-state.js').DataState} */
   _updateActiveCategoryCounts() {
     const field = this.getActiveField();
     if (!field || field.kind !== 'category') {
@@ -266,17 +267,17 @@ export class DataStateColorMethods {
    * gene comes out of `adata.X` and a field out of `adata.obs` — so it has to be
    * a property of the field being described, not of the viewer.
    *
-   * This read `activeFieldSource`, which is what the viewer is *currently*
-   * colored by. That is right only when the field being validated is also the
-   * active one, and three of the callers are the opposite case:
-   * `computeGlobalVisibility()` walks every obs field carrying a filter, and
-   * `toggleFilterEnabled` / `removeFilter` validate one obs field by name. While
-   * a gene was colored, `activeFieldSource` was `'var'` for all of them, so an
-   * `obs` column that could not be drawn was reported as a gene and handed the
-   * reader `adata.X` repair advice for a column that is not in `adata.X`.
+   * It is not `activeFieldSource`, which is what the viewer is *currently*
+   * colored by: that is right only when the field being validated is also the
+   * active one, and `computeGlobalVisibility()` (every obs field carrying a
+   * filter) and `toggleFilterEnabled` / `removeFilter` (one obs field by
+   * name) are the opposite case. While a gene is colored, an `obs` column that
+   * could not be drawn would be reported as a gene, with `adata.X` repair
+   * advice for a column that is not in `adata.X`.
    *
    * Membership answers it truthfully: this object owns both collections.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{key?: unknown}} field
    * @returns {{kind: 'gene'|'field', name: string}}
    */
@@ -294,6 +295,7 @@ export class DataStateColorMethods {
     };
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   ensureContinuousMetadata(field) {
     requireContinuousField(field);
     if (field.values.length !== this.pointCount) {
@@ -442,6 +444,7 @@ export class DataStateColorMethods {
     };
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getContinuousColorDomain(field) {
     const meta = this.ensureContinuousMetadata(field);
     return computeContinuousDomain(field, meta, field._useLogScale);
@@ -453,6 +456,7 @@ export class DataStateColorMethods {
    * with negative values (scaled expression) has no such floor, nor has an
    * obs field: a zero there is a value.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} field
    * @param {boolean} expression
    * @returns {boolean}
@@ -479,6 +483,7 @@ export class DataStateColorMethods {
    * only (`_zeroGrayApplies`). On a log scale a 0 has no logarithm and is
    * gray either way.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} field
    * @param {{expression?: boolean, readRows?: number|null}} [options] -
    *   `expression`: the field is a gene's (default: the shown field is one);
@@ -518,6 +523,7 @@ export class DataStateColorMethods {
    * Make a categorical field's colors, visibility and filter switch where
    * it has none (its default colors, every category shown, filtering on),
    * and check them: each array once (`category-state.js`).
+   * @this {import('../core/data-state.js').DataState}
    */
   ensureCategoryMetadata(field) {
     requireCategoryField(field);
@@ -529,12 +535,11 @@ export class DataStateColorMethods {
     }
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   updateColorsCategorical(field) {
     const n = this.pointCount;
     requireCategoryField(field);
-    const categories = field.categories;
     const codes = field.codes;
-    const numCats = categories.length;
 
     if (
       !isCategoricalCodes(codes)
@@ -559,6 +564,7 @@ export class DataStateColorMethods {
    * overwritten before anything read it (and would withdraw the visibility
    * result the pass can reuse).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field Category field with resolved colors and visibility.
    */
   _writeCategoryColors(field) {
@@ -631,6 +637,7 @@ export class DataStateColorMethods {
     for (let i = 0; i < n; i++) colorWords[i] = wordBySpan[codes[i]];
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   clearCentroids() {
     this.centroidCount = 0;
     this.centroidPositions = null;
@@ -656,6 +663,7 @@ export class DataStateColorMethods {
    * them; a result is kept only while its field, codes, layout and positions
    * are still the current ones.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field - A loaded category field of this dataset.
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<void>}
@@ -699,6 +707,7 @@ export class DataStateColorMethods {
     field._normalizedLayouts.add(layoutKey);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   buildCentroidsForField(field, options) {
     requireCategoryField(field);
     if (
@@ -851,8 +860,8 @@ export class DataStateColorMethods {
     this.centroidCount = centroids.length;
     // A label element a category only while the view shows labels
     // (`_syncCentroidLabelsShown` makes them when they turn on): a field of a
-    // million categories made a million elements on every switch and
-    // filter, shown or not (7-11 s of the page at 10M cells).
+    // million categories would make a million elements on every switch and
+    // filter, shown or not (measured: 33_decisions_actions_domains_and_history.md).
     const allowLabels = this.viewer?.getCentroidFlags?.(String(viewKey))?.labels === true;
 
     this.centroidPositions = new Float32Array(this.centroidCount * 3);
@@ -914,7 +923,11 @@ export class DataStateColorMethods {
     }
   }
 
-  /** Whether `field` is a gene: one of the var fields of the state or of a kept view. @private */
+  /**
+   * Whether `field` is a gene: one of the var fields of the state or of a kept view.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _isGeneField(field) {
     if ((this.varData?.fields ?? []).includes(field)) return true;
     for (const context of this.viewContexts?.values?.() ?? []) {
@@ -923,6 +936,7 @@ export class DataStateColorMethods {
     return false;
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   updateLegendState(field) {
     if (
       field === null
@@ -988,6 +1002,7 @@ export class DataStateColorMethods {
     };
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   applyContinuousFilter(fieldIndex, newMin, newMax) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
     requireContinuousField(field);
@@ -1003,6 +1018,7 @@ export class DataStateColorMethods {
     this.computeGlobalVisibility();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   resetContinuousFilter(fieldIndex) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
     requireContinuousField(field);
@@ -1012,6 +1028,7 @@ export class DataStateColorMethods {
     this.computeGlobalVisibility();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   setContinuousColorRescale(fieldIndex, enabled) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
     requireContinuousField(field);
@@ -1035,6 +1052,7 @@ export class DataStateColorMethods {
     this._notifyColorChange(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   setContinuousColorRange(fieldIndex, min, max) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
     requireContinuousField(field);
@@ -1060,6 +1078,7 @@ export class DataStateColorMethods {
     this._notifyColorChange(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   setContinuousLogScale(fieldIndex, enabled) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
     requireContinuousField(field);
@@ -1079,6 +1098,7 @@ export class DataStateColorMethods {
    * cells; off (the default), in the color scale's lowest color
    * (`updateColorsContinuous`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {boolean} enabled
    */
@@ -1094,6 +1114,7 @@ export class DataStateColorMethods {
     this._notifyColorChange(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   setContinuousColormap(fieldIndex, colormapId) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
     requireContinuousField(field);
@@ -1106,6 +1127,7 @@ export class DataStateColorMethods {
     this._notifyColorChange(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getContinuousColormaps() {
     return CONTINUOUS_COLORMAPS;
   }
@@ -1115,6 +1137,7 @@ export class DataStateColorMethods {
    * what draws them (the legend) follows, whoever changed them (a control,
    * an undo, an agent, a notebook).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field
    */
   _notifyColorChange(field) {

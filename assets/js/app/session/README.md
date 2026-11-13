@@ -2,12 +2,14 @@
 
 **Owns:** the `.cellucid-session` file of the open dataset (format 4): saving its history, loading
 one back into the history, and putting a dataset's published starting view back
-(`session-serializer.js`, `createSessionSerializer`); the format itself (`history-file.js`:
+(`session-serializer.js` holds the `SessionSerializer` class, `index.js` its factory `createSessionSerializer`); the format itself (`history-file.js`:
 manifest, chunks, verification), its framing (`bundle/`) and codecs (`codecs/`: gzip, cell sets,
 varints); starting views (`published-default.js`, `catalog-default-session.js`); what a session
 says about its dataset (`session-context.js`: the dataset fingerprint, the fields its state uses),
 where the dataset opens from (`dataset-source-record.js`), the cells and genes it was saved on
-(`cell-subset-record.js`); the analysis results a shared file left out, run again once it is
+(`cell-subset-record.js`), what wrote the file (`app-stamp.js`: the Cellucid version, the catalog's
+digest, each action's parameter shape), the closed-schema assertions every owner validates with
+(`schema-contract.js`); the analysis results a shared file left out, run again once it is
 open (`recompute-results.js`); and what a reading of the same dataset with other cells keeps
 (`view-carry.js`, every state domain but the cells, through the domains' owners).
 
@@ -24,8 +26,7 @@ also what `cellucid-datasets` publishes starting views with).
 
 Only one current state document is accepted: session format 4, whose version is part of the file
 signature (`CELLUCID_SESSION/4\n`, `bundle/format.js`). A session of another format version is
-refused naming it (`otherSessionFormatMessage()`: format 3 held one state in per-feature chunks,
-not the history of the steps; formats 1 and 2 before it); a library file of My datasets
+refused naming it (`otherSessionFormatMessage()`); a library file of My datasets
 (`CELLUCID_LIBRARY/1\n`, the same framing: `app/library/library-file.js`) with
 `LIBRARY_FILE_NOT_A_SESSION_MESSAGE`, which says where it is imported; any other file with
 `NOT_A_SESSION_FILE_MESSAGE`. The framing is one for both kinds: `writeBundle` and `readBundle`
@@ -55,14 +56,15 @@ holds no `values` chunk; any other holds at least one eager one.
 
 **Bounded pieces.** `steps`, `parts` and `values` chunks are JSON cut where their text passes 16 MiB
 (`CHUNK_TEXT_CHARS`, `history-file.js`): one list or map in several chunks, read back as one. No
-single string nears the page's longest (2^29 − 24 characters in V8; one JSON string of every lazy
-value passed it near 70k steps), and a reader inflates one piece at a time. A skeleton longer than
+single string nears the page's longest (2^29 − 24 characters in V8: one JSON string of every lazy
+value of a long history passes it; measured: 33_decisions_actions_domains_and_history.md), and a
+reader inflates one piece at a time. A skeleton longer than
 a piece is a chunk of its own.
 
 **Compression, per chunk by measured gain.** Each chunk is stored gzip'd (`codec: 'gzip'`) when
 that saves at least a sixteenth of its bytes, else as it is (`codec: 'none'`, `storedBytes` equal
-to `uncompressedBytes`). Skeletons shrink about 5-8×; float arrays and cell-set bytes barely, and
-are then read without inflating.
+to `uncompressedBytes`). Skeletons shrink several-fold; float arrays and cell-set bytes barely (measured:
+33_decisions_actions_domains_and_history.md), and are then read without inflating.
 
 **Skeletons** (`app/history/value-parts.js`): a value as JSON with every typed array as
 `{"$array": <digest>}` (`<type>:<length>:<sha256 of its bytes>`), every number JSON cannot hold as
@@ -77,7 +79,7 @@ against its own hash once joined, a part's name is never trusted, a part that na
 step whose parameters name an array or a part only the lazy chunks hold is read with them still a
 skeleton and given joined by `readRest` (`params`).
 
-No chunk holds a picture of a step (History v2 §3.15.7): a picture is drawn from the live view when
+No chunk holds a picture of a step: a picture is drawn from the live view when
 someone asks for one (the printable report, an agent's `view.picture`) and never kept.
 
 The manifest also carries the dataset fingerprint (below), where the dataset opens from
@@ -91,7 +93,7 @@ type then version; `params` is the SHA-256 of that version's params shape, `acti
 canonical JSON, when the writer's catalog is at that version, else null), what the share chose
 (`scope`, below), the page chrome it carries outside its history (`chrome`: `{pressed: {<group id>:
 <button id>}}`, the pressed button of each pressed-button group, `data-state-serializer-pressed-group`,
-today the selection tool `highlight-mode`, CEL-0249; written from the page at a save and kept in every
+the selection tool `highlight-mode`; written from the page at a save and kept in every
 form, put back once a load has shown its head, a group the page lacks named in a note; `{pressed: {}}`
 when the page keeps none), the active tracker
 (`activeTracker`) and every tracker's record.
@@ -137,10 +139,6 @@ and each step of a `steps` chunk is
   `draft: null`, because a save or a share squashes the changes made while paused first (this
   browser's autosave keeps the draft, as values it never prunes).
 
-Replaced in place (format 4 is unreleased; nothing reads the earlier shape): a tracker's
-`linkedFrom` by `start`, its `branchNames` and `activeTipId` by `branches` and `activeBranch`; a
-step's `origin`, `agent`, `host` and `turn` by `by`, and its `note` by `reason`.
-
 **What the share or save chose** (`scope`: `{trackers, branches, content, results, notes, chats,
 journal, times, source}`) is what the file holds:
 - the trackers named, each with the branches named (`branches`: `[{tracker, branches}]`) and the
@@ -148,10 +146,8 @@ journal, times, source}`) is what the file holds:
 - notes and bookmarks only with `notes`; conversations only with `chats`; the journal only with
   `journal` (checked whole by `validateSession`);
 - `content: 'history'`: the trackers and branches with every value their steps name;
-- `content: 'state'` (Current state only): one tracker of one branch holding the root (the dataset
-  as opened) and one squashed step "Shared state" (`cause: 'share'`, no count, no author) shown,
-  with no turn, group, note, journal or conversation; Python, R and this reader apply it as any
-  file;
+- `content: 'state'` (Current state only): one squashed step "Shared state" over the dataset as
+  opened, with nothing else (developer doc 10, "What a choice keeps");
 - `content: 'steps'` (Steps only): no `values` chunk (`array` and `parts` chunks only for what the
   steps' parameters and outcomes still name); each step keeps its record, with `null` in
   place of every parameter that names cells by position (an `x-cells` array) or holds a value per
@@ -194,9 +190,8 @@ conversations, Recently deleted, late parameters) following it, and a name taken
 "(shared)". Each tracker added is journaled (`load`, "Loaded … from <file>"): undoing it removes the
 tracker to Recently deleted, and the notice after the load offers that **Undo** for all of them
 (`history.journal.undo`). A file of steps only opens as a replay (`history.replay`). A saved state
-opened from this browser replaces the history (`history.load`). The page chrome a file carries is
-planned against this page before anything is replaced (`planPageChrome`), applied once its head is
-shown, and what this page lacks of it is said.
+opened from this browser replaces the history (`history.load`). `planPageChrome` plans the page
+chrome a file carries before anything is replaced (developer doc 10, "Loading").
 
 A load is one awaited public operation, all or nothing: once the eager chunks are read the active
 head is shown; the lazy ones are read while it is shown, before the history accepts a new step; any
@@ -204,9 +199,8 @@ later failure, and Cancel, puts back what was shown and keeps the trackers there
 is read and the dataset fingerprint checked before anything else is refused, so a session opened
 with no dataset says which dataset it was saved on. If the file's dataset fingerprint does not match the dataset loaded, the complete restore
 rejects and rolls back; no dataset-agnostic layout subset is salvaged. Its steps can still be
-replayed on that dataset (the State panel's Replay a session file here…, `openSessionFile`): the
-file is read whole and checked as a file, its values are never put back, and its steps are applied
-again by name in a new tracker linked to the one they come from (`app/history/replay.js`). A loaded session plays its
+replayed on that dataset (the State panel's Replay a session file here…, `openSessionFile`,
+`app/history/replay.js`). A loaded session plays its
 camera path when it was saved with Autoplay on (`onLoaded`).
 
 The autosave's saved states (`app/history/autosave.js`) load the same way (`loadSavedHistory`).
@@ -264,10 +258,9 @@ Why the stored values, by original position:
   cell.
 - Observation and variable names are also invariant under a row permutation, so they cannot
   detect the change either.
-- Display coordinates are centered and scaled by the bounds of the cells an embedding was first
-  read for, a frame an opening grown or cut in place keeps: they depend on how the cells were
-  opened. The stored values do not, so the same cells digest alike whole, grown, after **Apply**,
-  cut in place to a session's share, in priority order or as given.
+- Display coordinates depend on how the cells were opened (developer doc 10, "Cell-order digest"),
+  so the digest is never taken over them: the stored values do not, and the same cells digest
+  alike however they were opened.
 
 Why the embedding travels with the digest:
 - A digest is comparable only within one embedding's columns.
@@ -283,22 +276,10 @@ Cost:
   Once the digest is answered it re-checks every fingerprint field but the digest
   (`datasetFingerprintStillCurrent()`).
 
-Restore is verify-then-apply (`verifySessionFingerprint()`): every check below runs before any
-value is put back, and each refusal has its own message, surfaced verbatim by the session
-controls:
-
-| Cause | Where it is raised | What the user is told |
-|---|---|---|
-| A session of another format version (format 3 and earlier included) | the signature, `bundle/reader.js` | `otherSessionFormatMessage()`: saved by an earlier (or a newer) Cellucid, naming its format |
-| A dataset's published sample view of another format version (the app and the datasets are deployed minutes apart) | the signature, `bundle/reader.js` (`isOtherSessionFormat`), `app/main.js` | the dataset opens on its default view, with one short line that the starting view isn't available right now; nothing about formats, and no other format is read |
-| A library file of My datasets (`.cellucid-library`) | the signature, `bundle/reader.js` | `LIBRARY_FILE_NOT_A_SESSION_MESSAGE`: what it is, and where it is imported |
-| A file without a session signature | the signature, `bundle/reader.js` | `NOT_A_SESSION_FILE_MESSAGE` |
-| The id or a count differs | `verifySessionFingerprint()` | it is a different dataset, with both saved and current cell/gene counts, or both identities, named |
-| `dataMapping` differs in a group the viewer cannot change (graph, gene names, expression, latent space, vector fields), or turns on an embedding this dataset cannot show | `verifySessionFingerprint()` | the group or the embedding is named, by its embedding id or `obsm` key |
-| `cellOrder.embedding` names no layout of this dataset | `verifySessionFingerprint()` | the embedding is named |
-| `cellOrder.digest` differs, everything else matches | `verifySessionFingerprint()` | same name and counts, different cell order, so every saved selection would mark the wrong cells |
-| A field in `requires` is missing; a gene too, when the saved mapping names genes the way the open one does (else the domain that holds it names it) | `describeMissingRequiredFields()` | every missing key is named |
-| A value this version's domains do not have | `history.load` | the domain is named |
+Restore is verify-then-apply (`verifySessionFingerprint()`): every check runs before any value is
+put back, and each cause has its own message, surfaced verbatim by the session controls. The causes,
+where each is detected and what the person is told are in developer doc 10, "Refusals"
+(`cellucid-python/docs/user_guide/web_app/p_developer_docs/10_sessions_persistence_and_serialization.md`).
 
 A session whose embeddings differ from the open dataset's, but which the dataset can show, is not
 refused: the data mapping is put back right after the open cells (`app/actions/domains.js`
@@ -327,12 +308,11 @@ objects; notifications; in-progress interaction state (a pointer lock, a selecti
 ## Extension rule
 
 A new persisted feature is a state domain's value (or part of one): the session file stores it as
-it is, with no encoder of its own. Name its fields, genes, categories and views by name and its
-cells by original position, keep typed arrays immutable, restore it exactly and idempotently, and
-add capture, restore, undo and file round-trip coverage. A change to the file itself changes the
-only current format: update every current producer, consumer, fixture, and reference together; do
-not add a reader for an older shape.
+it is, with no encoder of its own; the rule, with its coverage, is developer doc 10, "Adding or
+changing persistence". A change to the file itself changes the only current format: update every
+current producer, consumer, fixture, and reference together; do not add a reader for an older
+shape.
 
 **Tests:** `tests/session-history-file.test.mjs`, `tests/session-serializer-contract.test.mjs`,
 `tests/session-starting-view-contract.test.mjs`, `tests/session-cell-order-identity-contract.test.mjs`,
-`tests/session-docs-current-contract.test.mjs` (this page), `tests/browser/history-session-file.spec.mjs`.
+`tests/browser/history-session-file.spec.mjs`.

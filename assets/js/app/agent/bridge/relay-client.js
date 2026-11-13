@@ -258,7 +258,7 @@ export function createRelayClient({
     }
     // One name everywhere a person sees this agent (activity line, confirm card, history steps), as
     // Manage… names the connection (`connect/model.js` `appName`): an app no site vouches for is its
-    // host (or an app on this computer) with its own name quoted, so two of them are told apart (L26-4).
+    // host (or an app on this computer) with its own name quoted, so two of them are told apart.
     const named = known === true ? agent : appName(agent, client, false);
     void calls.run({ id, tool, args, agent: named, connection: { id: grant, client, host, known: known === true } });
   }
@@ -676,7 +676,9 @@ export function createRelayClient({
  *   onConnectionsChanged?: () => void,
  *   datasetName?: () => string|null,
  *   datasetLink?: () => string|null,
- * }} options
+ *   currentStep?: () => ({id: string, label: string}|null),
+ *   permissionFor?: (question: {kind: string, connection: {id: string, kind: string}}) => ('ask'|'allow'|'deny'|null),
+ * }} options - Each but `actions` and `onApprovalError` as `createRelayClient` takes it
  */
 export function startRelayClientForPage({ actions, onApprovalError = () => {}, ...listeners }) {
   const version = pageVersion() ?? '';

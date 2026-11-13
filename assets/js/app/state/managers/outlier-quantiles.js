@@ -96,7 +96,7 @@ export function describePlanBytes(plan) {
 }
 
 export class DataStateOutlierQuantileMethods {
-  /** @private */
+  /** @this {import('../core/data-state.js').DataState} @private */
   _outlierRegistry() {
     if (!(this._outlierJobs instanceof Map)) {
       this._outlierJobs = new Map();
@@ -108,7 +108,9 @@ export class DataStateOutlierQuantileMethods {
 
   /**
    * The descriptor of an obs field the file holds, when it is that field
-   * (a user-defined field has none), else null. @private
+   * (a user-defined field has none), else null.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
    */
   _outlierDescriptor(fieldIndex) {
     const field = this.obsData?.fields?.[fieldIndex];
@@ -121,6 +123,7 @@ export class DataStateOutlierQuantileMethods {
   /**
    * The latent space a descriptor's outlier route measures in: the route
    * names it, whatever the data mapping says while a new one is applied.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _outlierLatentKey(descriptor) {
@@ -131,7 +134,9 @@ export class DataStateOutlierQuantileMethods {
 
   /**
    * The `obsm` arrays that look like a latent space, likeliest first: wider
-   * than an embedding, not a vector field, not named as positions. @private
+   * than an embedding, not a vector field, not named as positions.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
    */
   _latentSuggestions() {
     const candidates = this.getMappingCandidates?.() ?? null;
@@ -153,7 +158,11 @@ export class DataStateOutlierQuantileMethods {
       .sort((a, b) => hintRank(a.key) - hintRank(b.key) || a.key.localeCompare(b.key));
   }
 
-  /** What getting a descriptor's quantiles costs, once known; asks for it once. @private */
+  /**
+   * What getting a descriptor's quantiles costs, once known; asks for it once.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _outlierPlan(descriptor) {
     const plans = this._outlierRegistry()._outlierPlans;
     if (plans.has(descriptor)) {
@@ -181,6 +190,7 @@ export class DataStateOutlierQuantileMethods {
   /**
    * Where one obs field's outlier filter stands (module states).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} [fieldIndex] - The active field by default
    * @returns {Readonly<Object>}
    */
@@ -245,6 +255,7 @@ export class DataStateOutlierQuantileMethods {
    * canceled or `signal` aborted (the job goes on for other callers), and
    * with the failure otherwise.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Float32Array|null>}
@@ -263,6 +274,7 @@ export class DataStateOutlierQuantileMethods {
    * kept, and its thresholds are back at 100%. Nothing happens when none is
    * being got.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} [fieldIndex] - The active field by default
    * @returns {boolean} Whether a job was canceled
    */
@@ -279,6 +291,7 @@ export class DataStateOutlierQuantileMethods {
    * failures recorded for its fields go with it. Called when another dataset
    * (or none) is published: a job left running would keep reading the old
    * latent space and then report on, or mark choices of, the new dataset.
+   * @this {import('../core/data-state.js').DataState}
    */
   retireOutlierJobs() {
     const registry = this._outlierRegistry();
@@ -294,6 +307,7 @@ export class DataStateOutlierQuantileMethods {
    * threshold below 100% in some view) and does not have them — after the
    * latent space changed — and recolor the views once each arrives. Each is
    * an ordinary job: it shows progress and can be canceled.
+   * @this {import('../core/data-state.js').DataState}
    */
   resumeOutlierFilters() {
     const indexes = new Set();
@@ -319,7 +333,7 @@ export class DataStateOutlierQuantileMethods {
     }
   }
 
-  /** @private */
+  /** @this {import('../core/data-state.js').DataState} @private */
   _startOutlierJob(fieldIndex, descriptor) {
     const registry = this._outlierRegistry();
     registry._outlierFailures.delete(descriptor);
@@ -369,7 +383,11 @@ export class DataStateOutlierQuantileMethods {
     return job;
   }
 
-  /** Every view's copy of the field, and the field cache, get `quantiles`. @private */
+  /**
+   * Every view's copy of the field, and the field cache, get `quantiles`.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _installOutlierQuantiles(fieldIndex, quantiles) {
     const field = this.obsData.fields[fieldIndex];
     const lists = [this.obsData.fields];
@@ -387,7 +405,11 @@ export class DataStateOutlierQuantileMethods {
     if (cached) this._fieldDataCache.set(cacheKey, { ...cached, outlierQuantiles: quantiles });
   }
 
-  /** Every view's threshold of the field back at 100%: no quantiles, no filter. @private */
+  /**
+   * Every view's threshold of the field back at 100%: no quantiles, no filter.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _resetOutlierThresholds(fieldIndex) {
     const lists = [this.obsData?.fields];
     for (const [viewId, context] of this.viewContexts ?? []) {
@@ -401,7 +423,7 @@ export class DataStateOutlierQuantileMethods {
     }
   }
 
-  /** @private */
+  /** @this {import('../core/data-state.js').DataState} @private */
   _endOutlierJob(job, error) {
     const registry = this._outlierRegistry();
     if (registry._outlierJobs.get(job.descriptor) === job) registry._outlierJobs.delete(job.descriptor);

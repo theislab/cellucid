@@ -30,6 +30,7 @@ import {
   stalePageFiles,
   writePageBundle,
 } from './build-page-bundle.mjs';
+import { builtKeptCodeFingerprints } from './kept-code-fingerprints.mjs';
 import { THIS_MACHINE_HOSTS } from '../assets/js/workers/worker-script.js';
 
 const execFileAsync = promisify(execFile);
@@ -432,23 +433,36 @@ export function renderPageBoot({ entry, preload }) {
       ];
       const entry = new URL(thisMachine ? ${JSON.stringify(PAGE_ENTRY)} : bundle[0], document.baseURI).href;
       if (!thisMachine) {
-        for (const path of bundle) {
+        // Each startup file's preload, settled once the file is in or failed.
+        const preloaded = bundle.map(path => {
           const link = document.createElement('link');
           link.rel = 'modulepreload';
           link.href = path;
+          const settled = new Promise(resolve => {
+            link.addEventListener('load', resolve, { once: true });
+            link.addEventListener('error', resolve, { once: true });
+          });
           document.head.append(link);
-        }
+          return settled;
+        });
         // The code cache (service-worker.js), once the page has loaded: a
         // later visit takes every file whose address names its bytes from
-        // this browser. It is told which files this visit loaded, so the next
-        // one already finds them.
+        // this browser. It is told the startup files and every other file
+        // this visit loaded, so the next one already finds them, once the
+        // startup files are in: the page's load does not wait for a module
+        // preload, and a file still arriving is in neither the page's
+        // resource timing nor the browser's HTTP cache, so the worker would
+        // fetch it a second time.
         if ('serviceWorker' in navigator) {
           window.addEventListener('load', () => {
             const build = document.querySelector('meta[name="cellucid-web-build-id"]')?.content ?? '';
             navigator.serviceWorker.register(\`service-worker.js?build=\${encodeURIComponent(build)}\`)
-              .then(() => navigator.serviceWorker.ready)
-              .then(registration => registration.active?.postMessage({
-                keep: performance.getEntriesByType('resource').map(entry => entry.name),
+              .then(() => Promise.all([navigator.serviceWorker.ready, ...preloaded]))
+              .then(([registration]) => registration.active?.postMessage({
+                keep: [...new Set([
+                  ...bundle.map(path => new URL(path, document.baseURI).href),
+                  ...performance.getEntriesByType('resource').map(entry => entry.name),
+                ])],
               }))
               .catch(() => {});
           }, { once: true });
@@ -871,7 +885,19 @@ async function writeInventoryAtomically(outputPath, bytes) {
 async function runCli() {
   const rootDir = resolve(fileURLToPath(new URL('..', import.meta.url)));
   const args = process.argv.slice(2);
-  // The worker bundles come first: they are shipped files, so the inventory,
+  // The code fingerprints of kept data come before everything: they are a
+  // source module (kept-code-fingerprints.mjs), which the bundles hold.
+  const keptCode = await builtKeptCodeFingerprints({ rootDir });
+  if (keptCode.stale) {
+    if (args.length === 1 && args[0] === '--check') {
+      throw new Error(
+        `${keptCode.path} is not what the code that writes kept data gives: `
+          + 'run `node scripts/generate-web-asset-inventory.mjs`.'
+      );
+    }
+    if (args.length === 0) await writeInventoryAtomically(keptCode.absolutePath, keptCode.bytes);
+  }
+  // Then the worker bundles: they are shipped files, so the inventory,
   // the import map and the build id are taken over them.
   const workers = await buildWorkerBundles({ rootDir });
   if (args.length === 0) {

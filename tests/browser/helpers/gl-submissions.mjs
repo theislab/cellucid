@@ -15,9 +15,9 @@
  * Why it is asserted and not left to the pixels:
  *
  * - The frame a spec reads has to be the same kind of frame on both sides.
- *   On hosted Windows Firefox two pixels of `segmented-point-stores` differed
- *   (nightly run 42180511574), and the draws attached to that failure were not
- *   the same on both sides: one frame was the first drawn after the level
+ *   Two frames can differ when the draws behind them are not the same on both
+ *   sides (measured: 38_decisions_testing_and_hosted_runners.md): one frame is
+ *   the first drawn after the level
  *   changed (it also ran the highlight renderer's transform-feedback pass,
  *   which writes the highlight words of the new level), the other a later
  *   pulse frame without it. Four animation frames after a change had stood
@@ -25,9 +25,8 @@
  *   the pulse is paced by the measured frame cost (`ambient-frame-pacing.js`),
  *   so on a slow renderer the first frame after a change is still the last
  *   one drawn. `steadyPulseFrame` waits for the frame loop to repeat itself.
- * - Where a renderer does not draw equal inputs to equal pixels (hosted macOS
- *   Firefox, `hosted-gl.mjs`), equal submissions are what a spec still proves
- *   exactly.
+ * - When the pixels of two frames differ, the submissions say whether the
+ *   two frames drew the same thing, so a failure starts from what was drawn.
  *
  * Not recorded: the contents of textures and where a texture keeps its
  * texels, which vertices of a store a call draws (the stores' bytes and the

@@ -3,7 +3,7 @@
  * the data. Floating panels and where they float, the analysis windows'
  * places and the sizes remembered per analysis, which sidebar sections are
  * open, the sidebar itself, and the theme. History settings › "Panels,
- * windows and theme" switches its recording (History v2 §3.15.5).
+ * windows and theme" switches its recording.
  *
  * Value:
  *
@@ -24,9 +24,8 @@
  *                                            // a width the person dragged it to, null
  *                                            // for the default
  *
- * The theme is part of the dataset's history (the owner's decision,
- * 2026-11-03: layout, panels, docking and theme are steps). Page chrome is
- * not (History v2 §3.3.8): the phone sheet open or closed, the sidebar's
+ * The theme is part of the dataset's history (layout, panels, docking and
+ * theme are steps). Page chrome is not: the phone sheet open or closed, the sidebar's
  * scroll and focus, which panel is in front. The sidebar's `open` is the
  * choice its owner keeps (`ui/modules/sidebar-controls.js`), which on the
  * phone layout the sheet does not change. A restore shows
@@ -96,7 +95,7 @@ function requirePanelFrame(dockable, details, context) {
  * The geometry a floating panel *has*, which is not always what it shows: a
  * collapsed panel is drawn `height: auto` and a panel wider than the window
  * is capped by `max-width` (`css/components/_accordion.css`). Measuring what
- * is drawn saved the header height of a collapsed panel and narrowed a wide
+ * is drawn would save the header height of a collapsed panel and narrow a wide
  * panel on every save on a narrow window; the box is the frame's
  * `--pos-x/y/width/height`, which the dockable owner sets.
  */
@@ -217,23 +216,42 @@ function readSidebar(sidebarLayout) {
 // The analysis windows' places and the sizes remembered per analysis
 // ---------------------------------------------------------------------------
 
-/** The value when the analysis code never loaded: no window, no size remembered. */
-const NO_ANALYSIS_LAYOUT = Object.freeze({ windows: Object.freeze([]), sizes: null });
+/** No size remembered, as the analysis window manager exports it. */
+const NO_VIEW_SIZES = Object.freeze({ window: Object.freeze({}), expandedView: Object.freeze({}) });
+
+/** Whether two values place and size the analysis windows alike (`sizes: null` is no size remembered). */
+function sameAnalysisLayout(a, b) {
+  return sameValue(a.windows, b.windows) && sameValue(a.sizes ?? NO_VIEW_SIZES, b.sizes ?? NO_VIEW_SIZES);
+}
 
 /**
  * The part of the layout the analysis windows make (`layout.analysis`):
  * `{windows: [{rect, open}, …], sizes: {window, expandedView} | null}`, read
- * and put back through the analysis window manager. Pure of the DOM.
+ * and put back through the analysis window manager. Pure of the DOM. Capture
+ * never waits for the analysis code; restore waits for it only to place or
+ * size what it shows.
  *
- * @param {() => Promise<{analysisWindowManager: object}|null>} analysis - The analyses once their code arrived, or null
+ * @param {() => {analysisWindowManager: object}|null} analysis - The analyses now, null before their code has
+ *   arrived and when it could not load
+ * @param {() => Promise<{analysisWindowManager: object}|null>} analysisArrived - Settles with them once the code
+ *   has arrived, or with null once it could not load
  */
-export function createAnalysisWindowLayout(analysis) {
-  if (typeof analysis !== 'function') throw new TypeError('The layout domain needs the analyses (analysis()).');
+export function createAnalysisWindowLayout(analysis, analysisArrived) {
+  if (typeof analysis !== 'function' || typeof analysisArrived !== 'function') {
+    throw new TypeError('The layout domain needs the analyses (analysis() and analysisArrived()).');
+  }
 
+  /**
+   * `{windows: [], sizes: null}` is no window and no size remembered: before
+   * the analysis code has arrived, on a page where it could not load, and
+   * where it has and nothing was placed or sized, which is one value, so the
+   * code's arrival changes nothing the history holds.
+   */
   async function capture() {
-    const refs = await analysis();
+    const refs = analysis();
     if (refs === null) return { windows: [], sizes: null };
-    return { windows: refs.analysisWindowManager.exportWindowPlaces(), sizes: refs.analysisWindowManager.exportViewSizes() };
+    const sizes = refs.analysisWindowManager.exportViewSizes();
+    return { windows: refs.analysisWindowManager.exportWindowPlaces(), sizes: sameValue(sizes, NO_VIEW_SIZES) ? null : sizes };
   }
 
   /** Checked whole before anything moves. */
@@ -245,18 +263,23 @@ export function createAnalysisWindowLayout(analysis) {
   }
 
   async function restore(current, value) {
-    if (sameValue(current, value)) return;
-    const refs = await analysis();
-    if (refs === null) {
-      if (sameValue(value, NO_ANALYSIS_LAYOUT)) return;
-      throw new Error('The analysis tools could not load on this page, so its analysis windows cannot be arranged.');
+    if (sameAnalysisLayout(current, value)) return;
+    // Places and sizes to put back while the analysis code is still loading are put back once it has arrived.
+    if (analysis() === null) {
+      if (await analysisArrived() === null) {
+        throw new Error('The analysis tools could not load on this page, so its analysis windows cannot be arranged.');
+      }
+      current = await capture();
+      if (sameAnalysisLayout(current, value)) return;
     }
+    const refs = analysis();
     // Places first: placing a window remembers its size for its analysis,
     // which the remembered sizes then set exactly. Places for other windows
     // than are open (the analysis domain left as it is) are applied to those
     // both name (`applyWindowPlaces`).
     if (!sameValue(current.windows, value.windows)) refs.analysisWindowManager.applyWindowPlaces(structuredClone(value.windows));
-    if (value.sizes !== null && !sameValue(current.sizes, value.sizes)) refs.analysisWindowManager.importViewSizes(structuredClone(value.sizes));
+    const sizes = value.sizes ?? NO_VIEW_SIZES;
+    if (!sameValue(current.sizes ?? NO_VIEW_SIZES, sizes)) refs.analysisWindowManager.importViewSizes(structuredClone(sizes));
   }
 
   function describe(a, b) {
@@ -278,17 +301,18 @@ export function createAnalysisWindowLayout(analysis) {
 
 /**
  * @param {{sidebar: HTMLElement, getDockable: () => object|null,
- *   analysis: () => Promise<{analysisWindowManager: object}|null>,
+ *   analysis: () => {analysisWindowManager: object}|null,
+ *   analysisArrived: () => Promise<{analysisWindowManager: object}|null>,
  *   sidebarLayout: {isSidebarShown: () => boolean, showSidebar: (shown: boolean) => void,
  *     setSidebarWidth: (width: number|null) => void}}} options
  */
-export function createLayoutDomain({ sidebar, getDockable, analysis, sidebarLayout }) {
+export function createLayoutDomain({ sidebar, getDockable, analysis, analysisArrived, sidebarLayout }) {
   for (const method of ['isSidebarShown', 'showSidebar', 'setSidebarWidth']) {
     if (typeof sidebarLayout?.[method] !== 'function') {
       throw new TypeError('The layout domain needs the sidebar\'s owner (isSidebarShown, showSidebar, setSidebarWidth).');
     }
   }
-  const analysisWindows = createAnalysisWindowLayout(analysis);
+  const analysisWindows = createAnalysisWindowLayout(analysis, analysisArrived);
   const controls = createUiControlSerializer({ sidebar, domains: ['layout'] });
 
   async function capture() {

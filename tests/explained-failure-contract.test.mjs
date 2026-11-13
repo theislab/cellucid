@@ -95,9 +95,9 @@ test('a compression the browser cannot decode is refused by name, before a read 
   const snappy = explainFormatError(zarrFailure, 'zarr');
   assert.match(snappy.message, /'snappy'.*write_zarr/);
   assert.equal(isExplainedFailure(snappy), true);
-  // lzma and bz2, refused by the earlier reader, are now read (`codec-layer-contract`).
+  // lzma and bz2 are read, not refused (`codec-layer-contract`).
   assert.equal(await unsupportedZarrFailure('lzma').then(error => error instanceof ZarrUnsupportedError), false);
-  // Blosc with Zstandard, refused by the earlier reader, is now read.
+  // Blosc with Zstandard is read, not refused.
   assert.equal(await unsupportedZarrFailure('zstd').then(error => error instanceof ZarrUnsupportedError), false);
 
   // Anything else is not dressed up as a format failure.
@@ -155,7 +155,7 @@ test('a failed opening over the empty viewer says the reason itself, and whether
 });
 
 test('an explained failure is said with the caller\'s own verb', () => {
-  // Found 2026-11-10: the samples' listing, offline, said "Sample datasets could not be opened".
+  // The samples' listing, offline, must not say "Sample datasets could not be opened".
   const explained = explainedFailure('The AnnData reader could not start.', DataSourceErrorCode.NETWORK_ERROR, 'local-demo');
   assert.equal(
     describeDataSourceFailure('Sample datasets', 'could not be loaded', explained),
@@ -163,7 +163,7 @@ test('an explained failure is said with the caller\'s own verb', () => {
   );
 });
 
-test('a subsample this dataset cannot be read with is a settled refusal said in its own words, never a connection problem (R9M-12)', async () => {
+test('a subsample this dataset cannot be read with is a settled refusal said in its own words, never a connection problem', async () => {
   const { isSettledDataSourceFailure, classifyDataSourceFailure } = await import('../assets/js/app/ui/modules/dataset-connections.js');
   const refused = explainedFailure(
     "A spatial subsample needs the embedding obsm['X_sparse'], which this dataset does not have as a dense array.",

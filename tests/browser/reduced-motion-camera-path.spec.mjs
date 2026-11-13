@@ -20,16 +20,15 @@ const CANVAS_CLIP = { x: 420, y: 260, width: 480, height: 380 };
 // Sampling a frame is a screenshot, and on a hosted runner with no GPU one
 // costs far more than the wait between samples — so the sample count, not the
 // interval, is what this test's wall-clock is made of. Four samples spaced
-// 300 ms apart watch for the same 1.2 s as the eight-at-150 ms they replace,
-// at half the screenshots. Reduced motion is the case that has to take all of
+// 300 ms apart watch for 1.2 s, at half the screenshots of eight 150 ms
+// apart. Reduced motion is the case that has to take all of
 // them; ordinary playback stops as soon as two samples differ, which is the
 // whole of what it asserts.
 const SAMPLE_COUNT = 4;
 const SAMPLE_INTERVAL_MS = 300;
 // The path has to still be playing while the samples that matter are taken, or
 // they all land after the end, hash identically, and "it animated" reads as "it
-// did not" — which is exactly how this failed on hosted macOS Firefox while
-// passing everywhere else. Eight seconds leaves room for a screenshot an order
+// did not" (as on hosted macOS Firefox). Eight seconds leaves room for a screenshot an order
 // of magnitude slower than on developer hardware, and the transport poll below
 // allows thirty.
 const PATH_DURATION_SECONDS = 8;
@@ -68,10 +67,9 @@ async function waitForViewerPaint(page) {
  * Before the next click in the sidebar: the opening over, and the page
  * showing the spec's last step (`whenActionsShown`). Every Camera Path control
  * is a recorded step, and the History panel above the Camera Path draws its
- * row on a later frame, moving every control below it. Web contracts run
- * 42293355104, Linux WebKit r2388: Apply aimed at y 627 with its box at
- * 617-637, released with it at 641-661 on the "End with a return to the
- * first keyframe" row.
+ * row on a later frame, moving every control below it (on Linux WebKit Apply
+ * aimed at y 627 with its box at 617-637 was released with it at 641-661, on the
+ * "End with a return to the first keyframe" row).
  */
 async function settle(page) {
   await waitForPageAtRest(page);
@@ -188,7 +186,7 @@ async function playAndMeasure(page, reducedMotion) {
     // Ordinary playback is proven the moment two frames differ, so sample
     // by presented frames, not by the clock: on a hosted renderer where one
     // frame takes seconds and a screenshot more, a clocked window of a few
-    // hundred milliseconds saw one frame and called the playback still. The
+    // hundred milliseconds sees one frame and calls the playback still. The
     // idle picture counts as a frame: a path whose first presented frame is
     // already its endpoint has moved the camera all the same. Sampling stops
     // at the proof (every sample costs a screenshot) or when playback ends.
@@ -233,17 +231,16 @@ const PREFERENCE_CASES = Object.freeze([
 
 // Each preference owns a full real dataset bootstrap and GPU playback. Keeping
 // them as separate contracts gives each independent operation the repository's
-// normal timeout fence; combining both made the second operation inherit time
+// normal timeout fence; combining both would make the second operation inherit time
 // already consumed by the first on hosted macOS Firefox.
 for (const scenario of PREFERENCE_CASES) {
   test(scenario.title, async ({ browser }) => {
     // Frame-driven from end to end: every click, screenshot and paint wait
     // below waits for a presented frame, and the scene draws a settle window
     // after each camera change. On
-    // hosted macOS Firefox a frame took about three seconds: a click about
-    // nine, a screenshot about six, and the case without a preference had
-    // done all its work, final camera read back, at 95 s of a 90 s budget.
-    // The budget is the frame-driven WebGL specs' own, as in
+    // hosted macOS Firefox a frame takes seconds, a click and a screenshot several
+    // times that (measured: 38_decisions_testing_and_hosted_runners.md). The
+    // budget is the frame-driven WebGL specs' own, as in
     // presented-layout and studio-background.
     test.setTimeout(240_000);
     // The browser-only fixture must stay lazy: this contract owns the one

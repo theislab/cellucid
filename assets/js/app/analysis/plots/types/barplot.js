@@ -106,7 +106,7 @@ const barplotDefinition = {
   },
 
   buildLayout(pageData, options) {
-    const { orientation = 'vertical', sortBy = 'count', normalize = false, barMode = 'group', logScale = false } = options;
+    const { sortBy = 'count', barMode = 'group' } = options;
     const sortedCategories = PlotFactory.getSortedCategories(pageData, sortBy);
     const layout = PlotFactory.createLayout({ pageData, options, custom: { barmode: barMode } });
     PlotFactory.configureCategoricalAxes(layout, { categories: sortedCategories, options });

@@ -15,7 +15,7 @@
  */
 
 import { StateValidator } from '../../../utils/state-validator.js';
-import { ChangeType, FieldKind, FieldSource } from '../../../utils/field-constants.js';
+import { ChangeType, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import {
@@ -100,6 +100,7 @@ export class FieldCategoryOpsMethods {
    *   takes new codes, categories and centroid tables (never written into the
    *   ones it had, which every view's copy shares), published to every copy.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {number} categoryIndex
    * @param {object} options
@@ -280,6 +281,7 @@ export class FieldCategoryOpsMethods {
    *   when possible) to support repeated drag-merge workflows without repeated large
    *   allocations or a growing field list.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {number} fromCategoryIndex
    * @param {number} toCategoryIndex
@@ -487,6 +489,7 @@ export class FieldCategoryOpsMethods {
    * category-for-category function of its root column (`_sourceField`), so
    * cells opened later are labeled from it (`open-cells.js` `derivedCodes`).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {{groups: Array<{label: string, members: number[]}>, restLabel: string|null, newKey: string}} options
    * @returns {{newFieldIndex: number, newKey: string, categories: number}}
@@ -566,6 +569,7 @@ export class FieldCategoryOpsMethods {
     return { newFieldIndex, newKey: options.newKey, categories: transform.categories.length };
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   createCategoricalFromPages(options) {
     StateValidator.validateUserDefinedOptions(options);
     if (

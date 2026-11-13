@@ -33,6 +33,7 @@
 import { isContinuousValues } from '../../../../data/continuous-values.js';
 import { columnFormOf, filledForm, noteColumnForm } from '../../../../data/column-forms.js';
 import { cancel, isCancellation } from '../../../../utils/abort.js';
+import { promiseWithResolvers } from '../../../../utils/promise-resolvers.js';
 
 /**
  * How many cells a read takes within `ms`, from the reads measured
@@ -74,6 +75,7 @@ export class FieldGeneSampleMethods {
    * `{cells, of, fit}` (open cells `[0, cells)`), or null when a gene is read
    * for every open cell.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {Readonly<{cells: number, of: number, fit: Object|null}>|null}
    */
   getGeneSample() {
@@ -88,14 +90,16 @@ export class FieldGeneSampleMethods {
     // place: an opening, a progressive step, Apply): the opening's sample,
     // known to the loader at once, stands for it -- never "every cell", which
     // a matrix read after its map does not have (its genes not read for any
-    // cell yet: a gene picked then was refused as having no value).
+    // cell yet: a gene picked then would be refused as having no value).
     return this._openingGeneSample();
   }
 
   /**
    * The gene sample of the opening the var loader reads (`loader.geneSample`,
    * the reader's `cellSubset.genes`, current as soon as the open cells are)
-   * when it is of the cells open now, else null. @private
+   * when it is of the cells open now, else null.
+   * @this {import('../../core/data-state.js').DataState}
+   * @private
    */
   _openingGeneSample() {
     const sample = this.varFieldLoader?.geneSample?.() ?? null;
@@ -112,6 +116,7 @@ export class FieldGeneSampleMethods {
    * more cells), and say when it changed (`'gene-sample:changed'`). A gene
    * loaded says its own as it arrives (`noteGeneSample`).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {Promise<Object|null>}
    */
   async refreshGeneSample() {
@@ -146,6 +151,7 @@ export class FieldGeneSampleMethods {
    * or null: every open cell's genes are read), as a gene's read said it or
    * the source answered (`refreshGeneSample`); said when it changed.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {{cells: number, of: number}|null} of
    * @returns {Readonly<{cells: number, of: number, fit: Object|null}>|null}
    */
@@ -178,6 +184,7 @@ export class FieldGeneSampleMethods {
    * what an agent is asked about and what the gene time spends all count
    * them.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} [target] - Open cells; every one by default
    * @param {{geneTime?: {ms: number, spentBytes: number, spentRequests?: number}|null}} [options] -
    *   The top-up's (`topUpGeneSample`): the cells lowered to those a share's
@@ -206,6 +213,7 @@ export class FieldGeneSampleMethods {
    * the rest. `heavy`: an action's `ctx.heavy`, asked before the cells'
    * totals of normalized values are summed for the cells to read.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} [target]
    * @param {{signal?: AbortSignal|null, onStep?: ((sample: Object|null, cells: number) => void)|null,
    *   topUp?: boolean, heavy?: ((estimate: Object) => Promise<void>)|null}} [options]
@@ -234,8 +242,8 @@ export class FieldGeneSampleMethods {
     // Stopped by `signal`, or by `stopReadingGenesForMoreCells`.
     const controller = new AbortController();
     const stop = signal === null ? controller.signal : AbortSignal.any([signal, controller.signal]);
-    let settle;
-    const growth = { controller, target: Math.min(this.pointCount, target), cells: start.cells, topUp, settled: new Promise(resolve => { settle = resolve; }) };
+    const { promise: settled, resolve: settle } = promiseWithResolvers();
+    const growth = { controller, target: Math.min(this.pointCount, target), cells: start.cells, topUp, settled };
     this._geneSampleGrowth = growth;
     this.emit?.('gene-sample:changed', { sample: start, growth: { cells: growth.cells, target: growth.target } });
     signal = stop;
@@ -283,9 +291,9 @@ export class FieldGeneSampleMethods {
    * many cells as the link really delivers in the gene time rather than as
    * many as were priced before it was measured. The price is made over the
    * link the reads measured so far: on a first visit to a host its early
-   * reads are small and measure a fraction of its rate (a CELLxGENE atlas
-   * over S3: 1 MB/s priced at the opening, 11 MB/s measured over the first
-   * gene), and a host's speed changes while it is read. So the steps are
+   * reads are small and measure a fraction of its rate (measured:
+   * 23_decisions_partial_reading.md), and a host's speed changes while it is
+   * read. So the steps are
    * sized by what the reads took, never by a price: the time of a read is
    * the one fact that holds whatever the link model says.
    *
@@ -315,6 +323,7 @@ export class FieldGeneSampleMethods {
    * it or asks for cells themselves (their growth takes over), or when the
    * dataset changes. Once per sample: a later gene reads the index.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} ms - How long the first gene took, from its read's start
    * @returns {Promise<void>|null} The steps, or null when there are none to make
    */
@@ -354,7 +363,9 @@ export class FieldGeneSampleMethods {
       while (current()) {
         // A gene asked for goes first: the steps wait until it is read.
         if (topUp.yields > 0) {
-          await new Promise(resolve => { topUp.resume = resolve; });
+          const resumed = promiseWithResolvers();
+          topUp.resume = resumed.resolve;
+          await resumed.promise;
           topUp.resume = null;
           if (!current()) return;
         }
@@ -404,11 +415,12 @@ export class FieldGeneSampleMethods {
    * read, and makes no further step; this resolves once its last step is
    * filled and said (`'gene-sample:changed'`), so the analysis reads on the
    * sample that stays. A growth the person asked for (Genes read for)
-   * goes on. A sample growing under a run was a new load to the data layer:
-   * a DE started while the first gene's top-up read on failed ("invalidated
-   * by a dataset lifecycle change", 10M cells). Null when no top-up step
+   * goes on. A sample growing under a run is a new load to the data layer: a
+   * differential expression started while the first gene's top-up reads on
+   * fails ("invalidated by a dataset lifecycle change"). Null when no top-up step
    * runs (nothing to wait for: the caller goes on in the same turn).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {Promise<void>|null}
    */
   holdGeneSample() {
@@ -428,6 +440,7 @@ export class FieldGeneSampleMethods {
    * until the returned function is called (the gene read, or failed); the
    * steps then go on within what is left of the gene time.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {() => void} What lets the steps go on
    */
   yieldGeneSampleTopUp() {
@@ -451,6 +464,7 @@ export class FieldGeneSampleMethods {
    * Genes being read for more cells now (`readGenesForMoreCells`): how many
    * are read so far and for how many; null when none is.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {{cells: number, target: number}|null}
    */
   getGeneSampleGrowth() {
@@ -458,12 +472,16 @@ export class FieldGeneSampleMethods {
     return growth === null ? null : { cells: growth.cells, target: growth.target };
   }
 
-  /** Stop reading genes for more cells: what is read stays. */
+  /** Stop reading genes for more cells: what is read stays. @this {import('../../core/data-state.js').DataState} */
   stopReadingGenesForMoreCells() {
     cancel(this._geneSampleGrowth?.controller, 'user', 'Reading genes for more cells was stopped.');
   }
 
-  /** The sample of this dataset grown to fill its gene time (`topUpGeneSample`), or null. @private */
+  /**
+   * The sample of this dataset grown to fill its gene time (`topUpGeneSample`), or null.
+   * @this {import('../../core/data-state.js').DataState}
+   * @private
+   */
   _toppedUp() {
     const topUp = this._geneSampleTopUp ?? null;
     return topUp !== null && topUp.generation === (this._datasetGeneration ?? 0) ? topUp : null;
@@ -471,7 +489,9 @@ export class FieldGeneSampleMethods {
 
   /**
    * The gene whose read builds each step of a growth: the gene shown, else
-   * the first. @private
+   * the first.
+   * @this {import('../../core/data-state.js').DataState}
+   * @private
    */
   _geneSampleDriver() {
     const descriptors = this._varFieldDescriptors ?? null;
@@ -483,7 +503,9 @@ export class FieldGeneSampleMethods {
   /**
    * Every loaded gene's values on open cells `[from, to)`, read now that
    * the gene sample holds them (they were NaN, not read), in new arrays;
-   * the gene shown is drawn again. @private
+   * the gene shown is drawn again.
+   * @this {import('../../core/data-state.js').DataState}
+   * @private
    */
   async _fillGeneRows(from, to, signal = null) {
     const loader = this.varFieldLoader ?? null;

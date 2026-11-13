@@ -6,7 +6,7 @@
  * `Buffer`, `__dirname` and `__filename` exist. A bare reference to one of
  * them passes every Node test and throws a `ReferenceError` in every browser
  * the moment it runs: a debugging line reading `process.env` in the share
- * planner once stopped every converted store from opening in browsers while
+ * planner would stop every converted store from opening in browsers while
  * the whole Node suite stayed green.
  *
  * Code that must reach a Node facility asks for it as a property of
@@ -88,4 +88,15 @@ test('no browser module references a Node-only global', () => {
   const found = files.flatMap(file => nodeGlobals(readFileSync(file, 'utf8'), file)
     .map(where => `${path.relative(ROOT, file)} ${where}`));
   assert.deepEqual(found, [], 'browser modules reference Node-only globals (a ReferenceError in every browser)');
+});
+
+// Firefox's page-world guard (tests/browser/helpers/firefox-aria-reflection.mjs) answers this
+// property with null; code that read it would see the guard's answer in the suite and the engine's
+// in a person's browser.
+test('no application source reads ariaLabelledByElements', () => {
+  const sources = [path.join(ROOT, 'index.html'), ...scripts(path.join(ROOT, 'assets', 'js'))];
+  const readers = sources
+    .filter(source => readFileSync(source, 'utf8').includes('ariaLabelledByElements'))
+    .map(source => path.relative(ROOT, source));
+  assert.deepEqual(readers, []);
 });

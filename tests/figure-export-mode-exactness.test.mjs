@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { access, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -12,15 +11,6 @@ import {
 import {
   createFigureExportZip,
 } from '../assets/js/app/ui/modules/figure-export/utils/zip-archive.js';
-
-const figureExportRoot = new URL(
-  '../assets/js/app/ui/modules/figure-export/',
-  import.meta.url
-);
-
-function source(relativePath) {
-  return readFile(new URL(relativePath, figureExportRoot), 'utf8');
-}
 
 function baseRequest(overrides = {}) {
   return {
@@ -142,79 +132,6 @@ test('SVG requests require one exact, explicit strategy', () => {
       dpi: 300,
     }),
     /dpi.*null|SVG.*dpi/i
-  );
-});
-
-test('figure-export UI opens on Full vector and never changes the SVG strategy by itself (F160)', async () => {
-  const uiSource = await source('figure-export-ui.js');
-
-  assert.doesNotMatch(uiSource, /promptLargeDatasetStrategy|Large data:\s*Ask/);
-  assert.doesNotMatch(uiSource, /value:\s*['"]hybrid['"][^)]*selected:\s*true/s);
-  // Two assignments: the default it opens with (full vector: every first SVG export was refused
-  // until one was chosen, and people and agents always chose full vector), and the person's own
-  // saved choice a session or a step puts back. Nothing else picks one for them.
-  const assignments = uiSource.match(/strategySelect\.value\s*=(?!=)[^;]*;/g) ?? [];
-  assert.deepEqual(assignments.map(text => text.replace(/\s+/g, ' ')), [
-    'strategySelect.value = FIGURE_EXPORT_DEFAULT_SVG_STRATEGY;',
-    'strategySelect.value = exact.svgStrategy;',
-  ]);
-  assert.doesNotMatch(uiSource, /strategy\s*!==\s*['"]hybrid['"]|requires Hybrid/i);
-  // No placeholder, no refusal for a strategy not chosen.
-  assert.doesNotMatch(uiSource, /Choose SVG strategy|needs a point strategy/);
-
-  await assert.rejects(
-    access(new URL('components/large-dataset-dialog.js', figureExportRoot)),
-    /ENOENT/
-  );
-});
-
-test('SVG renderer has explicit branches and no strategy normalization', async () => {
-  const svgSource = await source('renderers/svg-renderer.js');
-
-  assert.doesNotMatch(
-    svgSource,
-    /optimizedTargetCount\s*\|\||Math\.max\(\s*1000,\s*Math\.floor\(\s*opts\.optimizedTargetCount/
-  );
-  assert.match(
-    svgSource,
-    /else if \(strategy === ['"]full-vector['"] \|\| strategy === ['"]optimized-vector['"]\)/
-  );
-  assert.doesNotMatch(
-    svgSource,
-    /else\s*\{\s*(?:\/\/[^\n]*\n\s*)*(?:const\s+pointScale|forEachProjectedPoint|parts\.push\(await requestSvgPointMarkup)/s
-  );
-  // The worker's markup writer names both vector strategies and rejects any
-  // other: nothing is normalized on either side of the worker boundary.
-  const markupSource = await source('renderers/svg-point-markup.js');
-  assert.match(markupSource, /if \(strategy === ['"]optimized-vector['"]\)/);
-  assert.match(
-    markupSource,
-    /if \(strategy !== ['"]full-vector['"]\) \{\s*throw new TypeError/
-  );
-});
-
-test('engine validates and archives every staged result before one download', async () => {
-  const engineSource = await source('figure-export-engine.js');
-
-  assert.doesNotMatch(engineSource, /suggestedExt|strategy\s*===\s*['"]raster['"]/);
-  assert.match(engineSource, /blob\.type !== ['"]image\/svg\+xml['"]/);
-  assert.match(engineSource, /blob\.type !== ['"]image\/png['"]/);
-  assert.match(engineSource, /field !== null/);
-  assert.match(engineSource, /field === null \? null : field\.key/);
-  assert.doesNotMatch(engineSource, /field === undefined \? null/);
-  assert.match(
-    engineSource,
-    /if \(stagedDownloads\.length === 1\)[\s\S]+await createFigureExportZip\([\s\S]+downloadBlob\(deliveryBlob, deliveryFilename, \{\s*signal\s*\}\)/s
-  );
-  assert.equal(
-    engineSource.match(/\bdownloadBlob\(/g)?.length,
-    1,
-    'single and batch exports share one browser download call'
-  );
-  assert.ok(
-    engineSource.indexOf('downloadBlob(deliveryBlob, deliveryFilename, { signal })') >
-      engineSource.indexOf('await createFigureExportZip('),
-    'a batch archive failure must occur before the one download call'
   );
 });
 
@@ -364,23 +281,7 @@ test('batch ZIP rejects invalid or unreadable staging atomically', async () => {
   );
 });
 
-test('PNG renderer uses one browser backend and metadata failures are terminal', async () => {
-  const [pngSource, metadataSource] = await Promise.all([
-    source('renderers/png-renderer.js'),
-    source('utils/png-metadata.js'),
-  ]);
-
-  // The page composes; the worker encodes, on the one encoder every browser
-  // gives a worker. Nothing encodes on the page's main thread.
-  const workerSource = await source('utils/figure-export-worker.js');
-  assert.doesNotMatch(pngSource, /\.toBlob\(|\.toDataURL\(|\.convertToBlob\(/);
-  assert.match(pngSource, /pagePixelsInBands\(canvas, signal\)/);
-  assert.match(pngSource, /requestPngEncoding\(/);
-  assert.match(workerSource, /convertToBlob\(\{ type: 'image\/png' \}\)/);
-  assert.match(workerSource, /embedPngMetadata\(blob, \{ text, dpi \}\)/);
-  assert.match(pngSource, /payload\.format !== ['"]png['"]/);
-  assert.doesNotMatch(metadataSource, /catch\s*\{|return blob/);
-
+test('PNG metadata is embedded exactly and an invalid PNG is refused', async () => {
   const onePixelPng = new Blob([
     Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',

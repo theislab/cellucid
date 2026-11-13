@@ -46,9 +46,9 @@ const GRAPH = 'https://graph.microsoft.com/v1.0';
  * The pre-authenticated download URL Graph names beside a file's item. It is
  * asked for by asking for the whole item, with no `$select`: Graph leaves
  * the annotation out of an answer whose fields are selected, even when the
- * selection names it (seen 2026-10-25 on a personal OneDrive's
- * `/shares/{id}/driveItem`: `$select=…,@microsoft.graph.downloadUrl` answered
- * every other field it named). The whole item is a few kilobytes, in the
+ * selection names it (on a personal OneDrive's `/shares/{id}/driveItem`,
+ * `$select=…,@microsoft.graph.downloadUrl` answers every other field it
+ * names). The whole item is a few kilobytes, in the
  * same one request; following `/content` to its redirect instead would cost
  * a second round trip and a range request of the file to learn the URL.
  */
@@ -91,7 +91,7 @@ const DRIVE_ITEM = /^([A-Za-z0-9!_.-]+)\/([A-Za-z0-9!_.-]+)$/;
  * or SharePoint page that is not a share link: its file list, or a file
  * opened in it), or null.
  */
-export function parseOneDrive(input, explicit = true) {
+function parseOneDrive(input, explicit = true) {
   if (typeof input !== 'string') return null;
   const text = input.trim();
   if (explicit) {

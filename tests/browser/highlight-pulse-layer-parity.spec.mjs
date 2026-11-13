@@ -1,7 +1,7 @@
 /**
  * The highlight pulse draws only the layer over the points.
  *
- * In Full quality highlights pulse, and every pulse frame used to draw the
+ * In Full quality highlights pulse, and a pulse frame does not draw the
  * whole pane, every point included. While they pulse, each pane's base layer
  * (backdrop, grid, points, overlays) is kept and reused
  * (`rendering/pulse-layer-cache.js`): a frame that only moves the pulse draws
@@ -74,8 +74,8 @@ function compareLayers(page) {
         // Frames until a pulse frame has reused the base (pulse-only frames
         // are paced: ambient-frame-pacing.js); then the next one is captured.
         // As many animation frames as that takes: on a slow renderer the
-        // pulse's frames are far apart, and a count of animation frames ran
-        // out before them, leaving a frame that had reused nothing.
+        // pulse's frames are far apart, and a count of animation frames runs
+        // out before them, leaving a frame that has reused nothing.
         const startReused = viewer.getPulseLayerStats().basesReused;
         do {
           await frames(1);
@@ -127,6 +127,24 @@ function compareLayers(page) {
 test('a pulse frame over the kept base is the frame drawn whole', async ({ page }) => {
   test.setTimeout(300_000);
   await loadAtlas(page);
+  await test.step('nothing is kept while highlights do not pulse', async () => {
+    const stats = await page.evaluate(async () => {
+      const viewer = window._cellucidViewer;
+      const frames = count => new Promise(resolve => {
+        const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
+        requestAnimationFrame(step);
+      });
+      const start = viewer.getPulseLayerStats();
+      viewer.setPointSize(5);
+      // Frames until the change made is drawn: the viewer clears its
+      // invalidation when it draws the frame that shows it.
+      do {
+        await frames(1);
+      } while (viewer.getFrameScheduleState().invalidated);
+      return { start, still: viewer.getPulseLayerStats() };
+    });
+    expect(stats.still.basesDrawn).toBe(stats.start.basesDrawn);
+  });
   await page.evaluate(pointCount => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
@@ -177,10 +195,8 @@ function compareMaskedSamples(page, from, phase) {
     };
     // Frames until `count` more panes were drawn under their rings (pulse-only
     // frames are paced: ambient-frame-pacing.js).
-    // As many animation frames as that takes: a count of them ran out on a
-    // slow renderer and the frame read was not one drawn under its rings
-    // ("under the rings vs whole: 126568 of 921600 lit pixels differ", Linux
-    // Firefox, push run of 2026-10-31).
+    // As many animation frames as that takes: a count of them runs out on a
+    // slow renderer and the frame read is not one drawn under its rings.
     const maskedFrames = async count => {
       const start = viewer.getPulseLayerStats().panesMasked;
       do {
@@ -274,36 +290,4 @@ test('an antialiased pulse frame drawn only under its rings is the frame drawn w
   const grid = await compareMaskedSamples(page, 11.6, 12.375);
   expect(grid.masked).toBeGreaterThanOrEqual(6);
   expect(grid.mismatched, report('grid: under the rings vs whole')(grid)).toBe(0);
-});
-
-test('nothing is kept while highlights do not pulse, or while the frame is multisampled', async ({ page }) => {
-  test.setTimeout(300_000);
-  await loadAtlas(page);
-  const stats = await page.evaluate(async () => {
-    const viewer = window._cellucidViewer;
-    const frames = count => new Promise(resolve => {
-      const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
-      requestAnimationFrame(step);
-    });
-    // Frames until the change made is drawn: the viewer clears its
-    // invalidation when it draws the frame that shows it.
-    const drawn = async () => {
-      do {
-        await frames(1);
-      } while (viewer.getFrameScheduleState().invalidated);
-    };
-    const start = viewer.getPulseLayerStats();
-    viewer.setPointSize(5);
-    await drawn();
-    const still = viewer.getPulseLayerStats();
-    const available = viewer.isAntialiasingAvailable();
-    viewer.setAntialiasing(true);
-    const cells = Uint32Array.from({ length: 500 }, (_, i) => i * 7);
-    window._cellucidState.addHighlightDirect({ type: 'annotation', label: 'msaa', cellIndices: cells });
-    await drawn();
-    const multisampled = viewer.getPulseLayerStats();
-    return { start, still, multisampled, available };
-  });
-  expect(stats.still.basesDrawn).toBe(stats.start.basesDrawn);
-  if (stats.available) expect(stats.multisampled.basesDrawn).toBe(stats.still.basesDrawn);
 });

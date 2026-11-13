@@ -169,7 +169,7 @@ test('the confirmer\'s answer is what the agent reads: Allow runs it, Deny refus
 });
 
 test('a confirm card says who asks, what, why, and the parameters; every kind of asking has its reason', () => {
-  // Every definition's confirm kind, and the question an opensLinks action asks of its own (F121).
+  // Every definition's confirm kind, and the question an opensLinks action asks of its own.
   // Besides the definitions' kinds, the questions an implementation asks of its own: an unseen link, work not kept.
   assert.deepEqual(Object.keys(CONFIRM_REASONS).sort(), [...ACTION_CONFIRMS, 'unseen-link', 'replaces-unkept'].sort());
   const definition = defineAction({
@@ -218,7 +218,7 @@ test('the activity of agent turns: acting, done with its steps, read-only turns 
   const m4 = meta('t3');
   activity.onDispatch({ kind: 'start', type: 'color.by', meta: m4 });
   assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3')), 'Claude is working · 1 step · Color by a field');
-  // While the history's recording is paused, the line starts with ⏸ (History v2 §3.15.1).
+  // While the history's recording is paused, the line starts with ⏸.
   assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3'), { paused: true }), '⏸ Claude is working · 1 step · Color by a field');
   activity.markStopped(turnKey('Claude', 't3'));
   activity.onDispatch({ kind: 'failed', type: 'color.by', meta: m4, error: new Error('x') });
@@ -255,7 +255,7 @@ test('two agents of one name at once (the chat\'s Claude, Claude Desktop through
   assert.equal(agentLabel('ChatGPT', { kind: 'connector', client: 'ChatGPT', host: 'chatgpt.com' }), 'ChatGPT (chatgpt.com)');
   assert.equal(agentLabel('Claude', { kind: 'connector', client: null, host: null }), 'Claude (connector)');
   assert.equal(agentLabel('Claude', { kind: 'connector', client: 'Claude Desktop', host: 'claude.ai', known: true }), 'Claude (Claude Desktop)');
-  // L26-4 / F122: an app no site vouches for is its host (or an app on this computer), its own name only quoted:
+  // An app no site vouches for is its host (or an app on this computer), its own name only quoted:
   // two of them are told apart, and none passes for Claude.
   // The relay client names such an agent as Manage… does (`appName`); the label adds nothing to it.
   const fake = appName('evil.example', 'Claude', false);
@@ -553,7 +553,7 @@ test('the activity line counts what a turn did outside the state, and keeps a tu
   assert.equal(activityTextOf(line), 'Claude · 2 votes published, not undoable');
 });
 
-test('a turn counts steps, not actions: a change merged into the step before is that one step (R9R-6)', () => {
+test('a turn counts steps, not actions: a change merged into the step before is that one step', () => {
   const activity = createAgentActivity({ titleOf: type => type });
   const meta = () => ({ origin: 'agent', agent: 'Claude', turn: 't-merge' });
   const set = (id, label) => {

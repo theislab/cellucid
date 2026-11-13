@@ -41,7 +41,7 @@ test('a guessed 3-column array does not open over the 2D UMAP the file carries',
   assert.equal(openingSlot(slots), '2d');
 });
 
-test('the owner\'s file shape opens on its first UMAP in 2D; wide arrays fill no 3D slot', () => {
+test('a segmentation export\'s file shape opens on its first UMAP in 2D; wide arrays fill no 3D slot', () => {
   const entries = [
     entry('X_pca_scale0_latents', 500),
     entry('X_pca_scale1_latents', 50),
@@ -167,7 +167,7 @@ test('an obs field descriptor carries one palette color per category, or none', 
   }, /\(missing: palette\)/);
 });
 
-test('every width is treated alike: the UMAP names its width, the others are guessed, and only a file naming none opens on a guess (R9M-11)', () => {
+test('every width is treated alike: the UMAP names its width, the others are guessed, and only a file naming none opens on a guess', () => {
   // X_umap beside X_umap_3d: the dimensional key names 3D, X_umap 2D (guessed).
   const both = resolveEmbeddingSlots([entry('X_umap', 2), entry('X_umap_3d', 3)], { latentKey: null });
   assert.deepEqual(both.slots, { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': { key: 'X_umap_3d', columns: [0, 1, 2] } });

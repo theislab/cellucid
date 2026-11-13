@@ -1,7 +1,6 @@
 /**
  * @fileoverview One line above the graph that says where the tracker in use
- * comes from, while it is one that came from elsewhere (History v2 §3.10,
- * §3.11), until dismissed:
+ * comes from, while it is one that came from elsewhere, until dismissed:
  *
  * - **Loaded from a session file** (`start.kind` import): `Shared · "T cell
  *   analysis" · 3 branches   ▶ Tour  Methods  ✕`, or, for a state shared

@@ -5,8 +5,7 @@
  * the directory, and a reader's opening forgets or removes directories
  * meanwhile. WebKit logs a read of a file removed after the read began as a
  * failed load ("WebKitBlobResource error 1"), whatever the caller does with
- * the error: Web contracts runs 41213981681 and 41255961977, macOS WebKit,
- * `kept-parts.spec.mjs`. Here a listing is held inside its read of a
+ * the error (`kept-parts.spec.mjs`, macOS WebKit). Here a listing is held inside its read of a
  * manifest while another context forgets that file's kept copies: nothing
  * is removed until the read is done, and then the directory goes.
  */

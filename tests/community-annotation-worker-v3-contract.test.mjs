@@ -2,8 +2,7 @@
 // reads, the content-addressed tree read, conditional requests, the relayed
 // GitHub headers, the ref force update and the caller binding of every
 // write. Each test drives `worker.fetch` directly with GitHub stubbed; nothing
-// reaches the network. Repros r02 and r04 of the 2026-11-05 backend audit are
-// kept here.
+// reaches the network.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -247,11 +246,11 @@ test('GraphQL routes refuse anything but their exact request before asking GitHu
   assert.equal(stub.calls.length, 0);
 });
 
-// -- Trees (repro r02) -------------------------------------------------------
+// -- Trees -------------------------------------------------------
 
-test('a tree is read by object id, non-recursively, and relayed whole without a byte cut (repro r02)', async () => {
-  // About 230 bytes per entry: 100,000 entries are some 23 MB, three times the
-  // 7,500,000-byte cut the Worker used to make after its 200.
+test('a tree is read by object id, non-recursively, and relayed whole without a byte cut', async () => {
+  // About 230 bytes per entry: 100,000 entries are some 23 MB, three times a
+  // 7,500,000-byte cut, which the Worker never makes after its 200.
   const entry = index => JSON.stringify({
     path: `ghid_${100_000_000 + index}.json`,
     mode: '100644',
@@ -302,9 +301,9 @@ test('the branch and recursive tree read is gone; a tree read takes exactly one 
   assert.equal(stub.calls.length, 0);
 });
 
-// -- Relayed headers (repro r04) and conditional requests ------------------
+// -- Relayed headers and conditional requests ------------------
 
-test('every GitHub answer carries its rate-limit headers to the page, failures included (repro r04)', async () => {
+test('every GitHub answer carries its rate-limit headers to the page, failures included', async () => {
   const scenarios = [
     ['JSON 503', 503, '{"message":"Service Unavailable"}', 'Service Unavailable'],
     ['HTML 503', 503, '<html>Unicorn!</html>', 'GitHub API GET /repos/o/r failed: GitHub answered HTTP 503'],

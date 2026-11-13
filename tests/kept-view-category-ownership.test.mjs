@@ -5,15 +5,15 @@
  * (`_cloneFieldState`): the category list, its originals, the centroid
  * tables and their records, the color and visibility arrays are shared.
  * That is sound only while none of them is written in place. A category
- * rename wrote the label into the shared list, and every relabel of centroids
- * (`_syncCentroidCategoryLabels`, run by a rename and by re-reading the
- * rename registry when a view is focused or a history step restores the
- * renames) wrote the shared centroid records. Restoring the renames in the
- * focused view then relabeled the other view's centroids under its
- * unchanged categories, and focusing that view failed: "Category centroids
+ * rename must not write the label into the shared list, and no relabel of
+ * centroids (`_syncCentroidCategoryLabels`, run by a rename and by re-reading
+ * the rename registry when a view is focused or a history step restores the
+ * renames) may write the shared centroid records: restoring the renames in the
+ * focused view would relabel the other view's centroids under its
+ * unchanged categories, and focusing that view would fail: "Category centroids
  * of layout ... reference an unknown category identity". Color by a field,
  * keep a view, rename a category, undo past the kept view (or the same with
- * the rename before the kept view and one jump back) failed every time.
+ * the rename before the kept view and one jump back) works every time.
  *
  * Each case here takes a field change in one view with a kept view present
  * (kept before or after the change), restores the values from before

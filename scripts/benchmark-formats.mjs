@@ -12,7 +12,7 @@
  * time, so each measures its own time and peak memory. Per file: the time to
  * the first view (open, metadata, the default embedding; for a stream format
  * the open is the whole read-and-transcode pass), the first and next gene,
- * the peak memory, and the ratios the roofline is held to (plan §11.5):
+ * the peak memory, and the ratios the roofline is held to:
  *
  * - a range format (Loom, 10x, MuData) against the `.h5ad` of the same data:
  *   its first view within 1.3x of the `.h5ad`'s;

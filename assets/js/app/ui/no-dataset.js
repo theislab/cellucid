@@ -3,12 +3,12 @@
  * one fact, one verb ("Open", as the Open data block names it, never "Load",
  * which is the session file's) and one place to do it.
  *
- * Found 2026-11-11 (R9E-8): the same state was "No dataset selected", "No
+ * The same state has one wording everywhere, not "No dataset selected", "No
  * dataset loaded", "No dataset is open yet.", "Load a dataset to …", "Open a
- * dataset before …" and "History starts when …" / "The history starts once
- * the dataset is open." in different panels, and some places named a wrong
- * cause ("Requires gene expression data.", "No neighbor graph available for
- * this dataset"). Contract: `tests/no-dataset-wording-contract.test.mjs`.
+ * dataset before …" or "History starts when …" in different panels, and no
+ * place names a wrong cause ("Requires gene expression data.", "No neighbor
+ * graph available for this dataset"). Contract:
+ * `tests/no-dataset-wording-contract.test.mjs`.
  *
  * @module ui/no-dataset
  */

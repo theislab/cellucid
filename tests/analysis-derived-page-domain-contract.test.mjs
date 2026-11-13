@@ -1,60 +1,48 @@
 /**
- * CEL-0218 — every analysis validator admits the same pages the shared
- * selection can hold.
+ * Every analysis validator admits the same pages the shared selection can hold.
  *
  * `AnalysisUIManager._currentPages` is one selection shared by every analysis
  * mode. Its setter admits the derived "Rest of X" pages, because the page
- * selectors offer them:
- * `assets/js/app/analysis/ui/analysis-ui-manager.js:396` expands the inventory
- * with `expandPagesWithDerived(..., { includeRestOf: true })`.
+ * selectors offer them: `analysis-ui-manager.js` expands the inventory with
+ * `expandPagesWithDerived(..., { includeRestOf: true })`.
  *
- * The per-UI validators computed a narrower domain of their own. Both took a
- * page selector's inventory when one existed and `this.dataLayer.getPages()` —
- * base pages only — when it did not:
+ * A per-UI validator that computed a narrower domain of its own (a page
+ * selector's inventory when one exists, `this.dataLayer.getPages()` - base
+ * pages only - when it does not; `base-analysis-ui.js`,
+ * `analysis-types/base/form-based-analysis.js`) would refuse a page the
+ * selection accepts. `this._pageSelector` is not an occasional null:
+ * Differential Expression and Marker Genes never construct one (Quick
+ * Insights, Detailed, Correlation and Gene Signature do), so for those two
+ * modes the narrow branch would be the only branch.
  *
- *   assets/js/app/analysis/ui/base-analysis-ui.js:463
- *   assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js:352
- *
- * `this._pageSelector` is not an occasional null. Differential Expression and
- * Marker Genes never construct one — `grep -n 'new PageSelectorComponent'`
- * finds it in Quick Insights, Detailed, Correlation and Gene Signature only —
- * so for those two modes the narrow branch is the only branch there is.
- *
- * That makes the crash a plain sequence, not a race:
+ * The failure is then a plain sequence, not a race:
  *
  *   1. Detailed analysis is open; its selector carries `includeDerivedPages`
- *      (`detailed-analysis-ui.js:301`), so "Rest of Page 1" is selectable. The
- *      committed screenshot
- *      `cellucid-python/docs/_static/screenshots/analysis/detailed-categorical.png`
- *      shows it selected.
+ *      (`detailed-analysis-ui.js`), so "Rest of Page 1" is selectable.
  *   2. The choice reaches `setCurrentPages` through the module's config
- *      callback (`comparison-module.js:453`) and is accepted.
+ *      callback (`comparison-module.js`) and is accepted.
  *   3. Switching to Differential Expression or Marker Genes runs
- *      `switchToMode` → `entry.ui.onPageSelectionChange(this._currentPages)`
- *      (`analysis-ui-manager.js:322`) → `FormBasedAnalysisUI.onPageSelectionChange`
- *      (`form-based-analysis.js:1678`) → the narrow validator, which throws
+ *      `switchToMode` -> `entry.ui.onPageSelectionChange(this._currentPages)`
+ *      (`analysis-ui-manager.js`) -> `FormBasedAnalysisUI.onPageSelectionChange`
+ *      (`form-based-analysis.js`) -> the validator, which would throw
  *      `Form-based analysis selectedPages page "restof__page_1" was not found`.
  *
  * `_requireSettings` reaches the same wall from `importSettings`, which
  * is how a floating analysis window is populated
- * (`analysis-window-manager.js:833`) — a Correlation or Gene Signature panel can
+ * (`analysis-window-manager.js`): a Correlation or Gene Signature panel can
  * legitimately export a rest-of selection, and the copy validates it before its
  * own selector exists.
  *
- * The domain is therefore one rule, and these tests hold the four sites to it.
- *
- * CEL-0231 — the fourth site. `_requireCustomPageColors`
- * (`form-based-analysis.js:391`) kept deriving its domain from
- * `this._pageSelector._getPages()`, the widget's current view, while
- * `_requireSettings` ten lines above it — validating the *same*
- * settings object, in the same `importSettings` call — used the shared rule. The
- * two agree today only because every form-based selector is constructed with
- * `includeDerivedPages: true`; the option defaults to `false`
- * (`page-selector.js:168`), so a selector built without it would have accepted a
- * rest-of page as a selection and refused a color for that page, out of one
- * saved session. All four sites resolve the domain from `selectablePageIdSet`
- * now, and the last two tests pin that the color half no longer depends on what
- * a widget happens to be displaying.
+ * The domain is therefore one rule, and these tests hold four sites to it.
+ * The fourth, `_requireCustomPageColors` (`form-based-analysis.js`), resolves
+ * its domain from `selectablePageIdSet` like `_requireSettings`, which
+ * validates the same settings object in the same `importSettings` call, and
+ * not from `this._pageSelector._getPages()`, the widget's current view: the
+ * option `includeDerivedPages` defaults to `false` (`page-selector.js`), so a
+ * selector built without it would accept a rest-of page as a selection and
+ * refuse a color for that page, out of one saved session. The last two tests
+ * pin that the color half does not depend on what a widget happens to be
+ * displaying.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -336,7 +324,7 @@ test('the color domain still refuses what it always refused', () => {
 
 test('widening the domain does not weaken the empty-page rule', () => {
   // A rest-of page whose complement is empty is still not a selectable page:
-  // the fix must widen what exists, not what may be analyzed.
+  // the domain must widen what exists, not what may be analyzed.
   const dataLayer = createDataLayer({ emptyPageIds: [REST_OF_PAGE_1] });
   const baseUI = createSelectorlessUI(BaseAnalysisUI.prototype, dataLayer);
   const formUI = createSelectorlessUI(FormBasedAnalysisUI.prototype, dataLayer);

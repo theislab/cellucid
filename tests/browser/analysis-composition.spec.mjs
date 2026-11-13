@@ -100,81 +100,86 @@ async function run(panel) {
   await expect(panel.locator('.composition-result-container .js-plotly-plot')).toBeVisible();
 }
 
-test('finds its fields, counts without a condition, then tests across samples', async ({ page }) => {
+// One opening: the second step clears the samples the first one tested across.
+test('composition: its fields, counts without a condition, a test across samples, then cells as the replicates', async ({ page }) => {
   const errors = observeProductErrors(page);
   const panel = await openComposition(page);
-  await expect(panel.locator('select[name="cellTypes"]')).toHaveValue('cell_type');
-  await expect(panel.locator('select[name="samples"]')).toHaveValue('sample_id');
-  await expect(panel.locator('select[name="condition"]')).toHaveValue('');
-  // Nothing is explained under the button.
-  await expect(panel.locator('.analysis-run-row + *')).toHaveCount(0);
 
-  await run(panel);
-  const plain = await page.evaluate(() => window._comparisonModule.getUI('composition')._lastResult.composition);
-  expect(plain.test).toBeNull();
-  expect(plain.totalCells).toBe(480);
+  await test.step('finds its fields, counts without a condition, then tests across samples', async () => {
+    await expect(panel.locator('select[name="cellTypes"]')).toHaveValue('cell_type');
+    await expect(panel.locator('select[name="samples"]')).toHaveValue('sample_id');
+    await expect(panel.locator('select[name="condition"]')).toHaveValue('');
+    // Nothing is explained under the button.
+    await expect(panel.locator('.analysis-run-row + *')).toHaveCount(0);
 
-  await panel.locator('select[name="condition"]').selectOption('condition');
-  await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
-  await run(panel);
-  await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
-  const tested = await page.evaluate(() => {
-    const { composition } = window._comparisonModule.getUI('composition')._lastResult;
-    return {
-      test: composition.test.test,
-      conditions: composition.conditions,
-      units: composition.units.map(unit => unit.label),
-      split: composition.splitSamples,
-      p: [...composition.test.pValue],
-      adjusted: [...composition.test.adjustedP],
-      ratio: [...composition.test.log2Ratio],
-    };
+    await run(panel);
+    const plain = await page.evaluate(() => window._comparisonModule.getUI('composition')._lastResult.composition);
+    expect(plain.test).toBeNull();
+    expect(plain.totalCells).toBe(480);
+
+    await panel.locator('select[name="condition"]').selectOption('condition');
+    await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
+    await run(panel);
+    await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
+    const tested = await page.evaluate(() => {
+      const { composition } = window._comparisonModule.getUI('composition')._lastResult;
+      return {
+        test: composition.test.test,
+        conditions: composition.conditions,
+        units: composition.units.map(unit => unit.label),
+        split: composition.splitSamples,
+        p: [...composition.test.pValue],
+        adjusted: [...composition.test.adjustedP],
+        ratio: [...composition.test.log2Ratio],
+      };
+    });
+    expect(tested.test).toBe("Welch's t-test");
+    expect(tested.conditions).toEqual(CONDITIONS);
+    expect(tested.split).toEqual(['s3']);
+    expect(tested.units).toEqual(['s1', 's2', 's3 · healthy', 's3 · disease', 's4', 's5', 's6']);
+    expect(tested.ratio[0]).toBeGreaterThan(0.5);
+    for (const p of tested.adjusted) expect(p).toBeGreaterThanOrEqual(0);
+    await expect(panel.locator('.analysis-chip', { hasText: '1 split sample' })).toBeVisible();
+
+    // The display redraws without a run.
+    await panel.locator('.analysis-options-form .disclosure-header', { hasText: 'More options' }).click();
+    await panel.locator('.disclosure-header', { hasText: 'Display' }).click();
+    await panel.getByRole('button', { name: 'Cell counts' }).click();
+    await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
+    expect(await page.evaluate(() => window._comparisonModule.getUI('composition')._lastResult.data.bars.proportions)).toBe(false);
+
+    // The expanded view: the per-type table, the per-sample view, one CSV per click.
+    await panel.getByRole('button', { name: /Expand/ }).click();
+    const modal = page.locator('.analysis-modal.open');
+    await expect(modal.locator('.composition-table tbody tr')).toHaveCount(4);
+    await modal.getByLabel('Plot', { exact: true }).selectOption({ label: 'Per sample' });
+    await expect(modal.locator('.analysis-modal-plot .js-plotly-plot .boxlayer')).toHaveCount(1);
+    // The analysis's display options stand beside the plot's, through a change of the plot's,
+    // and drive the analysis's own options.
+    const display = modal.locator('.analysis-modal-options .analysis-modal-display');
+    await expect(display.getByLabel('Cell type order', { exact: true })).toBeVisible();
+    await display.getByRole('button', { name: 'Proportions' }).click();
+    await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('composition')._options.values)).toBe('proportion');
+    await expect(panel.getByRole('button', { name: 'Proportions' })).toHaveAttribute('aria-pressed', 'true');
+    const results = page.waitForEvent('download');
+    await modal.getByRole('button', { name: /^CSV/ }).click();
+    await expectDownloadNamed(await results, 'composition_results.csv');
+    const counts = page.waitForEvent('download');
+    await modal.getByRole('button', { name: 'Counts CSV' }).click();
+    await expectDownloadNamed(await counts, 'composition_counts.csv');
+    expect(errors).toEqual([]);
   });
-  expect(tested.test).toBe("Welch's t-test");
-  expect(tested.conditions).toEqual(CONDITIONS);
-  expect(tested.split).toEqual(['s3']);
-  expect(tested.units).toEqual(['s1', 's2', 's3 · healthy', 's3 · disease', 's4', 's5', 's6']);
-  expect(tested.ratio[0]).toBeGreaterThan(0.5);
-  for (const p of tested.adjusted) expect(p).toBeGreaterThanOrEqual(0);
-  await expect(panel.locator('.analysis-chip', { hasText: '1 split sample' })).toBeVisible();
 
-  // The display redraws without a run.
-  await panel.locator('.analysis-options-form .disclosure-header', { hasText: 'More options' }).click();
-  await panel.locator('.disclosure-header', { hasText: 'Display' }).click();
-  await panel.getByRole('button', { name: 'Cell counts' }).click();
-  await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
-  expect(await page.evaluate(() => window._comparisonModule.getUI('composition')._lastResult.data.bars.proportions)).toBe(false);
-
-  // The expanded view: the per-type table, the per-sample view, one CSV per click.
-  await panel.getByRole('button', { name: /Expand/ }).click();
-  const modal = page.locator('.analysis-modal.open');
-  await expect(modal.locator('.composition-table tbody tr')).toHaveCount(4);
-  await modal.getByLabel('Plot', { exact: true }).selectOption({ label: 'Per sample' });
-  await expect(modal.locator('.analysis-modal-plot .js-plotly-plot .boxlayer')).toHaveCount(1);
-  // The analysis's display options stand beside the plot's, through a change of the plot's,
-  // and drive the analysis's own options.
-  const display = modal.locator('.analysis-modal-options .analysis-modal-display');
-  await expect(display.getByLabel('Cell type order', { exact: true })).toBeVisible();
-  await display.getByRole('button', { name: 'Proportions' }).click();
-  await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('composition')._options.values)).toBe('proportion');
-  await expect(panel.getByRole('button', { name: 'Proportions' })).toHaveAttribute('aria-pressed', 'true');
-  const results = page.waitForEvent('download');
-  await modal.getByRole('button', { name: /^CSV/ }).click();
-  await expectDownloadNamed(await results, 'composition_results.csv');
-  const counts = page.waitForEvent('download');
-  await modal.getByRole('button', { name: 'Counts CSV' }).click();
-  await expectDownloadNamed(await counts, 'composition_counts.csv');
-  expect(errors).toEqual([]);
-});
-
-test('without samples the cells are the replicates, and the result says so', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openComposition(page);
-  await panel.locator('select[name="samples"]').selectOption('');
-  await panel.locator('select[name="condition"]').selectOption('condition');
-  await run(panel);
-  await expect(panel.locator('.analysis-chip', { hasText: 'Cells as replicates' })).toBeVisible();
-  const test = await page.evaluate(() => window._comparisonModule.getUI('composition')._lastResult.composition.test);
-  expect(test.overall.df).toBe(3);
-  expect(errors).toEqual([]);
+  await test.step('without samples the cells are the replicates, and the result says so', async () => {
+    // The expanded view of the step above is closed first.
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.analysis-modal.open')).toHaveCount(0);
+    await panel.locator('select[name="samples"]').selectOption('');
+    await panel.locator('select[name="condition"]').selectOption('condition');
+    await run(panel);
+    await expect(panel.locator('.analysis-chip', { hasText: 'Cells as replicates' })).toBeVisible();
+    const test = await page.evaluate(() => window._comparisonModule.getUI('composition')._lastResult.composition.test);
+    expect(test.overall.df).toBe(3);
+    expect(errors).toEqual([]);
+  });
 });

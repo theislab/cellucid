@@ -19,6 +19,8 @@ import { escapeHtml } from '../../../utils/dom-utils.js';
 import { textHeight, textWidth } from '../text-measure.js';
 import { fitToSize } from '../size-fit.js';
 
+/** @typedef {import('../layout-engine.js').LayoutEngine} LayoutEngine */
+
 /** The statistics boxes' text and frame, in px. */
 const STATS_FONT_SIZE = 10;
 const STATS_BORDER_PAD = 4;
@@ -597,7 +599,7 @@ const scatterPlotDefinition = {
    * Update existing plot using Plotly.react for efficient updates
    * @param {Object} figure - Existing Plotly figure
    * @param {Object[]} correlationData - Correlation data
-   * @param {Object} options - Plot options
+   * @param {Object} _options - Plot options; the update reads none
    * @param {LayoutEngine} layoutEngine - Layout engine instance
    * @returns {Promise<Object>} Updated Plotly figure
    */
@@ -690,9 +692,9 @@ function axisLabel(pageResult, axis) {
 }
 
 /**
- * Compute confidence band for linear regression
+ * Compute the 95% confidence band of a linear regression
  */
-function computeConfidenceBand(xData, yData, slope, intercept, confidence = 0.95) {
+function computeConfidenceBand(xData, yData, slope, intercept) {
   const n = xData.length;
   if (n < 3) {
     return {
@@ -710,9 +712,8 @@ function computeConfidenceBand(xData, yData, slope, intercept, confidence = 0.95
   const sse = residuals.reduce((a, b) => a + b * b, 0);
   const se = Math.sqrt(sse / (n - 2));
 
-  // t-value for confidence level (alpha unused but kept for documentation)
-  const _alpha = 1 - confidence;
-  const tValue = 1.96; // Approximation for 95% CI with large n
+  // The t-value of a 95% interval with a large n.
+  const tValue = 1.96;
 
   return {
     ciLower: (x) => {

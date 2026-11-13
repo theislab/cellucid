@@ -2,7 +2,7 @@
  * No draw call may submit more vertices than every engine accepts.
  *
  * Firefox refuses a draw over 30,000,000 vertex ids with INVALID_OPERATION and
- * draws nothing, so a full-detail frame above 30M points used to be blank
+ * draws nothing, so a full-detail frame above 30M points would be blank
  * there. Every draw whose vertex count grows with the data goes through
  * `drawPointsInSegments`, which submits the same vertices in the same order as
  * consecutive calls of at most `MAX_VERTICES_PER_DRAW`.

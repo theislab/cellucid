@@ -3,8 +3,8 @@
  *
  * A spec that pauses a set time for work it cannot see (a redraw, a read, a
  * notification, a toggle event) passes where that work is quick and fails
- * where it is not: a hosted runner draws a frame of software GL in a second,
- * and macOS Firefox's in five. Such a spec fails on a different engine and
+ * where it is not: a hosted runner draws a frame of software GL in seconds.
+ * Such a spec fails on a different engine and
  * shard from run to run and teaches nothing but to re-run it, which slows
  * every change and every upgrade. So a spec waits for what proves the work
  * happened: a locator's state, `expect.poll` on the state the product
@@ -56,6 +56,13 @@ const KINDS = new Set(['time', 'poll', 'deadline']);
  * wait starts on; `count` is how many waits in the file have that line.
  */
 const ALLOWED_FIXED_WAITS = Object.freeze([
+  {
+    file: 'tests/browser/helpers/control-walk.mjs',
+    source: 'new Promise(resolve => { bound = setTimeout(() => resolve(null), quiet); }),',
+    count: 1,
+    kind: 'time',
+    reason: 'A walk that has already stalled reads the page once to say whether the page itself stood still; the read is given as long as the stall lasted, so a page that never answers cannot hold back the report of the stall.',
+  },
   {
     file: 'tests/browser/analysis-no-long-tasks.spec.mjs',
     source: 'const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));',
@@ -110,7 +117,7 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
     source: 'await page.waitForTimeout(3_000);',
     count: 1,
     kind: 'time',
-    reason: 'No role check on a timer of its own (round 9: the transport\'s retries are the one policy): the absence of requests past the host\'s named reset is the subject.',
+    reason: 'No role check on a timer of its own (the transport\'s retries are the one policy): the absence of requests past the host\'s named reset is the subject.',
   },
   {
     file: 'tests/browser/community-annotation-startup-lifecycle.spec.mjs',
@@ -132,20 +139,6 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
     count: 1,
     kind: 'time',
     reason: 'No background retry behind a shown notice: the absence of requests over a window is the subject.',
-  },
-  {
-    file: 'tests/browser/data-source-failure-modes.spec.mjs',
-    source: 'await new Promise(resolve => setTimeout(resolve, 250));',
-    count: 1,
-    kind: 'time',
-    reason: 'A slow link (every catalog answer 250 ms late) is the subject.',
-  },
-  {
-    file: 'tests/browser/gene-choice.spec.mjs',
-    source: 'await new Promise(resolve => setTimeout(resolve, host.delayMs));',
-    count: 1,
-    kind: 'time',
-    reason: 'A slowed stub host; the order of the read and the replacement is held by the spec\'s own promises, not by the delay.',
   },
   {
     file: 'tests/browser/gene-sample.spec.mjs',
@@ -211,25 +204,11 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
     reason: 'Procedural smoke time advances with the clock while it animates; the pause is that time.',
   },
   {
-    file: 'tests/browser/renderer-smoke.spec.mjs',
-    source: 'await page.waitForTimeout(Math.ceil(PROJECTILE_MIN_CHARGE_SECONDS * 1000 * 1.5));',
-    count: 1,
-    kind: 'time',
-    reason: 'A press held past the charge threshold fires a charged shot; a loaded runner only lengthens it.',
-  },
-  {
     file: 'tests/browser/session-restore-gene-sample.spec.mjs',
     source: 'await new Promise(resolve => setTimeout(resolve, Math.max(0, at - performance.now())));',
     count: 1,
     kind: 'time',
     reason: 'A simulated link of set latency and bandwidth.',
-  },
-  {
-    file: 'tests/browser/smoke-noise-async.spec.mjs',
-    source: 'await new Promise(resolve => setTimeout(resolve, 10));',
-    count: 1,
-    kind: 'poll',
-    reason: 'The interval of a loop that waits for the noise scheduler to leave its first phase; the phase it reached is asserted after the deadline.',
   },
   {
     file: 'tests/browser/studio-background.spec.mjs',

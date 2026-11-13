@@ -1,5 +1,5 @@
 /**
- * Declared inputs hold on the real page (History v2 §3.4, §6 test 2): an
+ * Declared inputs hold on the real page: an
  * action applied in two states that differ only in domains it neither
  * touches nor reads gives the same after-values, or the same refusal. That
  * is what makes a step's staleness and a deleted step's dependent re-apply
@@ -22,9 +22,9 @@
  * After-values are compared with the ids the app generates renamed in order
  * of appearance (a highlight group's and a page's counters, a user field's
  * time-and-counter id and its `createdAt` time, a keyframe's random id): an
- * action applied twice makes new ones each time, which is no input it reads. (That a re-applied
- * step never gives its first after-values back, by its ids alone, matters to
- * the history's dependent re-apply: History v2 §3.3.4.)
+ * action applied twice makes new ones each time, which is no input it reads.
+ * (That a re-applied step never gives its first after-values back, by its ids
+ * alone, matters to the history's dependent re-apply.)
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -38,14 +38,14 @@ const SCORE = { source: 'obs', key: 'score' };
 
 /**
  * What the base state holds besides the fixture's start: a continuous
- * coloring and a page with cells. No analysis is open: with one open, an
- * undo of a highlight or field change leaves the `analysis` domain changed
- * (its selected pages, its options), outside any step, so the base could not
- * be put back; the analyses' inputs are checked here once that is fixed.
+ * coloring, a page with cells, and the gene signature open in the panel with
+ * that page chosen, so every undo puts an open analysis back too (its page
+ * choice follows the pages and the open cells).
  */
 const SETUP = [
   ['color.by', { field: SCORE }],
   ['highlight.cells', { cells: Array.from({ length: 30 }, (_, cell) => cell * 2), label: 'Setup' }],
+  ['analysis.open', { analysis: 'signature' }],
 ];
 
 /** The actions checked, each with parameters that change the base state. */
@@ -81,6 +81,8 @@ function actionsUnderTest(camera) {
     ['setting.set', { setting: 'point-size', value: 7 }],
     ['layout.theme.set', { theme: 'dark' }],
     ['mapping.set', { latent: null }],
+    ['analysis.pages.set', { analysis: 'signature', pages: [] }],
+    ['analysis.close', {}],
   ];
 }
 

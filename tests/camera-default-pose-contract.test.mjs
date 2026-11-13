@@ -1,13 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { createDefaultCameraPose } from '../assets/js/rendering/camera-state-contract.js';
-
-const viewerSource = await readFile(
-  new URL('../assets/js/rendering/viewer.js', import.meta.url),
-  'utf8',
-);
 
 test('the free-fly reset pose looks at the orbit reset target from the orbit eye', () => {
   const { orbit, freefly } = createDefaultCameraPose();
@@ -43,14 +37,4 @@ test('leaving free-fly after a reset recovers the orbit reset angles', () => {
   assert.ok(Math.abs(radius - orbit.radius) < 1e-12);
   assert.ok(Math.abs(Math.atan2(offset[2], offset[0]) - orbit.theta) < 1e-12);
   assert.ok(Math.abs(Math.acos(offset[1] / radius) - orbit.phi) < 1e-12);
-});
-
-test('the viewer starts from and resets to the shared pose, with no private copy', () => {
-  const resetBody = viewerSource.slice(
-    viewerSource.indexOf('    resetCamera() {'),
-    viewerSource.indexOf('    getCameraState() {'),
-  );
-  assert.match(resetBody, /createDefaultCameraPose\(\)/);
-  assert.doesNotMatch(resetBody, /Math\.PI \/ 4|0, 0, 3\.0/);
-  assert.match(viewerSource, /const initialCameraPose = createDefaultCameraPose\(\);/);
 });

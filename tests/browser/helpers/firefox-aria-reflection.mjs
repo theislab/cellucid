@@ -15,7 +15,8 @@
  * asserts on a named role locator and then evaluates one crashes the page
  * when the element has `aria-labelledby`, every Cellucid dialog's name. It
  * reproduces on a page with no script at all: Cellucid's code never reads
- * the property (`firefox-aria-reflection.spec.mjs` checks both).
+ * the property (`firefox-aria-reflection.spec.mjs` checks the crash,
+ * `browser-globals-contract.test.mjs` the reading).
  *
  * In Firefox, the page's world answers `ariaLabelledByElements` with
  * `null`, so only the utility world reaches Gecko's getter; Playwright then

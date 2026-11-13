@@ -55,23 +55,26 @@ function servedDataset({ id, name, file, cells, genes }) {
  * @param {import('@playwright/test').Page} page
  * @param {string} origin
  * @param {Object} dataset - See `servedDataset`
- * @param {{version?: string, info?: Object|null, viewerHost?: boolean, holdDatasets?: Promise|null}} [options]
+ * @param {{version?: string, info?: Object|null, viewerHost?: boolean, hostEvents?: string[], holdDatasets?: Promise|null}} [options]
  *   `info`: extra server information fields (`host`, `port`), or null for a
  *   host viewer's server, which has none. `viewerHost` also answers the host's
  *   `protocol` route and its viewer channel: the channel answers `hello`
- *   with `welcome` and records every event the viewer sends after it.
+ *   with `welcome` and records every event the viewer sends after it;
+ *   `hostEvents` are the events the host says it accepts (`ready` alone by
+ *   default), and `send` sends the viewer a message as the host.
  *   `holdDatasets` holds the dataset list until it settles.
- * @returns {Promise<{events: Object[]}>}
+ * @returns {Promise<{events: Object[], send: (message: Object) => void}>}
  */
 export async function serveAnnDataServer(
   page,
   origin,
   dataset,
-  { version = '0.9.6', info = null, viewerHost = false, holdDatasets = null } = {},
+  { version = '0.9.6', info = null, viewerHost = false, hostEvents = ['ready'], holdDatasets = null } = {},
 ) {
   const served = servedDataset(dataset);
   const summary = { format: served.format, ...served.summary };
   const events = [];
+  let channel = null;
   await page.route(`${origin}/_cellucid/health`, route =>
     jsonResponse(route, { status: 'ok', type: 'anndata', version, ...summary }));
   if (info !== null || viewerHost) {
@@ -89,8 +92,9 @@ export async function serveAnnDataServer(
   if (viewerHost) {
     // A current host publishes its channel and what it accepts on it.
     await page.route(`${origin}/_cellucid/protocol`, route =>
-      jsonResponse(route, { channel: '_cellucid/ws', commands: [], binaryCommands: [], events: ['ready'] }));
+      jsonResponse(route, { channel: '_cellucid/ws', commands: [], binaryCommands: [], events: hostEvents }));
     await page.routeWebSocket(`${origin.replace(/^http/, 'ws')}/_cellucid/ws`, socket => {
+      channel = socket;
       let welcomed = false;
       socket.onMessage(message => {
         const value = typeof message === 'string' ? JSON.parse(message) : null;
@@ -104,5 +108,9 @@ export async function serveAnnDataServer(
       });
     });
   }
-  return { events };
+  const send = message => {
+    if (channel === null) throw new Error('No viewer has opened the host\'s channel.');
+    channel.send(JSON.stringify(message));
+  };
+  return { events, send };
 }

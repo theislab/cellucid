@@ -22,7 +22,7 @@
  *   reader-like worker: what spreading the work reaches. With
  *   `--parallel-candidates`, every other decoder that gives the app's bytes
  *   on k workers too (`parallelOthers`): a decoder fastest on one core can
- *   be slowest on eight (Firefox's `DecompressionStream` on small chunks).
+ *   be slowest on many (measured: 21_decisions_decoders_and_codecs.md).
  * - **A large store's own chunks** (`--store PATH`, repeatable: a
  *   `scale.py` `.h5ad` (DEFLATE) or Zarr v3 folder (Zstandard)): up to 300
  *   chunks of `X/data` and of `X/indices` spread over the file, fetched by
@@ -37,7 +37,7 @@
  *   node scripts/efficiency-floor/cpu-browser.mjs CORPUS [--engines chromium,firefox,webkit]
  *        [--python /path/to/python] [--candidates DIR] [--parallel-candidates] [--port 4575] [--out cpu.json]
  *
- * Run it alone (`heavy.sh`): it starts browsers, one after another.
+ * Run it alone: it starts browsers, one after another.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -485,8 +485,8 @@ async function measure(engineName, samples) {
       for (const k of ks) result.parallel[codec][k] = await guarded(`${codec} on ${k}`, () => parallelRate(page, codec, samples[codec], k));
     }
     // The other decoders that give the app's bytes, on k workers too: a
-    // decoder whose rate falls as workers are added (Firefox's
-    // DecompressionStream on small chunks) is judged at the pool's width.
+    // decoder whose rate falls as workers are added is judged at the pool's
+    // width.
     if (parallelCandidates) {
       result.parallelOthers = {};
       for (const codec of PARALLEL_CODECS) {

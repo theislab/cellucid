@@ -183,9 +183,9 @@ export function initAgentChat({
    * The selection each conversation already knows: the one attached to its
    * last message, or the one highlighted when its last turn ended (what its
    * agent highlighted among it). The chip offers, and a message carries, only
-   * another: an unchanged selection was sent again with every message, and an
-   * agent's own highlight came back to it as "the person attached their
-   * selection".
+   * another: an unchanged selection would be sent again with every message,
+   * and an agent's own highlight would come back to it as "the person
+   * attached their selection".
    */
   const knownSelections = new WeakMap();
   /** The turns of a conversation (its person's messages'): its agent's own steps are of these. */
@@ -639,7 +639,7 @@ export function initAgentChat({
     }
     const keptChats = watched.chatsOf(tree.id);
     const saved = latestConversation(keptChats);
-    // A kept conversation this version cannot show is said, never dropped silently (F155).
+    // A kept conversation this version cannot show is said, never dropped silently.
     const tellUnread = (error = undefined) => {
       const notice = unreadConversationNotice(keptChats, error);
       if (notice !== null) getNotificationCenter().warning(notice.message, { category: 'session', details: notice.details });
@@ -667,7 +667,7 @@ export function initAgentChat({
       return;
     }
     // The agent's last turn was in the conversation left behind: the first message of this new
-    // one says which history is shown now and what is in effect there (F270).
+    // one says which history is shown now and what is in effect there.
     const fresh = createConversation();
     fresh.seen = conversation.seen;
     show(fresh);
@@ -737,14 +737,14 @@ export function initAgentChat({
       dom.input.value = '';
       resizeInput();
       // What the person typed (not a choice the agent offered): the addresses in it are
-      // ones they have seen, which the agent may open without asking (F121).
+      // ones they have seen, which the agent may open without asking.
       noteSeenAddressesIn(text);
     }
     const context = contextFor();
     // What the person did since the agent's last turn (`conversation.seen`, kept with the conversation:
-    // its turn undone, their steps, another history shown), bug hunts L3-15, F270.
+    // its turn undone, their steps, another history shown).
     const since = historySinceSentence(boundTree(), conversation.seen, ownTurnsOf(conversation), { conversation: conversation.id });
-    // Where the tracker stood as the turn began: a step someone else takes while it runs is told next time (L18-4).
+    // Where the tracker stood as the turn began: a step someone else takes while it runs is told next time.
     const startTree = boundTree();
     const turnStart = startTree === null ? null : { tracker: startTree.id, next: startTree.nextStep ?? 0 };
     const attached = attachedSelection();
@@ -806,7 +806,7 @@ export function initAgentChat({
       ended?.detach();
       // What is highlighted as the turn ends is known to its conversation (its agent may have made it).
       knownSelections.set(turnConversation, selection.current());
-      // The history as the turn ends (others' steps taken while it ran left out, L18-4), kept with the
+      // The history as the turn ends (others' steps taken while it ran left out), kept with the
       // conversation (a reload, a save or a share keeps it): the next message says what changed since.
       if (turnConversation === conversation) {
         const endTree = boundTree();
@@ -879,14 +879,6 @@ export function initAgentChat({
   }
 
   const unregisterTurnLink = registerTurnLink({
-    /** A model's name as its provider's list gives it ("Claude Sonnet 4.6"), the id when no list holds it. */
-    modelLabel(model) {
-      for (const entry of modelLists.values()) {
-        const label = entry?.list?.find(each => each.id === model)?.label;
-        if (label) return label;
-      }
-      return model;
-    },
     reveal(turn) {
       if (!conversation.messages.some(message => message.role === 'user' && message.turn === turn)) return false;
       if (!shownOpen()) setOpen(true, { focus: false });

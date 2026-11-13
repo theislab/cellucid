@@ -12,11 +12,12 @@
  * earlier test in the same file did. A contract test asserting which
  * opening a link plans then passes alone and fails beside other work: with
  * pytest and R checks running, "a fast link: file order" opened every cell
- * in a `blocks` order (`gene-sample-contract.test.mjs`, 2026-11-04) -- its
- * plan turns below about 600 decoded bytes a millisecond, and the file's
- * earlier tests measure about 6,600 on an idle machine. An order whose
- * sample brings the first gene 142 ms sooner (`orderPays`) turns likewise
- * once its pass over 6,000 cells stalls for 20 ms.
+ * in a `blocks` order (`gene-sample-contract.test.mjs`): its plan turns
+ * once decoding is measured below a rate that an idle machine measures
+ * several times over. An order whose sample brings the first gene sooner
+ * (`orderPays`) turns likewise once its pass over thousands of cells stalls
+ * for tens of milliseconds (measured:
+ * 38_decisions_testing_and_hosted_runners.md).
  *
  * So a test file whose assertions follow from a plan holds them
  * (`utils/machine.js` `holdMachine`, `MACHINE_AT_REST`): decoding at
@@ -29,8 +30,8 @@
  * clock of their own, a rate set on the meter, answers delayed), and a held
  * link would take those models' place. A test whose host is a function in
  * this process, with no time of its own, measures only how busy the machine
- * is (`open-cells-folder-reuse.test.mjs`: with every interval timed 40 times
- * longer, genes read for 8 of 900 cells, 2026-11-06): it holds the link
+ * is (`open-cells-folder-reuse.test.mjs`: with every interval timed far
+ * longer, genes are read for only a few of its cells): it holds the link
  * too, with `holdMachineAtRest({link: LINK_AT_REST})`.
  *
  * A test of a measurement itself holds nothing of it

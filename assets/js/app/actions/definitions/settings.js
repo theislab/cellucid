@@ -28,10 +28,8 @@ import {
   FIGURE_EXPORT_FRAME_CELLS,
   FIGURE_EXPORT_PARAMS,
   FIGURE_EXPORT_SETTINGS,
-  figureExportParamsOf,
-  figureExportSettingsOf,
-  upgradeFigureSizeOfVersion2,
 } from '../../ui/modules/figure-export/utils/session-settings.js';
+import { FIGURE_WIDTH_PRESETS, mmOfFigurePx, ptOfFigurePx } from '../../ui/modules/figure-export/utils/figure-size.js';
 
 /** A figure-export parameter's value as a timeline label shows it ("preview enabled on, colorblind mode none"). */
 function figureValueWords(value, quote, nested = false) {
@@ -44,6 +42,37 @@ function figureValueWords(value, quote, nested = false) {
   return typeof value === 'string' ? quote.bare(value) : String(value);
 }
 
+/**
+ * A version-2 `figure-export.set` step's size in version 3's terms: its box's
+ * width (CSS pixels, 1/96 inch) is the figure's width in millimetres, a
+ * preset's when it is one; the box's height goes (the figure is as tall as its
+ * plots make it); text sizes in pixels become points (3/4 of a pixel each, to
+ * the half point). A size that followed the window (`screen`, `screen-half`)
+ * was nobody's choice of a figure size, so it becomes the default (neither
+ * `size_preset` nor `width` is set) instead of a width measured off the window
+ * that recorded it.
+ *
+ * @param {object} params
+ * @returns {object}
+ */
+function figureSizeOfVersion2(params) {
+  const { height: _height, ...next } = params;
+  if (params.size_preset === 'screen' || params.size_preset === 'screen-half') {
+    delete next.size_preset;
+    delete next.width;
+  } else if (Object.hasOwn(params, 'width') || Object.hasOwn(params, 'size_preset')) {
+    const widthMm = Number.isFinite(params.width) ? Math.round(mmOfFigurePx(params.width) * 10) / 10 : null;
+    const preset = widthMm === null ? null : Object.keys(FIGURE_WIDTH_PRESETS).find(key => FIGURE_WIDTH_PRESETS[key] === widthMm) ?? null;
+    if (widthMm !== null) next.width = widthMm;
+    if (Object.hasOwn(params, 'size_preset') || widthMm !== null) next.size_preset = preset ?? 'custom';
+  }
+  if (params.font_sizes !== null && typeof params.font_sizes === 'object' && !Array.isArray(params.font_sizes)) {
+    next.font_sizes = Object.fromEntries(Object.entries(params.font_sizes)
+      .map(([key, px]) => [key, Number.isFinite(px) ? Math.max(1, Math.round(ptOfFigurePx(px) * 2) / 2) : px]));
+  }
+  return next;
+}
+
 const SETTING_KINDS = Object.freeze(['number', 'count', 'switch', 'choice', 'color', 'text']);
 
 /** A setting value as a timeline label shows it. */
@@ -53,7 +82,7 @@ function shownValue(params, outcome, quote) {
 }
 
 /** One setting as `settings.list` gives it (`describeSetting` in ui-controls.js). */
-export const SETTING_SCHEMA = Object.freeze({
+const SETTING_SCHEMA = Object.freeze({
   type: 'object', additionalProperties: false,
   required: ['id', 'label', 'section', 'kind', 'value', 'available'],
   properties: {
@@ -117,18 +146,18 @@ export const settingsActions = Object.freeze([
   }),
   defineAction({
     type: 'figure-export.set',
-    // 2 (2026-11-11): svg_strategy is never null (full-vector until another
-    // is chosen, F160); frame takes "cells" (Fit the cells, F161).
-    // 3 (2026-11-11, F271): the figure is physical — width in millimetres
+    // 2: svg_strategy is never null (full-vector until another
+    // is chosen); frame takes "cells" (Fit the cells).
+    // 3: the figure is physical — width in millimetres
     // (size_preset a journal column), which the figure fills; no height;
-    // font_sizes in points. A version-2 step's pixels are converted as a
-    // saved record's are (`upgradeFigureSizeOfVersion2`).
+    // font_sizes in points. A version-2 step's pixels are converted by
+    // `figureSizeOfVersion2`.
     version: 3,
     upgrade: {
       1: ({ svg_strategy: strategy, ...rest }) => (strategy === undefined
         ? rest
         : { ...rest, svg_strategy: strategy ?? FIGURE_EXPORT_DEFAULT_SVG_STRATEGY }),
-      2: params => figureExportParamsOf(upgradeFigureSizeOfVersion2(figureExportSettingsOf(params))),
+      2: figureSizeOfVersion2,
     },
     title: 'Change figure export settings',
     summary: 'Set Figure export options: width (millimetres or a journal column; the figure fills it, text in points keeps its printed size), frame (frame "cells" fits it to the cells, so plots take their shape, not the pane\'s), background, fonts, title and axis labels, axes, legend, preview, what Export downloads; only those given change, nothing is exported (figure-export.get reads them; view.picture with source "export" shows the figure they make).',

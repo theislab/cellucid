@@ -32,7 +32,7 @@
  * | read-plan.js | selections into fetches and copies |
  * | load.js | objects and group links as they are loaded |
  * | nodes.js | the store's groups and arrays |
- * | context.js, binary.js, checksum.js, lru.js, errors.js | shared plumbing |
+ * | context.js, binary.js, checksum.js, errors.js | shared plumbing |
  *
  * @module formats/hdf5
  */

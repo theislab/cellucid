@@ -355,9 +355,9 @@ test('opened from this computer: the first view has no gene value, the share arr
 });
 
 test('a gene asked for before the share arrives waits for it and is read with its values, never as "not read" on every cell', async () => {
-  // The map's X holds no entry: read then, every gene was NaN on every
-  // cell and the page refused it as having no value (Web contracts run
-  // 42280096732, Linux Firefox, `tests/browser/text-matrix-stream.spec.mjs`).
+  // The map's X holds no entry: a gene read then would be NaN on every
+  // cell and the page would refuse it as having no value
+  // (`tests/browser/text-matrix-stream.spec.mjs` holds the same on a page).
   const nCells = 4000;
   const { source, byCell } = folder(nCells, 40);
   const fileSource = new AnnDataFileSource();

@@ -39,9 +39,9 @@
  * a column of a built index costs its entries in memory, and an index still
  * being built costs what is left of its pass as well. A byte read from the
  * store over a link slower than the reader turns bytes into an index costs
- * as much more as the link is slower (`sourceWeight`): two large groups of a
- * 1M-cell CSR `.h5ad` over 5 MB/s read from the built index in memory, not
- * 400 MB of rows again.
+ * as much more as the link is slower (`sourceWeight`): large groups are
+ * read from the built index in memory, not as rows from the link again
+ * (measured: 23_decisions_partial_reading.md).
  *
  * Reads of many columns or rows at once are issued together, so the store
  * plans them as one set of coalesced, parallel requests.
@@ -114,8 +114,9 @@ function chunkElements(array) {
  * A subsample's view of an array (`views/cell-subset.js` `gatheredArray`)
  * has chunks of its kept entries of each stored chunk: each one touched
  * costs the stored chunk it is part of, decoded whole (priced at its kept
- * entries, a 10% share's DE groups were read by their rows, 161 MB priced,
- * against its gene index already built, and read and decoded 750 MB).
+ * entries alone, a read by rows looks far cheaper than the gene index
+ * already built and decodes far more: measured,
+ * 23_decisions_partial_reading.md).
  */
 function touchedChunkBytes(array, starts, ends, count) {
   const bytes = elementBytes(array);
@@ -644,9 +645,9 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
       /** One gene's entries: rows checked, sorted ascending (stable) when stored unsorted. */
       // A gene's kept entries alone, when the value chunks it would skip
       // cost more than the round trip the extra read adds. Shared over the
-      // genes read at once, that round trip looked cheaper; measured, the
-      // runs' extra requests made 100 genes of a 1% subsample slower
-      // (3.2 s against 2.7 s, 150 ms at 5 MB/s) for 13% fewer bytes.
+      // genes read at once, that round trip looked cheaper; the runs' extra
+      // requests make many genes of a small subsample slower for fewer bytes
+      // (measured: 23_decisions_partial_reading.md).
       const entries = async (gene, options) => {
         const start = pointers[gene];
         const end = pointers[gene + 1];
@@ -995,8 +996,8 @@ class SubsetEntries {
  * request is worth (`requestEntries`, `requestPriceOf`): every request in
  * flight holds the reader's work for it (its promises, its plan, its pieces)
  * whatever its bytes, so reads of a few entries each (a scattered cell's
- * row) are not all put in flight at once: a million of them held the
- * reader's heap past its limit (a two-group subset of a 10M-cell file).
+ * row) are not all put in flight at once: a million of them would hold the
+ * reader's heap past its limit.
  */
 export async function pipelined(reads, inFlightEntries, request, handle, requestEntries = 0) {
   const pending = [];
@@ -1083,8 +1084,8 @@ function rowRuns(cells, order, pointers, gap, maxEntries, skipEmpty) {
  * The cells of a subset as the kernels of `subset-entries.js` look them up:
  * their rows ascending (`rows`) and each one's subset position
  * (`positions`), 8 bytes a cell, never a lookup of every row of the matrix
- * (a subset of a 100M-cell file then held 400 MB, on the reader thread and
- * again on every decode worker it was sent to). A row given twice keeps its
+ * (a lookup of every row of a 100M-cell file holds 400 MB, on the reader
+ * thread and again on every decode worker it is sent to). A row given twice keeps its
  * last position.
  *
  * @param {ArrayLike<number>} cells - Rows of the subset's cells, in subset order
@@ -1094,7 +1095,8 @@ function subsetCells(cells) {
   const n = cells.length;
   // The cells sorted by row, stably (a row given twice keeps its order), in
   // two passes of a radix sort on 16 bits each: linear in the cells, where a
-  // comparison sort of a million cells took a quarter of a second.
+  // comparison sort of a million cells is far slower (measured:
+  // 23_decisions_partial_reading.md).
   let keys = allocateTypedArray(Uint32Array, n, 'Cell subset');
   let order = allocateTypedArray(Uint32Array, n, 'Cell subset');
   for (let i = 0; i < n; i++) {
@@ -1139,14 +1141,12 @@ const RADIX = 1 << 16;
  * The genes of a CSC matrix (`columns.readEntries`) are read in runs: genes
  * stored one after another are one range of the indices and one of the
  * values, read with one call each, several runs in flight while the entries
- * already read are kept (every gene of Suo, 51.8 million entries: 26 reads
- * of each array instead of 8,192). A run's entries are kept on a decode
+ * already read are kept (a whole matrix is a few dozen reads of each array
+ * instead of one a gene). A run's entries are kept on a decode
  * worker (`keepSubsetRun`, `runOnDecodeWorker`): its arrays are transferred
  * there, and the reader thread goes on reading and decoding the next runs
- * while the workers keep them (every gene of the rebuilt Suo in its two
- * largest cell types, a local file in Chromium: 305-326 ms, about 150 of them
- * keeping entries on the reader thread, before; 206-215 ms after, against
- * 150 ms for reading the whole of `X`). A gene is the entries the access
+ * while the workers keep them (measured: 23_decisions_partial_reading.md).
+ * A gene is the entries the access
  * says a read of it takes (`entryCount`): a priority-ordered file opened as
  * a prefix reads each gene's counted entries alone, checked
  * (`requireEntries`), and its genes are then runs of their own. Other
@@ -1332,8 +1332,11 @@ async function subsetByColumns(columns, cells, genes, { nObs, label, inFlightEnt
 /**
  * @typedef {Object} MatrixRows
  * @property {(cell: number, options?: Object) => Promise<SparseRow>} row
- * @property {(cells: ReadonlyArray<number>) => number} [readCost] - Bytes reading these rows decodes
- * @property {(cells: ReadonlyArray<number>, genes: ReadonlyArray<number>, options: Object) => Promise<CellSubset>} [subset]
+ * @property {(cells: ReadonlyArray<number>|Uint32Array) => number} [readCost] - Bytes reading these rows decodes
+ * @property {(cells: ReadonlyArray<number>|Uint32Array, genes: ReadonlyArray<number>|Uint32Array, options: Object) => Promise<CellSubset>} [subset]
+ * @property {(cell: number) => number} [entries] - A CSR matrix's stored entries of one row
+ * @property {number} [entryBytes] - A CSR matrix's decoded bytes of one entry: its gene index and its value
+ * @property {(cells: ReadonlyArray<number>, options?: Object) => Promise<SparseRow[]>} [rows] - Many rows at once, where read in ranges
  */
 
 /**

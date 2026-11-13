@@ -109,7 +109,7 @@ export function domainDescription(id) {
  * (a file written before the domain, or by hand) gives `absent()`: that
  * value. A saved state restored onto the open dataset puts it back with the
  * rest (`history.js` `readSaved`), so one file restores one state whatever
- * was shown before (the Expression values: as stored, plan §3). Without
+ * was shown before (the Expression values: as stored). Without
  * `absent`, a saved state that does not hold the domain keeps its value
  * shown.
  *
@@ -117,7 +117,7 @@ export function domainDescription(id) {
  * view by position) gives `readPart(value, views)`: the part a step that
  * acted in one view read, `views` being the `views` value it ran with (its
  * `focus`). A step whose input differs only outside that part (another view
- * kept, another view's filters) is not stale (`provenance.js`, F156).
+ * kept, another view's filters) is not stale (`provenance.js`).
  * @returns {{
  *   provide: (id: string, owner: {capture: Function, restore: Function, describe?: Function, canonical?: Function, absent?: Function, readPart?: Function}) => () => void,
  *   owner: (id: string) => {capture: Function, restore: Function, describe?: Function, canonical?: Function, absent?: Function, readPart?: Function},

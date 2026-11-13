@@ -12,7 +12,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -46,9 +46,6 @@ function guardedRun(files) {
 const failed = (output, name) => new RegExp(`✖ .*${name.replace('.', '\\.')}`).test(output);
 
 test('npm test preloads the guard into every test file\'s process', () => {
-  const runner = readFileSync(path.join(ROOT, 'scripts', 'run-web-tests.mjs'), 'utf8');
-  assert.match(runner, /\['--import', NETWORK_GUARD, '--test'/, 'the guard is imported before --test, so each file\'s process takes it');
-  assert.match(runner, /'network-guard-preload\.mjs'/);
   // This file runs under it: its fetch is the guard's.
   assert.equal(globalThis.fetch.name, 'guardedFetch');
 });

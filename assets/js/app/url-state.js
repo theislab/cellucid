@@ -27,7 +27,7 @@ import { validateDatasetId } from '../data/data-source.js';
 import { validateRemoteServerUrl } from '../data/remote-source.js';
 import { SUBSAMPLE_URL_PARAMETERS, linkedSubsampleSpec, subsampleUrlEntries } from './subsample-url.js';
 import { getProviderRegistry } from '../data/sources/registry.js';
-import { linkLeavesOutParts } from '../data/sources/link-credentials.js';
+import { linkLeavesOutParts } from '../data/sources/link-text.js';
 
 let latestPublicationGeneration = 0;
 

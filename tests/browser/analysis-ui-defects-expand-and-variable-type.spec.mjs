@@ -1,17 +1,16 @@
 /**
- * Two analysis-panel defects found by driving the running app.
+ * Two analysis-panel behaviors the controls keep.
  *
- * CEL-0057 — Detailed's "Variable:" type select discarded the first
- * interaction. Choosing a different type snapped the select back to "None" and
- * emptied the panel; choosing the same option a second time was obeyed. The
- * type lives in the selector component, but the panel rebuilt that component
- * from a config that cannot express "type chosen, variable not chosen yet", so
- * the rebuild seeded it with nothing.
+ * Detailed's "Variable:" type select obeys the first interaction: choosing a
+ * different type keeps it chosen, and does not snap the select back to "None"
+ * and empty the panel. The type lives in the selector component, and the panel
+ * rebuilds that component from a config that cannot express "type chosen,
+ * variable not chosen yet", so the rebuild must seed it with the chosen type.
  *
- * CEL-0058 — Correlation's expanded view was a bare click listener on the
- * preview `<div>`: no role, no name, `tabindex="-1"`. Every other analysis mode
- * offers a real `.analysis-expand-btn`, so in Correlation alone the expanded
- * view was unreachable by keyboard and unannounced.
+ * Correlation's expanded view is opened by a real `.analysis-expand-btn`, as in
+ * every other analysis mode: a bare click listener on the preview `<div>` (no
+ * role, no name, `tabindex="-1"`) leaves the expanded view unreachable by
+ * keyboard and unannounced.
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -58,276 +57,101 @@ const typeSelect = page => page.locator(`${DETAILED} select[id$="detailed-type"]
 const variableSelect = page =>
   page.locator(`${DETAILED} select[id$="-categorical"], ${DETAILED} select[id$="-continuous"]`);
 
-test('CEL-0057: the Variable type select obeys the first interaction, both directions', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'detailed');
-
-  // Establish a complete selection: categorical obs -> cell_type.
-  await typeSelect(page).selectOption('categorical');
-  await expect(typeSelect(page)).toHaveValue('categorical');
-  await variableSelect(page).selectOption('cell_type');
-  await expect(variableSelect(page)).toHaveValue('cell_type');
-  await expect(
-    page.locator(`${DETAILED} select[id$="analysis-plot-type"]`)
-  ).toBeVisible();
-
-  // categorical -> continuous, first interaction.
-  await typeSelect(page).selectOption('continuous');
-  await expect(
-    typeSelect(page),
-    'switching categorical -> continuous must be kept, not reset to None'
-  ).toHaveValue('continuous');
-  // The dependent variable select is rebuilt for the new type and is empty.
-  await expect(page.locator(`${DETAILED} select[id$="-continuous"]`)).toHaveValue('-1');
-
-  // Finish the selection so the reverse direction starts from a complete one.
-  await page.locator(`${DETAILED} select[id$="-continuous"]`).selectOption('score');
-  await expect(page.locator(`${DETAILED} select[id$="-continuous"]`)).toHaveValue('score');
-
-  // continuous -> categorical, first interaction.
-  await typeSelect(page).selectOption('categorical');
-  await expect(
-    typeSelect(page),
-    'switching continuous -> categorical must be kept, not reset to None'
-  ).toHaveValue('categorical');
-  await expect(page.locator(`${DETAILED} select[id$="-categorical"]`)).toHaveValue('-1');
-
-  // continuous -> gene, the third direction the selector offers.
-  await page.locator(`${DETAILED} select[id$="-categorical"]`).selectOption('cell_type');
-  await typeSelect(page).selectOption('gene');
-  await expect(typeSelect(page)).toHaveValue('gene');
-  await expect(page.locator(`${DETAILED} input[id$="-gene-search"]`)).toBeVisible();
-
-  expect(productErrors).toEqual([]);
-});
-
-test('CEL-0058: every analysis preview offers the same keyboard-operable Expand button', async ({
-  page
-}) => {
+// One opening: the Detailed panel's selects first, then a Correlation run and its preview.
+test("Detailed's Variable type select keeps the first choice in every direction; Correlation's preview offers a keyboard-operable Expand button", async ({ page }) => {
   const productErrors = observeProductErrors(page);
   await openDataset(page);
 
-  // Correlation: pick X and Y, wait for the preview, then check the control.
-  await openMode(page, 'correlation');
-  const correlation = panelFor('correlation');
-  await page.locator(`${correlation} select[id$="-x-type"]`).selectOption('continuous');
-  await page.locator(`${correlation} select[id$="-x-continuous"]`).selectOption('score');
-  await page.locator(`${correlation} select[id$="-y-type"]`).selectOption('gene');
-  const geneSearch = page.locator(`${correlation} input[id$="-y-gene-search"]`);
-  await geneSearch.click();
-  await geneSearch.fill('GAPDH');
-  await page.locator('.dropdown-item', { hasText: 'GAPDH' }).first().click();
-  // Correlation runs on Run, never on a choice.
-  await page.locator(correlation).getByRole('button', { name: 'Run correlation' }).click();
+  await test.step('the Variable type select obeys the first interaction, both directions', async () => {
+    await openMode(page, 'detailed');
 
-  const expand = page.locator(`${correlation} .analysis-expand-btn`);
-  await expect(expand, 'Correlation must offer a real Expand button').toHaveCount(1);
-  await expect(expand).toBeVisible();
+    // Establish a complete selection: categorical obs -> cell_type.
+    await typeSelect(page).selectOption('categorical');
+    await expect(typeSelect(page)).toHaveValue('categorical');
+    await variableSelect(page).selectOption('cell_type');
+    await expect(variableSelect(page)).toHaveValue('cell_type');
+    await expect(
+      page.locator(`${DETAILED} select[id$="analysis-plot-type"]`)
+    ).toBeVisible();
 
-  // It reaches the accessibility tree as a named button, not as a bare div.
-  await expect(expand).toHaveRole('button');
-  await expect(expand).toHaveAccessibleName(/Expand/);
+    // categorical -> continuous, first interaction.
+    await typeSelect(page).selectOption('continuous');
+    await expect(
+      typeSelect(page),
+      'switching categorical -> continuous must be kept, not reset to None'
+    ).toHaveValue('continuous');
+    // The dependent variable select is rebuilt for the new type and is empty.
+    await expect(page.locator(`${DETAILED} select[id$="-continuous"]`)).toHaveValue('-1');
 
-  // In the tab order: a native button with no negative tabindex. (Asserted on
-  // the element rather than by walking Tab, because WebKit leaves buttons out
-  // of sequential navigation unless the OS setting is on.)
-  expect(await expand.evaluate(el => ({
-    tag: el.tagName,
-    tabIndex: el.tabIndex,
-    explicit: el.getAttribute('tabindex')
-  }))).toEqual({ tag: 'BUTTON', tabIndex: 0, explicit: null });
+    // Finish the selection so the reverse direction starts from a complete one.
+    await page.locator(`${DETAILED} select[id$="-continuous"]`).selectOption('score');
+    await expect(page.locator(`${DETAILED} select[id$="-continuous"]`)).toHaveValue('score');
 
-  // Operable from the keyboard alone, with both keys a button answers to.
-  await expand.focus();
-  await expect(expand).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(page.locator('.analysis-modal').first()).toBeVisible();
-  await page.keyboard.press('Escape');
-  await expect(page.locator('.analysis-modal')).toHaveCount(0);
-  await expand.focus();
-  await page.keyboard.press(' ');
-  await expect(page.locator('.analysis-modal').first()).toBeVisible();
-  await page.keyboard.press('Escape');
+    // continuous -> categorical, first interaction.
+    await typeSelect(page).selectOption('categorical');
+    await expect(
+      typeSelect(page),
+      'switching continuous -> categorical must be kept, not reset to None'
+    ).toHaveValue('categorical');
+    await expect(page.locator(`${DETAILED} select[id$="-categorical"]`)).toHaveValue('-1');
 
-  // The preview is no longer a mouse-only pseudo control.
-  const preview = page.locator(`${correlation} .analysis-preview-container`);
-  await expect(preview).not.toHaveAttribute('title', /Click to open/);
-  await expect(preview).toHaveCSS('cursor', 'auto');
+    // continuous -> gene, the third direction the selector offers.
+    await page.locator(`${DETAILED} select[id$="-categorical"]`).selectOption('cell_type');
+    await typeSelect(page).selectOption('gene');
+    await expect(typeSelect(page)).toHaveValue('gene');
+    await expect(page.locator(`${DETAILED} input[id$="-gene-search"]`)).toBeVisible();
 
-  expect(productErrors).toEqual([]);
-});
+    expect(productErrors).toEqual([]);
+  });
 
-test('CEL-0058: collapsible analysis settings are built as real disclosure controls', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'genesPanel');
+  await test.step('every analysis preview offers the same keyboard-operable Expand button', async () => {
+    // Correlation: pick X and Y, wait for the preview, then check the control.
+    await openMode(page, 'correlation');
+    const correlation = panelFor('correlation');
+    await page.locator(`${correlation} select[id$="-x-type"]`).selectOption('continuous');
+    await page.locator(`${correlation} select[id$="-x-continuous"]`).selectOption('score');
+    await page.locator(`${correlation} select[id$="-y-type"]`).selectOption('gene');
+    const geneSearch = page.locator(`${correlation} input[id$="-y-gene-search"]`);
+    await geneSearch.click();
+    await geneSearch.fill('GAPDH');
+    await page.locator('.dropdown-item', { hasText: 'GAPDH' }).first().click();
+    // Correlation runs on Run, never on a choice.
+    await page.locator(correlation).getByRole('button', { name: 'Run correlation' }).click();
 
-  // "More options", then the four groups of options inside it.
-  const panel = panelFor('genesPanel');
-  const more = page.locator(`${panel} .analysis-more-options > .disclosure-header`);
-  const groups = page.locator(`${panel} .analysis-options-group > .disclosure-header-row > .disclosure-header`);
-  await expect(more).toHaveCount(1);
-  await expect(groups).toHaveCount(4);
-  const headers = {
-    count: 5,
-    async nth(index) {
-      if (index === 0) return more;
-      if ((await more.getAttribute('aria-expanded')) !== 'true') await more.click();
-      return groups.nth(index - 1);
-    },
-  };
+    const expand = page.locator(`${correlation} .analysis-expand-btn`);
+    await expect(expand, 'Correlation must offer a real Expand button').toHaveCount(1);
+    await expect(expand).toBeVisible();
 
-  for (let index = 0; index < headers.count; index++) {
-    const header = await headers.nth(index);
-    await expect(header).toHaveRole('button');
-    await expect(header).toHaveAttribute('aria-expanded', 'false');
-    const regionId = await header.getAttribute('aria-controls');
-    const region = page.locator(`[id="${regionId}"]`);
-    await expect(region).toBeHidden();
+    // It reaches the accessibility tree as a named button, not as a bare div.
+    await expect(expand).toHaveRole('button');
+    await expect(expand).toHaveAccessibleName(/Expand/);
 
-    // One key press, one toggle: the chevron turns with the announced state.
-    const chevron = header.locator('> .disclosure-chevron');
-    await expect(chevron).toHaveCSS('transform', 'none');
-    await header.focus();
+    // In the tab order: a native button with no negative tabindex. (Asserted on
+    // the element rather than by walking Tab, because WebKit leaves buttons out
+    // of sequential navigation unless the OS setting is on.)
+    expect(await expand.evaluate(el => ({
+      tag: el.tagName,
+      tabIndex: el.tabIndex,
+      explicit: el.getAttribute('tabindex')
+    }))).toEqual({ tag: 'BUTTON', tabIndex: 0, explicit: null });
+
+    // Operable from the keyboard alone, with both keys a button answers to.
+    await expand.focus();
+    await expect(expand).toBeFocused();
     await page.keyboard.press('Enter');
-    await expect(header).toHaveAttribute('aria-expanded', 'true');
-    await expect(region).toBeVisible();
-    await expect(chevron).not.toHaveCSS('transform', 'none');
+    await expect(page.locator('.analysis-modal').first()).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.analysis-modal')).toHaveCount(0);
+    await expand.focus();
     await page.keyboard.press(' ');
-    await expect(header).toHaveAttribute('aria-expanded', 'false');
-    await expect(region).toBeHidden();
-    await expect(chevron).toHaveCSS('transform', 'none');
-  }
+    await expect(page.locator('.analysis-modal').first()).toBeVisible();
+    await page.keyboard.press('Escape');
 
-  expect(productErrors).toEqual([]);
-});
+    // The preview is no longer a mouse-only pseudo control.
+    const preview = page.locator(`${correlation} .analysis-preview-container`);
+    await expect(preview).not.toHaveAttribute('title', /Click to open/);
+    await expect(preview).toHaveCSS('cursor', 'auto');
 
-test('an expanded view follows a newer result and draws only the committed snapshot', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-
-  // Form-based: a newer result arriving while the first render is in flight
-  // owns the same overlay; the superseded render must not close it.
-  const formOutcome = await page.evaluate(async () => {
-    const { FormBasedAnalysisUI } = await import(
-      '/assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js'
-    );
-    const resultA = { data: [], title: 'Result A' };
-    const resultB = { data: [], title: 'Result B' };
-    const ui = Object.create(FormBasedAnalysisUI.prototype);
-    Object.assign(ui, {
-      _isDestroyed: false,
-      _modal: null,
-      _lastResult: resultA,
-      _currentPageData: null,
-      _requestedPlotOptions: null,
-      _notifications: { error() {}, success() {} },
-    });
-    const drawn = [];
-    const busyDuringDraw = [];
-    ui._drawExpandedViewContent = async (modal, result) => {
-      busyDuringDraw.push(modal._body.getAttribute('aria-busy'));
-      if (result === resultA) {
-        await ui._publishAnalysisResult(resultB);
-        return false;
-      }
-      modal._title.textContent = result.title;
-      drawn.push(result.title);
-      return true;
-    };
-    await ui._openExpandedView();
-    const modal = ui._modal;
-    const outcome = {
-      busyDuringDraw,
-      busyAfter: modal === null ? 'closed' : modal._body.getAttribute('aria-busy'),
-      drawn,
-      open: modal !== null && modal.isConnected,
-      title: modal?._title.textContent ?? null,
-    };
-    if (modal !== null) {
-      const { closeModal } = await import(
-        '/assets/js/app/analysis/ui/components/modal.js'
-      );
-      await closeModal(modal);
-    }
-    return outcome;
+    expect(productErrors).toEqual([]);
   });
-  expect(formOutcome).toEqual({
-    busyDuringDraw: ['true', 'true'],
-    busyAfter: null,
-    drawn: ['Result B'],
-    open: true,
-    title: 'Result B',
-  });
-
-  // Detailed: a control change moves `_currentConfig` before its debounced
-  // fetch; the expanded view must draw the config its data was fetched for.
-  const detailedOutcome = await page.evaluate(async () => {
-    const { DetailedAnalysisUI } = await import(
-      '/assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js'
-    );
-    const { closeModal } = await import(
-      '/assets/js/app/analysis/ui/components/modal.js'
-    );
-    const { getActions } = await import('/assets/js/app/actions/index.js');
-    const ui = new DetailedAnalysisUI({ comparisonModule: {}, dataLayer: {} });
-    // The committed snapshot holds page data as the data layer reads it (its
-    // `variableInfo` names the values the heading and the axes say), never a
-    // hand-made shape that drifts from it.
-    await getActions().dispatch('highlight.category', {
-      field: { source: 'obs', key: 'cell_type' }, categories: ['alpha'], page: 'Expanded',
-    });
-    const layer = window._comparisonModule.dataLayer;
-    const pageId = layer.getPages().find(entry => entry.name === 'Expanded').id;
-    const committedConfig = {
-      dataSource: { type: 'categorical_obs', variable: 'cell_type' },
-      pages: [pageId],
-      plotType: 'barplot',
-      plotOptions: {},
-    };
-    const committedData = await layer.getDataForPages({
-      type: 'categorical_obs', variableKey: 'cell_type', pageIds: [pageId],
-    });
-    ui._committedView = Object.freeze({
-      config: committedConfig,
-      pageData: committedData,
-      layoutEngine: {},
-    });
-    ui._currentConfig = {
-      dataSource: { type: 'continuous_obs', variable: 'score' },
-      pages: ['page-1'],
-      plotType: 'histogram',
-      plotOptions: {},
-    };
-    let drawnWith = null;
-    ui._drawExpandedView = async (modal, committed) => {
-      drawnWith = {
-        busy: modal._body.getAttribute('aria-busy'),
-        sameConfig: committed.config === committedConfig,
-        sameData: committed.pageData === committedData,
-      };
-    };
-    await ui._openExpandedView();
-    const modal = ui._modal;
-    const outcome = {
-      drawnWith,
-      title: modal._title.textContent,
-      busyAfter: modal._body.getAttribute('aria-busy'),
-    };
-    await closeModal(modal);
-    return outcome;
-  });
-  expect(detailedOutcome).toEqual({
-    drawnWith: { busy: 'true', sameConfig: true, sameData: true },
-    title: 'Comparing: cell_type',
-    busyAfter: null,
-  });
-  expect(productErrors).toEqual([]);
 });

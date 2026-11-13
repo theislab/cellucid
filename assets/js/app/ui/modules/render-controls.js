@@ -16,12 +16,11 @@
  * Also exposes a `markSmokeDirty()` hook used by the coordinator to trigger
  * debounced smoke rebuilds after visibility changes.
  *
- * The renderer controls arrived here late. They were wired inline at the far
- * end of the `main.js` bootstrap, past the point where a saved session is
- * restored — and the session serializer publishes a restored control by writing
- * the DOM and dispatching the event its owner listens for. With no listener
- * attached yet, every restored renderer setting stopped in the panel and the
- * viewer never heard about it (CEL-0129). Their owner is this module, which
+ * The renderer controls are wired here, by `initUI`, before anything is
+ * restored: the session serializer publishes a restored control by writing
+ * the DOM and dispatching the event its owner listens for, and with no
+ * listener attached yet, every restored renderer setting would stop in the
+ * panel and the viewer never hear about it. Their owner is this module, which
  * `initUI` builds before anything is restored, so the restore reaches the
  * viewer by the same path a click does.
  *
@@ -32,7 +31,7 @@ import { lodLadder } from '../../../rendering/high-perf/draw-order.js';
 import { parseFiniteNumberInRange } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { formatDecimal } from '../components/display-format.js';
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 import {
   antialiasingInForce,
   resolveAntialiasPreference,
@@ -863,7 +862,7 @@ export function initRenderControls(options) {
   backgroundSelect.value = initialBackground;
   viewer.setBackground(initialBackground);
   // A background the person never chose (none kept) follows the theme: its twin in the
-  // theme's group. It is not kept, so it goes on following (owner, 2026-11-10).
+  // theme's group. It is not kept, so it goes on following.
   const followTheme = event => {
     let chosen;
     try {
@@ -887,8 +886,8 @@ export function initRenderControls(options) {
   // Only a person's own pick is kept as their background (`isTrusted`): a
   // restore (undo, a session, a starting view) or an action shows its value
   // without making it the person's choice, so a background never picked
-  // goes on following the theme (owner, 2026-11-10, F46). An undo of a theme
-  // step put the background back through this event and kept it.
+  // goes on following the theme. (An undo of a theme step would otherwise put
+  // the background back through this event and keep it.)
   listen(backgroundSelect, 'change', event => {
     let preferencePublished = false;
     let viewerPublished = false;

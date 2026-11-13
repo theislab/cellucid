@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Render and interaction scenarios: the measurement driver of wave W0 of the
- * render-performance plan (cellucid-private/plans/render-performance-audit.md).
+ * Render and interaction scenarios: the driver that measures what drawing and
+ * driving the viewer cost.
  *
  * Each scenario loads the real application in one browser, installs the
  * render probes (`assets/js/app/ui/modules/benchmark/render-probes.js`) on the

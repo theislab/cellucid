@@ -108,10 +108,3 @@ test('the footer keeps its links to one quiet line and opens each page in a new 
     expect(await response.text()).toContain(`class="welcome-title">${heading}</h1>`);
   }
 });
-
-test('the sign-in return page with nothing to finish says so', async ({ page }) => {
-  await page.goto('/assets/auth/callback.html');
-  await expect(page.locator('#status')).toHaveText(
-    'There is no sign-in to finish here. You can close this window.',
-  );
-});

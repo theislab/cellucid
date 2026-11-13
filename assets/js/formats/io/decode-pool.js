@@ -91,19 +91,16 @@ import { DecoderProbe, adoptDecidedDecoders, choiceKey, fixDecoders, forgetDecid
 import { decoderMemoryStore, decoderMemoryVersion, keepDecoderDecisions, recallDecoderDecisions } from './decoder-memory.js';
 
 /**
- * Smallest decoded chunk worth sending (a scheduling choice, measured): a
+ * Smallest decoded chunk worth sending (a scheduling choice, measured: 21_decisions_decoders_and_codecs.md): a
  * round trip to a worker costs about as much as decoding this many bytes in
  * this thread.
  */
 export const POOL_MIN_BYTES = 32 * 1024;
 
 /**
- * The memory one decode worker holds while it decodes, measured: Chromium on
- * an M1 Pro building the gene index of Suo (gzip CSR, 562k cells, 104 MB
- * stored) grew by 620 MB decoding in the reader thread and by 750, 790 and
- * 950 MB with 2, 4 and 8 decode workers, about 40 MB per worker (its heap,
- * the decompressor's buffers, chunks in flight). Node's worker threads hold
- * 60–110 MB each.
+ * The memory one decode worker holds while it decodes: its heap, the
+ * decompressor's buffers and the chunks in flight (measured:
+ * 21_decisions_decoders_and_codecs.md).
  */
 export const DECODE_WORKER_BYTES = 40 * 1024 * 1024;
 
@@ -398,8 +395,8 @@ class DecodePool {
    * Make one worker ahead of the first chunk (its start is then not on the
    * first chunk's path); the others are made as chunks queue for them
    * (`pump`). A worker is a JavaScript engine of its own: warming every one
-   * the pool may run held six of them from opening on, for a file whose
-   * chunks one decodes. @private
+   * the pool may run would hold six of them from opening on, for a file whose
+   * chunks one decodes.
    */
   warm() {
     if (this.noWorkers || this.workers.length > 0 || this.size === 0) return;

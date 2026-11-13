@@ -1,11 +1,10 @@
 /**
  * A key that comes from data stays the data's own key through the walkers
- * that rebuild results and saved state (round 8 security lens, LG-4): a
- * category, field or group may be named `__proto__`, and `out[key] = value`
- * with that key changes `out`'s prototype instead, so the entry vanished
- * from what an agent was sent, from a saved session and from a figure's
- * legend (and an object value became inherited state of the record). The
- * walkers write with `setOwnDataProperty` (`utils/exact-record.js`).
+ * that rebuild results and saved state: a category, field or group may be
+ * named `__proto__`, and `out[key] = value` with that key changes `out`'s
+ * prototype instead, so the entry would vanish from what an agent was sent,
+ * from a saved session and from a figure's legend (and an object value would
+ * become inherited state of the record). The walkers write with `setOwnDataProperty` (`utils/exact-record.js`).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

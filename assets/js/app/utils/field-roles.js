@@ -22,8 +22,7 @@
  * colored by its first other categorical field with 2 to
  * {@link modestCategoryCount} categories, the colors the category palette
  * designs (`data/palettes.js`); beyond them its colors are generated and
- * harder to tell apart (owner, 2026-11-10: "a priority order of stuff, not
- * only a couple").
+ * harder to tell apart.
  *
  * The analyses read the same ranks for their defaults (the cell types of a
  * composition or a dot plot, its samples: `analysis/options/composition-options.js`).
@@ -52,7 +51,7 @@ export function normalizedFieldName(key) {
  * The first coloring, best first: each tier's patterns in order, matched
  * against the normalized name.
  */
-export const COLOR_FIELD_TIERS = Object.freeze([
+const COLOR_FIELD_TIERS = Object.freeze([
   Object.freeze({ role: 'cell type', patterns: Object.freeze([/^cell_types?$/, /^celltypes?$/]) }),
   Object.freeze({
     role: 'cell type',
@@ -93,7 +92,7 @@ export const COLOR_FIELD_TIERS = Object.freeze([
 ]);
 
 /** The roles that name the cells' identity: what a composition or a dot plot groups by. */
-export const IDENTITY_ROLES = Object.freeze(new Set(['cell type', 'annotation', 'lineage', 'cluster']));
+const IDENTITY_ROLES = Object.freeze(new Set(['cell type', 'annotation', 'lineage', 'cluster']));
 
 /**
  * Names that read as the sample a cell came from, best replicate first: the
@@ -156,7 +155,7 @@ export function isNeverFirstColoring(key) {
  * @param {string} key
  * @returns {{tier: number, pattern: number, level: number, role: string}|null}
  */
-export function colorFieldRank(key) {
+function colorFieldRank(key) {
   if (isNeverFirstColoring(key)) return null;
   const name = normalizedFieldName(key);
   for (let tier = 0; tier < COLOR_FIELD_TIERS.length; tier++) {
@@ -268,7 +267,7 @@ export function sampleField(fields, except = '') {
  * `total_umis`, `umi_count`), then a plain library size. A size factor
  * (`size_factor`, scran, DESeq2) is a total already scaled, not one.
  */
-export const LIBRARY_SIZE_FIELD_TIERS = Object.freeze([
+const LIBRARY_SIZE_FIELD_TIERS = Object.freeze([
   /^total_counts$/,
   /^n_counts$/,
   /^n_count_rna$/,

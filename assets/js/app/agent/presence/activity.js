@@ -54,7 +54,7 @@ export function turnKey(agent, turn, connection = null) {
  * names it, its host (or an app on this computer) with the name it gives
  * itself only quoted ("evil.example (calls itself “Claude”)": the relay
  * client names it so, `appName`), so two such apps are told apart and none
- * passes for Claude (F122, L26-4); the bare name when the way is not known.
+ * passes for Claude; the bare name when the way is not known.
  * @param {string} agent
  * @param {{kind: string, client?: string|null, host?: string|null, known?: boolean}|null|undefined} connection
  */
@@ -174,7 +174,7 @@ export function createAgentActivity({ titleOf = type => type, outsideOf = () => 
         entry.running.delete(meta);
         if (event.kind === 'done' && event.step !== null && event.step !== undefined) {
           // Steps, not actions: a change merged into the step before (a
-          // slider set again, coalesced) is that one step (R9R-6).
+          // slider set again, coalesced) is that one step.
           entry.stepIds.add(event.step.id);
           entry.steps = entry.stepIds.size;
           entry.lastLabel = event.step.label;

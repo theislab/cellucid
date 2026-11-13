@@ -4,8 +4,7 @@
  * (`app/open-cells-resize.js` reads them back) and the failure is said once,
  * naming the dataset and the reason, with the raw error under Details; the
  * reading resolves `{shown: false}`, never rejects (an Apply that rejected
- * was an unhandled rejection the person never saw: Web contracts run
- * 41269083996, Linux WebKit). A cancellation is said by nobody.
+ * would be an unhandled rejection the person never sees). A cancellation is said by nobody.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';

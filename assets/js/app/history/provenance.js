@@ -1,5 +1,5 @@
 /**
- * @fileoverview Provenance and staleness for any step (History v2 §3.4).
+ * @fileoverview Provenance and staleness for any step .
  *
  * An action declares the inputs its result is computed from (`reads`, the
  * catalog's result inputs): state domains, and `history` (another branch's
@@ -14,15 +14,14 @@
  *   on the path that changed that input ("Filters changed at step 23"), or
  *   none when the values differ with no step between (the cause was
  *   deleted); R's cause is the earliest of them (the step a timeline marks it stale from).
- *   Each reason names its own input's cause, never one cause for all (F156).
+ *   Each reason names its own input's cause, never one cause for all.
  *
  * An input held per view (the filters, hidden cells, coloring field and
  * views of each view) is compared at the view R acted in (the view in focus
  * when it ran): its owner's `readPart(value, views)` is that view's part,
  * and R is stale only when that part differs (`sameRead`). Keeping another
  * view, or changing another view's filters, changes the domain's value but
- * not the cells R used, so it makes no step stale (F156, live pass 6: a test
- * went stale when a view was kept).
+ * not the cells R used, so it makes no step stale.
  *
  * An input the action **captures** (`captures`: a keyframe holds the camera
  * it was saved at) is read, for replay, but its result never follows it: a
@@ -140,7 +139,7 @@ export function staleOnPath(tracker, headId, { branchMoved = () => false, captur
 
 /**
  * Why a stale step is stale, one sentence per input that changed, each with
- * its own cause (F156): "Filters changed at step 23 ("Hid Alpha in View 2")."
+ * its own cause: "Filters changed at step 23 ("Hid Alpha in View 2")."
  * The one wording `history.stale`, `history.step` and the State panel give.
  *
  * @param {{inputs: string[], causes?: Record<string, object|null>}} entry - a `staleOnPath` entry

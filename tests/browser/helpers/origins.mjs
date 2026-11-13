@@ -16,7 +16,7 @@
 //
 // Everything here is a Node-side binding. `page.evaluate`, `addInitScript` and
 // `waitForFunction` serialize their callback and run it in the page, where none
-// of these names exist — a literal used to survive that boundary because it was
+// of these names exist — a literal survives that boundary because it is
 // part of the function source, and an identifier does not. Pass the value in as
 // an argument instead:
 //

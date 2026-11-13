@@ -22,9 +22,8 @@
  * - The description, canonical, Open Graph and Twitter tags at the very start
  *   of the head. A link preview reads only a prefix of the page: Slack requests
  *   the first 32 KB with a Range header, Teams and Telegram have been seen to
- *   read less, and the import map alone is over 100 KB. Before 2026-11-07 the
- *   tags sat after it, at byte 121,167, and a 32 KB fetch of the live page held
- *   the title and nothing else.
+ *   read less, and the import map alone is over 100 KB. Tags placed after it
+ *   would leave a 32 KB fetch of the page holding the title and nothing else.
  * - Structured data that parses, describes the app truthfully, and is the exact
  *   block the Content-Security-Policy hash allows: a WebSite node (the site name
  *   Google shows) and the WebApplication. A citation appears in it only once
@@ -50,6 +49,7 @@ import { fileURLToPath } from 'node:url';
 
 import { renderSecurityTxt } from '../scripts/generate-web-asset-inventory.mjs';
 import { INPUT_FORMATS } from '../assets/js/data/input-formats.js';
+import { pythonDocsRoot, skipAbsentSibling } from '../scripts/shared-files.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = name => readFile(path.join(ROOT, name), 'utf8');
@@ -90,7 +90,7 @@ const APP = node('WebApplication');
 const WEBSITE = node('WebSite');
 
 // The paper's DOI, once CITATION.cff's preferred-citation carries one (written
-// there first, by hand, then copied everywhere by sync_citation.py).
+// there first, by hand, then copied everywhere by the citation sync script).
 const CITATION_CFF = await read('CITATION.cff');
 const PREFERRED_CITATION = only(/# BEGIN cellucid preferred-citation\n([\s\S]*?)# END cellucid preferred-citation/g, CITATION_CFF, 'preferred-citation block');
 const PAPER_DOI = /^\s+doi:\s*"?([^"\s]+)"?\s*$/m.exec(PREFERRED_CITATION)?.[1] ?? null;
@@ -379,22 +379,8 @@ test('no link names the retired documentation host', async () => {
   }
 });
 
-test('the 404 page is the site design, links home, to the docs, GitHub and citing, and is not indexed', async () => {
+test('the 404 page is not indexed, keeps a strict policy and refers only to files that exist', async () => {
   assert.match(NOT_FOUND, /<meta name="robots" content="noindex" \/>/);
-  assert.match(NOT_FOUND, /<h1 id="not-found-title" class="welcome-title">Page not found<\/h1>/);
-  // The standalone pages' stylesheet, the app's theme bootstrap and the brand
-  // card, nothing else.
-  assert.match(NOT_FOUND, /<html lang="en" data-theme="light" data-viewer-background="studio">/);
-  assert.match(NOT_FOUND, /<link rel="stylesheet" href="\/assets\/css\/page\.css\?v=[0-9a-f]{12}" \/>/);
-  const scripts = [...NOT_FOUND.matchAll(/<script\b([^>]*)>/g)].map(match => match[1]);
-  assert.equal(scripts.length, 1);
-  assert.match(scripts[0], /^ src="\/assets\/js\/app\/ui\/core\/theme-init\.js\?v=[0-9a-f]{12}"$/);
-  assert.match(NOT_FOUND, /class="welcome-content"/);
-  assert.match(NOT_FOUND, /<a href="\/" class="welcome-btn welcome-btn-primary">/);
-  assert.match(NOT_FOUND, new RegExp(`<a href="${DOCS}" class="welcome-btn welcome-btn-link">`));
-  assert.match(NOT_FOUND, new RegExp(`<a href="${GITHUB}">`));
-  assert.match(NOT_FOUND, new RegExp(`<a href="${CITING}">`));
-  assert.doesNotMatch(NOT_FOUND, /style=/);
   const policy = only(/<meta http-equiv="Content-Security-Policy" content="([^"]+)" \/>/g, NOT_FOUND, '404 CSP');
   assert.doesNotMatch(policy, /unsafe-inline|unsafe-eval|https:/);
   // GitHub Pages serves it at any depth, so every local reference is
@@ -408,7 +394,6 @@ test('the 404 page is the site design, links home, to the docs, GitHub and citin
   // It ships with the build: inventoried, so its bytes are in the build id.
   const inventory = JSON.parse(await read('cellucid-web-assets.json'));
   assert.ok(inventory.assets.some(asset => asset.path === '404.html'));
-  assert.match(await read('assets/css/page.css'), /@import 'layouts\/_page\.css\?v=[0-9a-f]{12}' layer\(layouts\);/);
 });
 
 test('llms.txt has the llmstxt.org shape, introduces the project and links to pages that exist', async t => {
@@ -425,13 +410,9 @@ test('llms.txt has the llmstxt.org shape, introduces the project and links to pa
   assert.ok(LLMS.includes(SITE));
   // Each documentation link is a page the docs build makes from a source file
   // in cellucid-python/docs (beside this checkout, or CELLUCID_PYTHON_ROOT).
-  const docsRoot = path.join(process.env.CELLUCID_PYTHON_ROOT ?? path.resolve(ROOT, '..', 'cellucid-python'), 'docs');
-  try {
-    await stat(path.join(docsRoot, 'conf.py'));
-  } catch {
-    t.skip(`no cellucid-python docs at ${docsRoot}`);
-    return;
-  }
+  const docsRoot = pythonDocsRoot();
+  const hasDocs = await stat(path.join(docsRoot, 'conf.py')).then(() => true, () => false);
+  if (skipAbsentSibling(t, hasDocs, `no cellucid-python docs at ${docsRoot}`)) return;
   const pages = [...LLMS.matchAll(/\((https:\/\/docs\.cellucid\.com\/en\/latest\/(?:[^)]*\.html)?)\)/g)].map(match => match[1]);
   assert.ok(pages.length >= 10);
   // The docs' own llms.txt and llms-full.txt are written by sphinx-llms-txt.

@@ -3,18 +3,16 @@
  *
  * Every field or gene read can be its own request, so the number that decides
  * how long an analysis waits is not how many requests it makes but how many of
- * them it makes *in sequence*. Two loaders used to await each unit before
+ * them it makes *in sequence*. Two loaders do not await each unit before
  * starting the next:
  *
- *  - `fetchBulkObsFields` awaited one observation field at a time. Quick
- *    Insights asks for four fields on first open, which the categorical
- *    outlier masks turn into six requests; measured in Chromium at 150 ms
- *    emulated latency that was six strictly serial round trips spanning
- *    2.07 s with never more than one request in flight.
- *  - gene loading for a signature ran fixed batches of ten with a macrotask
- *    barrier between them, so a 60-gene signature cost six sequential waves
- *    however fast the link was. `readGeneColumns` asks for every gene at
- *    once; the reader's fetch scheduler paces the requests.
+ *  - `fetchBulkObsFields` does not await one observation field at a time
+ *    (Quick Insights asks for four fields on first open, which the
+ *    categorical outlier masks turn into six requests, never serial).
+ *  - gene loading for a signature does not run fixed batches with a
+ *    macrotask barrier between them, which would cost a 60-gene signature
+ *    six sequential waves however fast the link is. `readGeneColumns` asks
+ *    for every gene at once; the reader's fetch scheduler paces the requests.
  *
  * These tests pin the shape rather than the clock: they count how many loads
  * are open at once, which is load-invariant and reproduces identically on a
@@ -174,10 +172,10 @@ test('an invalidated gene-column read aborts the reads in flight', async () => {
 });
 
 test('a page fetch reads the exact membership its cache key was built from', async () => {
-  // The digest that becomes the cache key and the values that go under it used
-  // to be two separate traversals with an `await` between them, so a
-  // membership change in that window was cached under a version it no longer
-  // matched. They now share one snapshot.
+  // The digest that becomes the cache key and the values that go under it share
+  // one snapshot: two separate traversals with an `await` between them would
+  // cache a membership change in that window under a version it no longer
+  // matched.
   const layer = Object.create(DataLayer.prototype);
   const page = {
     id: 'page-1',

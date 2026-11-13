@@ -1,5 +1,5 @@
 /**
- * An analysis's "Expression matrix" (analysis overhaul §2.6): the mapped
+ * An analysis's "Expression matrix": the mapped
  * matrix, or another of the file read through `DataState.openExpressionMatrix`
  * without changing what is shown. The data layer lists the choices from the
  * data-mapping candidates, reads a non-mapped matrix's genes by their names on

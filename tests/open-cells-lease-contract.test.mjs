@@ -276,7 +276,7 @@ test('a growth step waits for a cell export, and an export asked during one read
     await step;
     while (outcomes.length === 0) await turn();
     // The obs-column CSV: header, kind and categories rows (the field's
-    // categories in its order, F125), then a row per cell.
+    // categories in its order), then a row per cell.
     assert.deepEqual(outcomes[0], ['complete', 'Export the field (CSV): cluster.csv (85 B)']);
     const first = await saved[0].text();
     assert.equal(first, 'obs_name,cluster\nkind,categorical\ncategories,"[""a"",""b""]"\ncell0,a\ncell1,b\ncell2,a\n',
@@ -299,7 +299,7 @@ test('a growth step waits for a cell export, and an export asked during one read
   }
 });
 
-test('a cell export is stopped by its card\'s Cancel: its reads stop, nothing is written, nothing is reported as failed (CE-07)', async () => {
+test('a cell export is stopped by its card\'s Cancel: its reads stop, nothing is written, nothing is reported as failed', async () => {
   const release = deferred();
   const named = deferred();
   const adapters = {

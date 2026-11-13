@@ -4,7 +4,7 @@
  * focused view is colored by one field and another pane by a different one,
  * the gesture must select by the field of the pane that was pressed, among
  * the cells that pane shows, while focus stays where it was. Reading the
- * focused view's field instead selected a value range of the wrong field.
+ * focused view's field instead would select a value range of the wrong field.
  *
  * Whether a press can start at all, and the cursor the armed tool shows, are
  * the pressed pane's too: with the focused view colored by no field, an Alt
@@ -151,139 +151,137 @@ async function openTwoPanes(page) {
   return keptId;
 }
 
-test('Alt+click in an unfocused pane selects that pane\'s category among the cells it shows', async ({
-  page,
-}) => {
+// One opening with the two differently colored panes. The click is confirmed, so the drag
+// starts with no selection in hand.
+test("an Alt gesture in an unfocused pane selects by that pane's own field: a category by a click, a value range by a drag", async ({ page }) => {
   const productErrors = observeProductErrors(page);
   const keptId = await openTwoPanes(page);
-  const [point] = await findPaneCells(page, 'live', 1);
 
-  await armSelection(page, 'annotation', async () => {
+  await test.step("Alt+click in an unfocused pane selects that pane's category among the cells it shows", async () => {
+    const [point] = await findPaneCells(page, 'live', 1);
+
+    await armSelection(page, 'annotation', async () => {
+      await page.mouse.move(point.x, point.y);
+      await page.keyboard.down('Alt');
+      await page.mouse.down();
+      await page.mouse.up();
+      await page.keyboard.up('Alt');
+    });
+
+    const expected = await page.evaluate(cellIndex => {
+      const field = window._cellucidState.getFieldForView('live');
+      const visible = window._cellucidViewer.getViewTransparency('live');
+      const code = field.codes[cellIndex];
+      const cells = [];
+      for (let cell = 0; cell < field.codes.length; cell++) {
+        if (field.codes[cell] === code && visible[cell] === 1) cells.push(cell);
+      }
+      return { category: field.categories[code], cells };
+    }, point.cellIndex);
+    // `alpha` is hidden in the pane, so the clicked cell is beta or gamma, and
+    // each of those has 40 cells, all shown there.
+    expect(['beta', 'gamma']).toContain(expected.category);
+    expect(expected.cells).toHaveLength(40);
+
+    const selection = await unifiedState(page);
+    expect(selection.inProgress).toBe(true);
+    expect([...selection.candidates].sort((a, b) => a - b)).toEqual(expected.cells);
+    expect(await focusOf(page), 'an Alt gesture never moves view focus')
+      .toEqual({ viewer: keptId, state: keptId });
+    // The help line describes the pane that was pressed: a categorical one
+    // replaces on a plain Alt gesture, although the focused view is continuous.
+    await expect(page.locator('#highlight-mode-description'))
+      .toContainText('Alt to replace');
+
+    // Confirming commits exactly those cells as an annotation group, named by
+    // the pane's category; the group names no field, so nothing in it can
+    // point at the focused view's.
+    await page.locator('#annotation-confirm-btn').click();
+    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+    const group = await page.evaluate(
+      () => {
+        const saved = window._cellucidState.getHighlightedGroups().at(-1);
+        return {
+          type: saved.type,
+          label: saved.label,
+          cells: [...saved.cellIndices].sort((a, b) => a - b),
+          fieldKey: saved.fieldKey ?? null,
+        };
+      },
+    );
+    expect(group).toEqual({
+      type: 'annotation',
+      label: expected.category,
+      cells: expected.cells,
+      fieldKey: null,
+    });
+    expect(await focusOf(page)).toEqual({ viewer: keptId, state: keptId });
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step("an Alt drag in an unfocused pane selects a value range of that pane's continuous field", async () => {
+    // Focus the categorical `live` view; the drag below lands in the kept pane,
+    // which is colored by the continuous `score`.
+    await page.locator('.split-badge').filter({
+      has: page.locator('.split-badge-pill', { hasText: /^1$/ }),
+    }).click();
+    await expect.poll(() => focusOf(page)).toEqual({ viewer: 'live', state: 'live' });
+    await expect.poll(() => focusedFieldKindOf(page)).toBe('category');
+
+    const [point] = await findPaneCells(page, keptId, 1);
+    const dragDeltaY = -60;
+    const label = page.locator('#selection-range-label');
+
     await page.mouse.move(point.x, point.y);
     await page.keyboard.down('Alt');
     await page.mouse.down();
+    await page.mouse.move(point.x, point.y + dragDeltaY, { steps: 6 });
+    // The live preview labels the range of the pane's continuous field while
+    // the gesture is still in hand; a categorical field would have no label.
+    await expect(label).toBeVisible();
+    const labelText = await label.textContent();
     await page.mouse.up();
     await page.keyboard.up('Alt');
-  });
+    await expect(page.locator('#annotation-step-controls')).toBeAttached();
+    await expect(label).toBeHidden();
 
-  const expected = await page.evaluate(cellIndex => {
-    const field = window._cellucidState.getFieldForView('live');
-    const visible = window._cellucidViewer.getViewTransparency('live');
-    const code = field.codes[cellIndex];
-    const cells = [];
-    for (let cell = 0; cell < field.codes.length; cell++) {
-      if (field.codes[cell] === code && visible[cell] === 1) cells.push(cell);
+    const expected = await page.evaluate(({ id, cellIndex, deltaY, scale }) => {
+      const field = window._cellucidState.getFieldForView(id);
+      const visible = window._cellucidViewer.getViewTransparency(id);
+      const { min, max } = field._continuousStats;
+      const clicked = field.values[cellIndex];
+      const dragAmount = -deltaY * scale * (max - min);
+      const minVal = clicked;
+      const maxVal = Math.min(max, clicked + dragAmount);
+      const cells = [];
+      for (let cell = 0; cell < field.values.length; cell++) {
+        const value = field.values[cell];
+        if (value >= minVal && value <= maxVal && visible[cell] === 1) cells.push(cell);
+      }
+      return { minVal, maxVal, cells };
+    }, {
+      id: keptId,
+      cellIndex: point.cellIndex,
+      deltaY: dragDeltaY,
+      scale: DRAG_VALUE_SCALE,
+    });
+    expect(expected.cells).toContain(point.cellIndex);
+
+    const selection = await unifiedState(page);
+    expect([...selection.candidates].sort((a, b) => a - b)).toEqual(expected.cells);
+    expect(await focusOf(page), 'an Alt gesture never moves view focus')
+      .toEqual({ viewer: 'live', state: 'live' });
+
+    // The label read "min → max" of the same range, rounded for display.
+    const [shownMin, shownMax] = labelText.split('→').map(part => Number(part.trim()));
+    for (const [shown, exact] of [[shownMin, expected.minVal], [shownMax, expected.maxVal]]) {
+      expect(Number.isFinite(shown)).toBe(true);
+      expect(Math.abs(shown - exact)).toBeLessThanOrEqual(0.01 * Math.max(1, Math.abs(exact)));
     }
-    return { category: field.categories[code], cells };
-  }, point.cellIndex);
-  // `alpha` is hidden in the pane, so the clicked cell is beta or gamma, and
-  // each of those has 40 cells, all shown there.
-  expect(['beta', 'gamma']).toContain(expected.category);
-  expect(expected.cells).toHaveLength(40);
-
-  const selection = await unifiedState(page);
-  expect(selection.inProgress).toBe(true);
-  expect([...selection.candidates].sort((a, b) => a - b)).toEqual(expected.cells);
-  expect(await focusOf(page), 'an Alt gesture never moves view focus')
-    .toEqual({ viewer: keptId, state: keptId });
-  // The help line describes the pane that was pressed: a categorical one
-  // replaces on a plain Alt gesture, although the focused view is continuous.
-  await expect(page.locator('#highlight-mode-description'))
-    .toContainText('Alt to replace');
-
-  // Confirming commits exactly those cells as an annotation group, named by
-  // the pane's category; the group names no field, so nothing in it can
-  // point at the focused view's.
-  await page.locator('#annotation-confirm-btn').click();
-  await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
-  const group = await page.evaluate(
-    () => {
-      const saved = window._cellucidState.getHighlightedGroups().at(-1);
-      return {
-        type: saved.type,
-        label: saved.label,
-        cells: [...saved.cellIndices].sort((a, b) => a - b),
-        fieldKey: saved.fieldKey ?? null,
-      };
-    },
-  );
-  expect(group).toEqual({
-    type: 'annotation',
-    label: expected.category,
-    cells: expected.cells,
-    fieldKey: null,
+    await expect(page.locator('#highlight-mode-description'))
+      .toContainText('Alt to intersect');
+    expect(productErrors).toEqual([]);
   });
-  expect(await focusOf(page)).toEqual({ viewer: keptId, state: keptId });
-  expect(productErrors).toEqual([]);
-});
-
-test('an Alt drag in an unfocused pane selects a value range of that pane\'s continuous field', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  const keptId = await openTwoPanes(page);
-
-  // Focus the categorical `live` view; the drag below lands in the kept pane,
-  // which is colored by the continuous `score`.
-  await page.locator('.split-badge').filter({
-    has: page.locator('.split-badge-pill', { hasText: /^1$/ }),
-  }).click();
-  await expect.poll(() => focusOf(page)).toEqual({ viewer: 'live', state: 'live' });
-  await expect.poll(() => focusedFieldKindOf(page)).toBe('category');
-
-  const [point] = await findPaneCells(page, keptId, 1);
-  const dragDeltaY = -60;
-  const label = page.locator('#selection-range-label');
-
-  await page.mouse.move(point.x, point.y);
-  await page.keyboard.down('Alt');
-  await page.mouse.down();
-  await page.mouse.move(point.x, point.y + dragDeltaY, { steps: 6 });
-  // The live preview labels the range of the pane's continuous field while
-  // the gesture is still in hand; a categorical field would have no label.
-  await expect(label).toBeVisible();
-  const labelText = await label.textContent();
-  await page.mouse.up();
-  await page.keyboard.up('Alt');
-  await expect(page.locator('#annotation-step-controls')).toBeAttached();
-  await expect(label).toBeHidden();
-
-  const expected = await page.evaluate(({ id, cellIndex, deltaY, scale }) => {
-    const field = window._cellucidState.getFieldForView(id);
-    const visible = window._cellucidViewer.getViewTransparency(id);
-    const { min, max } = field._continuousStats;
-    const clicked = field.values[cellIndex];
-    const dragAmount = -deltaY * scale * (max - min);
-    const minVal = clicked;
-    const maxVal = Math.min(max, clicked + dragAmount);
-    const cells = [];
-    for (let cell = 0; cell < field.values.length; cell++) {
-      const value = field.values[cell];
-      if (value >= minVal && value <= maxVal && visible[cell] === 1) cells.push(cell);
-    }
-    return { minVal, maxVal, cells };
-  }, {
-    id: keptId,
-    cellIndex: point.cellIndex,
-    deltaY: dragDeltaY,
-    scale: DRAG_VALUE_SCALE,
-  });
-  expect(expected.cells).toContain(point.cellIndex);
-
-  const selection = await unifiedState(page);
-  expect([...selection.candidates].sort((a, b) => a - b)).toEqual(expected.cells);
-  expect(await focusOf(page), 'an Alt gesture never moves view focus')
-    .toEqual({ viewer: 'live', state: 'live' });
-
-  // The label read "min → max" of the same range, rounded for display.
-  const [shownMin, shownMax] = labelText.split('→').map(part => Number(part.trim()));
-  for (const [shown, exact] of [[shownMin, expected.minVal], [shownMax, expected.maxVal]]) {
-    expect(Number.isFinite(shown)).toBe(true);
-    expect(Math.abs(shown - exact)).toBeLessThanOrEqual(0.01 * Math.max(1, Math.abs(exact)));
-  }
-  await expect(page.locator('#highlight-mode-description'))
-    .toContainText('Alt to intersect');
-  expect(productErrors).toEqual([]);
 });
 
 /**
@@ -313,109 +311,105 @@ async function openFieldlessFocusedPane(page) {
   return keptId;
 }
 
-test('Alt+click in a colored pane selects although the focused view has no field', async ({
-  page,
-}) => {
+// One opening. The cursor step comes last: it ends by coloring the focused pane.
+test('with the focused pane colored by no field: a press there is refused, a press in the colored pane selects, and the armed cursor follows the pane under it', async ({ page }) => {
   const productErrors = observeProductErrors(page);
   const keptId = await openFieldlessFocusedPane(page);
 
-  // One pane on screen has a field, so the panel invites a click rather than
-  // asking for a field first.
-  await expect(page.locator(TOOL_HINT)).toContainText(
-    'Alt+click a cell to select',
-  );
-  await expect(page.locator(TOOL_HINT)).not.toContainText(
-    'Color by a field first',
-  );
+  await test.step('Alt+click in a pane colored by no field changes nothing and says why', async () => {
+    const [point] = await findPaneCells(page, keptId, 1);
 
-  const [point] = await findPaneCells(page, 'live', 1);
-  await armSelection(page, 'annotation', async () => {
     await page.mouse.move(point.x, point.y);
     await page.keyboard.down('Alt');
     await page.mouse.down();
     await page.mouse.up();
     await page.keyboard.up('Alt');
+
+    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+      'That panel is not colored by a field, so there is nothing to select.',
+    );
+    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+    expect((await unifiedState(page)).inProgress).toBe(false);
+    expect(
+      await focusOf(page),
+      'a refused press is still the selection tool\'s, so focus stays put',
+    ).toEqual({ viewer: keptId, state: keptId });
+    expect(productErrors).toEqual([]);
   });
 
-  const expected = await page.evaluate(cellIndex => {
-    const field = window._cellucidState.getFieldForView('live');
-    const visible = window._cellucidViewer.getViewTransparency('live');
-    const code = field.codes[cellIndex];
-    const cells = [];
-    for (let cell = 0; cell < field.codes.length; cell++) {
-      if (field.codes[cell] === code && visible[cell] === 1) cells.push(cell);
-    }
-    return cells;
-  }, point.cellIndex);
-  expect(expected).toHaveLength(40);
+  await test.step('Alt+click in a colored pane selects although the focused view has no field', async () => {
+    // One pane on screen has a field, so the panel invites a click rather than
+    // asking for a field first.
+    await expect(page.locator(TOOL_HINT)).toContainText(
+      'Alt+click a cell to select',
+    );
+    await expect(page.locator(TOOL_HINT)).not.toContainText(
+      'Color by a field first',
+    );
 
-  const selection = await unifiedState(page);
-  expect(selection.inProgress).toBe(true);
-  expect([...selection.candidates].sort((a, b) => a - b)).toEqual(expected);
-  expect(await focusOf(page), 'an Alt gesture never moves view focus')
-    .toEqual({ viewer: keptId, state: keptId });
-  expect(productErrors).toEqual([]);
-});
+    const [point] = await findPaneCells(page, 'live', 1);
+    await armSelection(page, 'annotation', async () => {
+      await page.mouse.move(point.x, point.y);
+      await page.keyboard.down('Alt');
+      await page.mouse.down();
+      await page.mouse.up();
+      await page.keyboard.up('Alt');
+    });
 
-test('Alt+click in a pane colored by no field changes nothing and says why', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  const keptId = await openFieldlessFocusedPane(page);
-  const [point] = await findPaneCells(page, keptId, 1);
+    const expected = await page.evaluate(cellIndex => {
+      const field = window._cellucidState.getFieldForView('live');
+      const visible = window._cellucidViewer.getViewTransparency('live');
+      const code = field.codes[cellIndex];
+      const cells = [];
+      for (let cell = 0; cell < field.codes.length; cell++) {
+        if (field.codes[cell] === code && visible[cell] === 1) cells.push(cell);
+      }
+      return cells;
+    }, point.cellIndex);
+    expect(expected).toHaveLength(40);
 
-  await page.mouse.move(point.x, point.y);
-  await page.keyboard.down('Alt');
-  await page.mouse.down();
-  await page.mouse.up();
-  await page.keyboard.up('Alt');
+    const selection = await unifiedState(page);
+    expect(selection.inProgress).toBe(true);
+    expect([...selection.candidates].sort((a, b) => a - b)).toEqual(expected);
+    expect(await focusOf(page), 'an Alt gesture never moves view focus')
+      .toEqual({ viewer: keptId, state: keptId });
+    expect(productErrors).toEqual([]);
+  });
 
-  await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-    'That panel is not colored by a field, so there is nothing to select.',
-  );
-  await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
-  expect((await unifiedState(page)).inProgress).toBe(false);
-  expect(
-    await focusOf(page),
-    'a refused press is still the selection tool\'s, so focus stays put',
-  ).toEqual({ viewer: keptId, state: keptId });
-  expect(productErrors).toEqual([]);
-});
+  await test.step('the armed annotation cursor follows the field of the pane under it', async () => {
+    // The selection of the step above is let go first.
+    await page.locator('#annotation-cancel-btn').click();
+    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+    const [livePoint] = await findPaneCells(page, 'live', 1);
+    const [keptPoint] = await findPaneCells(page, keptId, 1);
+    // The viewer ignores an Alt key typed into a form control, and the field
+    // menus just used keep focus.
+    const releaseFormFocus = () => page.evaluate(() => document.activeElement?.blur());
 
-test('the armed annotation cursor follows the field of the pane under it', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  const keptId = await openFieldlessFocusedPane(page);
-  const [livePoint] = await findPaneCells(page, 'live', 1);
-  const [keptPoint] = await findPaneCells(page, keptId, 1);
-  // The viewer ignores an Alt key typed into a form control, and the field
-  // menus just used keep focus.
-  const releaseFormFocus = () => page.evaluate(() => document.activeElement?.blur());
+    await releaseFormFocus();
+    await page.mouse.move(livePoint.x, livePoint.y);
+    await page.keyboard.down('Alt');
+    await expect.poll(() => canvasCursor(page)).toBe('cell');
+    await page.mouse.move(keptPoint.x, keptPoint.y, { steps: 4 });
+    await expect.poll(() => canvasCursor(page)).toBe('not-allowed');
+    await page.mouse.move(livePoint.x, livePoint.y, { steps: 4 });
+    await expect.poll(() => canvasCursor(page)).toBe('cell');
+    await page.keyboard.up('Alt');
+    await expect.poll(() => canvasCursor(page)).toBe('grab');
 
-  await releaseFormFocus();
-  await page.mouse.move(livePoint.x, livePoint.y);
-  await page.keyboard.down('Alt');
-  await expect.poll(() => canvasCursor(page)).toBe('cell');
-  await page.mouse.move(keptPoint.x, keptPoint.y, { steps: 4 });
-  await expect.poll(() => canvasCursor(page)).toBe('not-allowed');
-  await page.mouse.move(livePoint.x, livePoint.y, { steps: 4 });
-  await expect.poll(() => canvasCursor(page)).toBe('cell');
-  await page.keyboard.up('Alt');
-  await expect.poll(() => canvasCursor(page)).toBe('grab');
+    // Color the focused kept view by the continuous `score`: its pane now
+    // offers a value-range drag, while the live pane still offers a category.
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    await expect.poll(() => focusedFieldKindOf(page)).toBe('continuous');
+    await releaseFormFocus();
+    await page.mouse.move(keptPoint.x, keptPoint.y);
+    await page.keyboard.down('Alt');
+    await expect.poll(() => canvasCursor(page)).toBe('ns-resize');
+    await page.mouse.move(livePoint.x, livePoint.y, { steps: 4 });
+    await expect.poll(() => canvasCursor(page)).toBe('cell');
+    await page.keyboard.up('Alt');
 
-  // Color the focused kept view by the continuous `score`: its pane now
-  // offers a value-range drag, while the live pane still offers a category.
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await expect.poll(() => focusedFieldKindOf(page)).toBe('continuous');
-  await releaseFormFocus();
-  await page.mouse.move(keptPoint.x, keptPoint.y);
-  await page.keyboard.down('Alt');
-  await expect.poll(() => canvasCursor(page)).toBe('ns-resize');
-  await page.mouse.move(livePoint.x, livePoint.y, { steps: 4 });
-  await expect.poll(() => canvasCursor(page)).toBe('cell');
-  await page.keyboard.up('Alt');
-
-  expect(await focusOf(page)).toEqual({ viewer: keptId, state: keptId });
-  expect(productErrors).toEqual([]);
+    expect(await focusOf(page)).toEqual({ viewer: keptId, state: keptId });
+    expect(productErrors).toEqual([]);
+  });
 });

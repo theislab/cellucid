@@ -32,7 +32,7 @@ import { prefixLevels } from '../priority-layout.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
 
 /** The seed of a transcoded store's priority order: the specification's default. */
-export const TRANSCODED_PRIORITY_SEED = DEFAULT_SUBSAMPLE_SEED;
+const TRANSCODED_PRIORITY_SEED = DEFAULT_SUBSAMPLE_SEED;
 
 /**
  * The priority order of `nObs` cells: `order[r]` the original position at
@@ -50,7 +50,7 @@ export function cellPriority(nObs, seed = TRANSCODED_PRIORITY_SEED) {
 }
 
 /** The inverse of a permutation. */
-export function inverseOf(order) {
+function inverseOf(order) {
   const inverse = allocateTypedArray(Uint32Array, order.length, 'Cell priority positions');
   for (let i = 0; i < order.length; i++) inverse[order[i]] = i;
   return inverse;
@@ -93,15 +93,6 @@ function rowsOf(values, order, width = 1) {
   return out;
 }
 
-/** Bytes of `itemSize`-byte items (any byte order) with the items in `order`. */
-function itemsOf(bytes, itemSize, order) {
-  const out = allocateTypedArray(Uint8Array, order.length * itemSize, 'Per-cell values in priority order');
-  for (let r = 0; r < order.length; r++) out.set(bytes.subarray(order[r] * itemSize, (order[r] + 1) * itemSize), r * itemSize);
-  return out;
-}
-
-const ITEM_BYTES = { b1: 1, i1: 1, u1: 1, i2: 2, u2: 2, i4: 4, u4: 4, f4: 4, i8: 8, u8: 8, f8: 8 };
-
 const HOST_TYPES = { i1: Int8Array, u1: Uint8Array, i2: Int16Array, i4: Int32Array, u4: Uint32Array, f4: Float32Array, f8: Float64Array };
 
 /** A region's values (R's big-endian doubles and integers) as a host-order typed array. */
@@ -114,7 +105,6 @@ async function hostValues(part, readRegion) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const little = part.dtype[0] !== '>';
   const out = allocateTypedArray(Type, count, 'Per-cell values');
-  const width = Type.BYTES_PER_ELEMENT;
   const get = {
     i1: k => view.getInt8(k), u1: k => view.getUint8(k), i2: k => view.getInt16(k * 2, little),
     i4: k => view.getInt32(k * 4, little), u4: k => view.getUint32(k * 4, little),

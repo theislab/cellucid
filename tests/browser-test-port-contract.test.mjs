@@ -1,30 +1,25 @@
 /**
- * Two browser-test runs on one machine used to be impossible: the static
- * server hard-coded 4173 and 4174 and the Playwright config hard-coded the
- * same numbers, so the second run either lost the race for the address or was
- * refused by a config that had no way to ask for a different one (CEL-0111).
- * The cost was real — a run lost its Firefox and WebKit coverage and another
- * waited about twenty-five minutes for an address that was never coming free.
+ * Two browser-test runs on one machine are possible: the static server and
+ * the Playwright config would each hard-code 4173 and 4174, and the second run
+ * would either lose the race for the address or be refused by a config that
+ * has no way to ask for a different one.
  *
- * The address now comes from one module that both halves read, defaulting to
- * the numbers that were literals before so an existing run is unaffected. A
- * taken address is named, with the variable that moves it, instead of being
- * discovered as silence.
+ * The address comes from one module that both halves read, defaulting to
+ * 4173 and 4174 so an existing run is unaffected. A taken address is named,
+ * with the variable that moves it, instead of being discovered as silence.
  *
- * The failure artifacts have the same shape of collision (CEL-0046): Playwright
- * empties `outputDir` when a run starts, so two runs sharing it delete each
- * other's evidence. That is what produced a stray `test-results-obj7/` at the
- * repository root, outside the ignore rule of the day. The directory is keyed
- * by port for the same reason the address is, and stays inside an ignored path.
+ * The failure artifacts have the same shape of collision: Playwright empties
+ * `outputDir` when a run starts, so two runs sharing it delete each other's
+ * evidence. The directory is keyed by port for the same reason the address is,
+ * and stays inside an ignored path.
  *
- * Moving the servers was only half the fix (CEL-0128). About a hundred absolute
- * URLs in `tests/browser/` still spelled the two ports out, most of them
- * percent-encoded inside the `sampleCatalog` query parameter that tells the
- * application where to fetch its fixtures. A moved run then served the page at
- * the new address and asked it for fixtures at the old one, so an overridden
- * port failed the suite instead of relieving the collision. The specs derive
- * every origin from `tests/browser/helpers/origins.mjs` now, and the sweep
- * below is what keeps a new one from reintroducing a literal.
+ * Moving the servers is only half of it. An absolute URL in `tests/browser/`
+ * that spells a port out (most of them percent-encoded inside the
+ * `sampleCatalog` query parameter that tells the application where to fetch
+ * its fixtures) would make a moved run serve the page at the new address and
+ * ask it for fixtures at the old one. The specs derive every origin from
+ * `tests/browser/helpers/origins.mjs`, and the sweep below keeps a new one from
+ * introducing a literal.
  */
 
 import assert from 'node:assert/strict';

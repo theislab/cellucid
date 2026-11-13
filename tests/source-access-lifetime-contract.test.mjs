@@ -1,7 +1,7 @@
 /**
  * A remote file's access (`data/sources/access.js`: the provider closure
  * holding its item, its download link or its token getter) lives as long as
- * the source that reads the file, never the page's life (F123, LC-4):
+ * the source that reads the file, never the page's life:
  *
  * - the reading source (`AnnDataFileSource`) lets its file's access go when
  *   another dataset replaces it and when it is closed;

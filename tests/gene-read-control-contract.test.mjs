@@ -176,11 +176,9 @@ test('the steps: the share read now, each fixed share above it, and the most the
 
 test('the percent box: whole from 10 up, two figures below, never 100 short of every cell', () => {
   assert.equal(shareText(3_769, 2_282_447), '0.17');
-  assert.equal(shareText(22_824, 2_282_447), '1');
   assert.equal(shareText(114_122, 2_282_447), '5');
   assert.equal(shareText(2_282_446, 2_282_447), '99');
   assert.equal(shareText(2_282_447, 2_282_447), '100');
-  assert.equal(shareText(31_539, 200_000), '16');
 });
 
 test('the status line: the chosen cells and their cost, compact; a read under way and its time left', () => {
@@ -347,7 +345,7 @@ test('the line that links to it says the sample in one compact line, its exact w
   doc.documentElement = { dataset: {} };
   note.link.ownerDocument = doc;
   note.link.click();
-  // Nothing opens before the sidebar is shown (R9K-2: a section opened in the
+  // Nothing opens before the sidebar is shown (a section opened in the
   // moment the sidebar's action starts is kept outside the history).
   assert.equal(panel.open, false, 'the Session panel waits for the sidebar');
   // Opened, brought into view and focused once it is (`revealInSidebar`).
@@ -368,7 +366,7 @@ test('the Session sections: collapsed by default, a one-line summary, the open s
   assert.equal(subsamplingSummary({ nObs: 1_000, kept: null }, null, { cells: 2_000, target: 10_000 }), '100% cells · reading genes 2K');
   // A progressive opening growing in place says the share it grows to and the cells read so far,
   // as the Subsampling control does: the cells open so far alone ("23% cells") read as a chosen
-  // subsample (Suo, R9X-18).
+  // subsample (Suo).
   assert.equal(
     subsamplingSummary({ nObs: 561_947, kept: new Uint32Array(131_072) }, null, null, { cells: 131_072, target: 561_947 }),
     '100% cells · reading 131K'

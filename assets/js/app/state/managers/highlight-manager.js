@@ -444,28 +444,33 @@ function requireSelectionTransparency(transparency, pointCount) {
 export const highlightStateMethods = {
   // --- Cell Highlighting/Selection API ---------------------------------------
 
+  /** @this {import('../core/data-state.js').DataState} */
   _notifyHighlightChange() {
     this.emit('highlight:changed');
   },
 
   // --- Highlight Page Management ---
 
+  /** @this {import('../core/data-state.js').DataState} */
   _notifyHighlightPageChange() {
     this.emit('page:changed');
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _getActivePage() {
     if (!this.activePageId) return null;
     return this.highlightPages.find((p) => p.id === this.activePageId) || null;
   },
 
   // Convenience alias: highlighted groups for the active page.
+  /** @this {import('../core/data-state.js').DataState} */
   get highlightedGroups() {
     const page = this._getActivePage();
     return page ? page.highlightedGroups : [];
   },
 
   // Set highlighted groups for the active page.
+  /** @this {import('../core/data-state.js').DataState} */
   set highlightedGroups(groups) {
     const page = this._getActivePage();
     if (page) {
@@ -473,14 +478,17 @@ export const highlightStateMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getHighlightPages() {
     return this.highlightPages;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getActivePageId() {
     return this.activePageId;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getActivePage() {
     return this._getActivePage();
   },
@@ -490,6 +498,7 @@ export const highlightStateMethods = {
    *
    * Every entry is zero on entry and on exit; callers clear exactly the
    * indices they set, so the buffer never carries a previous page's cells.
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Uint8Array}
    */
   _borrowHighlightMembershipScratch() {
@@ -511,6 +520,7 @@ export const highlightStateMethods = {
    * draws for that page. An out-of-dataset index throws here exactly as it
    * throws during painting, instead of being counted here and dropped there.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} pageId - Id of an existing page; an unknown id counts zero.
    * @returns {number}
    */
@@ -567,6 +577,7 @@ export const highlightStateMethods = {
    * `base (3)`, … that is free: pages are named by their names (the actions,
    * an agent, a replay), so two pages never share one.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} base
    * @returns {string}
    */
@@ -583,6 +594,7 @@ export const highlightStateMethods = {
    * The name a new page gets when none is given: "Page N", N the number of
    * pages it makes, or the first larger N that is free.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {string}
    */
   defaultHighlightPageName() {
@@ -592,6 +604,7 @@ export const highlightStateMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   createHighlightPage(name = null) {
     const id = `page_${++this._highlightPageIdCounter}`;
     const pageName = name || this.defaultHighlightPageName();
@@ -612,6 +625,7 @@ export const highlightStateMethods = {
     return page;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   switchToPage(pageId) {
     const page = this.highlightPages.find((p) => p.id === pageId);
     if (!page) return false;
@@ -625,6 +639,7 @@ export const highlightStateMethods = {
     return true;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   deleteHighlightPage(pageId) {
     const idx = this.highlightPages.findIndex((p) => p.id === pageId);
     if (idx === -1) return false;
@@ -645,6 +660,7 @@ export const highlightStateMethods = {
     return true;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   renameHighlightPage(pageId, newName) {
     const page = this.highlightPages.find((p) => p.id === pageId);
     if (!page) return false;
@@ -657,6 +673,7 @@ export const highlightStateMethods = {
    * Set a persistent color for a highlight page.
    * This is used across the app (Highlighted Cells tabs + analysis UI).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} pageId
    * @param {string} color - Hex color (#RRGGBB)
    * @returns {boolean}
@@ -678,6 +695,7 @@ export const highlightStateMethods = {
 
   /**
    * Get the current color for a page (falls back to the default palette).
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} pageId
    * @returns {string}
    */
@@ -690,6 +708,7 @@ export const highlightStateMethods = {
 
   /**
    * Combine two highlight pages using intersection or union
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} pageId1 - First page ID
    * @param {string} pageId2 - Second page ID
    * @param {'intersection' | 'union'} operation - The set operation to perform
@@ -782,12 +801,14 @@ export const highlightStateMethods = {
   },
 
   // Ensure at least one page exists.
+  /** @this {import('../core/data-state.js').DataState} */
   ensureHighlightPage() {
     if (this.highlightPages.length === 0) {
       this.createHighlightPage('Page 1');
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _ensureHighlightArray() {
     if (!this.highlightArray || this.highlightArray.length !== this.pointCount) {
       this.highlightArray = new Uint8Array(this.pointCount);
@@ -800,6 +821,7 @@ export const highlightStateMethods = {
    * The painted set is `collectEnabledPageCells` applied to the active page —
    * the same function `getHighlightedCellCountForPage` counts — so the count
    * the interface shows for the active page equals the set published here.
+   * @this {import('../core/data-state.js').DataState}
    */
   _recomputeHighlightArray() {
     this._ensureHighlightArray();
@@ -835,6 +857,7 @@ export const highlightStateMethods = {
     this._pushHighlightToViewer(allHighlightedIndices);
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _pushHighlightToViewer(highlightedIndices = null) {
     if (this.viewer && typeof this.viewer.updateHighlight === 'function') {
       this.viewer.updateHighlight(this.highlightArray, highlightedIndices);
@@ -849,6 +872,7 @@ export const highlightStateMethods = {
    * in (`getFieldForView`), which is not the focused view's field when the
    * pane is not focused.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field - Categorical field metadata with loaded codes.
    * @param {number} categoryIndex - Category index to match.
    * @param {Uint8Array} viewTransparency - Exact per-view transparency array
@@ -878,6 +902,7 @@ export const highlightStateMethods = {
    * that are visible in one view. Keyed by the field object for the same
    * reason as `getCellIndicesForCategory`.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field - Continuous field metadata with loaded values.
    * @param {number} minVal - Minimum value for range
    * @param {number} maxVal - Maximum value for range
@@ -920,6 +945,7 @@ export const highlightStateMethods = {
   },
 
   // Clear preview highlight (restore to only permanent highlights).
+  /** @this {import('../core/data-state.js').DataState} */
   clearPreviewHighlight() {
     this._recomputeHighlightArray();
   },
@@ -934,6 +960,7 @@ export const highlightStateMethods = {
    * current hits, because this method has no way to tell an addition from a
    * subtraction and will union whatever it is handed.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Uint32Array} cellIndices - Cell list of the in-progress
    *   selection (ascending; every index names a cell of the current dataset).
    */
@@ -1003,6 +1030,7 @@ export const highlightStateMethods = {
   },
 
   // Add a highlighted group from a categorical selection.
+  /** @this {import('../core/data-state.js').DataState} */
   addHighlightFromCategory(fieldIndex, categoryIndex, source) {
     const { field, categoryName } = requireCategorySelection(
       this,
@@ -1076,6 +1104,7 @@ export const highlightStateMethods = {
   },
 
   // Add a highlighted group from a continuous range selection.
+  /** @this {import('../core/data-state.js').DataState} */
   addHighlightFromRange(fieldIndex, minVal, maxVal, source = 'obs') {
     const field = source === 'var'
       ? this.varData?.fields?.[fieldIndex]
@@ -1119,6 +1148,7 @@ export const highlightStateMethods = {
   },
 
   // Add a highlight group directly with pre-computed cell indices.
+  /** @this {import('../core/data-state.js').DataState} */
   addHighlightDirect(groupData) {
     if (
       groupData === null
@@ -1176,6 +1206,7 @@ export const highlightStateMethods = {
 
   /**
    * The page `pageId` names (the active page by default), or null.
+   * @this {import('../core/data-state.js').DataState}
    * @param {string|null} pageId
    * @returns {Object|null}
    */
@@ -1186,6 +1217,7 @@ export const highlightStateMethods = {
   /**
    * Publish a change to the groups of `page`: the active page repaints the
    * highlight; any other page only changes what the page list counts.
+   * @this {import('../core/data-state.js').DataState}
    */
   _publishHighlightPageGroups(page) {
     if (page.id === this.activePageId) {
@@ -1199,6 +1231,7 @@ export const highlightStateMethods = {
   /**
    * Remove one group from a page (the active page by default).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} groupId
    * @param {string} [pageId]
    * @returns {boolean} Whether a group was removed
@@ -1216,6 +1249,7 @@ export const highlightStateMethods = {
   /**
    * Turn one group of a page (the active page by default) on or off.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} groupId
    * @param {boolean} enabled
    * @param {string} [pageId]
@@ -1239,6 +1273,7 @@ export const highlightStateMethods = {
    * the page's list are new objects, so a value the history captured before
    * keeps the old cells.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} groupId
    * @param {Uint32Array} cellIndices - the new cells (copied; not empty)
    * @param {string} [pageId]
@@ -1260,9 +1295,10 @@ export const highlightStateMethods = {
   /**
    * Remove every highlight group from the active page; other pages keep
    * theirs. The Clear button of the active page's group list, and the
-   * dataset-replacement paths in `main.js` (straight after `initScene`, which
+   * dataset-replacement paths in `dataset/publication.js` (straight after `initScene`, which
    * left one empty page), clear this.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number} Groups removed from the active page.
    */
   clearActivePageHighlights() {
@@ -1292,6 +1328,7 @@ export const highlightStateMethods = {
    * Remove every group of one page; the page stays. The active page's Clear
    * is `clearActivePageHighlights`.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} pageId
    * @returns {number} Groups removed, or -1 when there is no such page
    */
@@ -1310,6 +1347,7 @@ export const highlightStateMethods = {
    * notebook's `clear_highlights()` ("Clear all cell highlights in the
    * viewer") clears this.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number} Groups removed.
    */
   clearHighlightsOnAllPages() {
@@ -1326,12 +1364,14 @@ export const highlightStateMethods = {
     return removed;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getHighlightedGroups() {
     return this.highlightedGroups;
   },
 
   /**
    * Find a highlight group that was created from a specific category.
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} fieldIndex - The field index
    * @param {number} categoryIndex - The category index within the field
    * @param {string} [source='obs'] - The field source ('obs' or 'var')
@@ -1347,6 +1387,7 @@ export const highlightStateMethods = {
     ) || null;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getHighlightedCellCount() {
     // Returns count of highlighted cells that are currently visible (cached)
     if (!this.highlightArray) return 0;
@@ -1395,6 +1436,7 @@ export const highlightStateMethods = {
     return count;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getTotalHighlightedCellCount() {
     // Returns total count of all highlighted cells, including filtered-out ones (cached)
     if (!this.highlightArray) return 0;
@@ -1413,6 +1455,7 @@ export const highlightStateMethods = {
   },
 
   // Invalidate highlight count caches (call when highlight array or visibility changes).
+  /** @this {import('../core/data-state.js').DataState} */
   _invalidateHighlightCountCache(visibleOnly = false) {
     this._cachedHighlightCount = null;
     this._cachedHighlightLodMembership = null;

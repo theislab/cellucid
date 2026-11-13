@@ -908,7 +908,7 @@ test('a cancelled gene read stops at once, cancels its store reads, and keeps th
 test('clearing the reader releases cell-row access even when releasing the gene columns fails', async () => {
   const { reader } = await openReader(treeWithX(sparse(), 1, 1));
   const failure = new Error('matrix release failed');
-  reader._matrices.set('X', { element: 'X', loadPromise: null, columns: { dispose() { throw failure; } } });
+  reader._matrices.set('X', { element: 'X', load: null, columns: { dispose() { throw failure; } } });
   // Row access (a CSR or dense matrix's: its row pointers) holds no index to dispose.
   reader._rows = { element: 'X', rows: Promise.resolve({ row() {} }) };
   assert.throws(() => reader.clearCache(), error => error === failure);

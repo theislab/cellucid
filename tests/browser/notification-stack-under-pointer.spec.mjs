@@ -1,9 +1,9 @@
 /**
- * The notification stack stands on the bottom edge, so a card leaving let
- * every card above it fall by its height. A person pressing one card's Dismiss
- * as a card below it left had the button move from under the pointer before
- * the release, and the click landed on the plot behind (Web app tests run
- * 42385814622, WebKit, `empty-dataset-state.spec.mjs`). While the pointer is
+ * The notification stack stands on the bottom edge, so a card leaving would let
+ * every card above it fall by its height: a person pressing one card's Dismiss
+ * as a card below it leaves would have the button move from under the pointer
+ * before the release, and the click would land on the plot behind. While the
+ * pointer is
  * over the stack a card that leaves keeps its place, and the earlier-messages
  * control under the stack waits; once the pointer leaves, the stack closes up
  * (`notification-center.js` `_holdStackUnderPointer`).
@@ -19,6 +19,11 @@ async function openQuietApp(page) {
   await page.goto(APP_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await waitForPageAtRest(page);
+  await clearStack(page);
+}
+
+/** Dismiss every card and take the pointer off the stack: nothing is left in it. */
+async function clearStack(page) {
   await page.evaluate(async () => {
     const { getNotificationCenter } = await import('/assets/js/app/notification-center.js');
     getNotificationCenter().dismissAll();
@@ -58,66 +63,69 @@ async function centreOf(locator) {
   return { x: box.x + box.width / 2, y: box.y + box.height / 2, box };
 }
 
-test('a card leaving below the pointer does not move the card being pressed', async ({ page }) => {
+test('cards under the pointer stay where they are: one pressed while another leaves, the gaps of the stack, and the earlier-messages control', async ({ page }) => {
   await openQuietApp(page);
-  const [lower] = await showCards(page, ['Lower card', 'Middle card', 'Upper card']);
-  const dismiss = card(page, 'Upper card').locator('.notification-dismiss');
-  await expect(dismiss).toBeVisible();
-  await settled(card(page, 'Upper card'));
 
-  const before = await centreOf(dismiss);
-  await page.mouse.move(before.x, before.y);
-  await page.mouse.down();
-  await dismissCard(page, lower);
-  await expect(card(page, 'Lower card')).toHaveCount(0);
-  const during = await centreOf(dismiss);
-  expect(during.box, 'the pressed Dismiss stayed under the pointer').toEqual(before.box);
-  await page.mouse.up();
-  // The press and the release met on the same button, so it was a click.
-  await expect(card(page, 'Upper card')).toHaveCount(0);
-  await expect(card(page, 'Middle card')).toHaveCount(1);
-});
+  await test.step('a card leaving below the pointer does not move the card being pressed', async () => {
+    const [lower] = await showCards(page, ['Lower card', 'Middle card', 'Upper card']);
+    const dismiss = card(page, 'Upper card').locator('.notification-dismiss');
+    await expect(dismiss).toBeVisible();
+    await settled(card(page, 'Upper card'));
 
-test('the stack closes up once the pointer leaves it, gaps between cards included', async ({ page }) => {
-  await openQuietApp(page);
-  const [lower] = await showCards(page, ['Lower card', 'Upper card']);
-  const upper = card(page, 'Upper card');
-  await settled(upper);
-  const before = await centreOf(upper);
-  await page.mouse.move(before.x, before.y);
-  await dismissCard(page, lower);
-  await expect(card(page, 'Lower card')).toHaveCount(0);
-  expect((await centreOf(upper)).box.y, 'the place of the card that left is kept').toBe(before.box.y);
+    const before = await centreOf(dismiss);
+    await page.mouse.move(before.x, before.y);
+    await page.mouse.down();
+    await dismissCard(page, lower);
+    await expect(card(page, 'Lower card')).toHaveCount(0);
+    const during = await centreOf(dismiss);
+    expect(during.box, 'the pressed Dismiss stayed under the pointer').toEqual(before.box);
+    await page.mouse.up();
+    // The press and the release met on the same button, so it was a click.
+    await expect(card(page, 'Upper card')).toHaveCount(0);
+    await expect(card(page, 'Middle card')).toHaveCount(1);
+  });
 
-  // Into the gap where the card that left stood: still the stack's area.
-  const spacer = page.locator('#notification-center > .notification-spacer');
-  await expect(spacer).toHaveCount(1);
-  const gap = await centreOf(spacer);
-  await page.mouse.move(gap.x, gap.y, { steps: 4 });
-  expect((await centreOf(upper)).box.y).toBe(before.box.y);
+  await test.step('the stack closes up once the pointer leaves it, gaps between cards included', async () => {
+    await clearStack(page);
+    const [lower] = await showCards(page, ['Lower card', 'Upper card']);
+    const upper = card(page, 'Upper card');
+    await settled(upper);
+    const before = await centreOf(upper);
+    await page.mouse.move(before.x, before.y);
+    await dismissCard(page, lower);
+    await expect(card(page, 'Lower card')).toHaveCount(0);
+    expect((await centreOf(upper)).box.y, 'the place of the card that left is kept').toBe(before.box.y);
 
-  // Off the stack: it closes up.
-  await page.mouse.move(gap.box.x - 40, gap.y, { steps: 4 });
-  await expect(spacer).toHaveCount(0);
-  await expect.poll(async () => (await centreOf(upper)).box.y).toBeGreaterThan(before.box.y);
-});
+    // Into the gap where the card that left stood: still the stack's area.
+    const spacer = page.locator('#notification-center > .notification-spacer');
+    await expect(spacer).toHaveCount(1);
+    const gap = await centreOf(spacer);
+    await page.mouse.move(gap.x, gap.y, { steps: 4 });
+    expect((await centreOf(upper)).box.y).toBe(before.box.y);
 
-test('the earlier-messages control waits under the stack until the pointer leaves', async ({ page }) => {
-  await openQuietApp(page);
-  const first = ['Card 1', 'Card 2', 'Card 3', 'Card 4', 'Card 5'];
-  await showCards(page, first);
-  const top = card(page, 'Card 5');
-  await settled(top);
-  const before = await centreOf(top);
-  await page.mouse.move(before.x, before.y);
+    // Off the stack: it closes up.
+    await page.mouse.move(gap.box.x - 40, gap.y, { steps: 4 });
+    await expect(spacer).toHaveCount(0);
+    await expect.poll(async () => (await centreOf(upper)).box.y).toBeGreaterThan(before.box.y);
+  });
 
-  // A sixth card retires the oldest to make room.
-  await showCards(page, ['Card 6']);
-  await expect(card(page, 'Card 1')).toHaveCount(0);
-  await expect(page.locator('#notification-center .notification-overflow')).toHaveCount(0);
-  expect((await centreOf(top)).box.y, 'nothing under the pointer moved').toBe(before.box.y);
+  await test.step('the earlier-messages control waits under the stack until the pointer leaves', async () => {
+    await clearStack(page);
+    const first = ['Card 1', 'Card 2', 'Card 3', 'Card 4', 'Card 5'];
+    await showCards(page, first);
+    const top = card(page, 'Card 5');
+    await settled(top);
+    const before = await centreOf(top);
+    await page.mouse.move(before.x, before.y);
 
-  await page.mouse.move(5, 5, { steps: 4 });
-  await expect(page.locator('#notification-center .notification-overflow-toggle')).toHaveText('Show 1 earlier message');
-  await expect(page.locator('#notification-center > .notification-spacer')).toHaveCount(0);
+    // A sixth card retires the oldest to make room.
+    await showCards(page, ['Card 6']);
+    await expect(card(page, 'Card 1')).toHaveCount(0);
+    await expect(page.locator('#notification-center .notification-overflow')).toHaveCount(0);
+    expect((await centreOf(top)).box.y, 'nothing under the pointer moved').toBe(before.box.y);
+
+    await page.mouse.move(5, 5, { steps: 4 });
+    await expect(page.locator('#notification-center .notification-overflow-toggle')).toHaveText('Show 1 earlier message');
+    await expect(page.locator('#notification-center > .notification-spacer')).toHaveCount(0);
+  });
 });

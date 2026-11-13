@@ -1,8 +1,8 @@
 /**
  * @fileoverview The whole text of a row cut to one line, on a click or a tap.
  *
- * The sidebar keeps one line per row and cuts what does not fit with "…"
- * (owner, 2026-11-10, bug hunt F8). Hover shows the whole text (`title`), but
+ * The sidebar keeps one line per row and cuts what does not fit with "…".
+ * Hover shows the whole text (`title`), but
  * a touch screen has no hover: an element marked `data-full-text` whose text
  * is cut shows it in a small popover on a click or a tap, and nothing when
  * it fits. The mark is opt-in: an element whose single click already means

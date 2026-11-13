@@ -14,425 +14,423 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
-test('centroid labels reject element aliasing and roll back hostile staging exactly', async ({
-  page,
-}) => {
-  const pageErrors = [];
-  page.on('pageerror', error => pageErrors.push(error.message));
+// One opening, three scenarios. The first two end with the labels cleared; the last disposes
+// the viewer.
+test('centroid labels: aliasing refused and staging rolled back, a replacement committed once with its retirements retried, and failed owners kept through disposal', async ({ page }) => {
+  await test.step('centroid labels reject element aliasing and roll back hostile staging exactly', async () => {
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
 
-  const proof = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const state = window._cellucidState;
-    const ui = window._cellucidUi;
-    const labelLayer = document.querySelector('#label-layer');
-    viewer.setCentroidLabels([], 'live');
+    const proof = await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const state = window._cellucidState;
+      const ui = window._cellucidUi;
+      const labelLayer = document.querySelector('#label-layer');
+      viewer.setCentroidLabels([], 'live');
 
-    const payload = state.getSnapshotPayload();
-    const snapshot = ui.publishSnapshotView({
-      label: 'Centroid label ownership',
-      fieldKey: payload.fieldKey,
-      fieldKind: payload.fieldKind,
-      colors: payload.colors,
-      transparency: payload.transparency,
-      centroidPositions: payload.centroidPositions,
-      centroidColors: payload.centroidColors,
-      dimensionLevel: payload.dimensionLevel,
-      sourceViewId: 'live',
-      meta: { filtersText: payload.filtersText },
-      cameraState: viewer.getViewCameraState('live'),
+      const payload = state.getSnapshotPayload();
+      const snapshot = ui.publishSnapshotView({
+        label: 'Centroid label ownership',
+        fieldKey: payload.fieldKey,
+        fieldKind: payload.fieldKind,
+        colors: payload.colors,
+        transparency: payload.transparency,
+        centroidPositions: payload.centroidPositions,
+        centroidColors: payload.centroidColors,
+        dimensionLevel: payload.dimensionLevel,
+        sourceViewId: 'live',
+        meta: { filtersText: payload.filtersText },
+        cameraState: viewer.getViewCameraState('live'),
+      });
+
+      const oldElement = document.createElement('div');
+      oldElement.textContent = 'published-live-label';
+      const oldEntry = {
+        el: oldElement,
+        position: [0, 0, 0],
+      };
+      viewer.setCentroidLabels([oldEntry], 'live');
+
+      let duplicateError = null;
+      try {
+        viewer.setCentroidLabels([
+          { el: oldElement, position: [0, 0, 0] },
+          { el: oldElement, position: [1, 1, 1] },
+        ], 'live');
+      } catch (error) {
+        duplicateError = {
+          message: error.message,
+          name: error.name,
+        };
+      }
+
+      let crossViewError = null;
+      try {
+        viewer.setCentroidLabels([
+          { el: oldElement, position: [0, 0, 0] },
+        ], snapshot.id);
+      } catch (error) {
+        crossViewError = {
+          message: error.message,
+          name: error.name,
+        };
+      }
+
+      const externalParent = document.createElement('div');
+      const before = document.createElement('span');
+      const candidateA = document.createElement('div');
+      const after = document.createElement('span');
+      candidateA.setAttribute('data-view-id', 'external-owner');
+      externalParent.append(before, candidateA, after);
+      document.body.appendChild(externalParent);
+      const candidateB = document.createElement('div');
+
+      const originalAppendChild = labelLayer.appendChild;
+      let appendAttempts = 0;
+      labelLayer.appendChild = function (element) {
+        appendAttempts += 1;
+        const result = Reflect.apply(originalAppendChild, this, [element]);
+        if (appendAttempts === 2) {
+          throw new Error(
+            'synthetic centroid candidate append-after-mutation failure',
+          );
+        }
+        return result;
+      };
+      let stagingError = null;
+      try {
+        viewer.setCentroidLabels([
+          { el: candidateA, position: [1, 0, 0] },
+          { el: candidateB, position: [0, 1, 0] },
+        ], 'live');
+      } catch (error) {
+        stagingError = {
+          message: error.message,
+          name: error.name,
+        };
+      } finally {
+        labelLayer.appendChild = originalAppendChild;
+      }
+
+      const externalOrder = Array.from(externalParent.children);
+      const rollbackOrphan = document.createElement('div');
+      const originalRemoveChild = labelLayer.removeChild;
+      labelLayer.appendChild = function (element) {
+        const result = Reflect.apply(originalAppendChild, this, [element]);
+        if (element === rollbackOrphan) {
+          throw new Error('synthetic centroid rollback staging failure');
+        }
+        return result;
+      };
+      labelLayer.removeChild = function (element) {
+        if (element === rollbackOrphan) {
+          throw new Error('synthetic centroid rollback removal failure');
+        }
+        return Reflect.apply(originalRemoveChild, this, [element]);
+      };
+      let incompleteRollbackError = null;
+      try {
+        viewer.setCentroidLabels([
+          { el: rollbackOrphan, position: [0, 0, 1] },
+        ], 'live');
+      } catch (error) {
+        incompleteRollbackError = {
+          errorCount: error instanceof AggregateError
+            ? error.errors.length
+            : 0,
+          message: error.message,
+          name: error.name,
+        };
+      } finally {
+        labelLayer.appendChild = originalAppendChild;
+        labelLayer.removeChild = originalRemoveChild;
+      }
+      const rollbackOrphanHidden = (
+        rollbackOrphan.parentNode === labelLayer &&
+        rollbackOrphan.style.display === 'none'
+      );
+      viewer.setCentroidLabels([oldEntry], 'live');
+      const rollbackOrphanRetired = rollbackOrphan.parentNode === null;
+
+      const result = {
+        appendAttempts,
+        candidateAViewId: candidateA.getAttribute('data-view-id'),
+        candidateBHasViewId: candidateB.hasAttribute('data-view-id'),
+        candidateBParent: candidateB.parentNode,
+        crossViewError,
+        duplicateError,
+        externalOrderRestored: (
+          externalOrder[0] === before &&
+          externalOrder[1] === candidateA &&
+          externalOrder[2] === after
+        ),
+        incompleteRollbackError,
+        oldDataset: oldElement.dataset.viewId,
+        oldStillPublished: oldElement.parentNode === labelLayer,
+        rollbackOrphanHidden,
+        rollbackOrphanRetired,
+        snapshotId: snapshot.id,
+        stagingError,
+      };
+      viewer.setCentroidLabels([], 'live');
+      ui.retireSnapshotView(snapshot.id);
+      externalParent.remove();
+      return result;
     });
 
-    const oldElement = document.createElement('div');
-    oldElement.textContent = 'published-live-label';
-    const oldEntry = {
-      el: oldElement,
-      position: [0, 0, 0],
-    };
-    viewer.setCentroidLabels([oldEntry], 'live');
-
-    let duplicateError = null;
-    try {
-      viewer.setCentroidLabels([
-        { el: oldElement, position: [0, 0, 0] },
-        { el: oldElement, position: [1, 1, 1] },
-      ], 'live');
-    } catch (error) {
-      duplicateError = {
-        message: error.message,
-        name: error.name,
-      };
-    }
-
-    let crossViewError = null;
-    try {
-      viewer.setCentroidLabels([
-        { el: oldElement, position: [0, 0, 0] },
-      ], snapshot.id);
-    } catch (error) {
-      crossViewError = {
-        message: error.message,
-        name: error.name,
-      };
-    }
-
-    const externalParent = document.createElement('div');
-    const before = document.createElement('span');
-    const candidateA = document.createElement('div');
-    const after = document.createElement('span');
-    candidateA.setAttribute('data-view-id', 'external-owner');
-    externalParent.append(before, candidateA, after);
-    document.body.appendChild(externalParent);
-    const candidateB = document.createElement('div');
-
-    const originalAppendChild = labelLayer.appendChild;
-    let appendAttempts = 0;
-    labelLayer.appendChild = function (element) {
-      appendAttempts += 1;
-      const result = Reflect.apply(originalAppendChild, this, [element]);
-      if (appendAttempts === 2) {
-        throw new Error(
-          'synthetic centroid candidate append-after-mutation failure',
-        );
-      }
-      return result;
-    };
-    let stagingError = null;
-    try {
-      viewer.setCentroidLabels([
-        { el: candidateA, position: [1, 0, 0] },
-        { el: candidateB, position: [0, 1, 0] },
-      ], 'live');
-    } catch (error) {
-      stagingError = {
-        message: error.message,
-        name: error.name,
-      };
-    } finally {
-      labelLayer.appendChild = originalAppendChild;
-    }
-
-    const externalOrder = Array.from(externalParent.children);
-    const rollbackOrphan = document.createElement('div');
-    const originalRemoveChild = labelLayer.removeChild;
-    labelLayer.appendChild = function (element) {
-      const result = Reflect.apply(originalAppendChild, this, [element]);
-      if (element === rollbackOrphan) {
-        throw new Error('synthetic centroid rollback staging failure');
-      }
-      return result;
-    };
-    labelLayer.removeChild = function (element) {
-      if (element === rollbackOrphan) {
-        throw new Error('synthetic centroid rollback removal failure');
-      }
-      return Reflect.apply(originalRemoveChild, this, [element]);
-    };
-    let incompleteRollbackError = null;
-    try {
-      viewer.setCentroidLabels([
-        { el: rollbackOrphan, position: [0, 0, 1] },
-      ], 'live');
-    } catch (error) {
-      incompleteRollbackError = {
-        errorCount: error instanceof AggregateError
-          ? error.errors.length
-          : 0,
-        message: error.message,
-        name: error.name,
-      };
-    } finally {
-      labelLayer.appendChild = originalAppendChild;
-      labelLayer.removeChild = originalRemoveChild;
-    }
-    const rollbackOrphanHidden = (
-      rollbackOrphan.parentNode === labelLayer &&
-      rollbackOrphan.style.display === 'none'
+    expect(proof.duplicateError?.name).toBe('TypeError');
+    expect(proof.duplicateError?.message).toMatch(/aliases an element/);
+    expect(proof.crossViewError?.name).toBe('TypeError');
+    expect(proof.crossViewError?.message).toContain(
+      `already owned by view "live"`,
     );
-    viewer.setCentroidLabels([oldEntry], 'live');
-    const rollbackOrphanRetired = rollbackOrphan.parentNode === null;
-
-    const result = {
-      appendAttempts,
-      candidateAViewId: candidateA.getAttribute('data-view-id'),
-      candidateBHasViewId: candidateB.hasAttribute('data-view-id'),
-      candidateBParent: candidateB.parentNode,
-      crossViewError,
-      duplicateError,
-      externalOrderRestored: (
-        externalOrder[0] === before &&
-        externalOrder[1] === candidateA &&
-        externalOrder[2] === after
-      ),
-      incompleteRollbackError,
-      oldDataset: oldElement.dataset.viewId,
-      oldStillPublished: oldElement.parentNode === labelLayer,
-      rollbackOrphanHidden,
-      rollbackOrphanRetired,
-      snapshotId: snapshot.id,
-      stagingError,
-    };
-    viewer.setCentroidLabels([], 'live');
-    ui.retireSnapshotView(snapshot.id);
-    externalParent.remove();
-    return result;
+    expect(proof.appendAttempts).toBe(2);
+    expect(proof.stagingError?.message).toBe(
+      'synthetic centroid candidate append-after-mutation failure',
+    );
+    expect(proof.oldStillPublished).toBe(true);
+    expect(proof.oldDataset).toBe('live');
+    expect(proof.externalOrderRestored).toBe(true);
+    expect(proof.candidateAViewId).toBe('external-owner');
+    expect(proof.candidateBParent).toBeNull();
+    expect(proof.candidateBHasViewId).toBe(false);
+    expect(proof.incompleteRollbackError?.name).toBe('AggregateError');
+    expect(proof.incompleteRollbackError?.message).toMatch(
+      /were not published and rollback was incomplete/,
+    );
+    expect(proof.incompleteRollbackError?.errorCount).toBe(2);
+    expect(proof.rollbackOrphanHidden).toBe(true);
+    expect(proof.rollbackOrphanRetired).toBe(true);
+    expect(pageErrors).toEqual([]);
   });
 
-  expect(proof.duplicateError?.name).toBe('TypeError');
-  expect(proof.duplicateError?.message).toMatch(/aliases an element/);
-  expect(proof.crossViewError?.name).toBe('TypeError');
-  expect(proof.crossViewError?.message).toContain(
-    `already owned by view "live"`,
-  );
-  expect(proof.appendAttempts).toBe(2);
-  expect(proof.stagingError?.message).toBe(
-    'synthetic centroid candidate append-after-mutation failure',
-  );
-  expect(proof.oldStillPublished).toBe(true);
-  expect(proof.oldDataset).toBe('live');
-  expect(proof.externalOrderRestored).toBe(true);
-  expect(proof.candidateAViewId).toBe('external-owner');
-  expect(proof.candidateBParent).toBeNull();
-  expect(proof.candidateBHasViewId).toBe(false);
-  expect(proof.incompleteRollbackError?.name).toBe('AggregateError');
-  expect(proof.incompleteRollbackError?.message).toMatch(
-    /were not published and rollback was incomplete/,
-  );
-  expect(proof.incompleteRollbackError?.errorCount).toBe(2);
-  expect(proof.rollbackOrphanHidden).toBe(true);
-  expect(proof.rollbackOrphanRetired).toBe(true);
-  expect(pageErrors).toEqual([]);
-});
+  await test.step('centroid replacement commits once, attempts all retirements, and retries exact failures', async () => {
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
 
-test('centroid replacement commits once, attempts all retirements, and retries exact failures', async ({
-  page,
-}) => {
-  const pageErrors = [];
-  page.on('pageerror', error => pageErrors.push(error.message));
+    const proof = await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const labelLayer = document.querySelector('#label-layer');
+      viewer.setCentroidLabels([], 'live');
 
-  const proof = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const labelLayer = document.querySelector('#label-layer');
-    viewer.setCentroidLabels([], 'live');
+      const oldA = document.createElement('div');
+      const oldB = document.createElement('div');
+      const oldAEntry = { el: oldA, position: [0, 0, 0] };
+      const oldBEntry = { el: oldB, position: [1, 0, 0] };
+      viewer.setCentroidLabels([oldAEntry, oldBEntry], 'live');
 
-    const oldA = document.createElement('div');
-    const oldB = document.createElement('div');
-    const oldAEntry = { el: oldA, position: [0, 0, 0] };
-    const oldBEntry = { el: oldB, position: [1, 0, 0] };
-    viewer.setCentroidLabels([oldAEntry, oldBEntry], 'live');
+      // Published ownership must retain the exact accepted element even if the
+      // caller later mutates its record.
+      const decoy = document.createElement('div');
+      const decoyParent = document.createElement('div');
+      decoyParent.appendChild(decoy);
+      document.body.appendChild(decoyParent);
+      oldAEntry.el = decoy;
 
-    // Published ownership must retain the exact accepted element even if the
-    // caller later mutates its record.
-    const decoy = document.createElement('div');
-    const decoyParent = document.createElement('div');
-    decoyParent.appendChild(decoy);
-    document.body.appendChild(decoyParent);
-    oldAEntry.el = decoy;
+      const candidate = document.createElement('div');
+      const originalRemoveChild = labelLayer.removeChild;
+      const rejectedElements = new Set();
+      let retirementAttempts = 0;
+      labelLayer.removeChild = function (element) {
+        if (
+          (element === oldA || element === oldB) &&
+          !rejectedElements.has(element)
+        ) {
+          rejectedElements.add(element);
+          retirementAttempts += 1;
+          throw new Error(
+            `synthetic centroid retirement rejection ${retirementAttempts}`,
+          );
+        }
+        return Reflect.apply(originalRemoveChild, this, [element]);
+      };
 
-    const candidate = document.createElement('div');
-    const originalRemoveChild = labelLayer.removeChild;
-    const rejectedElements = new Set();
-    let retirementAttempts = 0;
-    labelLayer.removeChild = function (element) {
-      if (
-        (element === oldA || element === oldB) &&
-        !rejectedElements.has(element)
-      ) {
-        rejectedElements.add(element);
-        retirementAttempts += 1;
-        throw new Error(
-          `synthetic centroid retirement rejection ${retirementAttempts}`,
-        );
+      let committedRetirementError = null;
+      try {
+        viewer.setCentroidLabels([
+          { el: candidate, position: [0, 1, 0] },
+        ], 'live');
+      } catch (error) {
+        committedRetirementError = {
+          errorCount: error instanceof AggregateError
+            ? error.errors.length
+            : 0,
+          message: error.message,
+          name: error.name,
+        };
+      } finally {
+        labelLayer.removeChild = originalRemoveChild;
       }
-      return Reflect.apply(originalRemoveChild, this, [element]);
-    };
 
-    let committedRetirementError = null;
-    try {
+      const committedBeforeRetry = (
+        candidate.parentNode === labelLayer &&
+        candidate.dataset.viewId === 'live'
+      );
+      const failedOldHidden = (
+        oldA.style.display === 'none' &&
+        oldB.style.display === 'none'
+      );
+      const stableElementRetained = (
+        oldA.parentNode === labelLayer &&
+        decoy.parentNode === decoyParent
+      );
+
       viewer.setCentroidLabels([
         { el: candidate, position: [0, 1, 0] },
       ], 'live');
-    } catch (error) {
-      committedRetirementError = {
-        errorCount: error instanceof AggregateError
-          ? error.errors.length
-          : 0,
-        message: error.message,
-        name: error.name,
-      };
-    } finally {
-      labelLayer.removeChild = originalRemoveChild;
-    }
-
-    const committedBeforeRetry = (
-      candidate.parentNode === labelLayer &&
-      candidate.dataset.viewId === 'live'
-    );
-    const failedOldHidden = (
-      oldA.style.display === 'none' &&
-      oldB.style.display === 'none'
-    );
-    const stableElementRetained = (
-      oldA.parentNode === labelLayer &&
-      decoy.parentNode === decoyParent
-    );
-
-    viewer.setCentroidLabels([
-      { el: candidate, position: [0, 1, 0] },
-    ], 'live');
-    const retrySettled = (
-      oldA.parentNode === null &&
-      oldB.parentNode === null &&
-      candidate.parentNode === labelLayer
-    );
-
-    const finalElement = document.createElement('div');
-    labelLayer.removeChild = function (element) {
-      const result = Reflect.apply(originalRemoveChild, this, [element]);
-      if (element === candidate) {
-        throw new Error(
-          'synthetic centroid delete-then-throw report',
-        );
-      }
-      return result;
-    };
-    let deleteThenThrowError = null;
-    try {
-      viewer.setCentroidLabels([
-        { el: finalElement, position: [0, 0, 1] },
-      ], 'live');
-    } catch (error) {
-      deleteThenThrowError = error.message;
-    } finally {
-      labelLayer.removeChild = originalRemoveChild;
-    }
-    const deleteThenThrowSettled = (
-      candidate.parentNode === null &&
-      finalElement.parentNode === labelLayer
-    );
-
-    viewer.setCentroidLabels([], 'live');
-    decoyParent.remove();
-    return {
-      committedBeforeRetry,
-      committedRetirementError,
-      deleteThenThrowError,
-      deleteThenThrowSettled,
-      failedOldHidden,
-      retirementAttempts,
-      retrySettled,
-      stableElementRetained,
-    };
-  });
-
-  expect(proof.retirementAttempts).toBe(2);
-  expect(proof.committedRetirementError?.name).toBe('AggregateError');
-  expect(proof.committedRetirementError?.message).toMatch(
-    /published, but prior-generation settlement was incomplete/,
-  );
-  expect(proof.committedRetirementError?.errorCount).toBe(2);
-  expect(proof.committedBeforeRetry).toBe(true);
-  expect(proof.failedOldHidden).toBe(true);
-  expect(proof.stableElementRetained).toBe(true);
-  expect(proof.retrySettled).toBe(true);
-  expect(proof.deleteThenThrowError).toBeNull();
-  expect(proof.deleteThenThrowSettled).toBe(true);
-  expect(pageErrors).toEqual([]);
-});
-
-test('terminal disposal retains failed centroid DOM owners for a later exact retry', async ({
-  page,
-}) => {
-  const pageErrors = [];
-  page.on('pageerror', error => pageErrors.push(error.message));
-
-  const proof = await page.evaluate(async () => {
-    const viewer = window._cellucidViewer;
-    const ui = window._cellucidUi;
-    if (ui === null || typeof ui?.destroy !== 'function') {
-      throw new Error(
-        'Viewer terminal ownership requires the application UI disposer.',
+      const retrySettled = (
+        oldA.parentNode === null &&
+        oldB.parentNode === null &&
+        candidate.parentNode === labelLayer
       );
-    }
-    // This test terminates the viewer directly so it can exercise the
-    // viewer's exact retry contract. Retire the higher-level UI owner first;
-    // otherwise its later cleanup would correctly attempt to call methods on
-    // a viewer the test has already made terminal.
-    await ui.destroy();
-    const labelLayer = document.querySelector('#label-layer');
-    viewer.setCentroidLabels([], 'live');
-    const first = document.createElement('div');
-    const second = document.createElement('div');
-    viewer.setCentroidLabels([
-      { el: first, position: [0, 0, 0] },
-      { el: second, position: [1, 0, 0] },
-    ], 'live');
 
-    const originalRemoveChild = labelLayer.removeChild;
-    let rejectedRetirements = 0;
-    labelLayer.removeChild = function (element) {
-      if (element === first || element === second) {
-        rejectedRetirements += 1;
-        throw new Error(
-          `synthetic terminal centroid retirement ${rejectedRetirements}`,
-        );
-      }
-      return Reflect.apply(originalRemoveChild, this, [element]);
-    };
-
-    let firstError = null;
-    try {
-      viewer.dispose();
-    } catch (error) {
-      const messages = [];
-      const collect = value => {
-        messages.push(value.message);
-        if (value instanceof AggregateError) {
-          value.errors.forEach(collect);
+      const finalElement = document.createElement('div');
+      labelLayer.removeChild = function (element) {
+        const result = Reflect.apply(originalRemoveChild, this, [element]);
+        if (element === candidate) {
+          throw new Error(
+            'synthetic centroid delete-then-throw report',
+          );
         }
+        return result;
       };
-      collect(error);
-      firstError = {
-        messages,
-        name: error.name,
-      };
-    } finally {
-      labelLayer.removeChild = originalRemoveChild;
-    }
+      let deleteThenThrowError = null;
+      try {
+        viewer.setCentroidLabels([
+          { el: finalElement, position: [0, 0, 1] },
+        ], 'live');
+      } catch (error) {
+        deleteThenThrowError = error.message;
+      } finally {
+        labelLayer.removeChild = originalRemoveChild;
+      }
+      const deleteThenThrowSettled = (
+        candidate.parentNode === null &&
+        finalElement.parentNode === labelLayer
+      );
 
-    const pendingHidden = (
-      first.parentNode === labelLayer &&
-      second.parentNode === labelLayer &&
-      first.style.display === 'none' &&
-      second.style.display === 'none'
+      viewer.setCentroidLabels([], 'live');
+      decoyParent.remove();
+      return {
+        committedBeforeRetry,
+        committedRetirementError,
+        deleteThenThrowError,
+        deleteThenThrowSettled,
+        failedOldHidden,
+        retirementAttempts,
+        retrySettled,
+        stableElementRetained,
+      };
+    });
+
+    expect(proof.retirementAttempts).toBe(2);
+    expect(proof.committedRetirementError?.name).toBe('AggregateError');
+    expect(proof.committedRetirementError?.message).toMatch(
+      /published, but prior-generation settlement was incomplete/,
     );
-    let secondError = null;
-    try {
-      viewer.dispose();
-    } catch (error) {
-      secondError = error.message;
-    }
-    return {
-      firstError,
-      pendingHidden,
-      rejectedRetirements,
-      retiredAfterRetry: (
-        first.parentNode === null &&
-        second.parentNode === null
-      ),
-      secondError,
-    };
+    expect(proof.committedRetirementError?.errorCount).toBe(2);
+    expect(proof.committedBeforeRetry).toBe(true);
+    expect(proof.failedOldHidden).toBe(true);
+    expect(proof.stableElementRetained).toBe(true);
+    expect(proof.retrySettled).toBe(true);
+    expect(proof.deleteThenThrowError).toBeNull();
+    expect(proof.deleteThenThrowSettled).toBe(true);
+    expect(pageErrors).toEqual([]);
   });
 
-  expect(proof.rejectedRetirements).toBe(2);
-  expect(proof.firstError?.name).toBe('AggregateError');
-  expect(proof.firstError?.messages).toContain(
-    'synthetic terminal centroid retirement 1',
-  );
-  expect(proof.firstError?.messages).toContain(
-    'synthetic terminal centroid retirement 2',
-  );
-  expect(proof.pendingHidden).toBe(true);
-  expect(proof.secondError).toBeNull();
-  expect(proof.retiredAfterRetry).toBe(true);
-  expect(pageErrors).toEqual([]);
+  await test.step('terminal disposal retains failed centroid DOM owners for a later exact retry', async () => {
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+
+    const proof = await page.evaluate(async () => {
+      const viewer = window._cellucidViewer;
+      const ui = window._cellucidUi;
+      if (ui === null || typeof ui?.destroy !== 'function') {
+        throw new Error(
+          'Viewer terminal ownership requires the application UI disposer.',
+        );
+      }
+      // This test terminates the viewer directly so it can exercise the
+      // viewer's exact retry contract. Retire the higher-level UI owner first;
+      // otherwise its later cleanup would correctly attempt to call methods on
+      // a viewer the test has already made terminal.
+      await ui.destroy();
+      const labelLayer = document.querySelector('#label-layer');
+      viewer.setCentroidLabels([], 'live');
+      const first = document.createElement('div');
+      const second = document.createElement('div');
+      viewer.setCentroidLabels([
+        { el: first, position: [0, 0, 0] },
+        { el: second, position: [1, 0, 0] },
+      ], 'live');
+
+      const originalRemoveChild = labelLayer.removeChild;
+      let rejectedRetirements = 0;
+      labelLayer.removeChild = function (element) {
+        if (element === first || element === second) {
+          rejectedRetirements += 1;
+          throw new Error(
+            `synthetic terminal centroid retirement ${rejectedRetirements}`,
+          );
+        }
+        return Reflect.apply(originalRemoveChild, this, [element]);
+      };
+
+      let firstError = null;
+      try {
+        viewer.dispose();
+      } catch (error) {
+        const messages = [];
+        const collect = value => {
+          messages.push(value.message);
+          if (value instanceof AggregateError) {
+            value.errors.forEach(collect);
+          }
+        };
+        collect(error);
+        firstError = {
+          messages,
+          name: error.name,
+        };
+      } finally {
+        labelLayer.removeChild = originalRemoveChild;
+      }
+
+      const pendingHidden = (
+        first.parentNode === labelLayer &&
+        second.parentNode === labelLayer &&
+        first.style.display === 'none' &&
+        second.style.display === 'none'
+      );
+      let secondError = null;
+      try {
+        viewer.dispose();
+      } catch (error) {
+        secondError = error.message;
+      }
+      return {
+        firstError,
+        pendingHidden,
+        rejectedRetirements,
+        retiredAfterRetry: (
+          first.parentNode === null &&
+          second.parentNode === null
+        ),
+        secondError,
+      };
+    });
+
+    expect(proof.rejectedRetirements).toBe(2);
+    expect(proof.firstError?.name).toBe('AggregateError');
+    expect(proof.firstError?.messages).toContain(
+      'synthetic terminal centroid retirement 1',
+    );
+    expect(proof.firstError?.messages).toContain(
+      'synthetic terminal centroid retirement 2',
+    );
+    expect(proof.pendingHidden).toBe(true);
+    expect(proof.secondError).toBeNull();
+    expect(proof.retiredAfterRetry).toBe(true);
+    expect(pageErrors).toEqual([]);
+  });
 });

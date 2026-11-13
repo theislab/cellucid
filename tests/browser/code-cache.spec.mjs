@@ -12,9 +12,9 @@
  * one leaves the page, commits uncontrolled, in every context and from
  * `page.goto` or the page's own navigation alike. The same Firefox build
  * without Playwright, or driven over WebDriver BiDi, starts the next visit
- * under the worker and takes every startup file from it (measured
- * 2026-10-31; the developer docs, "Build, run, and deployment", the code
- * cache). Firefox runs the first visit here.
+ * under the worker and takes every startup file from it (the developer docs,
+ * "Build, run, and deployment", the code cache). Firefox runs the first
+ * visit here.
  */
 import { readFileSync } from 'node:fs';
 
@@ -68,30 +68,31 @@ async function firstVisit(page) {
   expect((await keptFiles(page)).filter(path => path.startsWith('/tests/'))).toEqual([]);
 }
 
-test('a deployed page keeps its code in this browser, under its build', async ({ page }) => {
-  await firstVisit(page);
-});
+test('a deployed page keeps its code in this browser, and its next visit takes it from there', async ({ page, browserName }) => {
+  await test.step('a deployed page keeps its code in this browser, under its build', async () => {
+    await firstVisit(page);
+  });
 
-test('the next visit of a deployed page takes its code from this browser', async ({ page, browserName }) => {
-  test.skip(
-    browserName === 'firefox',
-    "Playwright's Firefox (Juggler) leaves a navigation the service worker does not answer uncontrolled; " +
-      'the same build without Playwright or over WebDriver BiDi does not (see the header of this file).',
-  );
-  await firstVisit(page);
+  // Playwright's Firefox (Juggler) leaves a navigation the service worker does
+  // not answer uncontrolled; the same build without Playwright or over
+  // WebDriver BiDi does not (see the header of this file). It runs the first
+  // visit only.
+  if (browserName === 'firefox') return;
 
-  // The next visit starts under the worker, which answers every startup file
-  // (`workerStart` marks it in Chromium and WebKit; Firefox 153 leaves it 0
-  // for a file its worker answered, so it would need another witness).
-  await openDataset(page, DEPLOYED_DATASET_URL);
-  expect(await page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true);
-  const answered = await page.evaluate(files => performance.getEntriesByType('resource')
-    .filter(entry => files.includes(new URL(entry.name).pathname))
-    .map(entry => ({ path: new URL(entry.name).pathname, viaWorker: entry.workerStart > 0 })), STARTUP_FILES);
-  expect(answered.map(({ path }) => path).sort()).toEqual([...STARTUP_FILES].sort());
-  expect(answered.filter(({ viaWorker }) => !viaWorker)).toEqual([]);
-  // A dataset request of this site is not the cache's: it is never kept.
-  expect((await keptFiles(page)).filter(path => path.startsWith('/tests/'))).toEqual([]);
+  await test.step('the next visit of a deployed page takes its code from this browser', async () => {
+    // The next visit starts under the worker, which answers every startup file
+    // (`workerStart` marks it in Chromium and WebKit; Firefox 153 leaves it 0
+    // for a file its worker answered, so it would need another witness).
+    await openDataset(page, DEPLOYED_DATASET_URL);
+    expect(await page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true);
+    const answered = await page.evaluate(files => performance.getEntriesByType('resource')
+      .filter(entry => files.includes(new URL(entry.name).pathname))
+      .map(entry => ({ path: new URL(entry.name).pathname, viaWorker: entry.workerStart > 0 })), STARTUP_FILES);
+    expect(answered.map(({ path }) => path).sort()).toEqual([...STARTUP_FILES].sort());
+    expect(answered.filter(({ viaWorker }) => !viaWorker)).toEqual([]);
+    // A dataset request of this site is not the cache's: it is never kept.
+    expect((await keptFiles(page)).filter(path => path.startsWith('/tests/'))).toEqual([]);
+  });
 });
 
 test('a page on this machine registers no code cache', async ({ page }) => {

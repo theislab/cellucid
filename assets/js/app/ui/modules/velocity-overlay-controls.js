@@ -27,6 +27,7 @@ import { defineControlReadout } from '../core/control-readout.js';
 import { PLACES } from '../place-names.js';
 import { representationOptionText } from '../../../data/representation-names.js';
 import { failureDetails, joinFailure, sayFailure } from '../../../utils/errors.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /**
  * Why `Show overlay` (and the Vector field select) cannot be used now, in the
@@ -218,8 +219,8 @@ const decimals = digits => value => formatDecimal(value, digits);
 
 /**
  * Every overlay slider: the viewer setting it drives, how a slider position
- * becomes that setting, and how the readout prints it. One table replaces the
- * twenty-three hand-written update functions it used to take.
+ * becomes that setting, and how the readout prints it. One table, not a
+ * hand-written update function per slider.
  *
  * `commit: 'change'` marks the one slider whose setting restarts the whole
  * particle system (every particle is re-seeded and the trails are cleared):
@@ -934,12 +935,8 @@ export function initVelocityOverlayControls(options) {
 
   function destroy() {
     if (destructionPromise !== null) return destructionPromise;
-    let resolveDestruction;
-    let rejectDestruction;
-    destructionPromise = new Promise((resolve, reject) => {
-      resolveDestruction = resolve;
-      rejectDestruction = reject;
-    });
+    const { promise, resolve: resolveDestruction, reject: rejectDestruction } = promiseWithResolvers();
+    destructionPromise = promise;
     destroyed = true;
     operationGeneration += 1;
 

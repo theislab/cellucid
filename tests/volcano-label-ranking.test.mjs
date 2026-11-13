@@ -3,11 +3,6 @@
  * ranks first: where p-values tie -- on hundreds of thousands of cells many
  * underflow to 0 -- the stronger test statistic comes first, before the
  * larger fold change.
- *
- * Found 2026-11-10 on Suo (NK, 30,283 cells, vs the other 531,664): 486 genes
- * had p = 0; the plot labelled HBE1, KLF1, RHAG… (strongly down, |log2FC| ≈ 10)
- * while the table's top genes were KLRD1, PRF1, KLRF1, IL2RB, GZMH (score
- * 544…450, log2FC ≈ 5).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -55,7 +50,7 @@ test('a result without a statistic keeps the fold-change tie-break', () => {
 });
 
 test('an infinite test statistic (a pseudobulk t with no spread) ranks strongest; an unavailable one last', () => {
-  // Found 2026-11-10: the score reader refused ±∞, so a pseudobulk DE failed ("score for CD3E must be
+  // The score reader accepts ±∞: a pseudobulk DE with one must not fail ("score for CD3E must be
   // a finite number or unavailable").
   const results = {
     results: [
@@ -72,7 +67,7 @@ test('an infinite test statistic (a pseudobulk t with no spread) ranks strongest
 });
 
 test('with p = 0 genes the y axis reads round values, none crowding the +∞ band', () => {
-  // Found 2026-11-10: ticks at quarters of the top read 80.2, 160, 241, 321, and 321 overlapped "+∞".
+  // Ticks at quarters of the top would read 80.2, 160, 241, 321, and 321 would overlap "+∞".
   const finite = { gene: 'MID', pValue: 1e-321, adjustedPValue: 1e-321, log2FoldChange: 2, score: 40 };
   const figure = buildVolcanoFigure({ results: [...deResults.results, finite] }, options(), { width: 900, height: 600 });
   const { tickvals, ticktext } = figure.layout.yaxis;

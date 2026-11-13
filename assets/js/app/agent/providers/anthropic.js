@@ -60,7 +60,7 @@ export const PROGRESS_BETA = 'thinking-display-updates-2026-08-18';
 /**
  * The models that write progress notes between tool calls and take
  * `thinking.display: "updates"`, as Anthropic's Thinking page lists them
- * ("Progress updates between tool calls", read 2026-11-11). The model list
+ * ("Progress updates between tool calls"). The model list
  * (`/v1/models`) does not say which models do, and the setting cannot be
  * sent to every model: it comes with `thinking: {type: "adaptive"}`, which
  * turns thinking on for a model that runs without it by default (Claude
@@ -328,7 +328,7 @@ export async function* anthropicEventsOf(events, { progress = false } = {}) {
 /**
  * @param {{fetch?: typeof fetch}} [options]
  */
-export function createAnthropicProvider({ fetch: fetchImpl = (...args) => globalThis.fetch(...args) } = {}) {
+export function createAnthropicProvider({ fetch: fetchImpl = (input, init) => globalThis.fetch(input, init) } = {}) {
   /** Models whose requests were refused for the progress-notes setting (`refusesProgress`): not asked again. */
   const withoutProgress = new Set();
 

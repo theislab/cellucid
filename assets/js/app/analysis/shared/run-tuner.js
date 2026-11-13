@@ -32,9 +32,9 @@
  *   read is measured and when the budget shrinks (a run that names its
  *   `geneCount`). A task's genes are read together and computed in one
  *   message, so the page's work per gene shrinks with them: held at the
- *   densest form, a 10M-cell differential expression of two groups (1.9M
- *   cells) went one gene a task, 30,000 tasks and page messages where the
- *   pushed tree sent 128.
+ *   densest form, a differential expression of two groups over millions of
+ *   cells goes one gene a task: tens of thousands of tasks and page messages
+ *   (measured: 37_decisions_analysis.md).
  * - **Compute in flight** = two tasks per worker (one running, one queued,
  *   so no worker waits for a message round trip), capped by half the budget
  *   over the measured bytes a task carries.

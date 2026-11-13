@@ -15,7 +15,7 @@
  *   line names it "Claude Code (local)"; its Undo turn takes the turn back;
  * - the tool list is the same whatever the person's settings (nothing says it
  *   changed); the agent is told the settings after its first result and again
- *   after a result once they changed (L26-9);
+ *   after a result once they changed;
  * - a change the settings ask about: the page's confirm card, and the app's
  *   own MCP elicitation; the app's Decline answers the card, and the agent
  *   reads that the person declined; the app giving up on a call while it
@@ -23,9 +23,10 @@
  *   ones too;
  * - `cellucid mcp --open` serves a file itself, and its viewer stops with it.
  *
- * Needs CELLUCID_PYTHON set to an interpreter with cellucid's dependencies
- * and the MCP SDK (`pip install 'cellucid[mcp]'`); without it the file is
- * skipped, as the other live-server specs are. Both processes run the
+ * Needs CELLUCID_PYTHON set to an interpreter with cellucid's dependencies and
+ * the MCP SDK (`pip install 'cellucid[mcp]'`); without it the file is skipped,
+ * as the other live-server specs are, and CELLUCID_REQUIRE_VIEWERS=1 (set by
+ * the CI job that runs this spec) makes that a failure. Both processes run the
  * cellucid-python checkout beside this repository (or CELLUCID_PYTHON_ROOT).
  */
 import { spawn } from 'node:child_process';
@@ -39,8 +40,9 @@ import { APP_ORIGIN } from './helpers/origins.mjs';
 import { waitForHistory } from './helpers/state-history.mjs';
 import { fieldNotShown, observeProductErrors, resultJson } from './helpers/agent-chat.mjs';
 import { expect, test } from './helpers/test.mjs';
+import { viewerInterpreter } from './helpers/viewer-interpreters.mjs';
 
-const PYTHON = process.env.CELLUCID_PYTHON ?? null;
+const PYTHON = viewerInterpreter('CELLUCID_PYTHON');
 const PYTHON_SOURCE = path.join(
   process.env.CELLUCID_PYTHON_ROOT
     ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'cellucid-python'),

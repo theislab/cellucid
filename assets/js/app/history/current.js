@@ -36,9 +36,10 @@ import { createListenerSet } from '../../utils/listener-set.js';
  *   happened; `code` `needs-person` when the page offers the person to reopen its file); `signal` stops its restore
  * @property {(id: string, options?: {signal?: AbortSignal|null, onStep?: Function|null}) => Promise<{tracker: string, report: object[]}>} replay -
  *   Apply its steps again, by name, on the dataset shown, in a new tracker linked to it (`dataset-history.js` `replay`)
- * @property {(id: string, name: string) => Promise<void>} rename
- * @property {(id: string) => Promise<void>} remove
- * @property {(name: string) => Promise<void>} saveAs - Keep the history shown under this name
+ * @property {(id: string, name: string) => Promise<boolean>} rename - Whether it was renamed
+ * @property {(id: string) => Promise<number>} remove - How many were removed
+ * @property {(name: string|null, options?: {content?: 'history'|'state'|'steps', results?: 'include'|'recompute'}) => Promise<object>} saveAs -
+ *   Keep the history shown under this name (null: a name of the dataset and the time); the saved state's entry
  * @property {(listener: () => void) => () => void} [subscribe] - Told when the list changes
  */
 

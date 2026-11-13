@@ -1,7 +1,7 @@
 /**
  * An analysis result records the expression values its genes were read
  * in as the analysis declares them (`form-based-analysis.js` `_valuesRead`),
- * not the app-wide setting (live pass 6 L24-16, lane queue-5 L25-4):
+ * not the app-wide setting:
  *
  * - a cell-level differential expression reads the matrix in the values it
  *   is shown in: its provenance records them, and it goes stale when the

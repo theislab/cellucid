@@ -232,31 +232,6 @@ test('figure export reads every background and knows which layer each draws', ()
   }
 });
 
-test('the viewer clears to the studio surface it publishes', async () => {
-  const viewerSource = await read('assets/js/rendering/viewer.js');
-  const studioCase = viewerSource.slice(
-    viewerSource.indexOf("case 'studio':"),
-    viewerSource.indexOf("case 'black':")
-  );
-  assert.match(studioCase, /case 'studio-dark': \{/);
-  assert.match(studioCase, /studioPalette = STUDIO_PALETTES\[exactMode\];/);
-  assert.match(studioCase, /setBackgroundClearColor\(surface\[0\], surface\[1\], surface\[2\]\);/);
-  assert.match(studioCase, /bgColor = surface;/);
-  // The background's clear color is the context's, opaque, and is set again
-  // on a context the browser restores (whose every value is back at its
-  // initial one, transparent black for the clear color).
-  const setter = viewerSource.slice(
-    viewerSource.indexOf('function setBackgroundClearColor('),
-    viewerSource.indexOf('let backdropLookId')
-  );
-  assert.match(setter, /backgroundClearColor = \[red, green, blue, 1\];\s+gl\.clearColor\(red, green, blue, 1\);/);
-  const restore = viewerSource.slice(
-    viewerSource.indexOf('function restoreLostGraphics()'),
-    viewerSource.indexOf('sceneMsaaTarget = createSceneMsaaTarget(gl);', viewerSource.indexOf('function restoreLostGraphics()'))
-  );
-  assert.match(restore, /primeGlState\(gl\);\s+applyViewerGlState\(\);/);
-});
-
 test('each background has one twin in the other theme, at the same place in its group', () => {
   const [light, dark] = VIEWER_BACKGROUND_GROUPS.map((group) => group.backgrounds);
   assert.equal(light.length, dark.length);

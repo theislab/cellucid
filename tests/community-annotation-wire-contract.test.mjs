@@ -1872,7 +1872,7 @@ test('GitHub sign-in verifies the exact current Worker before navigation and pre
     );
     const loginUrl = new URL(assignments[0]);
     assert.equal(loginUrl.pathname, '/auth/login');
-    // The rest of the fragment is kept; the sign-in's state (LG-3) is named after it.
+    // The rest of the fragment is kept; the sign-in's state is named after it.
     assert.match(
       loginUrl.searchParams.get('return_to'),
       /^https:\/\/app\.example\/view\?dataset=synthetic#view=umap&panel=genes&cellucid_github_state=[0-9a-f]{32}$/
@@ -3276,7 +3276,7 @@ test('local persistence rejects ambiguous compound vote keys before applying sta
     const payload = parseExactJson(values.get(key));
     payload.suggestions['cell_type:Alpha'][0].id = 'ghid_42_C';
     payload.myVotes = {
-      // If an ID containing ":" were parsed by the old last-delimiter rule,
+      // If an ID containing ":" were parsed by a last-delimiter rule,
       // this would silently move B:ghid_42_C from Alpha to legal id
       // ghid_42_C in Alpha:B.
       'cell_type:Alpha:B:ghid_42_C': 'up',
@@ -3798,7 +3798,7 @@ test('raw-file cache fails visibly when IndexedDB is unavailable', async () => {
 
 test('counts and exported keys have no fixed limit; the 1 MB file bounds them', () => {
   // A category label as long as an export may write, many markers, many
-  // buckets, and a minimum voter count above the former 50.
+  // buckets, and a minimum voter count above 50.
   const longBucket = `cell_type:${'L'.repeat(5_000)}`;
   const buckets = Object.fromEntries(
     Array.from({ length: 6_000 }, (_, index) => [`cell_type:c${index}`, []])

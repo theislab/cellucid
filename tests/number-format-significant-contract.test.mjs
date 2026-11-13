@@ -1,10 +1,10 @@
 /**
- * One number format for every measured value the app shows (audit NS-3):
+ * One number format for every measured value the app shows:
  * the legends' color bars, the filter list and figure provenance, exported
  * figures' axes and legends, cell info, range labels and analysis summaries
  * all write a value through `formatSignificant` (`utils/format-units.js`).
- * Three significant figures by default — in every range, where the two
- * former formatters gave one or two in [0.01, 1) and in their mantissas —
+ * Three significant figures by default — in every range (not one or two in
+ * [0.01, 1) and in the mantissas) —
  * with the notation chosen after rounding, so a value that rounds into the
  * next decade is written in that decade's form, never "10.0e-3".
  */
@@ -47,7 +47,7 @@ test('three significant figures in every range; scientific outside 0.01 to 10,00
 });
 
 test('decade boundaries: the rounded value picks the notation, the mantissa is renormalised', () => {
-  // The former formatters wrote these "1e-2"/"10.0e-3", "10.0e4" and "1e4" or worse.
+  // These are not written "1e-2"/"10.0e-3", "10.0e4" and "1e4" or worse.
   assert.equal(formatSignificant(0.00996), '9.96e-3');
   assert.equal(formatSignificant(0.009996), '0.01');
   assert.equal(formatSignificant(9999.6), '1e4');
@@ -73,7 +73,7 @@ test('a range bound is written exactly when typed or set by a slider', () => {
   for (const [bound, text] of [[1500, '1500'], [1234, '1234'], [0.012, '0.012'], [0.0135, '0.0135'], [1, '1'], [12345, '12345'], [99900, '99900']]) {
     assert.equal(formatBound(bound), text);
   }
-  // A filter of 0.012 to 0.014 is no longer "0.01 – 0.01".
+  // A filter of 0.012 to 0.014 is not "0.01 – 0.01".
   assert.notEqual(formatBound(0.012), formatBound(0.014));
 });
 
@@ -93,7 +93,7 @@ test('cell info writes a cell value to six figures, a count whole', () => {
   assert.equal(formatCellValue(12345), '12345');
   assert.equal(formatCellValue(1.6094379124341003), '1.60944');
   assert.equal(formatCellValue(0.000123), '1.23e-4');
-  assert.equal(formatCellValue(NaN), 'Missing', 'the word the legend and the filters use (R9D-9)');
+  assert.equal(formatCellValue(NaN), 'Missing', 'the word the legend and the filters use');
 });
 
 test('no other module writes a shown value with its own significant-figure rule', () => {

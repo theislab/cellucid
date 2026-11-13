@@ -529,12 +529,12 @@ export function pointRasterArgs(session, {
  *
  * An image crosses to the worker as its pixels, never as an ImageBitmap of
  * a page canvas. On Linux WebKit (WPE), whose workers have no GL (see
- * above), an ImageBitmap of a large page canvas encoded in the worker came
- * out without the canvas's pixels: a PNG figure held a blurred, magnified
- * patch of the screen's floor grid and none of the figure, and a backdrop
- * look's raster was entirely transparent (`backdrop-looks.spec.mjs`, "figure
- * export redraws the look under the points"). `getImageData` reads the
- * pixels on the thread that drew them, in every engine.
+ * above), an ImageBitmap of a large page canvas encoded in the worker comes
+ * out without the canvas's pixels: a PNG figure holds a patch of the screen
+ * and none of the figure, and a backdrop look's raster is transparent
+ * (`backdrop-looks.spec.mjs`, "figure export redraws the look under the
+ * points"). `getImageData` reads the pixels on the thread that drew them, in
+ * every engine.
  *
  * @param {HTMLCanvasElement|OffscreenCanvas|ImageBitmap} image - a canvas
  *   with a 2D context, or a frame (an ImageBitmap, closed here)
@@ -568,8 +568,9 @@ const BAND_PIXELS = 1 << 21;
 /**
  * The pixels of a composed 2D canvas, as `pagePixels`, read in bands of rows
  * with a yield to the event loop between them. One `getImageData` of a
- * 300 dpi figure held the page for ~40 ms (a GPU canvas is read back whole);
- * each band is a fraction of that, so no read is a long task.
+ * 300 dpi figure holds the page for a long task (a GPU canvas is read back
+ * whole); each band is a fraction of that, so no read is a long task
+ * (measured: 36_decisions_figure_export.md).
  *
  * @param {HTMLCanvasElement} canvas - a canvas with a 2D context
  * @param {AbortSignal|null} [signal]

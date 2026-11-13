@@ -1,11 +1,11 @@
 /**
- * The guided tour and the person (or an agent) acting while it plays (bug
- * hunt LB-3). The tour moves the history's head step by step and, at its end,
+ * The guided tour and the person (or an agent) acting while it plays. The
+ * tour moves the history's head step by step and, at its end,
  * jumps back to the step shown before it began. Anyone else's step, move or
- * edit while it plays used to be overwritten by the tour's next jump (the
- * person's coloring vanished from view, kept on a branch nobody was told
- * of), and the tour's return jumped away from it again. Now the tour ends at
- * once when someone else changes the history, and does not return: the
+ * edit while it plays must not be overwritten by the tour's next jump (the
+ * person's coloring would vanish from view, kept on a branch nobody was told
+ * of), and the tour's return must not jump away from it again. So the tour
+ * ends at once when someone else changes the history, and does not return: the
  * person moved on. What changes nothing shown (a note, a bookmark) leaves it
  * playing.
  *
@@ -118,8 +118,8 @@ test('the tour\'s own moves do not end it, and Stop returns to the step shown be
 test('an event that moves nothing while the tour\'s own jump is under way (an agent\'s chat kept as its turn ends) leaves it playing', async () => {
   const h = fakeHistory();
   const ownJump = h.jump;
-  // The history tells of the chat kept with it before the jump has moved the head (round 9 gate:
-  // an agent's history_tour_start ended the tour it had just started).
+  // The history tells of the chat kept with it before the jump has moved the head (else
+  // an agent's history_tour_start would end the tour it had just started).
   const jump = async stepId => {
     h.emit({ kind: 'chat', tracker: 't1', conversation: 'c1' });
     await ownJump(stepId);

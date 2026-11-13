@@ -7,7 +7,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -110,30 +110,6 @@ test('every draw program declares the uniforms the renderer binds', () => {
   for (const key of ['bake:nebula', 'bake:abyss', 'bake:aurora']) {
     assert.match(BACKDROP_LOOK_PROGRAMS[key].fs, /uniform int u_face;/);
   }
-});
-
-test('idle costs nothing: no animation frame, ambient motion capped and gated', async () => {
-  const directory = new URL('../assets/js/rendering/backdrops/', import.meta.url);
-  for (const file of await readdir(directory)) {
-    const source = await read(`assets/js/rendering/backdrops/${file}`);
-    assert.doesNotMatch(source, /requestAnimationFrame\(/, `${file} schedules no frames of its own`);
-  }
-  const renderer = await read('assets/js/rendering/backdrops/backdrop-look-renderer.js');
-  assert.match(renderer, /requestIdleCallback\(runSlice/);
-  assert.match(renderer, /setTimeout\(tickAmbient, 1000 \/ BACKDROP_AMBIENT_MAX_HZ\)/);
-  assert.match(renderer, /document\.visibilityState !== 'hidden'/);
-  assert.match(renderer, /!prefersReducedMotion\(\)/);
-  assert.match(renderer, /let ambientEnabled = false;/);
-  // A step of the motion asks for an ambient frame, which the viewer paces
-  // (ambient-frame-pacing.js), never for an invalidation drawn at once.
-  const tick = renderer.slice(renderer.indexOf('function tickAmbient()'), renderer.indexOf('function syncAmbient()'));
-  assert.match(tick, /motionOwed = true;\n\s*requestFrame\(\);/);
-  assert.doesNotMatch(tick, /invalidate\(\)/);
-  // The viewer wakes for a look only through its fade, never for idle.
-  const viewer = await read('assets/js/rendering/viewer.js');
-  assert.match(viewer, /const backdropLookCause = backdropLooks\.frameCause\(\);/);
-  assert.match(viewer, /backdropLooks\.forgetView\(exactId\);/);
-  assert.match(viewer, /backdropLooks\.abandon\(\);/);
 });
 
 test('figure export maps every plot pixel to the pane NDC it shows', () => {

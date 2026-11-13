@@ -22,6 +22,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { pythonDocsRoot, skipAbsentSibling } from '../scripts/shared-files.mjs';
 import { INFO_TIPS } from '../assets/js/app/ui/components/info-tips.js';
 import { isSentenceCase } from '../assets/js/app/analysis/options/option-schema.js';
 import { MARKER_OPTIONS } from '../assets/js/app/analysis/options/marker-options.js';
@@ -125,8 +126,7 @@ for (const schema of SCHEMAS) {
 // ---------------------------------------------------------------------------
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const DOCS_ROOT = process.env.CELLUCID_PYTHON_DOCS
-  ?? path.resolve(ROOT, '..', 'cellucid-python', 'docs');
+const DOCS_ROOT = pythonDocsRoot();
 const ANALYSIS_DOCS = path.join(DOCS_ROOT, 'user_guide', 'web_app', 'h_analysis');
 
 /** Every `<!-- options:<id> -->` table in the analysis pages, by id. */
@@ -151,10 +151,7 @@ async function docsTables() {
 }
 
 test('every analysis page states its defaults exactly as its options schema', async t => {
-  if (!existsSync(ANALYSIS_DOCS)) {
-    t.skip(`documentation tree not present at ${DOCS_ROOT}`);
-    return;
-  }
+  if (skipAbsentSibling(t, existsSync(ANALYSIS_DOCS), `documentation tree not present at ${DOCS_ROOT}`)) return;
   const tables = await docsTables();
   const missing = SCHEMAS.map(schema => schema.id).filter(id => !tables.has(id));
   assert.deepEqual(missing, [], 'every analysis has a defaults table');
@@ -170,7 +167,7 @@ test('every analysis page states its defaults exactly as its options schema', as
   assert.deepEqual(unknown, [], 'no table names an analysis without options');
 });
 
-test('a list of groups has one form, the picker\'s order: an agent\'s order is kept as the field\'s, so no refresh rewrites it (L25-2)', () => {
+test('a list of groups has one form, the picker\'s order: an agent\'s order is kept as the field\'s, so no refresh rewrites it', () => {
   // Kanemaru's categories as the picker lists them (largest first); the agent named ten in its own order.
   const groups = ['Myocardial fibroblast', 'Adventitial fibroblast', 'Great vessel progenitors', 'Valve interstitial cells', 'Epicardial fibroblast']
     .map((id, i) => ({ id, name: id, count: 1000 - i, color: null }));

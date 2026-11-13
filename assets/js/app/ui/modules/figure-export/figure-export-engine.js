@@ -39,6 +39,7 @@ import { citationText } from '../../../../data/anndata-cellucid-metadata.js';
 import { allocateLargeArray } from '../../../../utils/large-arrays.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 import { failureDetails, sayFailure } from '../../../../utils/errors.js';
+import { isCancellation } from '../../../../utils/abort.js';
 import { computeFigureLayout } from './utils/layout.js';
 import { cellsFrameRect01, unionCellsFrames } from './utils/cells-frame.js';
 import { readShownVectorFieldOverlay } from './utils/overlay-fidelity.js';
@@ -46,6 +47,12 @@ import { readShownVectorFieldOverlay } from './utils/overlay-fidelity.js';
 const LIVE_VIEW_ID = 'live';
 const userNotifiedFailures = new WeakSet();
 
+/**
+ * Say an export's failure once, on its progress card when it has one. A
+ * cancellation is never a failure (`utils/abort.js`): a renderer whose load
+ * the page's leaving cut off (`app-code.js` `loadAppCode`) withdraws the
+ * card and says nothing. Returns the error, for the caller to throw.
+ */
 export function reportFigureExportFailure(
   rawError,
   {
@@ -53,6 +60,10 @@ export function reportFigureExportFailure(
     calculationId = null,
   } = {}
 ) {
+  if (isCancellation(rawError)) {
+    if (calculationId !== null) (notifications ?? getNotificationCenter()).dismiss(calculationId);
+    return rawError;
+  }
   const error = rawError instanceof Error
     ? rawError
     : new Error(String(rawError));

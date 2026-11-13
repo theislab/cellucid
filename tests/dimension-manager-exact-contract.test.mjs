@@ -515,9 +515,9 @@ test('the cell axis is published through one validating seam', () => {
 
 test('publishing the cell axis before the metadata is refused, not discarded', () => {
   // `initFromMetadata` clears the cache and a cache clear zeroes the axis, so
-  // publishing first used to be silently dropped and left the first embedding
-  // bounded only by the browser byte ceiling. The owning module now refuses
-  // the order instead of relying on each construction site to remember it.
+  // publishing first would be silently dropped and leave the first embedding
+  // bounded only by the browser byte ceiling. The owning module refuses the
+  // order instead of relying on each construction site to remember it.
   const manager = new DimensionManager();
   manager.publishCellCount(120);
   assert.throws(
@@ -599,6 +599,76 @@ test('position caches are keyed by layout and every shown or pinned layout survi
   assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap']);
   // The transform outlives eviction: centroids normalized with it stay valid.
   assert.ok(manager.getNormTransform('pca'));
+});
+
+test('an allocation failure loading a layout releases what no view shows and retries the load once', async () => {
+  const manager = new DimensionManager({ embeddingsMetadata: metadata() });
+  manager.registerLayouts(['tsne', 'pca'].map(layoutKey => ({
+    layoutKey,
+    dimension: 2,
+    label: layoutKey,
+    path: `obsm/${layoutKey}/0-1`,
+    provenance: null,
+    origin: 'mapping',
+  })));
+  const raw = new Map([
+    ['X_umap', Float32Array.from([0, 0, 1, 1, 2, 2, 3, 3])],
+    ['tsne', Float32Array.from([0, 0, 10, 10, 20, 20, 30, 30])],
+    ['pca', Float32Array.from([0, 0, 2, 4, 4, 8, 6, 12])],
+  ]);
+  // The errors the next loads of `pca` throw, one each, before a load succeeds.
+  const failuresOf = { pca: [] };
+  const loads = [];
+  loadsAsReader(manager, async layoutKey => {
+    loads.push(layoutKey);
+    const failure = failuresOf[layoutKey]?.shift();
+    if (failure !== undefined) throw failure;
+    return Float32Array.from(raw.get(layoutKey));
+  });
+  const releases = [];
+  const trimUnshown = manager.trimUnshown.bind(manager);
+  manager.trimUnshown = budget => {
+    const released = trimUnshown(budget);
+    if (budget === 0) releases.push(released);
+    return released;
+  };
+  // The renderer's geometry for unshown layouts is released by the same pressure signal.
+  let pressures = 0;
+  manager.setResidencyListener({ onPressure: () => { pressures += 1; } });
+
+  manager.setViewLayout('live', 'X_umap');
+  await manager.getPositions('X_umap', { showProgress: false });
+  await manager.getPositions('tsne', { showProgress: false });
+  assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap', 'tsne']);
+
+  // One allocation failure: what no view shows is released, then the load runs again and succeeds.
+  failuresOf.pca = [new RangeError('Array buffer allocation failed')];
+  const pca = await manager.getPositions('pca', { showProgress: false });
+  assert.deepEqual(Array.from(pca), Array.from(manager.normalizedPositionCache.get('pca')));
+  assert.deepEqual(loads.slice(2), ['pca', 'pca']);
+  assert.deepEqual(releases, ['the positions of 1 layout no view shows']);
+  assert.equal(pressures, 1);
+  assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap', 'pca'], 'the shown layout stays');
+
+  // A failure that is not an allocation failure is not retried and releases nothing.
+  manager.normalizedPositionCache.delete('pca');
+  loads.length = 0;
+  releases.length = 0;
+  failuresOf.pca = [new RangeError('Layout is not a rectangle')];
+  await assert.rejects(manager.getPositions('pca', { showProgress: false }), /not a rectangle/);
+  assert.deepEqual(loads, ['pca']);
+  assert.deepEqual(releases, []);
+  assert.equal(pressures, 1);
+
+  // The retry happens once: a second allocation failure reaches the caller.
+  loads.length = 0;
+  failuresOf.pca = [
+    new RangeError('Array buffer allocation failed'),
+    new RangeError('Array buffer allocation failed'),
+  ];
+  await assert.rejects(manager.getPositions('pca', { showProgress: false }), /allocation failed/);
+  assert.deepEqual(loads, ['pca', 'pca']);
+  assert.deepEqual(releases, [null], 'the second attempt released what it could, and nothing was left to release');
 });
 
 test('a layout provider registers an AnnData reference once, as a mapping layout', () => {

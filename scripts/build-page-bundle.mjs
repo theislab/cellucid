@@ -6,8 +6,8 @@
 // import map in index.html names each module's bytes (`?v=`), and nothing is
 // built while developing. A deployed site asked for those sources would need
 // one request per module, found in waves (the browser discovers a module's
-// imports only once it has it: 588 modules, seven waves deep, in October
-// 2026), with every comment shipped. So the generator also builds the graph
+// imports only once it has it, so a graph of hundreds of modules is many waves
+// deep), with every comment shipped. So the generator also builds the graph
 // with esbuild (pinned in package.json) into `assets/page/`: minified, with
 // the parts the app imports on demand (`import()`) left in chunks of their
 // own, every file named by its content (`<name>.<esbuild content hash>.js`;
@@ -57,7 +57,7 @@ export const PAGE_BUNDLE_FILE = /^([a-z0-9-]+)\.([A-Z2-7]{8})\.js(\.map)?$/;
  * An external imports nothing but other externals (`externalImports`; the
  * build refuses one that does): a module it imported from the sources would
  * be asked for by a deployed page beside its copy in the bundle, a second
- * instance (round 9: `worker-script.js` came to import `listener-set.js`).
+ * instance.
  */
 export const PAGE_EXTERNALS = Object.freeze([
   WORKER_SCRIPTS_PATH,

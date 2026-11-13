@@ -1,12 +1,12 @@
 // The community-annotation Worker runs on the Workers Free plan: 10 ms of CPU
 // per request (https://developers.cloudflare.com/workers/platform/limits/).
 // A JavaScript loop over every character of a 1 MB body costs about that by
-// itself (repro r03 of the 2026-11-05 backend audit: a 1 MB publish cost
-// 13.4 ms and was refused by Cloudflare). So the Worker parses JSON natively,
+// itself (a 1 MB publish that scans its body in JavaScript is refused by
+// Cloudflare; measured: 38_decisions_testing_and_hosted_runners.md). So the Worker parses JSON natively,
 // checks base64 natively, and relays large reads without parsing them.
 //
 // That is what is held here, by counting, never by a clock on a shared runner
-// (CI run 42129386525 measured 12.1 parses of CPU where a Mac measures 5):
+// (a shared runner's CPU time for one parse is more than twice a laptop's):
 //
 // - the blocks of JavaScript the Worker runs (`helpers/block-counts.mjs`) do
 //   not grow with the body: a thousand times the bytes adds a few per chunk of

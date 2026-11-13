@@ -21,7 +21,7 @@
  *   which can cancel it (`jobs/cancellable-job.js`);
  * - a gene's reads that its own loading notification shows, with Cancel and
  *   any wait (offline, a host's budget): adopted by it (`adoptedBy`), so a
- *   wait is said once (bug hunt R9W-4);
+ *   wait is said once;
  * - work nobody waits for (`background`: an index built ahead of need).
  *
  * The reader's own words for each read (`obsm['X_umap'] columns 0, 1, open
@@ -55,8 +55,7 @@ function describeReadPurpose(activity) {
       const key = quoted(/obsm\['([^']+)'\]/);
       return key === null ? 'the embedding' : `the embedding ${key}`;
     }
-    case 'field':
-    case 'fields': {
+    case 'field': {
       const key = quoted(/obs\['([^']+)'\]/);
       return key === null ? 'a field' : `field ${key}`;
     }

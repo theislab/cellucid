@@ -14,6 +14,8 @@
  * @module formats/rds/gunzip-worker
  */
 
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
+
 /** Input bytes handed to the decompressor per write, as `stream.js` writes them in this thread. */
 const INFLATE_SLICE_BYTES = 64 * 1024;
 
@@ -43,7 +45,11 @@ function fail(error) {
 
 async function feed() {
   for (;;) {
-    while (inputs.length === 0 && !ended) await new Promise(resolve => { wakeFeeder = resolve; });
+    while (inputs.length === 0 && !ended) {
+      const woken = promiseWithResolvers();
+      wakeFeeder = woken.resolve;
+      await woken.promise;
+    }
     if (inputs.length === 0) break;
     const input = inputs.shift();
     for (let offset = 0; offset < input.length; offset += INFLATE_SLICE_BYTES) {
@@ -59,7 +65,11 @@ async function drain() {
   let gathered = [];
   let bytes = 0;
   const send = async () => {
-    while (credit === 0) await new Promise(resolve => { wakeReader = resolve; });
+    while (credit === 0) {
+      const woken = promiseWithResolvers();
+      wakeReader = woken.resolve;
+      await woken.promise;
+    }
     credit--;
     // A piece that is a view of a larger buffer is copied, so each goes by transfer alone.
     const own = gathered.map(piece => (piece.byteOffset === 0 && piece.byteLength === piece.buffer.byteLength ? piece : piece.slice()));

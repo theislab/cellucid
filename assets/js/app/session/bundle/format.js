@@ -24,11 +24,10 @@
  *   signature of another format version is refused with the sentence
  *   {@link sessionSignatureRefusal} gives (saved by an earlier, or a newer,
  *   Cellucid); any other file with {@link NOT_A_SESSION_FILE_MESSAGE}.
- * - Format 4 (this one) holds the history of steps; format 3 held one state
- *   in per-feature chunks and is not read (its file names its version, so it
- *   is refused with that version, never misread). Like format 3, it records
- *   the cell-order digest over an embedding's stored values by original
- *   position (`data/cell-order-digest.js`).
+ * - Format 4 (this one) holds the history of steps; a file of another
+ *   format names its version, so it is refused with that version, never
+ *   misread. It records the cell-order digest over an embedding's stored
+ *   values by original position (`data/cell-order-digest.js`).
  * - Treat session files as untrusted input: every length is checked against
  *   the bytes the file still holds, and every inflate is bounded by the
  *   chunk's declared `uncompressedBytes`.

@@ -58,6 +58,15 @@ const FIELD_HIGHLIGHT_GROUP_KEYS = Object.freeze([
   'fieldSource'
 ]);
 
+/**
+ * `owner`, once it is an object with every method named.
+ *
+ * @template T
+ * @param {T} owner
+ * @param {string} label
+ * @param {readonly string[]} methodNames
+ * @returns {T}
+ */
 export function requireMethods(owner, label, methodNames) {
   if (!isObjectRecord(owner)) {
     throw new TypeError(`${label} must be an object.`);
@@ -70,6 +79,15 @@ export function requireMethods(owner, label, methodNames) {
   return owner;
 }
 
+/**
+ * `element`, once it is an object with every method named.
+ *
+ * @template T
+ * @param {T} element
+ * @param {string} label
+ * @param {readonly string[]} [methods]
+ * @returns {T}
+ */
 export function requireDomElement(element, label, methods = []) {
   if (!isObjectRecord(element)) {
     throw new TypeError(`${label} must be a DOM element.`);

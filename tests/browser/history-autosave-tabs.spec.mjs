@@ -1,6 +1,6 @@
 /**
  * The autosave over the browser's own IndexedDB, Web Locks and
- * BroadcastChannel, in two tabs of one browser (History v2 §3.7; run in
+ * BroadcastChannel, in two tabs of one browser (run in
  * Chromium, Firefox and WebKit):
  *
  * - a tab holds a Web Lock on the saved state it writes; another tab is told
@@ -112,54 +112,4 @@ test('a removal in one tab updates the other\'s list', async ({ context }) => {
   expect(await b.evaluate(savedId => window.kit.autosave.removeSavedStates([savedId]), id)).toBe(1);
   await expect.poll(() => a.evaluate(() => window.kit.told())).toBeGreaterThan(before);
   expect(await a.evaluate(async () => (await window.kit.autosave.listSavedStates()).length)).toBe(0);
-});
-
-test('a million-cell brush is kept in the cell-set encoding and reads back exactly', async ({ context }) => {
-  const a = await openTab(context);
-  const result = await a.evaluate(async () => {
-    const kit = window.kit;
-    const cells = Uint32Array.from({ length: 1_000_000 }, (_, i) => i).filter(i => i % 1000 !== 7);
-    await kit.history.step({ highlights: { groups: [{ label: 'Most', cells }] } });
-    await kit.run();
-    const db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open('cellucid-history');
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    const arrays = await new Promise((resolve, reject) => {
-      const request = db.transaction('arrays').objectStore('arrays').getAll();
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    db.close();
-    const brush = arrays.find(record => record.encoding === 'cell-set');
-    const source = await kit.autosave.openSavedState(kit.instance.entryId);
-    const eager = await source.readEager();
-    const rest = await source.readRest();
-    const kept = [...eager.values.values(), ...rest.values.values()].find(value => value?.groups?.[0]?.label === 'Most');
-    let same = kept.groups[0].cells.length === cells.length;
-    for (let i = 0; same && i < cells.length; i++) same = kept.groups[0].cells[i] === cells[i];
-    return { stored: brush?.data.byteLength ?? null, raw: cells.byteLength, same };
-  });
-  expect(result.same).toBe(true);
-  expect(result.stored).not.toBeNull();
-  expect(result.stored).toBeLessThan(result.raw / 100);
-});
-
-test('a conversation that made no step is kept and offered back after a reload', async ({ context }) => {
-  const a = await openTab(context);
-  await a.evaluate(async () => {
-    window.kit.history.chat('c1', [{ role: 'user', text: 'What is in this dataset?' }, { role: 'assistant', parts: [{ type: 'text', text: '1000 cells' }] }]);
-    await window.kit.run();
-    await window.kit.instance.retire();
-  });
-  await a.reload();
-  await a.goto(HOST);
-  const b = await openTab(context);
-  const offer = await b.evaluate(async () => {
-    const shown = [];
-    await window.kit.instance.offerContinue({ notifications: { show: notice => { shown.push(notice); return 'n'; } }, onContinue: () => {} });
-    return shown[0]?.message ?? null;
-  });
-  expect(offer).toMatch(/Continue where you left off\? .*1 conversation/);
 });

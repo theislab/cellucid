@@ -1,10 +1,10 @@
 // Work handed a signal that has already aborted does nothing: no byte is
 // read, no request admitted, no pass over a matrix run, no gene read for an
 // analysis, no export request sent. An `abort` event is never dispatched
-// again, so before `onAbort` (`utils/abort.js`) answered a stopped signal at
-// once, each of these sites waited on an event that had already happened
-// and ran its work to the end (`tests/abort-listener-contract.test.mjs`
-// pins the helper and the rule).
+// again, so a site that waited on the event would wait for one that had
+// already happened and run its work to the end; each answers a stopped
+// signal at once through `onAbort` (`utils/abort.js`;
+// `tests/abort-listener-contract.test.mjs` pins the helper and the rule).
 import './helpers/anndata-reader-in-process.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';

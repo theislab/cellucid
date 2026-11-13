@@ -73,7 +73,7 @@ test('per-cell CSV bytes equal the joined rows however the rows are split', asyn
   for (const parts of [1, 3, 8]) {
     assert.equal(await written('signature-scores', scores, 'page', parts), joinedScores(scores), `${parts} parts`);
   }
-  // Scored per category of a Group by field, the first column says group, as the result's table does (L11-5).
+  // Scored per category of a Group by field, the first column says group, as the result's table does.
   assert.equal(await written('signature-scores', scores, 'group', 3), joinedScores(scores, 'group'));
   assert.equal(await written('page-data', [], 'v', 8), 'page,cell_index,v');
 });

@@ -300,7 +300,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
   expect(paneLabels.every(call => call.y > 20 && call.y < 80)).toBe(true);
 
   const differentText = result.differentCalls.map(call => call.text);
-  // Panels whose legend models differ can no longer share one legend, so each
+  // Panels whose legend models differ cannot share one legend, so each
   // panel draws its own instead of the grid drawing none.
   expect(differentText.filter(text => text === 'cluster')).toHaveLength(2);
   expect(differentText.filter(text => text === 'Alpha')).toHaveLength(2);

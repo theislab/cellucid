@@ -96,8 +96,8 @@ test('a camera drag in one pane redraws only that pane, also when it pauses, and
   // A drag that pauses, as a person's does: the camera settles with the button
   // still held (between two moves, on a GPU so slow that every move is a pause),
   // and a settled camera is a new framing the render controls look at. Nothing
-  // on screen changes for it: looking at it redrew all four panes (hosted macOS
-  // Firefox, every nightly).
+  // on screen changes for it: looking at it would redraw all four panes (hosted macOS
+  // Firefox).
   await page.evaluate(() => { window.__pointDraws.clear(); });
   for (let step = 1; step <= 3; step++) {
     await page.mouse.move(pane.x + 48 + step * 6, pane.y + 16 + step * 2);

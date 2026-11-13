@@ -87,9 +87,9 @@ export function openDataMapping(page) {
 /**
  * Opens the panels and returns once each one opened has dispatched its
  * `toggle`. That event is queued as a task, so returning right after setting
- * `open` left it pending: a listener a spec attached next (the toggle counter
- * of `panel-header-controls.spec.mjs`) could still receive it, and on macOS
- * WebKit it did, counting a toggle no control had caused.
+ * `open` would leave it pending: a listener a spec attaches next (the toggle
+ * counter of `panel-header-controls.spec.mjs`) could still receive it, and
+ * macOS WebKit delivers it, counting a toggle no control had caused.
  *
  * @param {import('@playwright/test').Page} page
  * @param {{sessionSections?: boolean}} [options]

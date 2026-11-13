@@ -117,6 +117,11 @@ export function stepParamsOf(definition) {
  * step → step made), or kept when `kept(id)` says the step is there as it is
  * (a step before the replayed ones on the path shown). Returns
  * `{params}`, or `{missing: id}` naming a step the replay did not make.
+ *
+ * @param {*} definition
+ * @param {*} params
+ * @param {Map<string, string>} made
+ * @param {(id: string) => boolean} [kept]
  */
 export function stepParamsIn(definition, params, made, kept = () => false) {
   let out = params;
@@ -163,7 +168,7 @@ export function isReplayable(step) {
 }
 
 // ---------------------------------------------------------------------------
-// Names mapped (History v2 §3.10: "Use instead")
+// Names mapped ("Use instead")
 
 /** Whether a schema allows values of JSON type `type` (`type` alone, or in a list: `['object', 'null']`). */
 function allows(schema, type) {

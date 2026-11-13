@@ -24,6 +24,7 @@ import { analysisViewSizes } from '../shared/analysis-view-sizes.js';
 import { expandPagesWithDerived } from '../shared/page-derivation-utils.js';
 import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
 import { isLeftOutResult } from '../shared/analysis-result-session.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -156,12 +157,7 @@ function isPromiseLike(value) {
 }
 
 function createOwnedOperation(assign, operation) {
-  let rejectOperation;
-  let resolveOperation;
-  const task = new Promise((resolve, reject) => {
-    resolveOperation = resolve;
-    rejectOperation = reject;
-  });
+  const { promise: task, resolve: resolveOperation, reject: rejectOperation } = promiseWithResolvers();
   assign(task);
   void Promise.resolve()
     .then(operation)
@@ -282,7 +278,7 @@ export class AnalysisWindowManager {
    * `{kind, version, payload}` of JSON values and typed arrays; see
    * shared/analysis-result-session.js). Where a window stands, its size and
    * whether it is folded are its place (`exportWindowPlaces`), which the
-   * `layout` domain holds with every other panel's (History v2 §3.15.5).
+   * `layout` domain holds with every other panel's.
    *
    * @returns {Array<{ modeId: string, settings: any, result: null|Object, headerTitle: string }>}
    */

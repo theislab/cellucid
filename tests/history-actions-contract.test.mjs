@@ -1,7 +1,7 @@
 /**
  * The history's actions (`assets/js/app/actions/definitions/history.js`):
  * every operation on the history is one catalog action, with the effect,
- * the confirmation and the parameters History v2 fixes, so the State panel,
+ * the confirmation and the parameters the history model fixes, so the State panel,
  * agents, Python and R take one path, and every one has a provider: the
  * history (`history.js`) or its persistence (`persistence-actions.js`). Also
  * the `reads` field every definition declares (`catalog.js`).
@@ -26,7 +26,7 @@ import {
   BY_ORIGINS, JOURNAL_OPS, REPLAY_OUTCOMES, SHARE_CONTENTS, SHARE_RESULTS, SQUASH_CAUSES, STEP_KINDS, recordFields,
 } from '../assets/js/app/history/model.js';
 
-/** Every history action: [effect, confirm]. The design's table (History v2 §4), as frozen. */
+/** Every history action: [effect, confirm]. The table of effects and confirmations, as frozen. */
 const EXPECTED = Object.freeze({
   'history.get': ['read', null],
   'history.summary': ['read', null],
@@ -75,7 +75,7 @@ const EXPECTED = Object.freeze({
   'history.replay': ['history', null],
   'history.share': ['outside', 'writes-file'],
   'history.saved.delete': ['outside', 'deletes-saved'],
-  // Load…'s Open: its dataset first, then its history (a whole-file download asked, F114).
+  // Load…'s Open: its dataset first, then its history (a whole-file download asked).
   'history.saved.open': ['dataset', 'large-download'],
   'history.save': ['outside', null],
   'history.anndata.save': ['outside', 'writes-file'],
@@ -100,7 +100,7 @@ const DATASET_OPENING = Object.freeze(['history.saved.open']);
  */
 const ASKED_BY_HANDLER = Object.freeze(['history.report', 'history.saved.open']);
 
-test('every operation on the history is one action, with the effect and the confirmation History v2 fixes', () => {
+test('every operation on the history is one action, with the effect and the confirmation the history model fixes', () => {
   const catalog = createActionCatalog(ACTION_DEFINITIONS);
   const history = catalog.list().filter(definition => definition.type.startsWith('history.'));
   assert.deepEqual(history.map(d => d.type).sort(), Object.keys(EXPECTED).sort());
@@ -176,7 +176,7 @@ test('parameters name branches and trackers by name or id, steps, notes and entr
   no('history.replay', { saved: 'state-1', mapping: { fields: [] } });
   ok('history.search', { text: 'alpha', by: 'agent', kind: 'state', domain: 'filters', has_note: true, bookmarked: false, flagged: true });
   no('history.search', { by: 'claude' });
-  // §3.15: groups, squash, clear, the recording switch, what a share or a save holds.
+  // Groups, squash, clear, the recording switch, what a share or a save holds.
   ok('history.group.create', { from: 's4', to: 's9', name: 'QC' });
   no('history.group.create', { from: 's4', to: 's9' });
   ok('history.group.rename', { group: 'g1', name: 'Clustering' });

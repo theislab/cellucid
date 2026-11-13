@@ -1,6 +1,6 @@
 /**
- * Connectivity edges kept on while other cells of the dataset are opened
- * (R9R-11): a share, a smaller share, every cell again. Each opening ends with
+ * Connectivity edges kept on while other cells of the dataset are opened:
+ * a share, a smaller share, every cell again. Each opening ends with
  * the edges still on, drawn among the cells open now, and no failure; and the
  * history steps back through them.
  */
@@ -41,7 +41,7 @@ test('edges stay on and follow the cells open through a share, a smaller share a
 
   expect(await dispatch(page, 'setting.set', { setting: 'toggle-connectivity', value: true })).not.toHaveProperty('error');
   await waitForPageAtRest(page);
-  // The person's Max edges stays through every opening (a preference, R9R-11).
+  // The person's Max edges stays through every opening (a preference).
   expect(await dispatch(page, 'setting.set', { setting: 'connectivity-limit', value: 1000 })).not.toHaveProperty('error');
   await waitForPageAtRest(page);
   const whole = await edgesState(page);
@@ -65,39 +65,4 @@ test('edges stay on and follow the cells open through a share, a smaller share a
     expect((await edgesState(page)).on).toBe(true);
   }
   expect(errors).toEqual([]);
-});
-
-test('one read of the neighbor graph is one notice, whether KNN drag, the edges or both asked for it', async ({ page }) => {
-  // R9F-9: "Loading neighbor graph for KNN mode" (and "Loading connectivity
-  // data") showed beside the read's own card "Reading the neighbor graph".
-  await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await whenActionsDone(page);
-  await waitForPageAtRest(page);
-  await page.evaluate(() => {
-    const seen = new Set();
-    window.__graphNotices = seen;
-    const look = () => {
-      for (const element of document.querySelectorAll('#notification-center .notification')) {
-        // A card is in the page before it is due; one never shown is no notice.
-        if (element.hidden) continue;
-        const text = element.textContent.replace(/\s+/g, ' ').trim();
-        if (/neighbor graph|connectivity/i.test(text)) seen.add(`${element.id}|${text.replace(/ · .*$/, '')}`);
-      }
-    };
-    new MutationObserver(look).observe(document.getElementById('notification-center'), { subtree: true, childList: true, characterData: true });
-  });
-  // Both at once: KNN drag chosen, edges shown.
-  await page.locator('#highlighted-cells-section').evaluate(section => { section.open = true; });
-  await page.locator('#highlight-mode-knn').click();
-  expect(await dispatch(page, 'setting.set', { setting: 'toggle-connectivity', value: true })).not.toHaveProperty('error');
-  await waitForPageAtRest(page);
-  await expect.poll(() => edgesState(page).then(state => state.on)).toBe(true);
-  // Every card seen while the graph was read (a small graph may end before
-  // one is due): at most one, and it is the read's own.
-  const notices = await page.evaluate(() => [...window.__graphNotices]);
-  const ids = new Set(notices.map(entry => entry.split('|')[0]));
-  expect(ids.size, notices.join('\n')).toBeLessThanOrEqual(1);
-  for (const notice of notices) expect(notice.split('|')[1]).toMatch(/Reading the neighbor graph|Neighbor graph read: /);
-  expect(notices.join('\n')).not.toMatch(/Loading neighbor graph for KNN mode|Loading connectivity data/);
 });

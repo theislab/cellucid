@@ -21,8 +21,9 @@ import { formatCount, formatCountOf, formatPercent, formatSignificant } from '..
 /**
  * Finite values (over all pages) from which the summary and the tests of
  * continuous pages are computed by an analysis worker before they are shown:
- * their order statistics and tests are linear-time but still take tens of
- * milliseconds per million values on the thread that draws the interface.
+ * their order statistics and tests are linear-time but still take time
+ * proportional to the values on the thread that draws the interface
+ * (measured: 37_decisions_analysis.md).
  */
 const WORKER_MIN_VALUES = 200_000;
 

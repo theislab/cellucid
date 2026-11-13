@@ -65,7 +65,6 @@ const LAYOUT_DESCRIPTOR_KEYS = Object.freeze([
   'path',
   'provenance',
 ]);
-const MIB = 1024 * 1024;
 
 /**
  * Whether one error is the engine refusing an allocation (a typed array or
@@ -380,8 +379,9 @@ export function parseEmbeddingMetadata(meta) {
 /**
  * Create a dimension manager instance
  * @param {Object} options - Configuration options
- * @param {string} options.baseUrl - Base URL for loading layout files
- * @param {Object} options.embeddingsMetadata - The dataset identity's embeddings metadata
+ * @param {string} [options.baseUrl] - Base URL for loading layout files
+ * @param {Object|null} [options.embeddingsMetadata] - The dataset identity's embeddings metadata; the manager starts empty without it
+ * @param {Object|null} [options.candidateAnnDataBinding] - The staged candidate its reads address (`createCandidateAnnDataBinding`); null reads the active dataset
  * @param {number|null} [options.maxPositionBytes] - A fixed bound of retained/transient position bytes (tests); by default the `positions` share, read whenever a layout loads
  * @returns {DimensionManager}
  */
@@ -1388,29 +1388,6 @@ class DimensionManager {
 
     let total = 0n;
     for (const bytes of uniqueBuffers.values()) total += bytes;
-    return total;
-  }
-
-  /**
-   * Bytes of the positions the views show now, plus `extra`.
-   *
-   * @param {Float32Array} extra
-   * @returns {bigint}
-   * @private
-   */
-  _shownPositionBytes(extra) {
-    const shown = [extra];
-    for (const layoutKey of new Set(this.viewLayouts.values())) {
-      const positions = this.normalizedPositionCache.get(layoutKey) ?? this.positionCache.get(layoutKey);
-      if (positions) shown.push(positions);
-    }
-    const unique = new Map();
-    for (const positions of shown) {
-      const descriptor = this._describePositionBuffer(positions);
-      unique.set(descriptor.identity, descriptor.bytes);
-    }
-    let total = 0n;
-    for (const bytes of unique.values()) total += bytes;
     return total;
   }
 

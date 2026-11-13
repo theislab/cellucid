@@ -1,6 +1,5 @@
 /**
- * Regressions found by the history bug hunt (2026-11-04), kept for good:
- * defects of the history core reproduced on fake domains
+ * Defects of the history core, reproduced on fake domains
  * (`assets/js/app/history/history.js`, `tree.js`). Each test states what a
  * person expects.
  */

@@ -7,10 +7,9 @@
  * and a caller that trusts them both is wrong in one browser: Chromium's
  * off-the-record storage (a private window; a test browser's new context)
  * keeps a site's files in memory and, once its share is spent, reports a
- * write whole while keeping only part of it (measured 2026-10-29: a payload
- * of 40,000,000 bytes kept as 29,060,298, `navigator.storage.estimate()`
- * still saying 3 GB), and a later read gives the short file back: a 10M-cell
- * Seurat object's UMAP read back as 94,031,122 of its 160,000,000 bytes. So
+ * write whole while keeping only part of it (`navigator.storage.estimate()`
+ * still saying there is room), and a later read gives the short file back.
+ * So
  * a write is checked against the file's size (once, where a run of
  * appended writes ends), refused as the quota refusal it is
  * (`QuotaExceededError`, as the browser would have thrown it); and a read

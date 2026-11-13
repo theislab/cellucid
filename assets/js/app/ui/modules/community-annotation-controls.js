@@ -48,7 +48,7 @@
 import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { getCommunityAnnotationFileCache } from '../../community-annotations/file-cache.js';
-import { describeCacheScope, removeRetiredFileShaIndexes, toCacheScopeKey } from '../../community-annotations/cache-scope.js';
+import { describeCacheScope, toCacheScopeKey } from '../../community-annotations/cache-scope.js';
 import { annotationCategories, annotationFieldKey, annotationKeyable } from '../../community-annotations/field-names.js';
 import {
   clearPublishedBaseline,
@@ -173,8 +173,6 @@ export function initCommunityAnnotationControls({
     );
   }
 
-  // Dead keys an earlier Cellucid left in this origin's storage (deleted, never read).
-  removeRetiredFileShaIndexes();
   const session = getCommunityAnnotationSession();
   const access = getCommunityAnnotationAccessStore();
   const fileCache = getCommunityAnnotationFileCache();
@@ -1519,7 +1517,7 @@ export function initCommunityAnnotationControls({
    * @type {{repository: string, datasetId: string}|null}
    */
   let urlRepositoryApplied = null;
-  /** A link's `annotations` that names no repository, said with the parameter's real name (R9E-12). */
+  /** A link's `annotations` that names no repository, said with the parameter's real name. */
   const LINK_REPOSITORY_REFUSED =
     'This link\'s "annotations" is not a repository: it is owner/repo or owner/repo@branch.';
   const linkedRepository = value => (parseOwnerRepo(value)?.ownerRepo ?? String(value)).toLowerCase();
@@ -2496,7 +2494,7 @@ export function initCommunityAnnotationControls({
         }
 
           // Each branch that tells the person in its own sentence is that failure said
-          // once: the Pull's card is then dismissed, not failed again (bug hunt R9A-6).
+          // once: the Pull's card is then dismissed, not failed again.
           let said = false;
           if (workerCompatibilityFailure) {
             // The error says the remedy: redeploy an older Worker, or reload
@@ -3079,9 +3077,8 @@ export function initCommunityAnnotationControls({
 
       // A branch that tells the person in its own sentence (a notification of
       // its own) is that failure said once: the publication's card is then
-      // dismissed, never failed again with the raw error beside it (bug hunt
-      // R9A-6: "GitHub PUT … failed with HTTP 401" beside "Your GitHub sign-in
-      // expired…").
+      // dismissed, never failed again with the raw error beside it ("GitHub PUT …
+      // failed with HTTP 401" beside "Your GitHub sign-in expired…").
       let said = false;
       if (workerCompatibilityFailure) {
         msg = `${msg}\nThe repository connection was preserved.`;
@@ -3164,7 +3161,7 @@ export function initCommunityAnnotationControls({
       // The person's own file changed on GitHub since the last Pull (another
       // device or tab published): a Pull merges it, then the same publication
       // is made again (`pushToGitHub`), so the card is not failed with "Pull
-      // first" (bug hunt R9A-3). Not when an author's staged settings or
+      // first". Not when an author's staged settings or
       // merges wait: a Pull would bring the repository's over them, so the
       // person is told to Pull themselves.
       const ownFileConflict = err?.code === 'COMMUNITY_ANNOTATION_CONFLICT'
@@ -3228,11 +3225,6 @@ export function initCommunityAnnotationControls({
     }
     session.setFieldCategories(key, categories);
     return { field, key, categories };
-  }
-
-  /** The repository's label of the category the agent named as shown. */
-  function repositoryCategory(target, category) {
-    return categoryLabel(target.categories[resolveCategory(target.field, category)]);
   }
 
   /** A suggestion as the voting dialog shows it: votes de-duplicated over a merged bundle, the person's vote, delegated or direct. */
@@ -3328,8 +3320,8 @@ export function initCommunityAnnotationControls({
       const type = 'annotation.suggestions';
       const repository = connectedRepository(type);
       // Never pulled, the browser holds none of the others' suggestions: a
-      // read of it would say "none suggested" of a repository full of them
-      // (live pass 5, L18-6). It is pulled first, as Pull latest does.
+      // read of it would say "none suggested" of a repository full of them. It is
+      // pulled first, as Pull latest does.
       if (pull === true || (pull === undefined && session.getLastPullAt() === null)) {
         await whenSyncIdle(signal);
         const pulled = await pullFromGitHub({ signal, quiet: true });

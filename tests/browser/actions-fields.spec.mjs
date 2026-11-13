@@ -5,7 +5,7 @@
  * naming fields, categories and genes; each action dispatched directly
  * changes exactly what it says; the legend follows a change made by an
  * action from anywhere; and a category keeps exactly the N cells the seeded
- * sample names (request §3.1, filter by cell count).
+ * sample names (filter by cell count).
  *
  * The fixture (`current-ui`): 120 cells, `cell_type` (alpha, beta, gamma: 40
  * each), a continuous `score`, six genes, a latent space.
@@ -122,8 +122,8 @@ test('every control of the area dispatches the action it stands for, naming what
   await expect(page.locator('.legend-item')).toHaveCount(3);
   // The fixture opens colored by cell_type already (`first-coloring.js`), so
   // the legend's three rows are there before the choice and say nothing of
-  // it: the control's action is waited for as itself (read at once, it had
-  // not been dispatched yet: Firefox, the full local run of 2026-11-12).
+  // it: the control's action is waited for as itself (read at once, it may
+  // not have been dispatched yet).
   await expect.poll(() => page.evaluate(() => window.__dispatched.length)).toBeGreaterThan(0);
   await whenActionsDone(page);
   expect(await takeDispatched(page)).toEqual([{ type: 'color.by', params: { field: CELL_TYPE }, origin: 'user' }]);
@@ -136,7 +136,7 @@ test('every control of the area dispatches the action it stands for, naming what
     type: 'filter.category.visibility', params: { field: CELL_TYPE, categories: ['alpha'], visible: false }, origin: 'user',
   }]);
 
-  // The count keeps 10 of beta's 40 cells (request §3.1): typed in place of the count.
+  // The count keeps 10 of beta's 40 cells: typed in place of the count.
   const betaCount = legendRow(page, 'beta').locator('.legend-count');
   await expect(betaCount).toHaveText('40 cells');
   await betaCount.click();
@@ -178,7 +178,7 @@ test('every control of the area dispatches the action it stands for, naming what
   expect(await takeDispatched(page)).toEqual([{
     type: 'category.rename', params: { field: CELL_TYPE, category: 'gamma', name: 'Gamma cells' }, origin: 'user',
   }]);
-  // The field's own category order, whatever the labels (F124): a rename
+  // The field's own category order, whatever the labels: a rename
   // keeps a category in its place, as the Group dialog and the figure legend.
   await expect(page.locator('#legend .legend-label-main')).toHaveText(['alpha', 'beta', 'Gamma cells']);
   await legendRow(page, 'Gamma cells').locator('.legend-rename-btn').click();
@@ -196,7 +196,7 @@ test('every control of the area dispatches the action it stands for, naming what
   }
   await takeDispatched(page);
 
-  // Group categories (F89): one row a category, a group typed for each; Group is one action, one step.
+  // Group categories: one row a category, a group typed for each; Group is one action, one step.
   await page.locator('#group-categorical-field').click();
   const groupDialog = page.locator('#group-categories-dialog');
   await expect(groupDialog).toBeVisible();
@@ -224,7 +224,7 @@ test('every control of the area dispatches the action it stands for, naming what
     origin: 'user',
   }]);
   await expect.poll(async () => (await shown(page)).active).toEqual({ source: 'obs', key: 'cell_type (grouped)' });
-  // The menu names the field shown (L10-7: it kept naming cell_type).
+  // The menu names the field shown.
   await expect(page.locator('#categorical-field option:checked')).toHaveText('cell_type (grouped)');
   await expect(page.locator('.legend-item')).toHaveCount(2);
   await expect(legendRow(page, 'Early')).toHaveCount(1);
@@ -338,13 +338,13 @@ test('each action dispatched directly changes exactly what it names, and the con
   await expect(page.locator('#categorical-field option:checked')).toHaveText('cell_type_v2');
   await dispatch(page, 'category.merge', { field: { source: 'obs', key: 'cell_type_v2' }, category: 'beta', into: 'gamma' });
   expect(await page.evaluate(() => [...window._cellucidState.getActiveField().categories].sort())).toEqual(['A', 'merged beta + gamma']);
-  // A label names the merged category: "into A" keeps A (lane-analyst L3-4); a name another category holds is refused.
+  // A label names the merged category: "into A" keeps A; a name another category holds is refused.
   expect((await dispatch(page, 'category.merge', { field: { source: 'obs', key: 'cell_type_v2' }, category: 'merged beta + gamma', into: 'A', label: 'merged beta + gamma ' })).refused)
     .toBe('ActionRefused: "merged beta + gamma " cannot be a category label: it starts or ends with a space; give it without.');
   expect((await dispatch(page, 'category.merge', { field: { source: 'obs', key: 'cell_type_v2' }, category: 'merged beta + gamma', into: 'A', label: 'A' })).outcome)
     .toMatchObject({ merged: 'A', in_place: true });
   expect(await page.evaluate(() => window._cellucidState.getActiveField().categories)).toEqual(['A']);
-  // Grouped into a new field (F89): its codes by group, the field it is made from untouched, shown at once.
+  // Grouped into a new field: its codes by group, the field it is made from untouched, shown at once.
   const before = await page.evaluate(() => {
     const field = window._cellucidState.getFields().find(each => each.key === 'cell_type_v2' && each._isDeleted !== true);
     return { categories: [...field.categories], codes: [...field.codes] };
@@ -463,7 +463,7 @@ test('apply then undo puts every state domain back exactly, action by action, on
     }],
     ['field.rename', { field: score, name: 'quality' }],
     ['field.duplicate', { field, name: 'copy' }],
-    // Groups of categories as a new field, the others kept, then into rest (F89).
+    // Groups of categories as a new field, the others kept, then into rest.
     ['field.group', { field, groups: [{ label: 'AB', categories: ['A', 'beta'] }] }],
     ['field.group', { field, groups: [{ label: 'G', categories: ['gamma'] }], rest: 'Other', name: 'lineage' }],
     ['category.merge', { field: { source: 'obs', key: 'copy' }, category: 'beta', into: 'gamma' }],

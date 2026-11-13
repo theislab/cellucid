@@ -2,12 +2,12 @@
  * A group edit reaches the history kept in this browser. A group made,
  * extended, removed or restored changes its steps' group in place, and the
  * journal records the runs, never the member steps; the history's `edited`
- * event named only the steps an edit kept, so the autosave never wrote the
- * grouped steps again. A step made later rewrote its parent with the group
- * and left the steps before it without one, and Continue after a reload
- * refused the whole history ("a group cuts the run of turn … between steps
- * s5 and s6"): live pass 3, L12-3, an agent's two branch steps grouped as
- * "Hormone-only comparison" on Pancreas.
+ * event names only the steps an edit kept, so the autosave must write the
+ * grouped steps again. A step made later would rewrite its parent with the
+ * group and leave the steps before it without one, and Continue after a
+ * reload would refuse the whole history ("a group cuts the run of turn …
+ * between steps s5 and s6": an agent's two branch steps grouped as
+ * "Hormone-only comparison" on Pancreas).
  *
  * Driven through the real history controller (`history-fake-page.mjs`) and the
  * real autosave over the in-memory database; the history read back must be

@@ -191,7 +191,7 @@ export function revealGeneReadControl(ownerDocument = document) {
   const block = ownerDocument.getElementById('gene-read-block');
   if (block === null || block.hidden) return false;
   // The sidebar first, then its Subsampling section and the slider's focus
-  // (while hidden it is inert): the one order of `revealInSidebar` (R9K-2).
+  // (while hidden it is inert): the one order of `revealInSidebar`.
   void revealInSidebar(ownerDocument, () => {
     expandSessionSection(ownerDocument, 'subsampling');
     block.scrollIntoView({ block: 'center' });

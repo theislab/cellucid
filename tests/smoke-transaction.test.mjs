@@ -279,22 +279,6 @@ test('smoke preparation admits exactly the transparency bytes that encode to vis
     /cannot build while the WebGL2 context is lost/,
   );
   assert.equal(contextLossChecks, 1);
-
-  const source = await readFile(
-    new URL(
-      '../assets/js/rendering/smoke-cloud/smoke-density.js',
-      import.meta.url,
-    ),
-    'utf8',
-  );
-  assert.match(
-    source,
-    /visible = alphaValue >= POINT_VISIBILITY_THRESHOLD;/,
-  );
-  assert.match(
-    source,
-    /if \(alpha !== null && alpha\[pointIndex\] < POINT_VISIBILITY_THRESHOLD\) continue;/,
-  );
 });
 
 function createFakeGl() {

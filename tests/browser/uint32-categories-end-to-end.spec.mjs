@@ -99,7 +99,7 @@ function legendRow(page, label) {
 }
 
 /**
- * The legend lists categories in the field's own order (F124), so a label's
+ * The legend lists categories in the field's own order, so a label's
  * row is its code's: alpha is row 65,536 of 70,000. The virtual list builds
  * only the rows in view; scroll it to the label's row so it is built.
  */

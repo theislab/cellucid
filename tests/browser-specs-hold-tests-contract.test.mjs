@@ -1,7 +1,7 @@
 /**
  * Every browser spec file declares tests. Playwright says nothing about a
- * spec file that holds none (an edit that cut a file to its imports went
- * unnoticed once: thirteen tests gone and the run still green), so each
+ * spec file that holds none (an edit that cuts a file to its imports goes
+ * unnoticed: its tests gone and the run still green), so each
  * spec file under `tests/browser/` must call `test(…)`, `test.describe(…)`
  * (or one of their modifiers) or hand `test` to a helper that declares them
  * (`declareWalkTests(test, …)`), and end as a whole file does (a newline).

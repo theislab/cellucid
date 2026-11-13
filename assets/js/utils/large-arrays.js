@@ -2,14 +2,14 @@
  * Typed arrays larger than one `ArrayBuffer`, and how a typed array of any
  * size crosses between threads in pieces.
  *
- * Every engine caps one `ArrayBuffer` (measured 2026-10-28, Playwright builds
- * on macOS arm64): Chromium at 2,145,386,496 bytes (earlier builds
- * 2,080,374,783), WebKit at 2^32, Firefox at 2^34. A 3-D position array (12
- * bytes a cell) therefore stops at 178.8M cells on Chromium. A
+ * Every engine caps one `ArrayBuffer`: Chromium at 2,145,386,496 bytes,
+ * WebKit at 2^32, Firefox at 2^34 (measured: 27_decisions_memory_model.md).
+ * A 3-D position array (12 bytes a cell) therefore stops at 178.8M cells on
+ * Chromium. A
  * `WebAssembly.Memory` holds up to 2^32 bytes (65,536 pages of 64 KiB) on all
  * three, and an ordinary typed array views it whole: reads, writes, `set`,
- * `subarray` and `slice` behave as on any buffer (measured on each engine at
- * 2^31, 2.6, 3 and 4 GiB). So `allocateLargeArray` gives an `ArrayBuffer`
+ * `subarray` and `slice` behave as on any buffer (checked on each engine up
+ * to 4 GiB). So
  * when the engine allocates one and a memory's buffer when it refuses, and
  * every consumer sees the same kind of typed array either way.
  *
@@ -51,6 +51,31 @@ const TYPED_ARRAYS = Object.freeze({
   Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array,
   Float32Array, Float64Array, BigInt64Array, BigUint64Array,
 });
+
+/**
+ * A typed array's constructor when which one it is, is a value: what `new`,
+ * `from` and `BYTES_PER_ELEMENT` are asked of.
+ *
+ * @template [T=any]
+ * @typedef {{
+ *   new(length: number): T,
+ *   from(source: ArrayLike<any>, map?: (value: any, index: number) => number): T,
+ *   readonly BYTES_PER_ELEMENT: number,
+ *   readonly name: string,
+ * }} TypedArrayConstructor
+ */
+
+/**
+ * A new typed array of `array`'s kind with `length` elements, all zero.
+ *
+ * @template {ArrayBufferView} T
+ * @param {T} array
+ * @param {number} length
+ * @returns {T}
+ */
+export function sameKind(array, length) {
+  return new (/** @type {TypedArrayConstructor<T>} */ (array.constructor))(length);
+}
 
 /** Buffers that belong to a WebAssembly memory this thread made. */
 const memoryBuffers = new WeakSet();
@@ -362,7 +387,7 @@ export class PieceSender {
     const sink = this.begin(view.constructor, view.length);
     for (const { offset, values } of arrayPieces(view)) sink.put(offset, values);
     // An empty array still sends one (empty) piece, so its placeholder resolves.
-    if (view.length === 0) sink.put(0, new view.constructor(0));
+    if (view.length === 0) sink.put(0, sameKind(view, 0));
     return sink.result;
   }
 }

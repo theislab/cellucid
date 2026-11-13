@@ -1,6 +1,6 @@
 /**
- * @fileoverview The history's preferences in this browser (History settings,
- * History v2 §3.15.5): what is recorded, what is kept, and how the person is
+ * @fileoverview The history's preferences in this browser (History settings):
+ * what is recorded, what is kept, and how the person is
  * named. Every switch is on by default; the name is unset.
  *
  * - `recordCamera`, `recordLayout`: the two detail switches. Off, changes of

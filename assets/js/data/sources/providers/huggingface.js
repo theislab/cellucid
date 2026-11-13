@@ -8,9 +8,9 @@
  * Hub when it opens, so files never change under an open dataset.
  *
  * Only the path the link names is asked for, never the repository's
- * listing (which names every file of every folder: 6.9 MB and 4.6 s for a
- * large dataset repository, measured; a Zarr v2 folder adds one entry per
- * chunk): the path, with what a folder holds that decides what it is
+ * listing (which names every file of every folder, megabytes for a large
+ * dataset repository (measured: 22_decisions_link_model_and_request_planning.md);
+ * a Zarr v2 folder adds one entry per chunk): the path, with what a folder holds that decides what it is
  * (`paths-info`: its `datasets.json`, `.zmetadata`, `zarr.json`), and the
  * revision's commit and licence (a few hundred bytes), together in one
  * round trip; a folder's own files (`tree`, one level, page by page) only

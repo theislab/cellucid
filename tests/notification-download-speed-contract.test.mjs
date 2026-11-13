@@ -1,11 +1,11 @@
 /**
- * What gets a transfer line (round 9 close, RCA-7). A load's line says a
+ * What gets a transfer line. A load's line says a
  * speed only once bytes were measured arriving: never "0 B/s" before the
  * first bytes, nor while the load does work that reads none (a phase), and a
  * starting view, which is a part of its dataset's opening and is already in
  * the page, has no line of its own (`session-serializer.js` `restoreLine`,
- * `session-serializer-contract.test.mjs`; "↓ Loading Starting view 0 B/s
- * Cancel" showed at every sample's start).
+ * `session-serializer-contract.test.mjs`; not "↓ Loading Starting view 0 B/s
+ * Cancel" at every sample's start).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

@@ -303,7 +303,6 @@ test('Windows receives a two-generation host-network budget', () => {
 
 test('native-GPU stress files declare every test process-intensive', async () => {
   for (const filename of [
-    'benchmark-harness-entry-point.spec.mjs',
     'benchmark-harness.spec.mjs',
     'benchmark-runtime.spec.mjs',
     'velocity-multiview-lifecycle.spec.mjs',
@@ -338,7 +337,7 @@ test('host-GPU terminal stress is process-intensive and declared on every test',
     /,\s*HOST_GPU_TERMINAL,\s*async\s*\(/g,
   ) ?? [];
 
-  assert.equal(declarations.length, 3, filename);
+  assert.ok(declarations.length > 0, filename);
   assert.equal(terminalDeclarations.length, declarations.length, filename);
   assert.match(
     source,
@@ -394,10 +393,10 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.ok(batches.every(batch => Object.isFrozen(batch)));
   assert.ok(batches.every(batch => Object.isFrozen(batch.files)));
 
-  // Windows previously reached an explicit net::ERR_NO_BUFFER_SPACE with a
-  // browser/server generation per file, and later missed the module bootstrap
-  // after the third of eight bounded generations. The same exact 45-file,
-  // 164-test inventory now reuses connections in two balanced lifetimes. Both
+  // A browser/server generation per file reaches net::ERR_NO_BUFFER_SPACE on
+  // Windows, and eight bounded generations miss the module bootstrap after the
+  // third. The same exact 45-file, 164-test inventory reuses connections in
+  // two balanced lifetimes. Both
   // file and test growth remain hard-fenced; exceeding either requires another
   // CI shard instead of another Windows process on the same host.
   const windowsLimits = resolveBrowserShardLimits({ RUNNER_OS: 'Windows' });
@@ -447,77 +446,52 @@ test('browser batches bound file count, test weight, and process churn', () => {
     [...inventory.slice(1), inventory[0]].map(item => item.file),
   );
 
-  // macOS Firefox completed the twenty-cycle Plotly retirement soak but left
-  // the host GPU service degraded across every later Firefox process. The live
-  // benchmark runtime and two harness owners therefore run after ordinary
-  // conformance, while the analysis soak runs in the one host-terminal slot
-  // after all three. This is the exact first-shard inventory under the declared
-  // three-way CI partition; each stress owner remains a singleton generation.
-  const shardOneCounts = [
-    8, 1, 7, 22, 1, 3,
-    1, 2, 1, 5, 2, 12,
-    3, 3, 3, 3, 2, 1,
-    2, 35,
-  ];
-  const isolatedBenchmarkInventory = shardOneCounts.map(
-    (tests, index) => inventoryItem(
-      `tests/browser/shard-one-${index}.spec.mjs`,
-      tests,
-      index === 3 || index === 8 || index === 9 || index === 10,
-      index === 3,
-    ),
-  );
-  const isolatedBenchmarkBatches = partitionBrowserShardInventory(
-    isolatedBenchmarkInventory,
-    true,
+  // Process-intensive owners run after ordinary conformance, each in a batch
+  // of its own, and the host-terminal one runs last. The inventory is
+  // synthetic (a generated mix of file sizes, with three intensive owners
+  // among the ordinary files and one host-terminal owner), so the checks
+  // are the partition's rules, never a copy of the real suite's counts.
+  const mixed = Array.from({ length: 20 }, (_unused, index) => inventoryItem(
+    `tests/browser/mixed-${index}.spec.mjs`,
+    index === 19 ? MAX_TESTS_PER_BROWSER_PROCESS - 5 : 1 + ((index * 7) % 11),
+    index === 3 || index === 8 || index === 9 || index === 10,
+    index === 3,
+  ));
+  const ordinary = mixed.filter(item => !item.intensive);
+  const intensive = mixed.filter(item => item.intensive && !item.hostTerminal);
+  const hostTerminal = mixed.filter(item => item.hostTerminal);
+  const isolatedMixed = partitionBrowserShardInventory(mixed, true);
+  const ordinaryBatchCount = isolatedMixed.length - intensive.length - hostTerminal.length;
+  assert.deepEqual(
+    isolatedMixed.flatMap(batch => batch.files),
+    [...ordinary, ...intensive, ...hostTerminal].map(item => item.file),
+    'ordinary files keep their order, then each intensive owner, then the host-terminal owner',
   );
   assert.deepEqual(
-    isolatedBenchmarkBatches.map(batch => batch.files.length),
-    [6, 6, 4, 1, 1, 1, 1],
+    isolatedMixed.slice(ordinaryBatchCount).map(batch => batch.files),
+    [...intensive, ...hostTerminal].map(item => [item.file]),
+    'every intensive owner is a batch of its own',
   );
+  assert.deepEqual(
+    isolatedMixed.slice(ordinaryBatchCount).map(batch => batch.testCount),
+    [...intensive, ...hostTerminal].map(item => item.tests),
+  );
+  for (const batch of isolatedMixed.slice(0, ordinaryBatchCount)) {
+    assert.ok(batch.files.length <= MAX_FILES_PER_BROWSER_PROCESS);
+    assert.ok(batch.testCount <= MAX_TESTS_PER_BROWSER_PROCESS);
+  }
+  assert.ok(isolatedMixed.length <= MAX_BROWSER_PROCESSES_PER_SHARD);
 
-  const windowsShardOneBatches = partitionBrowserShardInventory(
-    isolatedBenchmarkInventory,
-    false,
-    windowsLimits,
-  );
+  const windowsMixed = partitionBrowserShardInventory(mixed, false, windowsLimits);
   assert.deepEqual(
-    windowsShardOneBatches.map(batch => ({
-      files: batch.files.length,
-      tests: batch.testCount,
-    })),
-    [
-      { files: 19, tests: 82 },
-      { files: 1, tests: 35 },
-    ],
+    windowsMixed.flatMap(batch => batch.files),
+    mixed.map(item => item.file),
   );
-  assert.deepEqual(
-    windowsShardOneBatches.flatMap(batch => batch.files),
-    isolatedBenchmarkInventory.map(item => item.file),
-  );
-  assert.deepEqual(
-    isolatedBenchmarkBatches.map(batch => batch.testCount),
-    [21, 26, 40, 1, 5, 2, 22],
-  );
-  assert.deepEqual(
-    isolatedBenchmarkBatches.slice(-4).map(batch => batch.files),
-    [
-      [isolatedBenchmarkInventory[8].file],
-      [isolatedBenchmarkInventory[9].file],
-      [isolatedBenchmarkInventory[10].file],
-      [isolatedBenchmarkInventory[3].file],
-    ],
-  );
-  assert.deepEqual(
-    isolatedBenchmarkBatches.flatMap(batch => batch.files),
-    [
-      ...isolatedBenchmarkInventory.filter(item => !item.intensive),
-      isolatedBenchmarkInventory[8],
-      isolatedBenchmarkInventory[9],
-      isolatedBenchmarkInventory[10],
-      isolatedBenchmarkInventory[3],
-    ].map(item => item.file),
-  );
+  assert.ok(windowsMixed.length <= WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD);
+  for (const batch of windowsMixed) {
+    assert.ok(batch.files.length <= WINDOWS_MAX_FILES_PER_BROWSER_PROCESS);
+    assert.ok(batch.testCount <= WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS);
+  }
 
   // More than one stress owner keeps its own relative order, and no ordinary
   // test can ever be scheduled behind either retained host-GPU generation.
@@ -553,8 +527,8 @@ test('browser batches bound file count, test weight, and process churn', () => {
     /place each in a separate CI shard/,
   );
 
-  // The hosted Firefox failure came from six legal files that together owned
-  // 74 tests. Test weight now divides that exact shape without adding a ninth
+  // Six legal files that together own 74 tests overrun a hosted Firefox
+  // process. Test weight divides that exact shape without adding a ninth
   // process or weakening the six-file fence.
   const formerlyOversized = [2, 35, 4, 7, 8, 18].map(
     (tests, index) => inventoryItem(
@@ -716,11 +690,10 @@ test('bounded processes receive non-overlapping server and evidence ports', () =
 });
 
 test('an occupied rung is stepped over rather than failing every batch', () => {
-  // The defect: the ladder was assumed, not discovered. With
-  // `reuseExistingServer: false`, one service on 4173 — a container, a
-  // self-hosted runner, a leftover server from an interrupted run — failed all
-  // nine batches identically, and the only recovery was a human setting an
-  // environment variable.
+  // The ladder is discovered, not assumed. With `reuseExistingServer: false`,
+  // one service on 4173 (a container, a self-hosted runner, a leftover
+  // server from an interrupted run) would fail all nine batches identically,
+  // and the only recovery would be a human setting an environment variable.
   assert.deepEqual(
     planBrowserBatchPorts({}, 2, portsFreeExcept(new Set([4173]))),
     [

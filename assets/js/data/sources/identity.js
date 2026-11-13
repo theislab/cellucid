@@ -14,6 +14,11 @@
  *   kept under it may be used by a later visit.
  * - `addressOf`: where a source is, whatever its version.
  *
+ * These rules decide what a kept directory is filed under, so the code
+ * fingerprint of every kind of kept data covers this module
+ * (`scripts/kept-code-fingerprints.mjs`): a change to its code makes every
+ * browser remove what it kept and make it again. Keep here only the rules.
+ *
  * @module data/sources/identity
  */
 

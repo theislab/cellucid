@@ -1,10 +1,10 @@
 /**
  * A browser that keeps nothing for the site (site data blocked, a sandboxed
  * frame, some private windows) throws on the very read of `localStorage`.
- * Found 2026-11-11 (R9E-5): with site data blocked Cellucid did not start at
- * all ("Cellucid could not start"), because the theme bootstrap, the
- * antialiasing preference, the analysis debug switch and the history settings
- * each read the store themselves; others had private guarded copies.
+ * With site data blocked Cellucid still starts (never "Cellucid could not
+ * start"), which the theme bootstrap, the antialiasing preference, the
+ * analysis debug switch or the history settings would prevent by reading the
+ * store themselves, and private guarded copies would drift apart.
  *
  * Contract: every module reaches Web Storage through `utils/web-storage.js`,
  * which answers null where the browser gives none; a preference that cannot

@@ -1,19 +1,18 @@
 /**
- * CEL-0217 — a thinned categorical axis still names both of its ends.
+ * A thinned categorical axis still names both of its ends.
  *
  * `analysis-plot-label-collisions.spec.mjs` proves the sidebar stops
  * overprinting eighteen cell-type names. It cannot see the other end of the
  * same range: eighteen categories make `configureCategoricalAxes` rotate the
  * axis, which multiplies the capacity, and its acceptance is "at least three
- * labels survive". The failure below the fit was to keep exactly one.
+ * labels survive". Below the fit the axis must not keep exactly one.
  *
  * Eight categories is the case that reaches it, and it is the case the product
- * actually ships: `cell_type` and `clusters` in the published pancreas dataset
+ * ships: `cell_type` and `clusters` in the published pancreas dataset
  * hold eight, one short of the rotation threshold, so the axis is drawn upright
  * and a name like `Pre-endocrine` needs most of the 149px the sidebar leaves
  * between its margins. The capacity is one, and one label under eight bars tells
- * a reader nothing — it was visible in the committed screenshot
- * `cellucid-python/docs/_static/screenshots/analysis/detailed-categorical.png`.
+ * a reader nothing.
  *
  * The acceptance is measured from the rendered SVG, not from the layout that
  * was meant to produce it, because the whole question is whether two labels

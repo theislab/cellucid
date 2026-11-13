@@ -200,11 +200,9 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
   /**
    * The panel shows one analysis at a time: an action that draws on an
    * analysis of the panel shows it when the panel shows another, as a
-   * person opens an analysis to use it (an agent that set up two analyses
-   * was refused "not shown" running, setting the options and choosing the
-   * pages of the first after the second was shown: lane-analyst L3-6,
-   * lane-scientist L5-4), and is refused (`requireShown`) when it still
-   * cannot draw (the section or the sidebar closed), the shown one put back.
+   * person opens an analysis to use it, and is refused (`requireShown`) when
+   * it still cannot draw (the section or the sidebar closed), the shown one
+   * put back.
    * Returns what puts it back, for a refusal that comes later.
    */
   function showToDraw(type, mode, ui, where) {
@@ -427,9 +425,7 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
         // Options alone draw nothing; with a result shown, a display option
         // redraws it. The panel shows one analysis at a time: changing the
         // options of one with a result shows it, as a person opens it to
-        // change them (an agent that had run DE, then markers, was refused
-        // "not shown" twice for DE's options, `show: true` or not), and puts
-        // the shown one back when it still cannot draw.
+        // change them, and puts the shown one back when it still cannot draw.
         const shownBefore = comparisonModule.getOpenMode();
         const putBack = ui.describeResult(1) !== null ? showToDraw(`analysis.${mode.name}.set`, mode, ui, where) : () => {};
         const before = ui.getOptions();

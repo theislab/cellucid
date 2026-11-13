@@ -58,7 +58,18 @@ async function auditScope(page, scope) {
       '[role="checkbox"]', '[role="radio"]', '[role="slider"]', '[role="option"]',
     ].join(', ');
     const ROVING_ROLES = new Set(['tab', 'radio', 'option', 'menuitem', 'treeitem', 'gridcell']);
-    const frame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+    // A surface opened a moment ago may still be moving (a window or a bar
+    // easing in, a transition under way): the walk starts once every finite
+    // animation has ended and a frame has drawn the end state. Scrolling a
+    // control into view moves nothing else, so one control needs no frame.
+    const settled = async () => {
+      const finite = () => document.getAnimations().filter(animation => animation.playState === 'running'
+        && animation.effect?.getComputedTiming().iterations !== Infinity);
+      for (let running = finite(); running.length > 0; running = finite()) {
+        await Promise.allSettled(running.map(animation => animation.finished));
+      }
+      await new Promise(resolve => requestAnimationFrame(() => resolve()));
+    };
     const describe = element => {
       if (!element) return 'nothing';
       if (element.id) return `#${element.id}`;
@@ -117,6 +128,7 @@ async function auditScope(page, scope) {
     }
     const offenders = [];
     let checked = 0;
+    await settled();
     for (const element of controls) {
       if (!element.isConnected || element.getClientRects().length === 0) continue;
       if (element.closest('[aria-hidden="true"]')) continue;
@@ -134,7 +146,6 @@ async function auditScope(page, scope) {
       }
       checked += 1;
       element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-      await frame();
       const box = element.getBoundingClientRect();
       const x = box.left + box.width / 2;
       const y = box.top + box.height / 2;
@@ -221,7 +232,7 @@ async function dismissNotifications(page) {
 /**
  * The opening is over (`waitForPageAtRest`), so what it still had to say is
  * not said over a surface under audit, after the cards were dismissed (a
- * card stood in the confirm dialog on WebKit, Web contracts run 41213981681).
+ * card can stand in the confirm dialog).
  */
 const openingDone = page => waitForPageAtRest(page, { timeout: 60_000 });
 
@@ -235,6 +246,10 @@ async function openDataset(page) {
   // once the panel is open. Playwright 1.65 waits on an inert target
   // ("now times out if the element stays inert", release notes), where
   // earlier versions drove it through the closed panel.
+  await chooseCellTypes(page);
+}
+
+async function chooseCellTypes(page) {
   await setSheetOpen(page, true);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
@@ -296,239 +311,252 @@ for (const layout of LAYOUTS) {
   test.describe(layout.name, () => {
     test.use(layout.use);
 
-    test('every sidebar control is reachable, panel by panel and mode by mode', async ({
+    // The open sidebar, read three ways on one opening. The Tab order is read
+    // first, with no analysis mode open; the walk then opens each mode in
+    // turn and closes the last, so the standing card is checked over the
+    // sidebar as it stood before the walk.
+    test('the open sidebar: its Tab order, every control reachable, and none under a standing notification', async ({
       page,
     }) => {
-      test.setTimeout(240_000);
+      test.setTimeout(480_000);
       await openDataset(page);
       await setSheetOpen(page, true);
       await openEverySidebarPanel(page);
-      await expectReachable(page, '#sidebar', `${layout.name} sidebar`, 60);
-      for (const mode of ANALYSIS_MODES) {
-        const header = page.locator(`#analysis-header-${mode}`);
-        await header.scrollIntoViewIfNeeded();
-        if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
-        await expect(header).toHaveAttribute('aria-expanded', 'true');
-        // A mode fills in asynchronously, `aria-busy` until it has settled
-        // (`_claimBusy`, base-analysis-ui.js), and moves every header below
-        // it while it grows: its controls are walked, and the next header
-        // clicked, once it is done.
-        await expect(page.locator(`#analysis-panel-${mode}`)).not.toHaveAttribute('aria-busy', 'true');
-        await page.evaluate(region => {
-          for (const inner of document.querySelectorAll(
-            `#${region} .disclosure-header[aria-expanded="false"]`,
-          )) inner.click();
-        }, `analysis-panel-${mode}`);
-        await expectReachable(
-          page, `#analysis-panel-${mode}`, `${layout.name} analysis ${mode}`,
-        );
-      }
-    });
 
-    test('the sidebar Tab order follows the panels and rows top to bottom', async ({ page }) => {
-      await openDataset(page);
-      await setSheetOpen(page, true);
-      await openEverySidebarPanel(page);
-      const report = await page.evaluate(() => {
-        const positive = [...document.querySelectorAll('[tabindex]')]
-          .filter(element => element.tabIndex > 0)
-          .map(element => element.id || element.className);
-        const scroller = document.querySelector('#sidebar .sidebar-scroll') ?? document.getElementById('sidebar');
-        const top = element => element.getBoundingClientRect().top + scroller.scrollTop;
-        const panels = [...document.querySelectorAll('#sidebar .accordion-panel')]
-          .filter(panel => panel.getClientRects().length > 0);
-        const panelOrder = [];
-        for (let index = 1; index < panels.length; index += 1) {
-          if (top(panels[index]) < top(panels[index - 1])) {
-            panelOrder.push(`${panels[index].querySelector('details')?.id} sits above ${panels[index - 1].querySelector('details')?.id}`);
+      await test.step('the sidebar Tab order follows the panels and rows top to bottom', async () => {
+        const report = await page.evaluate(() => {
+          const positive = [...document.querySelectorAll('[tabindex]')]
+            .filter(element => element.tabIndex > 0)
+            .map(element => element.id || element.className);
+          const scroller = document.querySelector('#sidebar .sidebar-scroll') ?? document.getElementById('sidebar');
+          const top = element => element.getBoundingClientRect().top + scroller.scrollTop;
+          const panels = [...document.querySelectorAll('#sidebar .accordion-panel')]
+            .filter(panel => panel.getClientRects().length > 0);
+          const panelOrder = [];
+          for (let index = 1; index < panels.length; index += 1) {
+            if (top(panels[index]) < top(panels[index - 1])) {
+              panelOrder.push(`${panels[index].querySelector('details')?.id} sits above ${panels[index - 1].querySelector('details')?.id}`);
+            }
           }
+          const FOCUSABLE = 'button, select, input:not([type="hidden"]), textarea, summary, a[href], [tabindex="0"]';
+          const rows = [];
+          for (const panel of panels) {
+            // The header bar (undock, copy) deliberately precedes the panel's
+            // summary: it cannot live inside the summary, and before the
+            // details it is reached ahead of a long panel body
+            // (ensurePanelFrame in dockable-accordions.js). Each of its buttons
+            // names its panel. Order is checked from the summary on.
+            const items = [...panel.querySelectorAll(FOCUSABLE)].filter(element => {
+              if (element.closest('.accordion-panel-actions') !== null) return false;
+              if (element.getClientRects().length === 0 || element.tabIndex < 0 && element.localName !== 'summary') return false;
+              if (element.disabled) return false;
+              const box = element.getBoundingClientRect();
+              return box.width >= 2 && box.height >= 2;
+            });
+            for (let index = 1; index < items.length; index += 1) {
+              const previous = items[index - 1].getBoundingClientRect();
+              const current = items[index].getBoundingClientRect();
+              const sameRow = current.top < previous.bottom - 2 && current.bottom > previous.top + 2;
+              const backwards = sameRow
+                ? current.left < previous.left - 2
+                : current.top < previous.top - 2;
+              if (backwards) {
+                const name = element => element.id || `${element.localName}.${[...element.classList].join('.')} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 24)}"`;
+                rows.push(`${name(items[index])} comes after ${name(items[index - 1])} but is drawn before it`);
+              }
+            }
+          }
+          return { positive, panelOrder, rows };
+        });
+        expect.soft(report.positive, 'positive tabindex reorders the page').toEqual([]);
+        expect.soft(report.panelOrder, 'panels in DOM order down the sidebar').toEqual([]);
+        expect(report.rows, 'controls in DOM order within each panel').toEqual([]);
+      });
+
+      await test.step('every sidebar control is reachable, panel by panel and mode by mode', async () => {
+        await expectReachable(page, '#sidebar', `${layout.name} sidebar`, 60);
+        for (const mode of ANALYSIS_MODES) {
+          const header = page.locator(`#analysis-header-${mode}`);
+          await header.scrollIntoViewIfNeeded();
+          if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+          await expect(header).toHaveAttribute('aria-expanded', 'true');
+          // A mode fills in asynchronously, `aria-busy` until it has settled
+          // (`_claimBusy`, base-analysis-ui.js), and moves every header below
+          // it while it grows: its controls are walked, and the next header
+          // clicked, once it is done.
+          await expect(page.locator(`#analysis-panel-${mode}`)).not.toHaveAttribute('aria-busy', 'true');
+          await page.evaluate(region => {
+            for (const inner of document.querySelectorAll(
+              `#${region} .disclosure-header[aria-expanded="false"]`,
+            )) inner.click();
+          }, `analysis-panel-${mode}`);
+          await expectReachable(
+            page, `#analysis-panel-${mode}`, `${layout.name} analysis ${mode}`,
+          );
         }
-        const FOCUSABLE = 'button, select, input:not([type="hidden"]), textarea, summary, a[href], [tabindex="0"]';
-        const rows = [];
-        for (const panel of panels) {
-          // The header bar (undock, copy) deliberately precedes the panel's
-          // summary: it cannot live inside the summary, and before the
-          // details it is reached ahead of a long panel body
-          // (ensurePanelFrame in dockable-accordions.js). Each of its buttons
-          // names its panel. Order is checked from the summary on.
-          const items = [...panel.querySelectorAll(FOCUSABLE)].filter(element => {
-            if (element.closest('.accordion-panel-actions') !== null) return false;
-            if (element.getClientRects().length === 0 || element.tabIndex < 0 && element.localName !== 'summary') return false;
-            if (element.disabled) return false;
+        // The modes open one at a time: close the one the walk ended on.
+        const last = page.locator(`#analysis-header-${ANALYSIS_MODES.at(-1)}`);
+        await last.scrollIntoViewIfNeeded();
+        await last.click();
+        await expect(last).toHaveAttribute('aria-expanded', 'false');
+      });
+
+      await test.step('a standing notification never hides a control on the sidebar or the selection bar', async () => {
+        await page.evaluate(async () => {
+          const { getNotificationCenter } = await import('/assets/js/app/notification-center.js');
+          getNotificationCenter().progress('Downloading expression matrix', 40, { duration: 0 });
+        });
+        await expect(page.locator('.notification-progress')).toBeVisible();
+        // The card has stopped easing in, so its box is the one a touch meets.
+        await expect.poll(() => page.evaluate(() => document.getAnimations().filter(animation => animation.playState === 'running'
+          && animation.effect?.getComputedTiming().iterations !== Infinity).length)).toBe(0);
+        // Cards let a touch through to what lies under them, so the walk also
+        // checks that no card is drawn over a control's center.
+        const covered = await page.evaluate(async () => {
+          const cards = [...document.querySelectorAll('#notification-center .notification')];
+          const out = [];
+          for (const element of document.querySelectorAll(
+            '#sidebar :is(button, select, input:not([type="hidden"]), textarea, summary, a[href]), #select-bar :is(button, select)',
+          )) {
+            if (element.getClientRects().length === 0) continue;
+            const first = element.getBoundingClientRect();
+            if (first.width < 2 || first.height < 2) continue;
+            element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
             const box = element.getBoundingClientRect();
-            return box.width >= 2 && box.height >= 2;
+            const x = box.left + box.width / 2;
+            const y = box.top + box.height / 2;
+            for (const card of cards) {
+              const area = card.getBoundingClientRect();
+              if (x >= area.left && x <= area.right && y >= area.top && y <= area.bottom) {
+                out.push(element.id || `${element.localName}.${[...element.classList].join('.')} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 24)}"`);
+              }
+            }
+          }
+          return out;
+        });
+        expect(covered, 'controls drawn under a notification after scrolling').toEqual([]);
+      });
+    });
+
+    // The surfaces over the plot, on one opening: the dialogs first (the
+    // welcome is walked as startup shows it), each closed before the next;
+    // then the selection bar, left as it was found; then the windows.
+    test('dialogs, the selection bar, a floating panel and an analysis window keep every control reachable', async ({
+      page,
+    }) => {
+      test.setTimeout(300_000);
+
+      await test.step('dialogs keep every control reachable', async () => {
+        await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+        await expectWelcomeShown(page);
+        await expectReachable(page, '#welcome-modal', `${layout.name} welcome`, 2);
+        await page.keyboard.press('Escape');
+        await expect(page.locator('#welcome-modal')).toBeHidden();
+        await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+        await openingDone(page);
+        await dismissNotifications(page);
+
+        await page.evaluate(() => document.getElementById('license-link').click());
+        await expect(page.locator('#license-modal')).toBeVisible();
+        await expectReachable(page, '#license-modal', `${layout.name} license`, 1);
+        await page.locator('#license-close-btn').click();
+        await expect(page.locator('#license-modal')).toBeHidden();
+
+        await page.evaluate(async () => {
+          const { showConfirmDialog } = await import('/assets/js/app/ui/components/confirm-dialog.js');
+          showConfirmDialog({
+            title: 'Rename field',
+            message: 'Choose a new name for this field.',
+            confirmText: 'Rename',
+            inputLabel: 'Field name',
+            inputDefaultValue: 'cell_type',
+            onConfirm: () => {},
           });
-          for (let index = 1; index < items.length; index += 1) {
-            const previous = items[index - 1].getBoundingClientRect();
-            const current = items[index].getBoundingClientRect();
-            const sameRow = current.top < previous.bottom - 2 && current.bottom > previous.top + 2;
-            const backwards = sameRow
-              ? current.left < previous.left - 2
-              : current.top < previous.top - 2;
-            if (backwards) {
-              const name = element => element.id || `${element.localName}.${[...element.classList].join('.')} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 24)}"`;
-              rows.push(`${name(items[index])} comes after ${name(items[index - 1])} but is drawn before it`);
-            }
-          }
-        }
-        return { positive, panelOrder, rows };
-      });
-      expect.soft(report.positive, 'positive tabindex reorders the page').toEqual([]);
-      expect.soft(report.panelOrder, 'panels in DOM order down the sidebar').toEqual([]);
-      expect(report.rows, 'controls in DOM order within each panel').toEqual([]);
-    });
-
-    test('a floating panel and an analysis window keep every control reachable', async ({
-      page,
-    }) => {
-      test.setTimeout(120_000);
-      await openDataset(page);
-      await setSheetOpen(page, true);
-      await page.evaluate(() => {
-        document.getElementById('page-analysis-section').open = true;
-      });
-      await page.locator('#analysis-header-genesPanel').scrollIntoViewIfNeeded();
-      await page.locator('#analysis-header-genesPanel').click();
-      // The window is sized from the row: copied once the row has filled in.
-      await expect(page.locator('#analysis-panel-genesPanel')).not.toHaveAttribute('aria-busy', 'true');
-      // Clicked as a person does: Playwright presses it only once it is
-      // still, enabled, not inert and what the press lands on. A forced
-      // click skipped every one of those and once opened no window, on a
-      // phone in WebKit (1 run in 750, 2026-11-07 audit), with nothing to
-      // say what took the press.
-      await page.locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
-        .click();
-      const analysisWindow = page.locator('#floating-panels-root .analysis-window-frame');
-      await expect(analysisWindow).toHaveCount(1);
-      // Its copy of the analysis fills in too (`aria-busy` until it has).
-      await expect(analysisWindow.locator('[aria-busy="true"]')).toHaveCount(0);
-      await setSheetOpen(page, false);
-      await dismissNotifications(page);
-      await expectReachable(
-        page, '#floating-panels-root .analysis-window-frame', `${layout.name} analysis window`, 3,
-      );
-
-      // A second window opens where it leaves the first one's header in
-      // reach, so neither has to be dragged away to get at the other.
-      await setSheetOpen(page, true);
-      const frame = page.locator('.accordion-panel:has(> #coloring-filtering-section)');
-      const undock = frame.locator('> .accordion-panel-actions > .accordion-undock-btn');
-      await undock.scrollIntoViewIfNeeded();
-      await undock.click();
-      await expect(frame).toHaveClass(/\baccordion-floating\b/);
-      await setSheetOpen(page, false);
-      await dismissNotifications(page);
-      await expectReachable(
-        page, '.accordion-panel:has(> #coloring-filtering-section)', `${layout.name} floating panel`, 8,
-      );
-      await expectReachable(
-        page,
-        '#floating-panels-root .analysis-window-frame > :is(.accordion-panel-actions, .accordion-section > summary)',
-        `${layout.name} first window's header under the second window`,
-        1,
-      );
-    });
-
-    test('dialogs keep every control reachable', async ({ page }) => {
-      test.setTimeout(120_000);
-      await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-      await expectWelcomeShown(page);
-      await expectReachable(page, '#welcome-modal', `${layout.name} welcome`, 2);
-      await page.keyboard.press('Escape');
-      await expect(page.locator('#welcome-modal')).toBeHidden();
-      await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-      await openingDone(page);
-      await dismissNotifications(page);
-
-      await page.evaluate(() => document.getElementById('license-link').click());
-      await expect(page.locator('#license-modal')).toBeVisible();
-      await expectReachable(page, '#license-modal', `${layout.name} license`, 1);
-      await page.locator('#license-close-btn').click();
-      await expect(page.locator('#license-modal')).toBeHidden();
-
-      await page.evaluate(async () => {
-        const { showConfirmDialog } = await import('/assets/js/app/ui/components/confirm-dialog.js');
-        showConfirmDialog({
-          title: 'Rename field',
-          message: 'Choose a new name for this field.',
-          confirmText: 'Rename',
-          inputLabel: 'Field name',
-          inputDefaultValue: 'cell_type',
-          onConfirm: () => {},
         });
-      });
-      await expect(page.locator('.confirm-dialog')).toBeVisible();
-      await expectReachable(page, 'dialog.confirm-dialog', `${layout.name} confirm`, 3);
-      await page.keyboard.press('Escape');
-      await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
+        await expect(page.locator('.confirm-dialog')).toBeVisible();
+        await expectReachable(page, 'dialog.confirm-dialog', `${layout.name} confirm`, 3);
+        await page.keyboard.press('Escape');
+        await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
 
-      await page.evaluate(async () => {
-        const { confirmExportFidelityWarnings } = await import(
-          '/assets/js/app/ui/modules/figure-export/components/fidelity-warning-dialog.js'
+        await page.evaluate(async () => {
+          const { confirmExportFidelityWarnings } = await import(
+            '/assets/js/app/ui/modules/figure-export/components/fidelity-warning-dialog.js'
+          );
+          window.__reachabilityFidelity = confirmExportFidelityWarnings({
+            warnings: [
+              { title: 'Smoke is not exported', detail: 'The figure shows points only.' },
+              { title: 'Lighting differs', detail: 'Exported points use flat shading.' },
+            ],
+          });
+        });
+        await expect(page.locator('.figure-export-modal')).toBeVisible();
+        await expectReachable(page, '.figure-export-modal', `${layout.name} figure export`, 1);
+        await page.keyboard.press('Escape');
+        await expect(page.locator('.figure-export-modal')).toBeHidden();
+      });
+
+      // The field every other walk of this file starts from, chosen in the open panel.
+      await chooseCellTypes(page);
+
+      await test.step('the selection bar keeps every control reachable', async () => {
+        await setSheetOpen(page, false);
+        await page.evaluate(() => {
+          const toggle = document.getElementById('select-bar-mode');
+          if (toggle.getAttribute('aria-checked') !== 'true') toggle.click();
+        });
+        await expect(page.locator('#select-bar-mode')).toHaveAttribute('aria-checked', 'true');
+        await dismissNotifications(page);
+        await expectReachable(page, '#select-bar', `${layout.name} selection bar`, 4);
+        // Select mode off again, as it was.
+        await page.evaluate(() => document.getElementById('select-bar-mode').click());
+        await expect(page.locator('#select-bar-mode')).toHaveAttribute('aria-checked', 'false');
+      });
+
+      await test.step('a floating panel and an analysis window keep every control reachable', async () => {
+        await setSheetOpen(page, true);
+        await page.evaluate(() => {
+          document.getElementById('page-analysis-section').open = true;
+        });
+        await page.locator('#analysis-header-genesPanel').scrollIntoViewIfNeeded();
+        await page.locator('#analysis-header-genesPanel').click();
+        // The window is sized from the row: copied once the row has filled in.
+        await expect(page.locator('#analysis-panel-genesPanel')).not.toHaveAttribute('aria-busy', 'true');
+        // Clicked as a person does: Playwright presses it only once it is
+        // still, enabled, not inert and what the press lands on. A forced
+        // click skips every one of those and can open no window, with nothing to
+        // say what took the press.
+        await page.locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
+          .click();
+        const analysisWindow = page.locator('#floating-panels-root .analysis-window-frame');
+        await expect(analysisWindow).toHaveCount(1);
+        // Its copy of the analysis fills in too (`aria-busy` until it has).
+        await expect(analysisWindow.locator('[aria-busy="true"]')).toHaveCount(0);
+        await setSheetOpen(page, false);
+        await dismissNotifications(page);
+        await expectReachable(
+          page, '#floating-panels-root .analysis-window-frame', `${layout.name} analysis window`, 3,
         );
-        window.__reachabilityFidelity = confirmExportFidelityWarnings({
-          warnings: [
-            { title: 'Smoke is not exported', detail: 'The figure shows points only.' },
-            { title: 'Lighting differs', detail: 'Exported points use flat shading.' },
-          ],
-        });
-      });
-      await expect(page.locator('.figure-export-modal')).toBeVisible();
-      await expectReachable(page, '.figure-export-modal', `${layout.name} figure export`, 1);
-      await page.keyboard.press('Escape');
-    });
 
-    test('the selection bar keeps every control reachable', async ({ page }) => {
-      await openDataset(page);
-      await setSheetOpen(page, false);
-      await page.evaluate(() => {
-        const toggle = document.getElementById('select-bar-mode');
-        if (toggle.getAttribute('aria-checked') !== 'true') toggle.click();
+        // A second window opens where it leaves the first one's header in
+        // reach, so neither has to be dragged away to get at the other.
+        await setSheetOpen(page, true);
+        const frame = page.locator('.accordion-panel:has(> #coloring-filtering-section)');
+        const undock = frame.locator('> .accordion-panel-actions > .accordion-undock-btn');
+        await undock.scrollIntoViewIfNeeded();
+        await undock.click();
+        await expect(frame).toHaveClass(/\baccordion-floating\b/);
+        await setSheetOpen(page, false);
+        await dismissNotifications(page);
+        await expectReachable(
+          page, '.accordion-panel:has(> #coloring-filtering-section)', `${layout.name} floating panel`, 8,
+        );
+        await expectReachable(
+          page,
+          '#floating-panels-root .analysis-window-frame > :is(.accordion-panel-actions, .accordion-section > summary)',
+          `${layout.name} first window's header under the second window`,
+          1,
+        );
       });
-      await expect(page.locator('#select-bar-mode')).toHaveAttribute('aria-checked', 'true');
-      await dismissNotifications(page);
-      await expectReachable(page, '#select-bar', `${layout.name} selection bar`, 4);
-    });
-
-    test('a standing notification never hides a control on the sidebar or the selection bar', async ({
-      page,
-    }) => {
-      test.setTimeout(180_000);
-      await openDataset(page);
-      await setSheetOpen(page, true);
-      await openEverySidebarPanel(page);
-      await page.evaluate(async () => {
-        const { getNotificationCenter } = await import('/assets/js/app/notification-center.js');
-        getNotificationCenter().progress('Downloading expression matrix', 40, { duration: 0 });
-      });
-      await expect(page.locator('.notification-progress')).toBeVisible();
-      // Cards let a touch through to what lies under them, so the walk also
-      // checks that no card is drawn over a control's center.
-      const covered = await page.evaluate(async () => {
-        const frame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
-        const cards = [...document.querySelectorAll('#notification-center .notification')];
-        const out = [];
-        for (const element of document.querySelectorAll(
-          '#sidebar :is(button, select, input:not([type="hidden"]), textarea, summary, a[href]), #select-bar :is(button, select)',
-        )) {
-          if (element.getClientRects().length === 0) continue;
-          const first = element.getBoundingClientRect();
-          if (first.width < 2 || first.height < 2) continue;
-          element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-          await frame();
-          const box = element.getBoundingClientRect();
-          const x = box.left + box.width / 2;
-          const y = box.top + box.height / 2;
-          for (const card of cards) {
-            const area = card.getBoundingClientRect();
-            if (x >= area.left && x <= area.right && y >= area.top && y <= area.bottom) {
-              out.push(element.id || `${element.localName}.${[...element.classList].join('.')} "${(element.getAttribute('aria-label') || element.textContent || '').trim().slice(0, 24)}"`);
-            }
-          }
-        }
-        return out;
-      });
-      expect(covered, 'controls drawn under a notification after scrolling').toEqual([]);
     });
 
     test('the community annotation GitHub sync dialog is reachable on every step', async ({

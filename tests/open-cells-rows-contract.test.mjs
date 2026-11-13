@@ -516,9 +516,9 @@ test('a revisit never opens fewer cells than an earlier visit kept: each chunk p
 test('a progressive plan opens at least the first cells whose chunks are kept, and none of it when every chunk is', async () => {
   const { progressivePlan } = await import('../assets/js/data/anndata/progressive-open.js');
   // A slow link (a revisit measures little): one chunk of 100 cells takes
-  // longer than the first view's second; before, every first view was the
-  // square root of the cells (a revisit of 561,947 cells opened 750 where
-  // its first visit kept 65,536).
+  // longer than the first view's second; the first view is then not the
+  // square root of the cells whatever the link (a revisit of 561,947 cells
+  // would open 750 where its first visit kept 65,536).
   const link = { latencyMs: 400, bytesPerMs: 100, readsAhead: false };
   const target = 1_000_000;
   const chunk = 100_000;

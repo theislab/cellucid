@@ -1,5 +1,5 @@
 /**
- * @fileoverview Camera path captions (F110, owner 2026-11-11): while a path
+ * @fileoverview Camera path captions: while a path
  * plays, the label of the keyframe the film is at appears over the plot, as
  * a documentary's title — "Beta cells", "Overview".
  *

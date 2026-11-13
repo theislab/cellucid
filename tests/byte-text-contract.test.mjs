@@ -1,14 +1,14 @@
 /**
- * @fileoverview Bytes become text in one place (F242, round 9).
+ * @fileoverview Bytes become text in one place.
  *
  * `utils/byte-text.js` writes bytes as lowercase hex, base64 and base64url
  * and reads them back; `utils/sha256.js` is the one SHA-256 (WebCrypto where
- * there is one, the same digest in script on a plain-HTTP origin). Before,
- * a folder's identity (`local-file-handles.js` `heldBy`), a kept store's
- * directory (`transcode/space.js` `identityDigest`), the AnnData copy's state
- * digest and a sign-in's PKCE challenge each called `crypto.subtle.digest`
- * themselves and failed on `http://<lan-address>` (no `crypto.subtle`), and
- * the hex and base64 writing was copied in eighteen modules.
+ * there is one, the same digest in script on a plain-HTTP origin). A folder's
+ * identity (`local-file-handles.js` `heldBy`), a kept store's directory
+ * (`transcode/kept-format.js` `identityDigest`), the AnnData copy's state
+ * digest and a sign-in's PKCE challenge do not each call `crypto.subtle.digest`
+ * themselves, which fails on `http://<lan-address>` (no `crypto.subtle`), and
+ * the hex and base64 writing is not copied into every module.
  */
 
 import assert from 'node:assert/strict';
@@ -27,7 +27,7 @@ import {
   randomHex,
 } from '../assets/js/utils/byte-text.js';
 import { heldBy } from '../assets/js/app/library/local-file-handles.js';
-import { identityDigest, canonicalJson, cacheKey } from '../assets/js/data/anndata/transcode/space.js';
+import { identityDigest, canonicalJson, cacheKey } from '../assets/js/data/anndata/transcode/kept-format.js';
 import { codeChallengeOf } from '../assets/js/data/sources/auth/pkce.js';
 import { shareIdOf } from '../assets/js/data/sources/providers/onedrive.js';
 

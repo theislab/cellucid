@@ -15,9 +15,8 @@
  * frame run before the next animation frame (Chromium on an idle page), or
  * the next animation frame runs first (Firefox once a display interval has
  * passed, every engine once rendering has waited behind tasks). A pacer
- * that decided an ambient frame from the frame before the last one drew
- * pulse frames back to back in the second order (Firefox: 450 ms frames in
- * pairs, the page held 900 ms at a time).
+ * that decided an ambient frame from the frame before the last one would
+ * draw pulse frames back to back in the second order.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -304,9 +303,9 @@ test('a frame late with the GPU idle is not the GPU\'s: a stopped page, a long t
 
 test('a page stopped while the GPU still ran a frame is late only as long as the GPU was seen to run it', () => {
   // A slow GPU (a phone's), its tab switched away from right after an
-  // ambient frame, or a long task: the read when the next frame was due saw
-  // the GPU busy, and the next frame came 10 s later. The GPU had finished
-  // long before: a pacer that counted the whole 10 s held the ambient
+  // ambient frame, or a long task: the read when the next frame was due sees
+  // the GPU busy, and the next frame comes 10 s later. The GPU has finished
+  // long before: a pacer that counted the whole 10 s would hold the ambient
   // animation 10 s once the page ran again.
   for (const gpuMsAfterDue of [0, 2 * VSYNC_MS]) {
     const h = harness();

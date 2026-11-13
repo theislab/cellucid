@@ -44,19 +44,6 @@ test('every user-select declaration carries the -webkit- twin Safari reads', asy
   assert.deepEqual(offenders, []);
 });
 
-test('the plot and the controls on it refuse text selection and the callout', async () => {
-  const source = await readFile(new URL('assets/css/base/_global.css', ROOT), 'utf8');
-  const rule = /#glcanvas,\s*\.select-bar,\s*\.split-view-badges,\s*\.view-title-chip\s*\{([^}]*)\}/.exec(source);
-  assert.ok(rule, 'the plot touch-surface rule exists');
-  for (const declaration of [
-    '-webkit-user-select: none;',
-    'user-select: none;',
-    '-webkit-touch-callout: none;',
-  ]) {
-    assert.ok(rule[1].includes(declaration), `missing ${declaration}`);
-  }
-});
-
 test('inline user-select written from script sets the -webkit- twin too', async () => {
   const offenders = [];
   for (const file of await collectFiles(fileURLToPath(new URL('assets/js/', ROOT)), '.js')) {

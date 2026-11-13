@@ -300,8 +300,7 @@ const TEXT_ASCENT_EM = 0.8;
 const TEXT_DESCENT_EM = 0.3;
 /**
  * A y tick label's baseline below its tick, in font sizes: half a digit's
- * height, so the label is centered on the tick at any size (a fixed 4 px was
- * centered at 12 px only).
+ * height, so the label is centered on the tick at any size.
  */
 const Y_TICK_BASELINE_DROP_EM = 0.35;
 /** Room between a tick's end and its label, in tick font sizes (at least 3 px). */
@@ -359,7 +358,7 @@ function axisFontOf(fontPx, what) {
 
 /**
  * A plot's axes, laid out once: every line and text both formats draw, and
- * the margins the layout reserves for them (F158).
+ * the margins the layout reserves for them.
  *
  * The margins come from the text: the y tick labels are measured
  * (`measureText`, the layout's own measurement) and the y-axis label stands
@@ -369,11 +368,10 @@ function axisFontOf(fontPx, what) {
  * overlaps at any font size, and nothing is cut at the figure's edge. The
  * layout plans each plot's axes with this (`utils/layout.js`), and the PNG
  * and SVG builders draw exactly the plan (`placeFigureAxes`): they measure
- * and place nothing of their own. (Found 2026-11-11, L24-6: the y label stood
- * a fixed `5 + 8 + 1.15 × label` px left of the axis, so at 17 px ticks and a
- * 20 px label "UMAP 2" ran into "-0.5"; the margins were a fixed 62 px at any
- * size; and the PNG wrote the y tick labels 2 px from their ticks, the SVG
- * 8 px.)
+ * and place nothing of their own. A label placed at a fixed distance from
+ * the axis, or margins of a fixed width, would let a label run into wide tick
+ * labels at a large font size, and two formats would place the tick labels
+ * differently (36_decisions_figure_export.md).
  *
  * @param {object} options
  * @param {AxisBounds} options.bounds

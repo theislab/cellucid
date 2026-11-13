@@ -2,8 +2,8 @@
  * @fileoverview The coloring a dataset opens with when nothing chose one.
  *
  * A dataset whose catalog names no starting view (a person's own file, a
- * link, a served object) opened with every cell gray and Color by on None
- * (bug hunt F21). It now opens colored by its best categorical field
+ * link, a served object) would open with every cell gray and Color by on
+ * None. It opens colored by its best categorical field
  * (`utils/field-roles.js` `firstColoringCandidates`: a cell type name first,
  * then the other ranks; never a sample, an id or a quality flag), shown in
  * Color by like any choice. A field only its order recommends is read

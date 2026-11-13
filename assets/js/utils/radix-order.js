@@ -18,6 +18,8 @@
  * @module utils/radix-order
  */
 
+import { sameKind } from './large-arrays.js';
+
 /** The widest digit a pass sorts by: 65,536 counts. */
 const MAX_DIGIT_BITS = 16;
 
@@ -186,7 +188,7 @@ export function sortByKeyWithValues(keys, values) {
   for (let shift = 0; shift < 32 && largest >>> shift !== 0; shift += bits) {
     if (!digitStarts(fromKeys, shift, mask, counts)) continue;
     toKeys ??= new Uint32Array(n);
-    toValues ??= new values.constructor(n);
+    toValues ??= sameKind(values, n);
     scatterPairs(fromKeys, fromValues, toKeys, toValues, shift, mask, counts);
     [fromKeys, toKeys] = [toKeys, fromKeys];
     [fromValues, toValues] = [toValues, fromValues];

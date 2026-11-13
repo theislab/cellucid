@@ -141,7 +141,7 @@ test('a dropped folder is read through its handle where the drop gives one, else
   assert.equal(plain.handle, null);
 });
 
-test('a library file dropped goes to My datasets\' Import; a session file goes to its load (L25-8)', () => {
+test('a library file dropped goes to My datasets\' Import; a session file goes to its load', () => {
   const library = describeDatasetDrop(transfer([fileItem('Backup.cellucid-library')]));
   assert.equal(library.kind, 'library');
   assert.equal(library.label, 'Backup.cellucid-library');

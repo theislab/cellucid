@@ -73,8 +73,8 @@ test('a failed phase still releases the benchmark view and resumes the viewer', 
 // The analyzer draws through the renderer's public `render()` with parameters
 // it builds itself, so the renderer's contract is checked against them here:
 // a parameter the contract adds and the analyzer lacks fails this test, not
-// the person's Analyze performance (round 9, R9P-2: `pointSizeMax` was
-// added to the contract and the analysis hung).
+// the person's Analyze performance (a `pointSizeMax` added to the contract
+// without the analyzer would hang the analysis).
 function createGl() {
   return {
     ALIASED_POINT_SIZE_RANGE: 0x846d,
@@ -93,7 +93,7 @@ test('the parameters the analyzer draws with satisfy the renderer contract', asy
   const { pointSpriteCap } = await import('../assets/js/rendering/point-sprite.js');
   const gl = createGl();
   const renderer = { activeQuality: 'full', getViewPositionDimension: () => 3 };
-  // As the panel builds it (app/main.js).
+  // As the panel builds it (ui/modules/benchmark/benchmark-controls.js).
   const analyzer = new BottleneckAnalyzer(gl, renderer, null, { pointSizeMax: pointSpriteCap(gl) });
   const params = analyzer._getDefaultRenderParams();
   assert.doesNotThrow(() => requireRenderContract(params));
@@ -138,9 +138,10 @@ test('a frame that throws ends the analysis with its error and resumes the viewe
   }
 });
 
-// R9P-3: the LOD sweep ordered its levels by index (level 0 is the smallest
-// sample), so a frame that does not follow the point count scored ~10,000
-// and was named "Vertex Processing" on every run, smooth or not.
+// The LOD sweep orders its levels by points drawn, not by index (level 0 is
+// the smallest sample): ordered by index, a frame that does not follow the
+// point count would score ~10,000 and be named "Vertex Processing" on every
+// run, smooth or not.
 test('the LOD sweep scores how frame time follows the points drawn', () => {
   const analyzer = new BottleneckAnalyzer(null, {}, null);
   const flat = analyzer._calculateLODScaling({

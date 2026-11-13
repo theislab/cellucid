@@ -107,8 +107,9 @@ function pathOf(file) {
 /**
  * What a file or folder held when it was read: a file's size and
  * modification time; a folder's file count and the SHA-256 of every file's
- * path, size and modification time, a line each in path order (a folder of
- * 10^6 files takes about 0.4 s, measured in Node).
+ * path, size and modification time, a line each in path order (a fraction
+ * of a second for a folder of a million files; measured:
+ * 22_decisions_link_model_and_request_planning.md).
  *
  * @param {'file'|'folder'} kind
  * @param {ArrayLike<File>} files

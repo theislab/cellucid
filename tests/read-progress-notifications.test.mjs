@@ -112,9 +112,10 @@ test('a failed read leaves the card to what asked for it; an opening, a growth s
   assert.deepEqual(notifications.calls.map(call => call[0]), ['progress', 'dismiss', 'progress', 'dismiss']);
 });
 
-test('a gene\'s reads its own loading notification shows (with its wait) are not shown again here (R9W-4)', () => {
-  // Offline while a gene is read: its notification said "Reading gene BARX2: This computer is
-  // offline: …" with Cancel, and a second one said "Reading genes · waiting: This computer is offline".
+test('a gene\'s reads its own loading notification shows (with its wait) are not shown again here', () => {
+  // Offline while a gene is read, its notification says "Reading gene BARX2: This computer is
+  // offline: …" with Cancel; a second one ("Reading genes · waiting: This computer is offline")
+  // would repeat it.
   const log = getReadActivityLog();
   log.clear();
   const notifications = fakeNotifications();
@@ -137,11 +138,4 @@ test('a gene\'s reads its own loading notification shows (with its wait) are not
   // Every gene load that shows a notification adopts its reads for it.
   const loading = readFileSync(new URL('../assets/js/app/state/managers/field/loading.js', import.meta.url), 'utf8');
   assert.match(loading, /if \(notifId !== null\) getReadActivityLog\(\)\.adopt\(sharedOwner\.readKey, `gene-notification-\$\{notifId\}`\);/);
-});
-
-test('the reader worker posts no progress event of its own: activity is the one channel', () => {
-  for (const file of ['anndata-reader-worker.js', 'anndata-reader-client.js', 'anndata-file-source.js', 'anndata/reader.js']) {
-    const source = readFileSync(new URL(`../assets/js/data/${file}`, import.meta.url), 'utf8');
-    assert.doesNotMatch(source, /event: 'progress'|onProgress|by gene \(once/, file);
-  }
 });

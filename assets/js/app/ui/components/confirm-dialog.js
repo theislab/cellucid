@@ -197,6 +197,8 @@ export function showConfirmDialog({
     dialog.remove();
     throw error;
   }
+  // Closed while it opened (`wireAppDialog`): its onClose has run already.
+  if (!dialog.open) return cancel;
   if (wantsInput) textarea.select();
   activeCancel = cancel;
   return cancel;

@@ -142,8 +142,8 @@ export function applyLegendPosition(layout, legendPosition) {
       // A plot that already places its legend below the plot area has measured
       // the band it needs — tick labels, then the axis title, then the legend —
       // and expressed the offset in paper units derived from its own pixel
-      // geometry. Replacing that with a constant is how the volcano's axis
-      // title came to be drawn across its `Down (n)` entry. `-0.05` places the
+      // geometry. Replacing that with a constant draws the axis title across
+      // the legend's first entry. `-0.05` places the
       // legend for a plot that reserved nothing; it never overrides one that did.
       if (!placesLegendBelowPlot(baseLegend)) legend.y = -0.05;
       break;

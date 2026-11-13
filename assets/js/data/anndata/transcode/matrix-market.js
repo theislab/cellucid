@@ -29,7 +29,7 @@
  * cells (`UMAP_1`/`UMAP_2`-style columns become `obsm`), and a cell list
  * that is itself a table (a sci-RNA-seq3 `cell_annotate.csv`, Parse's
  * `cell_metadata.csv`). Without one the folder is refused with how to
- * compute one (D4), from the tables' first lines, before anything else is
+ * compute one, from the tables' first lines, before anything else is
  * read.
  *
  * ## Map first, then the matrix share
@@ -89,7 +89,8 @@ import { MatrixMarketError } from '../../../formats/text/matrix-market-entries.j
 import { writeModel } from './anndata-model.js';
 import { RObjectRefusal, noEmbeddingRefusal } from './refusals.js';
 import { transcodeOnce } from './session.js';
-import { THIS_TAB, findKeptStores, keptAbout, makeRoomForRetry, openTranscodeSpace } from './space.js';
+import { THIS_TAB, findKeptStores, makeRoomForRetry, openTranscodeSpace } from './space.js';
+import { keptAbout } from './kept-format.js';
 import { entriesFromJson, entriesToJson, keptStore } from './kept-store.js';
 import { cellPriority, matrixInOrder } from './priority.js';
 import { AnnDataStoreWriter } from './zarr-writer.js';
@@ -572,7 +573,7 @@ async function buildMap(space, { set, tables, readerOf, folderName, matrixBytes,
     sizeOf(readerOf(set.matrix), context),
     Promise.all(tables.map(path => mayHoldEmbedding(readerOf(path), { signal, activity }).catch(error => {
       if (signal?.aborted) throw error;
-      // A table that cannot be read so is read whole, as before.
+      // A table that cannot be read so is read whole.
       return true;
     }))),
     // A cell list named as a table (`.csv`, an annotation or metadata

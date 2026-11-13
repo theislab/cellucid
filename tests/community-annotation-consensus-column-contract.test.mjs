@@ -40,7 +40,7 @@ test('a disputed or pending category keeps its status exactly once; a category w
 });
 
 test('a label agreed as literally "Pending" or "Disputed" never merges with a status', () => {
-  // The audit's repro (consensus-sentinels.mjs): the community agreed on "Pending" for one category,
+  // Sentinel values: the community agreed on "Pending" for one category,
   // nobody voted on another, and agreed on "Disputed" for a third.
   const column = consensusColumnOf({ outcomes: [agreed('Pending'), pending, agreed('Disputed'), disputed], codes: Uint8Array.from([0, 1, 2, 3]) });
   assert.deepEqual(column.categories, ['Pending', 'Disputed', 'Disputed (status)', 'Pending (status)']);

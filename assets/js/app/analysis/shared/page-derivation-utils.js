@@ -78,7 +78,7 @@ export function createSamplePageId(basePageId, m) {
  * @param {string} pageId
  * @returns {boolean}
  */
-export function isSamplePageId(pageId) {
+function isSamplePageId(pageId) {
   return typeof pageId === 'string' && SAMPLE_PAGE_PATTERN.test(pageId);
 }
 
@@ -154,11 +154,12 @@ export function expandPagesWithDerived(pages, options = {}) {
  *
  * `AnalysisUIManager` holds one page selection shared by every analysis mode,
  * and every page selector offers the derived "Rest of X" pages alongside the
- * base ones — so a mode that derived a narrower domain of its own rejected a
+ * base ones — so a mode that derived a narrower domain of its own would reject a
  * page the shared selection had already accepted. Differential Expression and
- * Marker Genes own no page selector at all, so their validators fell back to
- * the base inventory and threw `page "restof__page_1" was not found` the moment
- * a rest-of page selected in another mode was handed to them on a mode switch.
+ * Marker Genes own no page selector at all, so validators that fell back to
+ * the base inventory would throw `page "restof__page_1" was not found` the
+ * moment a rest-of page selected in another mode was handed to them on a mode
+ * switch.
  * There is one domain, and it is this function.
  *
  * @param {Array<{id: string, name: string}>} pages - The base page inventory.

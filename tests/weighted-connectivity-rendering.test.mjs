@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { extractConnectivityEdges } from '../assets/js/data/connectivity-edges.js';
@@ -45,7 +44,7 @@ test('weighted rendering uses one deterministic relative-strength encoding', () 
   );
 });
 
-test('instanced edge shaders read each shown edge\'s strength from its instance record as alpha', async () => {
+test('instanced edge shaders read each shown edge\'s strength from its instance record as alpha', () => {
   assert.match(LINE_INSTANCED_VS_SOURCE, /layout\(location = 3\) in float a_strength;/);
   assert.match(
     LINE_INSTANCED_VS_SOURCE,
@@ -60,18 +59,4 @@ test('instanced edge shaders read each shown edge\'s strength from its instance 
   assert.match(EDGE_GATHER_VS_SOURCE, /floatBitsToUint\(texelFetch\(/);
   assert.match(EDGE_GATHER_VS_SOURCE, /v_strength = a_strengthBits;/);
   assert.deepEqual(EDGE_GATHER_VARYINGS, ['v_source', 'v_destination', 'v_strength']);
-
-  const selectionSource = await readFile(
-    new URL('../assets/js/rendering/connectivity-edge-selection.js', import.meta.url),
-    'utf8'
-  );
-  // The reader worker hands each edge's relative strength over; the
-  // selection copies its bits as they are, by edge.
-  assert.match(selectionSource, /out\[write \+ 2\] = strengthBits\[edge\];/);
-  assert.doesNotMatch(selectionSource, /Math\.fround|maxWeight/);
-  // The strengths are the payload's own: nothing is derived on the page.
-  for (const file of ['connectivity-edge-selection.js', 'connectivity-edge-layer.js']) {
-    const source = await readFile(new URL(`../assets/js/rendering/${file}`, import.meta.url), 'utf8');
-    assert.doesNotMatch(source, /weights/);
-  }
 });

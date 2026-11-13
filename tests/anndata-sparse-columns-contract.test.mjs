@@ -490,8 +490,8 @@ test('a scattered cell subset of an array read in part costs requests as the lin
 test('a run reading genes of the same cells by rows reads their rows once, then copies its genes out', async () => {
   // A CSR matrix whose cells are read by rows (a DE over every gene asks for
   // the same cells in batches, saying how many genes the run has left): each
-  // batch re-read every row of the cells (a 10M-cell file, 30,000 genes: 470
-  // reads of ~130 MB). The run's first read keeps every gene of the cells.
+  // batch would re-read every row of the cells (measured: 23_decisions_partial_reading.md).
+  // The run's first read keeps every gene of the cells.
   const nObs = 60;
   const nVars = 40;
   const csr = randomCsr(nObs, nVars, 5, { duplicates: true, zeros: true });

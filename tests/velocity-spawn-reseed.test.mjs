@@ -1,6 +1,6 @@
-// Owner decision (b), scale-50m-100m.md D-5: the velocity spawn table is
-// refilled each respawn epoch from where the last one stopped, so every
-// visible cell becomes a spawn source, not a fixed 65,536 of them.
+// The velocity spawn table is refilled each respawn epoch from where the
+// last one stopped, so every visible cell becomes a spawn source, not a
+// fixed 65,536 of them.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';

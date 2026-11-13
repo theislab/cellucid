@@ -49,9 +49,8 @@ import { getColormap } from '../../../../../data/palettes.js';
  * A category with no cell left by the filters on other fields is not listed
  * at all (`legendEntries`): the figure has none of its cells to hide, and the
  * filter that emptied it is named in the title (a grid panel's label:
- * `utils/figure-title.js`). Marking those
- * "(hidden)" listed 30 of 41 lung cell types as hidden when the person had
- * hidden none of them, only kept the epithelial cells (L12-6, F113).
+ * `utils/figure-title.js`). Marking those "(hidden)" would list categories as
+ * hidden that the person never hid, only filtered away through another field.
  */
 export const HIDDEN_LEGEND_ENTRY_SUFFIX = ' (hidden)';
 
@@ -147,12 +146,12 @@ const LEGEND_PADDING = 8;
 const LEGEND_SWATCH = 10;
 /** Gap between a swatch and its label (px). */
 const LEGEND_SWATCH_GAP = 6;
-/** The outline of a filled swatch (px), in both formats (the SVG drew 0.25, the PNG 0.5). */
+/** The outline of a filled swatch (px), in both formats. */
 const SWATCH_OUTLINE = 0.5;
 /**
  * Room kept after the longest label in every column: one em of the legend's
- * font, so columns read apart (2 px let "Mesenteric_lymph_node" run into the
- * next column's swatch, found 2026-11-10).
+ * font, so columns read apart and a long label never runs into the next
+ * column's swatch.
  */
 function columnGapPx(fontPx) {
   return Math.round(fontPx);
@@ -174,10 +173,9 @@ const LABEL_BASELINE_DROP = 0.35;
  * Where a category entry's swatch and label stand in its row (`itemY` is the
  * row's top, `lineHeight` tall): both centered on the row, the label on an
  * alphabetic baseline half a capital below the centre, in both formats.
- * (Found 2026-11-11, L6-2: the SVG set its label's bottom at the swatch's
- * bottom with `dominant-baseline="ideographic"` and the PNG its baseline
- * there, so the two formats placed every label differently, and a label in
- * a font larger than the swatch rose into the legend's title.)
+ * One placement serves both formats: a label set by its bottom edge at the
+ * swatch's bottom would sit differently in each format, and in a font larger
+ * than the swatch it would rise into the legend's title.
  *
  * @param {number} itemY
  * @param {number} lineHeight
@@ -266,7 +264,7 @@ function vectorKeyRampStops(colormapId) {
  *   grows downwards by rows. A single column wider than `extentPx` makes the
  *   legend wider than it.
  *
- * A `highlight` entry (the highlighted cells the figure draws, F158) is one
+ * A `highlight` entry (the highlighted cells the figure draws) is one
  * more row under the entries, the color bar or the title, a title gap below
  * them, as wide as its text needs; beside a plot its row is kept out of the
  * height the entries fill. A `vectorKey` (the vector field the plot draws)

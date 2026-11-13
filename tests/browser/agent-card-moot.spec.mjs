@@ -3,8 +3,7 @@
  * replaced: a saved session of the same dataset loaded while a connector
  * agent's card waits refuses the card (the history stays the same object,
  * so this is its `loaded` event, not another dataset shown), and Allow can
- * never apply the change to the state just loaded. From the agents bug hunt
- * of 2026-11-04.
+ * never apply the change to the state just loaded.
  */
 import { expect, test } from './helpers/test.mjs';
 import { installScriptedModel, observeProductErrors, openAgentDataset, stepFacts } from './helpers/agent-chat.mjs';

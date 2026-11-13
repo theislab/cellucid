@@ -13,9 +13,10 @@
  *
  * The PNG and hybrid-SVG paths run that shader, so they carry the cue. The
  * `full-vector` and `optimized-vector` SVG strategies project points in
- * JavaScript and used to emit every circle at its raw color, producing a
- * figure in which foreground and background cells are indistinguishable. That
- * is not a cosmetic simplification: it flattens the depth axis of the data.
+ * JavaScript, so without the fog they would emit every circle at its raw
+ * color, producing a figure in which foreground and background cells are
+ * indistinguishable. That is not a cosmetic simplification: it flattens the
+ * depth axis of the data.
  *
  * WHAT IS AND IS NOT REPRODUCED
  * Reproduced exactly: the Beer-Lambert transmittance and the opacity it

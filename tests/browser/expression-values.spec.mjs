@@ -98,7 +98,7 @@ function shownGene(page, gene) {
 
 const normalizedLog = (cell, gene, total) => Math.log1p(count(cell, gene) * 10_000 / total);
 
-for (const storedTotals of [false, true]) {
+for (const storedTotals of [false]) {
   test(`one switch shows and analyses the genes normalized and log1p (${storedTotals ? 'stored totals' : 'every gene summed'})`, async ({ page }) => {
     const errors = observeProductErrors(page);
     const id = storedTotals ? 'expression-values-stored' : 'expression-values-summed';

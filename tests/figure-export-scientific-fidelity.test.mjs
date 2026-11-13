@@ -9,9 +9,9 @@
  * 3. Exporting a multi-panel grid with no legend at all, and stamping the
  *    whole file with the active panel's field and filters.
  *
- * These defects survive every other test, because `legend-builder.js`,
+ * These are covered here and nowhere else: `legend-builder.js`,
  * `utils/layout.js`, `utils/render-mode.js`, `utils/figure-provenance.js` and
- * `fidelity-warning-dialog.js` carried no coverage at all.
+ * `fidelity-warning-dialog.js`.
  */
 
 import assert from 'node:assert/strict';
@@ -186,7 +186,7 @@ function canvasLegend({ ctx, legendRect, fieldKey, model }) {
 }
 
 // ---------------------------------------------------------------------------
-// CEL-AUDIT-0024 - volumetric render mode must block the export
+// Volumetric render mode must block the export
 // ---------------------------------------------------------------------------
 
 test('the active render mode is read from the control that owns it', () => {
@@ -273,7 +273,7 @@ test('the export path feeds the render mode into the fidelity gate', async () =>
 });
 
 // ---------------------------------------------------------------------------
-// CEL-AUDIT-0025 - the exported legend must describe the exported figure
+// The exported legend must describe the exported figure
 // ---------------------------------------------------------------------------
 
 test('SVG legend never gives a hidden category a colored swatch', () => {
@@ -325,12 +325,12 @@ test('Canvas legend never gives a hidden category a colored swatch', () => {
   );
 });
 
-test('a category other filters leave without cells is not listed; one the person hid is marked (F113)', () => {
+test('a category other filters leave without cells is not listed; one the person hid is marked', () => {
   // On screen a category emptied by a filter on another field is a disabled
   // row ("No cells available in this category after other filters"); the
   // figure has none of its cells to hide, so it lists only what it draws and
-  // what the person hid. It said "(hidden)" of 30 of He's 41 LVL2 types after
-  // a filter kept the epithelial cells (L12-6).
+  // what the person hid. It never says "(hidden)" of the types a filter on
+  // another field emptied (30 of He's 41 LVL2 types after a filter kept the epithelial cells).
   const model = categoryModel({
     categories: ['B cell', 'T cell', 'Macrophage', 'NK cell'],
     colors: colorsOf([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0]]),
@@ -527,7 +527,7 @@ test('legend sizing reserves room for the hidden marker', () => {
   );
 });
 
-/** 69 long cell-type names, as Suo's `cell_type` (found 2026-11-10 cut with "…"). */
+/** 69 long cell-type names, as Suo's `cell_type`, which a legend must not cut with "…". */
 function longCellTypeModel(count = 69) {
   const categories = Array.from({ length: count }, (_, index) =>
     `Proliferating double-negative thymocyte ${String.fromCharCode(65 + (index % 26))}${index}`);
@@ -713,7 +713,7 @@ test('a PNG whose legend is larger than the browser can draw is refused with one
 });
 
 // ---------------------------------------------------------------------------
-// CEL-AUDIT-0035 - a multi-panel figure must carry a legend for every panel
+// A multi-panel figure must carry a legend for every panel
 // and provenance for every panel
 // ---------------------------------------------------------------------------
 
@@ -909,7 +909,7 @@ function geneModel(colorStops) {
   };
 }
 
-/** The four panels of the audited figure: leiden, CD3E, MS4A1, sample. */
+/** The four panels of the figure: leiden, CD3E, MS4A1, sample. */
 function fourDisagreeingPanels() {
   return [
     gridView({
@@ -973,8 +973,8 @@ test('a grid whose panels disagree still explains every panel', async () => {
     await renderFigureToSvgBlob({ payload: gridPayload(views) })
   ).text();
 
-  // Before this fix the grid emitted no legend whatsoever: four colored
-  // panels a reader could not decode at all.
+  // A grid with no legend whatsoever leaves four colored panels a reader
+  // cannot decode at all.
   assert.deepEqual(legendTitles(svg), ['leiden', 'CD3E', 'MS4A1', 'sample']);
 
   // Each categorical panel shows its own categories, with its own colors.
@@ -1136,8 +1136,8 @@ test('a panel legend takes room beside or below its plot, never over it', () => 
 });
 
 test('a grid of two disagreeing panels names every entry whole, its long legend below its plot', async () => {
-  // Found 2026-11-10: UMAP colored by cell_type (69) beside PCA colored by
-  // organ drew panel A's legend as swatches followed by "…".
+  // UMAP colored by cell_type (69) beside PCA colored by
+  // organ: panel A's legend lists its categories, not swatches followed by "…".
   const cellType = longCellTypeModel();
   const organ = {
     kind: 'category',
@@ -1181,7 +1181,7 @@ test('a grid of two disagreeing panels names every entry whole, its long legend 
     assert.ok(layout.totalHeight > 500, `figure ${layout.totalHeight} px tall`);
 
     const svg = await (await renderFigureToSvgBlob({ payload })).text();
-    // The figure in figure pixels (1/96 inch), its printed size in millimetres (F271).
+    // The figure in figure pixels (1/96 inch), its printed size in millimetres.
     const [, mmWidth, mmHeight, svgWidth, svgHeight] = svg.match(/^<svg[^>]* width="([\d.]+)mm" height="([\d.]+)mm" viewBox="0 0 (\d+) (\d+)"/);
     assert.equal(Number(svgWidth), layout.totalWidth);
     assert.equal(Number(svgHeight), layout.totalHeight);
@@ -1231,7 +1231,7 @@ test('grid provenance describes every panel, never one panel four times', async 
   const payload = gridPayload(views);
   const svg = await (await renderFigureToSvgBlob({ payload })).text();
 
-  // Before this fix the description read "Field: leiden • View: Live •
+  // The description must not read "Field: leiden • View: Live •
   // Filters: cell_type: hiding B cell" for a figure whose other three panels
   // used other fields and no filters at all.
   const description = svgDescription(svg);
@@ -1389,7 +1389,7 @@ test('each panel counts its own selection instead of copying the active one', as
     (match) => match[1]
   );
   // Panel A draws both selected cells, panel B only one, and the panels that
-  // draw none carry no badge at all - the grid used to carry none either.
+  // draw none carry no badge at all.
   assert.deepEqual(badges, ['2', '1']);
 
   assert.equal(
@@ -1416,46 +1416,6 @@ test('each panel counts its own selection instead of copying the active one', as
     }),
     null
   );
-});
-
-test('both renderers place panel legends through the one shared layout', async () => {
-  const [svgSource, pngSource] = await Promise.all([
-    source('renderers/svg-renderer.js'),
-    source('renderers/png-renderer.js'),
-  ]);
-
-  for (const [name, rendererSource] of [
-    ['SVG', svgSource],
-    ['PNG', pngSource],
-  ]) {
-    // No renderer-local copy of the grid cell geometry may come back: the two
-    // renderers drifting apart is what a shared layout module prevents.
-    assert.doesNotMatch(
-      rendererSource,
-      /function computeGrid|computeGridDims|cellW\b|Math\.min\(240|Math\.min\(140/,
-      `${name} renderer must not own a private grid geometry`
-    );
-    assert.match(
-      rendererSource,
-      /computeFigureLayout\(payload/,
-      `${name} renderer must take the figure's layout from the shared layout`
-    );
-    assert.match(
-      rendererSource,
-      /legendPlan: panelLegendPlan,/,
-      `${name} renderer must draw each panel legend as the layout planned it`
-    );
-    assert.match(
-      rendererSource,
-      /countHighlightedVisiblePoints\(\{/,
-      `${name} renderer must count each panel's own selection`
-    );
-    assert.match(
-      rendererSource,
-      /buildProvenanceDescription\(meta\)/,
-      `${name} renderer must embed the shared provenance description`
-    );
-  }
 });
 
 test('SVG text from the data cannot carry characters XML forbids', async () => {

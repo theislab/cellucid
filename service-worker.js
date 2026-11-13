@@ -86,23 +86,31 @@ self.addEventListener('activate', event => {
 // The page that registered this worker names the files it loaded (index.html,
 // CELLUCID_PAGE_BOOT); each whose address names its bytes is kept now, from
 // the browser's HTTP cache where it still has it, so the next visit finds it.
+// All at once: a browser ends a worker whose event outlasts its limit, and
+// what is not kept by then stays unkept (Firefox ends it a minute after the
+// event, `dom.serviceWorkers.idle_timeout` and `idle_extended_timeout`, 30 s
+// each; Chromium after 5 minutes), while one after another the files take the
+// sum of their fetches.
 // The page itself is not taken over: what it asks for from now on goes to the
 // network as before, and the next visit starts under this worker.
 self.addEventListener('message', event => {
   const urls = Array.isArray(event.data?.keep) ? event.data.keep : [];
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
-    for (const href of urls) {
-      if (typeof href !== 'string') continue;
-      const address = contentAddress(new URL(href));
-      if (address === null || await cache.match(href) !== undefined) continue;
-      const response = await fetch(href).catch(() => null);
-      if (response === null || response.status !== 200 || response.type !== 'basic') continue;
-      if (address !== true && await versionOf(response.clone()) !== address) continue;
-      await cache.put(href, response);
-    }
+    await Promise.all([...new Set(urls)].map(href => keep(cache, href).catch(() => {})));
   })().catch(() => {}));
 });
+
+/** Keep the file at `href` when its address names its bytes and they are those bytes. */
+async function keep(cache, href) {
+  if (typeof href !== 'string') return;
+  const address = contentAddress(new URL(href));
+  if (address === null || await cache.match(href) !== undefined) return;
+  const response = await fetch(href).catch(() => null);
+  if (response === null || response.status !== 200 || response.type !== 'basic') return;
+  if (address !== true && await versionOf(response.clone()) !== address) return;
+  await cache.put(href, response);
+}
 
 /** The version a request's address names, `true` for a bundle file, or null. */
 function contentAddress(url) {

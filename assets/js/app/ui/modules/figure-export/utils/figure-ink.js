@@ -2,16 +2,16 @@
  * @fileoverview The ink a figure writes its annotations in.
  *
  * WHY THIS EXISTS
- * Every annotation the export draws — title, axis ticks, axis labels, panel
+ * No annotation the export draws — title, axis ticks, axis labels, panel
  * letters, legend text, the plot frame, the selection badge, the "No visible
- * cells" notice — used to be hard-coded near-black on a near-white frame. That
- * is correct on white paper and unreadable on anything else. The viewer's
+ * cells" notice — is hard-coded near-black on a near-white frame, which is
+ * correct on white paper and unreadable on anything else. The viewer's
  * `Grid (dark)` and `Black` backgrounds are ordinary choices, and `Background:
- * Viewer` carries them into the figure, so those exports came out with a title
+ * Viewer` carries them into the figure, so a fixed ink would leave a title
  * and axis numbers the reader cannot see.
  *
  * Ink is therefore derived from the figure's own background rather than
- * assumed. The two palettes are the same gray family the export already used
+ * assumed. The two palettes are the same gray family the export uses
  * (`#111`, `#6b7280`, `#e5e7eb`), mirrored across the luminance midpoint.
  *
  * A transparent figure keeps the light palette: it will be placed on a page

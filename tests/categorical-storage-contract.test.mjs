@@ -167,15 +167,14 @@ test('no data-layer module re-derives the width or the sentinel', async () => {
 
 test('no application module re-derives the width or the sentinel', async () => {
   // The fields a user builds, copies, merges, and edits pass through these
-  // trees, and each of them used to answer "which code means missing"
-  // and "how many categories fit" for itself. One of those answers was 255 for
-  // every width, which refused every operation on a uint16 categorical the app
-  // had already loaded and drawn.
+  // trees, and none of them may answer "which code means missing" and "how
+  // many categories fit" for itself: an answer of 255 for every width would
+  // refuse every operation on a uint16 categorical the app has already loaded
+  // and drawn.
   //
-  // The sweep covers `app/` entire rather than the three trees where the
-  // original instances happened to sit. Scoping it to those three is why a
-  // fourth survived in the community-annotation consensus column: a rule that
-  // only looks where the last defect was found cannot catch the next one.
+  // The sweep covers `app/` entire rather than the three trees where such
+  // answers sit: a rule that only looks where a defect was last found cannot
+  // catch the next one.
   const offenders = [];
   for (const relative of [
     '../assets/js/app/',

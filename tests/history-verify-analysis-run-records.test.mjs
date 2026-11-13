@@ -1,10 +1,10 @@
 /**
- * L24-12 (live pass 6, 2026-11-11): Verify said a colleague's Figure 2
- * branch was "not reproduced: Analysis differential: result changed" at the
- * step that ran the test, though running it again gave every number the
- * same. The result records its run's wall-clock time (`summary.duration`:
- * 627 ms in the sender's browser, 82 ms in the replay); the analysis domain
- * had no canonical form, so Verify compared it. The analyses' canonical form
+ * Verify must not say a colleague's Figure 2 branch is "not reproduced:
+ * Analysis differential: result changed" at the step that ran the test when
+ * running it again gives every number the same. The result records its run's
+ * wall-clock time (`summary.duration`, which differs between the sender's
+ * browser and the replay), so the analysis domain has a canonical form:
+ * without one Verify compares it. The analyses' canonical form
  * leaves out what a result records about its run (its duration, whether it
  * came from the cache), never what it found.
  */
@@ -49,7 +49,7 @@ test('two runs of one analysis differ only in their run records: one canonical f
   assert.notEqual(await hashValue(sender), await hashValue(canonicalAnalyses(analyses({ duration: 627.2, pAdjusted: 4e-81 }))));
   assert.deepEqual(RUN_RECORD_KEYS, ['duration', 'durationMs', 'cached', 'computedAt', 'computeDuration', 'tuning']);
   // The page's own analysis domain compares by it.
-  assert.equal(createAnalysisDomain({ analysis: async () => null }).canonical, canonicalAnalyses);
+  assert.equal(createAnalysisDomain({ analysis: () => null, analysisArrived: async () => null }).canonical, canonicalAnalyses);
   // The value itself keeps them (a restore shows the run as it was).
   assert.equal(JSON.stringify(analyses({ duration: 627.2 })).includes('627.2'), true);
 });
@@ -84,7 +84,7 @@ test('Verify reproduces a branch whose analysis ran again in another time; a dif
   assert.deepEqual(changed.domains.map(domain => domain.domain), ['analysis']);
 });
 
-test('a marker genes result run again elsewhere is the same finding: its time, duration and read tuning are run records (L25-16)', async () => {
+test('a marker genes result run again elsewhere is the same finding: its time, duration and read tuning are run records', async () => {
   // As `marker-discovery-engine.js` and `genes-panel-controller.js` record them (Kanemaru, live).
   const markers = (computedAt, computeDuration, tuning, durationMs, cached, p) => ({
     windows: [],

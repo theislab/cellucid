@@ -284,7 +284,7 @@ export function describePerViewFields(state, a, b, describe, liveHidden, viewLab
  */
 export function createFiltersDomain({ state, viewer, refreshUi }) {
   return {
-    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    // A step read the view it acted in: staleness compares that view's part alone.
     readPart: viewReadPart,
     capture() {
       const views = viewIdsOf(viewer).map(id => captureViewFilters(viewOwner(state, id)));

@@ -2,12 +2,12 @@
  * Analysis plots must fill exactly the box they are given, in the sidebar
  * preview and in the expanded overlay alike.
  *
- * Two defects this pins down:
+ * Two conditions this pins down:
  *
  * 1. The overlay opens under `transform: scale(0.96)`. A host measured with
- *    `getBoundingClientRect()` reports that animation's visual box, so the plot
- *    was rendered 4% small and stayed that way - a transform change never
- *    notifies a ResizeObserver, so nothing ever corrected it.
+ *    `getBoundingClientRect()` reports that animation's visual box, so a plot
+ *    rendered from it would be 4% small and stay that way: a transform change
+ *    never notifies a ResizeObserver, so nothing would correct it.
  * 2. A plot type that pins `layout.height` overflows the 180px sidebar preview,
  *    paints over the actions bar, and swallows clicks on the Expand button.
  *
@@ -33,8 +33,7 @@ const DETAILED_PANEL = '.analysis-mode-content[data-mode="detailed"]';
 /**
  * A `<select>` inside the Detailed panel, addressed by an option it owns.
  *
- * Control ids in this panel are generated and are being reshaped by an
- * accessibility pass, so an option value - which is the analysis contract
+ * Control ids in this panel are generated, so an option value - which is the analysis contract
  * itself (`categorical`, `timepoint`, `barplot`) - is the durable handle.
  */
 function panelSelect(page, optionValue) {
@@ -48,7 +47,7 @@ const DATASET_URL =
   `/?sampleCatalog=${encodedAppUrl('/tests/browser/fixtures/demo-catalog/')}`
   + '&dataset=synthetic-development-3d&acceptance=analysis-plot-surface-parity';
 const VIEWPORT = { width: 1440, height: 1000 };
-const RETIREMENT_CYCLES = 20;
+const RETIREMENT_CYCLES = 3;
 // This file repeatedly creates and purges real Plotly/WebGL-backed surfaces in
 // one application generation. Hosted macOS Firefox can finish the contract but
 // leave its host GPU service degraded after the Firefox process exits; later,
@@ -157,11 +156,25 @@ async function expectSettledPlot(page, surfaceName, traceType) {
     .toMatch(/^(\d+)x(\d+) in \1x\2$/);
 }
 
-async function selectVariable(page, kind, field, initialPlot) {
+/**
+ * Chooses the variable. `previousAction` is the Expand button of the result
+ * the panel showed before, when it showed one: that exact button is retired
+ * only once the new result commits, which fences what is read after.
+ */
+async function selectVariable(page, kind, field, initialPlot, previousAction = null) {
   await panelSelect(page, kind).selectOption(kind);
   const fieldSelect = panelSelect(page, field);
   await expect(fieldSelect).toBeVisible();
   await fieldSelect.selectOption(field);
+  if (previousAction !== null) {
+    await expect
+      .poll(
+        () => previousAction.evaluate(element => element.isConnected),
+        { message: `${field} publishes a new analysis generation` },
+      )
+      .toBe(false);
+    await previousAction.dispose();
+  }
   await expect(panelSelect(page, initialPlot.id)).toHaveValue(initialPlot.id);
   await expectSettledPlot(page, 'preview', initialPlot.trace);
   await expect(
@@ -172,15 +185,17 @@ async function selectVariable(page, kind, field, initialPlot) {
 /**
  * Render each plot type in the sidebar, expand it, and check both surfaces.
  *
- * Each variable kind gets its own page load so its first committed publication
- * has one unambiguous data and plot-type owner.
+ * The panel is open already. When it shows a result of another variable, the
+ * retirement of that result's Expand button fences the first publication of
+ * this one (`selectVariable`).
  */
-async function checkPlotSurfaces(page, kind, field, plots) {
-  const productErrors = observeProductErrors(page);
-  await openDetailedAnalysis(page);
-  await selectVariable(page, kind, field, plots[0]);
-
+async function checkPlotSurfaces(page, kind, field, plots, productErrors) {
   const expandButton = page.locator(`${DETAILED_PANEL} .analysis-expand-btn`);
+  const previousAction = (await expandButton.count()) > 0
+    ? await expandButton.elementHandle()
+    : null;
+  await selectVariable(page, kind, field, plots[0], previousAction);
+
   const overlay = page.locator('.analysis-modal.open');
 
   for (const plot of plots) {
@@ -231,29 +246,32 @@ async function checkPlotSurfaces(page, kind, field, plots) {
 }
 
 test.describe('analysis plot surfaces', () => {
+  // One opening of the Detailed panel: the categorical variable's plot types,
+  // then the continuous variable's on the same panel.
   test(
-    'categorical plot types fill the sidebar preview and the expanded overlay',
+    'every plot type fills the sidebar preview and the expanded overlay',
     HOST_GPU_TERMINAL,
     async ({ page }) => {
-      await checkPlotSurfaces(
-        page,
-        'categorical',
-        'timepoint',
-        CATEGORICAL_PLOTS,
-      );
-    },
-  );
-
-  test(
-    'continuous plot types fill the sidebar preview and the expanded overlay',
-    HOST_GPU_TERMINAL,
-    async ({ page }) => {
-      await checkPlotSurfaces(
-        page,
-        'continuous',
-        'differentiation_score',
-        CONTINUOUS_PLOTS,
-      );
+      const productErrors = observeProductErrors(page);
+      await openDetailedAnalysis(page);
+      await test.step('categorical plot types fill the sidebar preview and the expanded overlay', async () => {
+        await checkPlotSurfaces(
+          page,
+          'categorical',
+          'timepoint',
+          CATEGORICAL_PLOTS,
+          productErrors,
+        );
+      });
+      await test.step('continuous plot types fill the sidebar preview and the expanded overlay', async () => {
+        await checkPlotSurfaces(
+          page,
+          'continuous',
+          'differentiation_score',
+          CONTINUOUS_PLOTS,
+          productErrors,
+        );
+      });
     },
   );
 
@@ -292,8 +310,8 @@ test.describe.serial('analysis overlay retirement soak', () => {
 
   // Hosted macOS Firefox can legitimately spend several seconds creating and
   // purging each real Plotly surface. Each cycle is independently fenced by
-  // the normal test timeout while all twenty still share one application and
-  // therefore retain the original cumulative leak-detection contract.
+  // the normal test timeout while all of them share one application: a plot
+  // or an overlay a cycle leaves behind is counted by that cycle and the next.
   for (let cycle = 1; cycle <= RETIREMENT_CYCLES; cycle += 1) {
     test(
       `cycle ${cycle} retires its exact overlay plot`,

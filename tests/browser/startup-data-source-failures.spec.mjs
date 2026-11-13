@@ -2,12 +2,9 @@
  * A data failure says what is wrong, what to do, and stays on screen with a
  * way back.
  *
- * Two defects are covered here. A catalog failure used to blame the network
- * whatever had happened — a 404, a 403, an address that answered with a web
- * page and a truncated list all produced the same sentence, even though the
- * loader publishes the difference on the error it throws. And a failed dataset
- * switch used to surface a raw browser string in a toast that faded away,
- * leaving nothing behind to read or to act on.
+ * A failed dataset switch does not surface a raw browser string in a toast
+ * that fades away, leaving nothing behind to read or to act on. (A catalog
+ * that fails names its own cause in `sample-catalog-cors.spec.mjs`.)
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -24,7 +21,6 @@ const fixturesDirectory = path.join(
   'fixtures',
 );
 const GOOD_CATALOG = `${ORIGIN}/tests/browser/fixtures/demo-catalog/`;
-const BROKEN = `${ORIGIN}/tests/browser/fixtures/broken-catalogs/`;
 const NOTICE = '#dataset-notice';
 const NOTICE_BUTTON = `${NOTICE} button`;
 
@@ -55,94 +51,6 @@ async function noticeText(page) {
 }
 
 /* ------------------------------------------------------------------ *
- * A catalog failure names its own cause
- * ------------------------------------------------------------------ */
-
-/**
- * Each of these is a different thing going wrong, and the loader already knows
- * which: a `DataSourceError` code, or the HTTP status the server answered with.
- */
-const CATALOG_FAILURES = Object.freeze([
-  Object.freeze({
-    label: 'wrong-address',
-    base: `${ORIGIN}/tests/browser/fixtures/no-such-catalog/`,
-    status: null,
-    expect: /datasets\.json was not found at [^ ]+ \(HTTP 404, not found\): the link or record does not exist/,
-    forbid: /Check your network/,
-  }),
-  Object.freeze({
-    label: 'permission-denied',
-    base: GOOD_CATALOG,
-    status: 403,
-    expect: /refused datasets\.json \(HTTP 403, forbidden\): .* the link's permissions/,
-    forbid: /Check your network/,
-  }),
-  Object.freeze({
-    label: 'server-error',
-    base: GOOD_CATALOG,
-    status: 500,
-    expect: /is not answering \(HTTP 500, a server error\) for datasets\.json: a problem on [^ ]+'s side, not with the link or with Cellucid/,
-    forbid: /Check your network/,
-  }),
-  Object.freeze({
-    // A body that is not a dataset list and a dropped connection arrive at the
-    // UI as the same error, so they honestly share one sentence naming both.
-    label: 'not-a-dataset-list',
-    base: `${BROKEN}truncated-catalog/`,
-    status: null,
-    expect: /may not hold Cellucid data/,
-    forbid: /not found|refused access/,
-  }),
-]);
-
-const seenCatalogSentences = new Map();
-
-for (const failure of CATALOG_FAILURES) {
-  test(
-    `a ${failure.label} catalog is reported as ${failure.label}, not as a network problem`,
-    async ({ page }, testInfo) => {
-      if (failure.status !== null) {
-        await page.route(`${failure.base}datasets.json`, route =>
-          route.fulfill({
-            status: failure.status,
-            contentType: 'text/plain',
-            body: 'no',
-          }));
-      }
-      await page.goto(catalogUrl(failure.base, null), {
-        waitUntil: 'domcontentloaded',
-      });
-      await dismissWelcome(page);
-
-      await expect(page.locator(NOTICE)).toBeVisible();
-      const message = await noticeText(page);
-      await testInfo.attach(`catalog-notice-${failure.label}.txt`, {
-        body: message,
-        contentType: 'text/plain',
-      });
-      expect(message).toMatch(/^Sample datasets could not be loaded/);
-      expect(message).toMatch(failure.expect);
-      expect(message).not.toMatch(failure.forbid);
-      // The notice speaks to a bench scientist: whose problem it is, with
-      // the host's status (`describeHostFault`), never a URL or a transport term.
-      expect(message).not.toMatch(/https?:|CORS|gzip|JSON/);
-
-      // Every failure keeps the persistent retry the notice has always had.
-      await expect(page.locator(NOTICE_BUTTON)).toHaveText('Try again');
-      await expect(page.locator(NOTICE_BUTTON)).toBeEnabled();
-
-      // No two of these read the same.
-      expect(
-        seenCatalogSentences.has(message)
-          ? seenCatalogSentences.get(message)
-          : failure.label,
-      ).toBe(failure.label);
-      seenCatalogSentences.set(message, failure.label);
-    },
-  );
-}
-
-/* ------------------------------------------------------------------ *
  * A failed dataset switch persists and offers a way back
  * ------------------------------------------------------------------ */
 
@@ -155,13 +63,9 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
-  // The first opening is over before the link goes (`goOffline`): a read of
-  // it still under way (its gene list, a tree its frames asked for) would
-  // fail offline on its own and say so beside the switch's failure. So is
-  // the samples' listing, which reads their files once the first view has
-  // settled (`holdListingUntil`): the other sample is listed with its cells.
-  await expect(page.locator(`#dataset-select option[value="${optionValue(OTHER_DATASET.id)}"]`))
-    .toHaveText(new RegExp(`${OTHER_DATASET.cells} cells`));
+  // The first opening and the samples' listing are over before the link goes
+  // (`goOffline`): a read of either still under way would fail offline on its
+  // own and say so beside the switch's failure.
   await goOffline(context);
   await page.locator('#dataset-select').selectOption(
     optionValue(OTHER_DATASET.id),
@@ -176,8 +80,8 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   });
   // It names the dataset that failed, what to do, and what survived.
   expect(message).toContain(`"${OTHER_DATASET.name}" could not be opened`);
-  // Why, as it is: this computer is offline (not a host refusing this
-  // network, which an offline switch was once said to be), and what to do.
+  // Why, as it is: this computer is offline (not a host refusing this network),
+  // and what to do.
   expect(message).toContain('This computer is offline');
   expect(message).toMatch(/try again/i);
   expect(message).toContain(`"${GOOD_DATASET.name}" is still open.`);

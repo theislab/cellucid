@@ -7,12 +7,11 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
 /* Cellucid moves things with the pointer in three places: a sidebar panel is
    torn off into a floating window, highlight pages are dropped into the
    category builder and reordered there, and a legend category is dragged onto
-   another to merge the two. Each of those had no keyboard path at all
-   (CEL-AUDIT-0078, CEL-AUDIT-0079, CEL-AUDIT-0085). They now share one
+   another to merge the two. Each of those has a keyboard path, and they share one
    grammar — pick up with Enter/Space, aim with the arrow keys, drop with
    Enter/Space, cancel with Escape — announced through one polite live region.
-   Every test below also drives the pointer path it replaced, because the fix
-   is only correct if the mouse still works. */
+   Every test below also drives the pointer path, because the keyboard path is
+   only correct if the mouse still works. */
 
 const PREPARED_DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=keyboard-move-lifecycle-ci`;
@@ -65,153 +64,250 @@ function liveRegionText(page) {
   });
 }
 
-test('a sidebar panel undocks and docks from the keyboard, and still from the pointer', async ({
+test('what moves by keyboard still moves by pointer: a sidebar panel, the pages of the category builder, a legend category', async ({
   page
 }) => {
   const productErrors = observeProductErrors(page);
   await openPreparedDataset(page);
 
-  const summary = page.locator('#visualization-section > summary');
-  const actions = page.locator(
-    '.accordion-panel:has(> #visualization-section) > .accordion-panel-actions'
-  );
-  const undockButton = actions.locator('> .accordion-undock-btn');
-  const dockButton = actions.locator('> .accordion-dock-btn');
+  await test.step('a sidebar panel undocks and docks from the keyboard, and still from the pointer', async () => {
+    const summary = page.locator('#visualization-section > summary');
+    const actions = page.locator(
+      '.accordion-panel:has(> #visualization-section) > .accordion-panel-actions'
+    );
+    const undockButton = actions.locator('> .accordion-undock-btn');
+    const dockButton = actions.locator('> .accordion-dock-btn');
 
-  /* The way out has to exist before you are through the door: the undock
-     control is present and reachable while the panel is still docked. */
-  await expect(undockButton).toBeVisible();
-  await expect(undockButton).toHaveAttribute(
-    'aria-label',
-    'Undock Visualization panel into a floating window'
-  );
-  await expect(dockButton).toBeHidden();
-  expect(await panelFloatingState(page)).toEqual({
-    floating: false,
-    parentId: '',
-  });
-
-  await undockButton.focus();
-  await expect(undockButton).toBeFocused();
-  await page.keyboard.press('Enter');
-
-  // The key's undock is an action, applied in its turn: waited for, as the
-  // dock below is (read at once, the panel was still docked: Windows Firefox,
-  // nightly run 43141748516).
-  await expect.poll(() => panelFloatingState(page)).toEqual({
-    floating: true,
-    parentId: 'floating-panels-root',
-  });
-  /* Focus follows the panel: the control that was activated is now hidden, so
-     it hands over to the one that reverses it. */
-  await expect(dockButton).toBeVisible();
-  await expect(dockButton).toBeFocused();
-  await expect(undockButton).toBeHidden();
-  expect(await liveRegionText(page)).toContain('is now a floating window');
-
-  await page.keyboard.press('Enter');
-  await expect.poll(() => panelFloatingState(page)).toEqual({
-    floating: false,
-    parentId: '',
-  });
-  await expect(undockButton).toBeFocused();
-  expect(await liveRegionText(page)).toContain('docked in the sidebar again');
-
-  /* The pointer path this replaced still tears the panel off and puts it
-     back. The press is made where the summary is when it is pressed: every
-     step taken above is drawn into the State panel's history as it is
-     recorded, which moves the panels under it. With the summary's place
-     read first and pressed two seconds later (hosted macOS Firefox, Web
-     contracts run 42202865024) the press landed on the Agents panel, which
-     had moved there, and that panel was torn off instead. So the steps are
-     recorded first, the pointer is moved onto the summary itself, and the
-     press is checked to have landed on it before the drag goes on; a
-     press that still met a moving layout is let go and made again. */
-  await page.evaluate(async () => {
-    const { getActions } = await import('/assets/js/app/actions/index.js');
-    await getActions().idle();
-    await window._cellucidHistories.current()?.idle();
-  });
-  for (;;) {
-    await summary.hover({ position: { x: 40, y: 12 } });
-    await page.evaluate(() => {
-      window.__pressedOn = null;
-      window.addEventListener('pointerdown', event => { window.__pressedOn = event.target; }, { capture: true, once: true });
+    /* The way out has to exist before you are through the door: the undock
+       control is present and reachable while the panel is still docked. */
+    await expect(undockButton).toBeVisible();
+    await expect(undockButton).toHaveAttribute(
+      'aria-label',
+      'Undock Visualization panel into a floating window'
+    );
+    await expect(dockButton).toBeHidden();
+    expect(await panelFloatingState(page)).toEqual({
+      floating: false,
+      parentId: '',
     });
-    await page.mouse.down();
-    if (await summary.evaluate(element => window.__pressedOn instanceof Node && element.contains(window.__pressedOn))) break;
+
+    await undockButton.focus();
+    await expect(undockButton).toBeFocused();
+    await page.keyboard.press('Enter');
+
+    // The key's undock is an action, applied in its turn: waited for, as the
+    // dock below is (read at once, the panel is still docked: Windows Firefox).
+    await expect.poll(() => panelFloatingState(page)).toEqual({
+      floating: true,
+      parentId: 'floating-panels-root',
+    });
+    /* Focus follows the panel: the control that was activated is now hidden, so
+       it hands over to the one that reverses it. */
+    await expect(dockButton).toBeVisible();
+    await expect(dockButton).toBeFocused();
+    await expect(undockButton).toBeHidden();
+    expect(await liveRegionText(page)).toContain('is now a floating window');
+
+    await page.keyboard.press('Enter');
+    await expect.poll(() => panelFloatingState(page)).toEqual({
+      floating: false,
+      parentId: '',
+    });
+    await expect(undockButton).toBeFocused();
+    expect(await liveRegionText(page)).toContain('docked in the sidebar again');
+
+    /* The pointer path this replaced still tears the panel off and puts it
+       back. The press is made where the summary is when it is pressed: every
+       step taken above is drawn into the State panel's history as it is
+       recorded, which moves the panels under it. With the summary's place
+       read first and pressed two seconds later (hosted macOS Firefox) the press can
+       land on the Agents panel, which has moved there, and that panel is torn off
+       instead. So the steps are
+       recorded first, the pointer is moved onto the summary itself, and the
+       press is checked to have landed on it before the drag goes on; a
+       press that still met a moving layout is let go and made again. */
+    await page.evaluate(async () => {
+      const { getActions } = await import('/assets/js/app/actions/index.js');
+      await getActions().idle();
+      await window._cellucidHistories.current()?.idle();
+    });
+    for (;;) {
+      await summary.hover({ position: { x: 40, y: 12 } });
+      await page.evaluate(() => {
+        window.__pressedOn = null;
+        window.addEventListener('pointerdown', event => {
+          window.__pressedOn = event.target;
+          window.__pressedAt = { x: event.clientX, y: event.clientY };
+        }, { capture: true, once: true });
+      });
+      await page.mouse.down();
+      if (await summary.evaluate(element => window.__pressedOn instanceof Node && element.contains(window.__pressedOn))) break;
+      await page.mouse.up();
+    }
+    const pressedAt = await page.evaluate(() => window.__pressedAt);
+    /* The drag leaves the sidebar sideways, from the point pressed, and stays
+       inside the page: the summary can stand anywhere in the scrolled sidebar,
+       up to its top edge, and a path aimed above the page never ends in
+       Firefox, whose driver turns a move outside the viewport into one to the
+       window's corner and drops a release there. */
+    await page.mouse.move(pressedAt.x + 540, pressedAt.y, { steps: 12 });
     await page.mouse.up();
-  }
-  const pressed = await summary.boundingBox();
-  if (pressed === null) throw new Error('Docked summary has no box');
-  await page.mouse.move(pressed.x + 540, pressed.y + 12 - 150, { steps: 12 });
-  await page.mouse.up();
-  /* The release floats the panel in the same task (`setupDockedDrag`): it is
-     floating once the release has been answered. */
-  expect(await panelFloatingState(page)).toEqual({
-    floating: true,
-    parentId: 'floating-panels-root',
-  });
-  await expect(
-    page.locator('.accordion-panel:has(> #visualization-section)')
-  ).not.toHaveClass(/floating-enter/);
+    /* The release floats the panel in the same task (`setupDockedDrag`): it is
+       floating once the release has been answered. */
+    expect(await panelFloatingState(page)).toEqual({
+      floating: true,
+      parentId: 'floating-panels-root',
+    });
+    await expect(
+      page.locator('.accordion-panel:has(> #visualization-section)')
+    ).not.toHaveClass(/floating-enter/);
 
-  /* The floating panel's size controls were pointer-only and `aria-hidden`.
-     Its edges are focusable window splitters now: the right edge widens it
-     by arrow key. */
-  const widthHandle = page.locator(
-    '.accordion-panel:has(> #visualization-section)'
-    + ' > .accordion-resize-handle[data-edge="e"]'
-  );
-  await expect(widthHandle).toHaveAttribute('role', 'separator');
-  await expect(widthHandle).toHaveAttribute(
-    'aria-label',
-    'Resize window from its right edge'
-  );
-  await expect(widthHandle).not.toHaveAttribute('aria-hidden', 'true');
-  await widthHandle.focus();
-  await expect(widthHandle).toBeFocused();
-  const widthBefore = await page.evaluate(
-    () => document.getElementById('visualization-section').getBoundingClientRect().width
-  );
-  await page.keyboard.press('ArrowRight');
-  const widthAfter = await page.evaluate(
-    () => document.getElementById('visualization-section').getBoundingClientRect().width
-  );
-  expect(widthAfter - widthBefore).toBeGreaterThanOrEqual(8);
-  /* The reported value tracks the rendered box; engines disagree with each
-     other by a border's width, which is not what this asserts. */
-  const reportedWide = Number(await widthHandle.getAttribute('aria-valuenow'));
-  expect(Number.isSafeInteger(reportedWide)).toBe(true);
-  expect(Math.abs(reportedWide - widthAfter)).toBeLessThanOrEqual(2);
-  await expect(widthHandle).toHaveAttribute(
-    'aria-valuetext',
-    new RegExp(`^${reportedWide} × \\d+ pixels$`)
-  );
+    /* The floating panel's size controls are reachable without a pointer: its
+       edges are focusable window splitters, not `aria-hidden`; the right edge
+       widens it by arrow key. */
+    const widthHandle = page.locator(
+      '.accordion-panel:has(> #visualization-section)'
+      + ' > .accordion-resize-handle[data-edge="e"]'
+    );
+    await expect(widthHandle).toHaveAttribute('role', 'separator');
+    await expect(widthHandle).toHaveAttribute(
+      'aria-label',
+      'Resize window from its right edge'
+    );
+    await expect(widthHandle).not.toHaveAttribute('aria-hidden', 'true');
+    await widthHandle.focus();
+    await expect(widthHandle).toBeFocused();
+    const widthBefore = await page.evaluate(
+      () => document.getElementById('visualization-section').getBoundingClientRect().width
+    );
+    await page.keyboard.press('ArrowRight');
+    const widthAfter = await page.evaluate(
+      () => document.getElementById('visualization-section').getBoundingClientRect().width
+    );
+    expect(widthAfter - widthBefore).toBeGreaterThanOrEqual(8);
+    /* The reported value tracks the rendered box; engines disagree with each
+       other by a border's width, which is not what this asserts. */
+    const reportedWide = Number(await widthHandle.getAttribute('aria-valuenow'));
+    expect(Number.isSafeInteger(reportedWide)).toBe(true);
+    expect(Math.abs(reportedWide - widthAfter)).toBeLessThanOrEqual(2);
+    await expect(widthHandle).toHaveAttribute(
+      'aria-valuetext',
+      new RegExp(`^${reportedWide} × \\d+ pixels$`)
+    );
 
-  await page.keyboard.press('ArrowLeft');
-  const widthRestored = await page.evaluate(
-    () => document.getElementById('visualization-section').getBoundingClientRect().width
-  );
-  expect(widthAfter - widthRestored).toBeGreaterThanOrEqual(8);
-  expect(
-    Number(await widthHandle.getAttribute('aria-valuenow'))
-  ).toBeLessThan(reportedWide);
+    await page.keyboard.press('ArrowLeft');
+    const widthRestored = await page.evaluate(
+      () => document.getElementById('visualization-section').getBoundingClientRect().width
+    );
+    expect(widthAfter - widthRestored).toBeGreaterThanOrEqual(8);
+    expect(
+      Number(await widthHandle.getAttribute('aria-valuenow'))
+    ).toBeLessThan(reportedWide);
 
-  const floatingBox = await summary.boundingBox();
-  if (floatingBox === null) throw new Error('Floating summary has no box');
-  await page.mouse.move(
-    floatingBox.x + 40,
-    floatingBox.y + floatingBox.height / 2
-  );
-  await page.mouse.down();
-  await page.mouse.move(200, 400, { steps: 12 });
-  await page.mouse.up();
-  expect(await panelFloatingState(page)).toEqual({
-    floating: false,
-    parentId: '',
+    const floatingBox = await summary.boundingBox();
+    if (floatingBox === null) throw new Error('Floating summary has no box');
+    await page.mouse.move(
+      floatingBox.x + 40,
+      floatingBox.y + floatingBox.height / 2
+    );
+    await page.mouse.down();
+    await page.mouse.move(200, 400, { steps: 12 });
+    await page.mouse.up();
+    expect(await panelFloatingState(page)).toEqual({
+      floating: false,
+      parentId: '',
+    });
   });
 
+  await test.step('the category builder still accepts the pointer drags it always accepted', async () => {
+    await openCategoryBuilder(page, 1);
+
+    const dropzone = page.locator('#cat-builder-dropzone');
+    const tabs = page.locator('.highlight-page-tab');
+    await expect(tabs).toHaveCount(2);
+
+    await dispatchAppDrag(tabs.nth(0), dropzone, {
+      expectedDataType: 'application/x-highlight-page'
+    });
+    await dispatchAppDrag(tabs.nth(1), dropzone, {
+      expectedDataType: 'application/x-highlight-page'
+    });
+    expect(await droppedLabels(page)).toEqual(['Page 1', 'Page 2']);
+
+    const items = page.locator('#dropzone-items .dropzone-item');
+    await dispatchAppDrag(items.nth(0), items.nth(1));
+    expect(await droppedLabels(page)).toEqual(['Page 2', 'Page 1']);
+  });
+
+  await test.step('a legend category merges into another from the keyboard, and still by drag', async () => {
+    await selectCategoricalField(page);
+    expect(await legendCategoryNames(page)).toEqual(['alpha', 'beta', 'gamma']);
+
+    const labels = page.locator('#legend .legend-label');
+    /* The label is `draggable` and also focusable, with a role. */
+    await expect(labels.first()).toHaveAttribute('role', 'button');
+    await expect(labels.first()).toHaveAttribute('tabindex', '0');
+    await expect(labels.first()).toHaveAttribute(
+      'aria-roledescription',
+      'movable category'
+    );
+    await expect(labels.first()).toHaveAttribute(
+      'aria-describedby',
+      'keyboard-move-instructions'
+    );
+
+    await labels.first().focus();
+    await expect(labels.first()).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect.poll(() => liveRegionText(page)).toContain('alpha picked up');
+    expect(await liveRegionText(page)).toContain('Destination 1 of 2: beta');
+    /* Aiming paints the row with the class the pointer path paints on
+       `dragenter`, so both inputs mark the destination the same way. */
+    expect(
+      await page.evaluate(() =>
+        document.querySelectorAll('#legend .legend-item-drag-over').length
+      )
+    ).toBe(1);
+    await page.keyboard.press('ArrowDown');
+    await expect.poll(() => liveRegionText(page)).toContain('Destination 2 of 2: gamma');
+
+    await page.keyboard.press('Escape');
+    await expect.poll(() => liveRegionText(page)).toContain('Move canceled');
+    expect(
+      await page.evaluate(() =>
+        document.querySelectorAll(
+          '#legend .legend-item-drag-over, #legend .legend-item-dragging'
+        ).length
+      )
+    ).toBe(0);
+    expect(await legendCategoryNames(page)).toEqual(['alpha', 'beta', 'gamma']);
+
+    /* Dropping runs the same confirmation the pointer drop runs. */
+    await labels.first().focus();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    const dialog = page.locator('.confirm-dialog');
+    await expect(dialog).toContainText('Merge category "alpha" into "beta"?');
+    await page.getByRole('button', { name: 'Merge', exact: true }).click();
+    /* The merge is an action: the legend is drawn again when it has run. The
+       rows keep the field's own order: the merged category takes the
+       place of the one it was merged into. */
+    await expect.poll(() => legendCategoryNames(page)).toEqual([
+      'merged alpha + beta',
+      'gamma'
+    ]);
+
+    /* And the drag that was the only way in still works. */
+    const remaining = page.locator('#legend .legend-item');
+    await dispatchAppDrag(
+      remaining.nth(1).locator('.legend-label'),
+      remaining.nth(0),
+      { expectedDataType: 'application/x-cellucid-category' }
+    );
+    await expect(dialog).toContainText('Merge category "gamma" into "merged alpha + beta"?');
+    await page.getByRole('button', { name: 'Merge', exact: true }).click();
+    await expect(page.locator('#legend .legend-item')).toHaveCount(1);
+  });
   expect(productErrors).toEqual([]);
 });
 
@@ -241,7 +337,7 @@ test('the category builder can be filled, reordered and confirmed from the keybo
   await openPreparedDataset(page);
   await openCategoryBuilder(page, 2);
 
-  /* The drop target announced nothing at all: no role, no name. */
+  /* The drop target announces itself: a role and a name. */
   const dropzone = page.locator('#cat-builder-dropzone');
   await expect(dropzone).toHaveAttribute('role', 'group');
   await expect(dropzone).toHaveAttribute('aria-label', 'Category labels');
@@ -296,8 +392,8 @@ test('the category builder can be filled, reordered and confirmed from the keybo
     )
   ).toBe(0);
 
-  /* The whole point of filling the zone: Create was permanently disabled for a
-     keyboard user because nothing could ever be dropped. */
+  /* The whole point of filling the zone: Create must not stay disabled for a
+     keyboard user because nothing can be dropped. */
   await page.locator('#cat-builder-name').fill('Keyboard categories');
   await expect(confirmButton).toBeEnabled();
   await confirmButton.click();
@@ -306,32 +402,6 @@ test('the category builder can be filled, reordered and confirmed from the keybo
       hasText: 'Keyboard categories'
     })
   ).toHaveCount(1);
-
-  expect(productErrors).toEqual([]);
-});
-
-test('the category builder still accepts the pointer drags it always accepted', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedDataset(page);
-  await openCategoryBuilder(page, 1);
-
-  const dropzone = page.locator('#cat-builder-dropzone');
-  const tabs = page.locator('.highlight-page-tab');
-  await expect(tabs).toHaveCount(2);
-
-  await dispatchAppDrag(tabs.nth(0), dropzone, {
-    expectedDataType: 'application/x-highlight-page'
-  });
-  await dispatchAppDrag(tabs.nth(1), dropzone, {
-    expectedDataType: 'application/x-highlight-page'
-  });
-  expect(await droppedLabels(page)).toEqual(['Page 1', 'Page 2']);
-
-  const items = page.locator('#dropzone-items .dropzone-item');
-  await dispatchAppDrag(items.nth(0), items.nth(1));
-  expect(await droppedLabels(page)).toEqual(['Page 2', 'Page 1']);
 
   expect(productErrors).toEqual([]);
 });
@@ -354,79 +424,3 @@ async function selectCategoricalField(page) {
   await select.selectOption(value);
   await expect(page.locator('#legend .legend-item')).toHaveCount(3);
 }
-
-test('a legend category merges into another from the keyboard, and still by drag', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedDataset(page);
-  await selectCategoricalField(page);
-  expect(await legendCategoryNames(page)).toEqual(['alpha', 'beta', 'gamma']);
-
-  const labels = page.locator('#legend .legend-label');
-  /* The label was `draggable` and nothing else — not focusable, no role. */
-  await expect(labels.first()).toHaveAttribute('role', 'button');
-  await expect(labels.first()).toHaveAttribute('tabindex', '0');
-  await expect(labels.first()).toHaveAttribute(
-    'aria-roledescription',
-    'movable category'
-  );
-  await expect(labels.first()).toHaveAttribute(
-    'aria-describedby',
-    'keyboard-move-instructions'
-  );
-
-  await labels.first().focus();
-  await expect(labels.first()).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect.poll(() => liveRegionText(page)).toContain('alpha picked up');
-  expect(await liveRegionText(page)).toContain('Destination 1 of 2: beta');
-  /* Aiming paints the row with the class the pointer path paints on
-     `dragenter`, so both inputs mark the destination the same way. */
-  expect(
-    await page.evaluate(() =>
-      document.querySelectorAll('#legend .legend-item-drag-over').length
-    )
-  ).toBe(1);
-  await page.keyboard.press('ArrowDown');
-  await expect.poll(() => liveRegionText(page)).toContain('Destination 2 of 2: gamma');
-
-  await page.keyboard.press('Escape');
-  await expect.poll(() => liveRegionText(page)).toContain('Move canceled');
-  expect(
-    await page.evaluate(() =>
-      document.querySelectorAll(
-        '#legend .legend-item-drag-over, #legend .legend-item-dragging'
-      ).length
-    )
-  ).toBe(0);
-  expect(await legendCategoryNames(page)).toEqual(['alpha', 'beta', 'gamma']);
-
-  /* Dropping runs the same confirmation the pointer drop runs. */
-  await labels.first().focus();
-  await page.keyboard.press('Enter');
-  await page.keyboard.press('Enter');
-  const dialog = page.locator('.confirm-dialog');
-  await expect(dialog).toContainText('Merge category "alpha" into "beta"?');
-  await page.getByRole('button', { name: 'Merge', exact: true }).click();
-  /* The merge is an action: the legend is drawn again when it has run. The
-     rows keep the field's own order (F124): the merged category takes the
-     place of the one it was merged into. */
-  await expect.poll(() => legendCategoryNames(page)).toEqual([
-    'merged alpha + beta',
-    'gamma'
-  ]);
-
-  /* And the drag that was the only way in still works. */
-  const remaining = page.locator('#legend .legend-item');
-  await dispatchAppDrag(
-    remaining.nth(1).locator('.legend-label'),
-    remaining.nth(0),
-    { expectedDataType: 'application/x-cellucid-category' }
-  );
-  await expect(dialog).toContainText('Merge category "gamma" into "merged alpha + beta"?');
-  await page.getByRole('button', { name: 'Merge', exact: true }).click();
-  await expect(page.locator('#legend .legend-item')).toHaveCount(1);
-
-  expect(productErrors).toEqual([]);
-});

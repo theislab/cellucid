@@ -8,12 +8,12 @@
  * with the identity display transform; the vectors are scaled exactly once,
  * by the writer's factor, in the same worker.
  *
- * What made this fragile was ownership: the adapter handed the DimensionManager
- * the very array it kept in its own cache, so the in-place display
- * normalization rewrote the adapter's cache, a reload after an eviction
- * normalized that rewritten array again, and the eviction released nothing
- * while the adapter still held it. The payload route now hands its array over
- * and forgets it.
+ * Ownership keeps it so: the payload route hands its array over to the
+ * DimensionManager and forgets it. Were the adapter to hand over the very
+ * array it keeps in its own cache, the in-place display normalization would
+ * rewrite the adapter's cache, a reload after an eviction would normalize
+ * that rewritten array again, and the eviction would release nothing while
+ * the adapter still held it.
  *
  * The cases below load real `.h5ad` and Zarr ZIP fixtures, reload them after
  * evictions, and check every result against the one normalization rule.

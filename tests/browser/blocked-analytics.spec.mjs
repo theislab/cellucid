@@ -1,8 +1,8 @@
 /**
  * A privacy blocker refusing the analytics modules must not stop Cellucid.
  *
- * EasyPrivacy refuses `/analytics/tracker.js`; while it was a static import,
- * the refusal aborted the whole module graph and the page showed "Cellucid
+ * EasyPrivacy refuses `/analytics/tracker.js`; were it a static import,
+ * the refusal would abort the whole module graph and the page would show "Cellucid
  * could not load its code". The request is refused here the way a blocker
  * refuses it, and the app must start, load the dataset and stay usable.
  */

@@ -55,7 +55,7 @@ test('a connection says who, through which host, since when and when last used',
   assert.deepEqual(describeConnection({
     agent: 'Claude', client: 'Claude Code', host: 'claude.ai', known: true, createdAt: now, lastUsedAt: now,
   }, now), { title: 'Claude (Claude Code)', meta: 'claude.ai · connected now · used now' });
-  // F122: an app no host vouches for is named by its host (or as an app on this computer); its own name only in quotes.
+  // An app no host vouches for is named by its host (or as an app on this computer); its own name only in quotes.
   assert.deepEqual(describeConnection({
     agent: 'evil.example', client: 'Claude', host: 'evil.example', known: false, createdAt: now, lastUsedAt: now,
   }, now), { title: 'evil.example (calls itself “Claude”)', meta: 'evil.example · connected now · used now' });
@@ -64,7 +64,7 @@ test('a connection says who, through which host, since when and when last used',
   }, now), { title: 'An app on this computer (calls itself “Claude Code (cli)”)', meta: 'an app on this computer · connected now · used now' });
 });
 
-test('F122: an app named "Claude" that no host vouches for is asked about by its host, its name only quoted', () => {
+test('an app named "Claude" that no host vouches for is asked about by its host, its name only quoted', () => {
   const fake = describeApproval({
     display: 'ABCD-EFGH', via: 'link',
     client: { agent: 'evil.example', name: 'Claude', host: 'evil.example', redirectHost: 'evil.example', loopback: false, known: false },
@@ -85,7 +85,7 @@ test('the approval says who asks, where the answer goes, and warns about an unkn
   assert.equal(known.title, 'Connect Claude?');
   assert.match(known.who, /^Claude \(claude\.ai\) asks to work in Cellucid in this browser/);
   assert.equal(known.where, 'The answer goes to claude.ai.');
-  // LG-W1: a link can come from anyone's Claude; the relay cannot tell whose.
+  // A link can come from anyone's Claude; the relay cannot tell whose.
   assert.deepEqual(known.warnings, ['Allow only if you asked Claude to connect just now, never for a link someone sent you.']);
   const typed = describeApproval({
     display: 'ABCD-EFGH', via: 'typed',

@@ -20,6 +20,14 @@
  */
 
 /**
+ * A debounced function (`debounce`): called with the arguments `A`, with its
+ * `cancel()`, `flush()` and `pending`.
+ *
+ * @template {unknown[]} A
+ * @typedef {((...args: A) => void) & {cancel: () => boolean, flush: () => boolean, readonly pending: boolean}} Debounced
+ */
+
+/**
  * `callback`, run once `waitMs` passed without another call, with the last
  * call's arguments. `waitMs` may be a function of those arguments (a wait the
  * caller measures or names per call). The function returned has:
@@ -35,7 +43,7 @@
  * @param {(...args: A) => void} callback
  * @param {number|((...args: A) => number)} waitMs
  * @param {{unref?: boolean}} [options]
- * @returns {((...args: A) => void) & {cancel: () => boolean, flush: () => boolean, readonly pending: boolean}}
+ * @returns {Debounced<A>}
  */
 export function debounce(callback, waitMs, { unref = false } = {}) {
   if (typeof callback !== 'function') throw new TypeError('A debounce runs a function.');

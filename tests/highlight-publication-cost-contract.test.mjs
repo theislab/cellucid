@@ -1,7 +1,7 @@
 /**
  * What applying a highlight is allowed to cost.
  *
- * Three separate regressions, all of which cost time proportional to the
+ * Three separate costs, none of which may be proportional to the
  * dataset rather than to what the user changed:
  *
  * - A filter interaction that moves no cell across the visible boundary must
@@ -250,7 +250,7 @@ function referencePackedBytes({
   return new Uint8Array(packed);
 }
 
-// --- CEL-0142: a filter change that moves no visible cell -------------------
+// --- A filter change that moves no visible cell -------------------
 
 test('an unmoved alpha generation is reported, so a no-op filter change repacks nothing', () => {
   const { alphaCalls, renderer } = makeHighPerfRenderer();
@@ -388,7 +388,7 @@ test('the live transparency publication gates the highlight invalidation', async
   );
 });
 
-// --- CEL-0143: how many times a selection may be walked and copied ----------
+// --- How many times a selection may be walked and copied ----------
 
 test('a direct highlight takes a cell list and owns a copy of it', () => {
   const fixture = makeFixture();
@@ -626,7 +626,7 @@ test('a preview union that outgrows its sizing pass fails loudly', () => {
   );
 });
 
-// --- CEL-0145: what the reported GPU memory covers --------------------------
+// --- What the reported GPU memory covers --------------------------
 
 test('reported GPU memory includes the per-view highlight buffers', () => {
   const { renderer } = makeHighPerfRenderer();

@@ -1,6 +1,5 @@
 /**
- * Icon-only controls in index.html must carry a real accessible name
- * (CEL-AUDIT-0086).
+ * Icon-only controls in index.html must carry a real accessible name.
  *
  * `title` is the last fallback in the accessible-name computation. It renders
  * as a hover tooltip, so a keyboard or touch user never sees it, and some

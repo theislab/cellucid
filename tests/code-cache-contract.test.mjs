@@ -41,8 +41,11 @@ function cacheStorage() {
   };
 }
 
-/** The worker of `build`, with the network answering from `files` (by URL). */
-function startWorker({ build, storage = cacheStorage(), files = new Map() }) {
+/**
+ * The worker of `build`, with the network answering from `files` (by URL),
+ * each answer once `answering` has resolved.
+ */
+function startWorker({ build, storage = cacheStorage(), files = new Map(), answering = Promise.resolve() }) {
   const listeners = new Map();
   const network = [];
   const scope = {
@@ -55,6 +58,7 @@ function startWorker({ build, storage = cacheStorage(), files = new Map() }) {
   const fetchImpl = async request => {
     const url = typeof request === 'string' ? request : request.url;
     network.push(url);
+    await answering;
     if (!files.has(url)) return Object.assign(new Response('missing', { status: 404 }), {});
     const response = new Response(files.get(url), { status: 200, headers: { 'content-type': 'text/javascript' } });
     Object.defineProperty(response, 'type', { value: 'basic' });
@@ -140,16 +144,24 @@ test('a file is answered from this browser once kept, and kept only when its byt
   assert.equal(worker.network.filter(request => request === missing).length, 2);
 });
 
-test('the files a visit loaded are kept when the page names them', async () => {
+test('the files a visit loaded are kept when the page names them, all at once', async () => {
   const main = 'main';
   const url = `${SCOPE}assets/js/app/main.js?v=${version(main)}`;
   const chunk = `${SCOPE}assets/page/main.ABCDEFGH.js`;
-  const worker = startWorker({ build: '2026-10-29.aaaaaaaa', files: new Map([[url, main], [chunk, 'entry']]) });
-  await worker.keep([url, chunk, `${SCOPE}assets/img/logo.svg`, 'https://example.org/x.js', 42]);
-  assert.deepEqual(worker.network, [url, chunk]);
+  let answer;
+  const answering = new Promise(resolve => { answer = resolve; });
+  const worker = startWorker({ build: '2026-10-29.aaaaaaaa', files: new Map([[url, main], [chunk, 'entry']]), answering });
+  const kept = worker.keep([url, chunk, chunk, `${SCOPE}assets/img/logo.svg`, 'https://example.org/x.js', 42, 'not a url']);
+  // Every file is asked for before the first answer: a worker's event has a
+  // time limit, and the files one after another take the sum of their fetches.
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(worker.network.sort(), [chunk, url].sort());
+  answer();
+  await kept;
+  assert.deepEqual(worker.network.sort(), [chunk, url].sort(), 'each file once');
   await worker.request(url);
   await worker.request(chunk);
-  assert.deepEqual(worker.network, [url, chunk], 'the next visit finds them kept');
+  assert.deepEqual(worker.network.sort(), [chunk, url].sort(), 'the next visit finds them kept');
 });
 
 test('a new build reuses what an earlier one kept and forgets all but the newest other build', async () => {

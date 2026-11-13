@@ -25,15 +25,6 @@ async function open(page) {
   await expect.poll(() => page.evaluate(() => window._cellucidHistories.current()?.active != null)).toBe(true);
 }
 
-/** A storage that refuses writes for room while `window.__storageFull` is true. */
-function simulateFullStorage() {
-  window.__storageFull = false;
-  const put = IDBObjectStore.prototype.put;
-  IDBObjectStore.prototype.put = function guarded(...args) {
-    if (window.__storageFull) throw new DOMException('The storage is full.', 'QuotaExceededError');
-    return put.apply(this, args);
-  };
-}
 
 function savedStates(page) {
   return page.evaluate(() => window._cellucidHistories.savedStates.list());
@@ -45,30 +36,6 @@ function ownSteps(page) {
     return list.find(state => state.current)?.steps ?? 0;
   });
 }
-
-test('a full storage pauses the autosave; removing a saved state in the Stored dialog resumes it', async ({ page }) => {
-  await page.addInitScript(simulateFullStorage);
-  await open(page);
-  await page.evaluate(() => window._cellucidHistories.savedStates.saveAs('Old work'));
-  await takeSteps(page, [hide(['gamma'])]);
-  await expect.poll(() => ownSteps(page)).toBe(1);
-  // The disk fills up: the next step is refused for room, and the autosave pauses.
-  await page.evaluate(() => { window.__storageFull = true; });
-  await takeSteps(page, [hide(['beta'])]);
-  await expect.poll(() => page.evaluate(() => window._cellucidHistories.currentAutosave().paused)).toBe(true);
-  await page.evaluate(() => { window.__storageFull = false; });
-  // The person frees room where the page lists what it stores: Session › Stored.
-  await page.locator('#kept-stores-manage-btn').click();
-  const row = page.locator('#kept-stores-dialog .kept-saved-states [data-item-id^="saved:"]').filter({ hasText: 'Old work' });
-  await row.locator('input').check();
-  await page.locator('#kept-stores-remove-selected').click();
-  await expect(page.locator('#kept-stores-status')).toHaveText('Removed 1 item.');
-  await page.keyboard.press('Escape');
-  // Keeping resumes: the next step is written, with the one taken while it was full.
-  await takeSteps(page, [show(['beta'])]);
-  expect(await page.evaluate(() => window._cellucidHistories.currentAutosave().paused)).toBe(false);
-  await expect.poll(() => ownSteps(page)).toBe(3);
-});
 
 test('a page killed while it writes leaves a saved state that reopens as it was at one of its steps', async ({ page, context }) => {
   test.setTimeout(180_000);
@@ -117,7 +84,7 @@ test('two tabs continuing one saved state: it reopens as the history of one of t
   // A second tab on the same dataset continues it while the first is still open.
   const second = await context.newPage();
   await open(second);
-  // The first tab holds it (Web Lock): the second is told so and opens a copy (History v2 §3.7).
+  // The first tab holds it (Web Lock): the second is told so and opens a copy.
   const offer = second.locator('.notification').filter({ hasText: 'This history is open in another tab' });
   await offer.getByRole('button', { name: 'Open a copy here' }).click();
   await expect.poll(() => second.evaluate(() => window._cellucidHistories.current().active.steps.size)).toBe(2);

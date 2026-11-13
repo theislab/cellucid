@@ -4,12 +4,10 @@
  * Multisample antialiasing: what the user asked for, and what a dataset asks for
  * when the user has not.
  *
- * Antialiasing used to be a WebGL context-creation attribute, fixed for the life
- * of the page, and this module existed to say so: it stored `on` or `off`, was
- * read once before the viewer was built, and the control told the user the choice
- * applied on the next load. `rendering/scene-msaa-target.js` replaced that with a
- * multisampled renderbuffer the application owns, so the setting is now live, and
- * this module answers a different question.
+ * Antialiasing is not a WebGL context-creation attribute fixed for the life of
+ * the page: `rendering/scene-msaa-target.js` multisamples a renderbuffer the
+ * application owns, so the setting is live, and this module answers what to
+ * do when nothing has been chosen.
  *
  * The question is what to do when nothing has been chosen. A single default
  * cannot be right for every dataset: at millions of cells multisampling is the
@@ -61,13 +59,12 @@ export const AUTOMATIC_ANTIALIAS_CELL_LIMIT = 5_000_000;
  * The cell count at which automatic antialiasing turns off for a 1D or 2D view.
  *
  * A flat view draws without depth testing, so every overlapping point is shaded
- * and blended in order — per sample under multisampling. Measured on an Apple
- * M1 Pro (ANGLE Metal) orbiting a 1,000,000-cell 2D view, antialiasing took
- * the GPU timer total from 11.6 to 25.5 ms a frame with `full` (2.2×) and from
- * 9.9 to 17.5 ms with `ultralight` (`scripts/render-scenarios.mjs --antialias`),
- * against a 20–35% cost in 3D, where depth testing rejects most fragments
- * first. The cost grows with the cell count, so at this many cells the
- * antialiased frame fits a 120 Hz budget on far smaller GPUs.
+ * and blended in order — per sample under multisampling, which more than
+ * doubles the GPU frame time of a million-cell 2D view, against a much smaller
+ * cost in 3D, where depth testing rejects most fragments
+ * first (measured: 28_decisions_rendering_layers.md). The cost grows with the
+ * cell count, so at this many cells the antialiased frame fits a 120 Hz budget
+ * on far smaller GPUs.
  */
 export const AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT = 200_000;
 

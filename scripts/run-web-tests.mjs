@@ -4,16 +4,26 @@ import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
+import { coreTestFiles } from './test-suites.mjs';
+
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testsDirectory = path.join(repositoryRoot, 'tests');
 
-// The files named on the command line, else every contract test.
-const testFiles = process.argv.length > 2
-  ? process.argv.slice(2).map(file => path.resolve(file))
-  : readdirSync(testsDirectory, { withFileTypes: true })
-    .filter(entry => entry.isFile() && entry.name.endsWith('.test.mjs'))
-    .map(entry => path.join(testsDirectory, entry.name))
-    .sort();
+// `--core`: the core contract tests (`scripts/test-suites.mjs`, `npm run
+// test:core`). Else the files named on the command line, else every contract
+// test.
+const named = process.argv.slice(2);
+if (named.includes('--core') && named.length > 1) {
+  throw new Error('--core runs the core contract tests and takes no file.');
+}
+const testFiles = named[0] === '--core'
+  ? coreTestFiles()
+  : named.length > 0
+    ? named.map(file => path.resolve(file))
+    : readdirSync(testsDirectory, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.endsWith('.test.mjs'))
+      .map(entry => path.join(testsDirectory, entry.name))
+      .sort();
 
 if (testFiles.length === 0) {
   throw new Error(`No web contract tests found in ${testsDirectory}`);
@@ -23,13 +33,11 @@ if (testFiles.length === 0) {
 // resolves once an earlier step failed). A file is stopped, and fails naming
 // the last test it finished, only when it has finished no test for this long:
 // a machine slower than expected is not a hang. A bound on a file's whole
-// time (`--test-timeout`, 120 s) failed four files on one runner five times
-// slower than its peers (Web contracts run 42334181105, ubuntu-latest / Node
-// 22: 18.7 min for the suite against 3.5-5.5 on every other runner; a test
-// of `formats-decode-pool` took 101 s there, 19.7 s on the others), while
-// every one of them was making progress. No contract test takes more than
-// seconds on a runner of the usual speed. `CELLUCID_TEST_STALL_MS` sets the
-// bound (`tests/web-test-runner-contract.test.mjs`).
+// time (`--test-timeout`) would fail files on a runner several times slower
+// than its peers while every one of them was making progress (measured:
+// 38_decisions_testing_and_hosted_runners.md). No contract test takes more
+// than seconds on a runner of the usual speed. `CELLUCID_TEST_STALL_MS` sets
+// the bound (`tests/web-test-runner-contract.test.mjs`).
 const STALL_MS = Number(process.env.CELLUCID_TEST_STALL_MS ?? 300_000);
 if (!Number.isFinite(STALL_MS) || STALL_MS <= 0) {
   throw new Error('CELLUCID_TEST_STALL_MS must be a positive number of milliseconds.');
@@ -65,7 +73,7 @@ function stopTree(child) {
 
 // A file's process leads a process group of its own (`detached`, POSIX), and
 // the terminal's Ctrl-C and a CI cancellation signal only this process's
-// group: without this, an interrupted run left every file it had started
+// group: without this, an interrupted run would leave every file it had started
 // running, a hung one for ever. Each is stopped with its tree before this
 // process ends on the signal. (On Windows the files share this console,
 // which delivers Ctrl-C to each of them.)

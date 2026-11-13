@@ -11,7 +11,7 @@ import { FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import { ICONS, createButton, createDisclosure, createIconButton } from '../components/controls.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { requireExactKeys } from '../../../utils/exact-record.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
 
 const INIT_KEYS = new Set(['state', 'deletedFieldsSection']);

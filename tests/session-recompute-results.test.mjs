@@ -1,6 +1,6 @@
 /**
  * The analysis results a shared session left out, computed again once it is
- * open (`app/session/recompute-results.js`, History v2 §3.15.4):
+ * open (`app/session/recompute-results.js`):
  *
  * - only results left out are found, in windows (by number) and in the
  *   docked panel; an analysis that never ran is not;

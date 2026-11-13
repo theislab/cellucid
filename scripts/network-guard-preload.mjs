@@ -7,11 +7,11 @@
  *   node --import ./scripts/network-guard-preload.mjs --test tests/<file>.test.mjs
  *
  * A contract test answers every host it reads from with a fake of it. A
- * request that reached the real network was one that outlived the fake (a
+ * request that reaches the real network is one that outlived the fake (a
  * read a disconnected source left running, retried after the test put the
- * real `fetch` back; requests an opening asked for beside one that failed:
- * `close-stops-reads-contract`, 2026-11-01) or one nobody faked, and it made
- * a run depend on a host it does not own. So:
+ * real `fetch` back; requests an opening asked for beside one that failed)
+ * or one nobody faked, and it makes a run depend on a host it does not own.
+ * So:
  *
  * - `fetch` to a non-loopback `http(s)`/`ws(s)` URL rejects at once with a
  *   `TypeError` naming the URL (as a refused connection does), before any

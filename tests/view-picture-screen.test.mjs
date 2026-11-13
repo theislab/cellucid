@@ -1,10 +1,9 @@
 /**
- * L18-1 (live pass 5): an agent asked "show me where the cells are heading"
- * turned the vector field overlay on, tuned it blind ("pictures leave the
- * overlay out, so I can't see the streaks myself") and left a flow blown to
- * white. `view.picture` drew only what the figure export draws. It now takes
- * `source: 'screen'`, the view's pane as the screen shows it (the overlay
- * included), and a figure picture taken while an overlay is on says so.
+ * `view.picture` takes `source: 'screen'`, the view's pane as the screen
+ * shows it (the overlay included), and a figure picture taken while an
+ * overlay is on says so: a figure picture leaves the overlay out, so an agent
+ * tuning the vector field overlay would do it blind and leave a flow blown
+ * to white.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -85,7 +84,7 @@ test('a view not on screen is refused with what to do', async () => {
   );
 });
 
-test('a figure picture taken while the flow is shown says it is drawn as arrows, and how to see the particles (R9V-10)', async () => {
+test('a figure picture taken while the flow is shown says it is drawn as arrows, and how to see the particles', async () => {
   const { reads, figureCalls } = setUp({ overlayOn: true });
   const out = await reads.picture({ width: 640, height: 480, legend: true }, {});
   assert.equal(figureCalls(), 1);

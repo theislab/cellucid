@@ -1,6 +1,6 @@
 /**
  * @fileoverview Turns: one agent's or one notebook's turn as a record of
- * its tracker (History v2 §3.3.10, §3.12). A turn is made with its first
+ * its tracker. A turn is made with its first
  * step (the dispatch's meta names it: `turn`, `turnLabel`, `agent`, `model`,
  * `conversation`, `message`), acts on one branch (where it started, or
  * where the agent switched to), and is undone as one: back to before it when

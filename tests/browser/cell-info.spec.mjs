@@ -77,9 +77,9 @@ async function countPicks(page) {
  * Polls on it keep the suite's expect timeout. Coming to rest is counted in
  * frames, not seconds: inertia decays once per frame, each frame advancing it
  * by at most MAX_FRAME_DT (0.25 s), and the presented camera then needs two
- * unchanged frames to settle. A renderer drawing a frame every 1.5-2 s (hosted
- * macOS Firefox) needs longer than a fixed ten seconds for a release with a
- * fling, while the camera is behaving exactly as designed.
+ * unchanged frames to settle. A renderer drawing a frame every 1.5-2 s needs
+ * longer than a fixed ten seconds for a release with a fling, while the
+ * camera is behaving exactly as designed.
  */
 function cameraMotion(page) {
   return page.evaluate(() => {
@@ -107,129 +107,146 @@ async function enable(page) {
   await page.locator('#cell-info-toggle').check();
 }
 
-test('cell info is on by default; unticked, a hover shows nothing', async ({ page }) => {
+// One opening, the card walked in turn. The long names come last: they rename the field.
+test('the hover card in one pane: off it shows nothing; on it names the category, a continuous value, drawn cells under level of detail, and long names whole', async ({ page }) => {
   await openDataset(page);
-  await expect(page.locator('#cell-info-toggle')).toBeChecked();
-  await expect(page.locator('#cell-info-categories-toggle')).toBeEnabled();
-  await page.locator('#cell-info-toggle').uncheck();
-  // Its option means nothing while the card is off.
-  await expect(page.locator('#cell-info-categories-toggle')).toBeDisabled();
-  const cell = await findCell(page);
-  await page.mouse.move(cell.x - 10, cell.y - 10);
-  await page.mouse.move(cell.x, cell.y, { steps: 3 });
-  await outlastCardTimer(page, REST_MS);
-  await expect(page.locator('#cell-info-card')).toBeHidden();
-});
+  await openCollapsedPanels(page);
 
-test('a hover names the value the pane is colored by, and leaving hides it', async ({ page }) => {
-  await openDataset(page);
-  await enable(page);
-  const cell = await findCell(page);
-  await page.mouse.move(cell.x - 10, cell.y - 10);
-  await page.mouse.move(cell.x, cell.y, { steps: 3 });
-  const card = page.locator('#cell-info-card');
-  await expect(card).toBeVisible();
-  await expect(card.locator('.cell-info-value')).toHaveText(await expectedLabel(page, cell));
-  await expect(card.locator('.cell-info-field')).toHaveText('cell_type');
-  // The count is what selecting this category in this pane would pick.
-  const expectedCount = await page.evaluate(({ viewId, cellIndex }) => {
-    const field = window._cellucidState.getFieldForView(viewId);
-    const visible = window._cellucidViewer.getViewTransparency(viewId);
-    const code = field.codes[cellIndex];
-    let count = 0;
-    for (let i = 0; i < field.codes.length; i++) {
-      if (field.codes[i] === code && visible[i] > 0) count++;
+  await test.step('cell info is on by default; unticked, a hover shows nothing', async () => {
+    await expect(page.locator('#cell-info-toggle')).toBeChecked();
+    await expect(page.locator('#cell-info-categories-toggle')).toBeEnabled();
+    await page.locator('#cell-info-toggle').uncheck();
+    // Its option means nothing while the card is off.
+    await expect(page.locator('#cell-info-categories-toggle')).toBeDisabled();
+    const cell = await findCell(page);
+    await page.mouse.move(cell.x - 10, cell.y - 10);
+    await page.mouse.move(cell.x, cell.y, { steps: 3 });
+    await outlastCardTimer(page, REST_MS);
+    await expect(page.locator('#cell-info-card')).toBeHidden();
+  });
+
+  await test.step('a hover names the value the pane is colored by, and leaving hides it', async () => {
+    await enable(page);
+    const cell = await findCell(page);
+    await page.mouse.move(cell.x - 10, cell.y - 10);
+    await page.mouse.move(cell.x, cell.y, { steps: 3 });
+    const card = page.locator('#cell-info-card');
+    await expect(card).toBeVisible();
+    await expect(card.locator('.cell-info-value')).toHaveText(await expectedLabel(page, cell));
+    await expect(card.locator('.cell-info-field')).toHaveText('cell_type');
+    // The count is what selecting this category in this pane would pick.
+    const expectedCount = await page.evaluate(({ viewId, cellIndex }) => {
+      const field = window._cellucidState.getFieldForView(viewId);
+      const visible = window._cellucidViewer.getViewTransparency(viewId);
+      const code = field.codes[cellIndex];
+      let count = 0;
+      for (let i = 0; i < field.codes.length; i++) {
+        if (field.codes[i] === code && visible[i] > 0) count++;
+      }
+      return count;
+    }, cell);
+    await expect(card.locator('.cell-info-count')).toHaveText(`${expectedCount} cells`);
+    await expect(card).not.toContainText(/Cell \d/);
+    await expect(card).toHaveCSS('pointer-events', 'none');
+
+    // Off the canvas, the card goes.
+    await page.locator('#sidebar').hover();
+    await expect(card).toBeHidden();
+
+    // Switching it off removes it at once, even under a resting pointer.
+    await page.mouse.move(cell.x, cell.y);
+    await expect(card).toBeVisible();
+    await page.locator('#cell-info-toggle').uncheck();
+    await expect(card).toBeHidden();
+  });
+
+  await test.step('a continuous field shows its value on the color scale', async () => {
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    await enable(page);
+    const cell = await findCell(page);
+    await page.mouse.move(cell.x - 10, cell.y - 10);
+    await page.mouse.move(cell.x, cell.y, { steps: 3 });
+    const card = page.locator('#cell-info-card');
+    await expect(card).toBeVisible();
+    const value = await page.evaluate(({ viewId, cellIndex }) => (
+      window._cellucidState.getFieldForView(viewId).values[cellIndex]
+    ), cell);
+    await expect(card.locator('.cell-info-field')).toHaveText('score');
+    expect(Number(await card.locator('.cell-info-value').textContent()))
+      .toBeCloseTo(value, 3);
+    await expect(card.locator('.cell-info-scale')).toBeVisible();
+    // Only the field the pane is colored by: nothing left over from the
+    // categorical field shown before, and no category count.
+    await expect(card).not.toContainText('cell_type');
+    await expect(card.locator('.cell-info-count')).toBeHidden();
+
+    // Show recent fields, when asked for, lists the loaded categorical field too.
+    await page.locator('#cell-info-categories-toggle').check();
+    await page.mouse.move(cell.x + 1, cell.y);
+    await page.mouse.move(cell.x, cell.y);
+    await expect(card.locator('.cell-info-rows dt')).toHaveText(['cell_type']);
+    await page.locator('#cell-info-categories-toggle').uncheck();
+    await page.mouse.move(cell.x + 1, cell.y);
+    await page.mouse.move(cell.x, cell.y);
+    await expect(card.locator('.cell-info-rows')).toBeHidden();
+  });
+
+  await test.step('with level of detail on, only drawn cells are read and counts still follow filters', async () => {
+    // The step above colored by a continuous field: back to the categorical one.
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await expect(page.locator('.legend-item')).toHaveCount(3);
+    await page.locator('#hp-lod-enabled').check();
+    await expect(page.locator('#lod-force-container')).toBeVisible();
+    const cell = await findCell(page);
+    await hoverAndRest(page, cell);
+    await expect(page.locator('#cell-info-card .cell-info-value')).toHaveText(await expectedLabel(page, cell));
+    await expect(page.locator('#cell-info-card .cell-info-count'))
+      .toHaveText(`${await selectionCount(page, cell)} cells`);
+  });
+
+  await test.step('a long or unicode label and a long field name are shown whole, inside the window', async () => {
+    // The card is aria-hidden and takes no pointer, so a label cut with an
+    // ellipsis could not be read anywhere on it. Level of detail, switched on
+    // by the step above, is off again first.
+    await page.locator('#hp-lod-enabled').uncheck();
+    await enable(page);
+    const cell = await findCell(page);
+    const category = await expectedLabel(page, cell);
+    const label = 'CD4-positive, alpha-beta memory T cell, tissue-resident, expressing IL7R and CCR7 (naïve-like) — 記憶T細胞';
+    const fieldName = 'cell type as annotated by the second round of the consortium, with tissue of origin';
+    const dispatch = (type, params) => page.evaluate(async ({ type: kind, params: values }) => {
+      const { getActions } = await import('/assets/js/app/actions/index.js');
+      await getActions().dispatch(kind, values, { origin: 'user' });
+    }, { type, params });
+    await dispatch('category.rename', { field: { source: 'obs', key: 'cell_type' }, category, name: label });
+    await dispatch('field.rename', { field: { source: 'obs', key: 'cell_type' }, name: fieldName });
+    await page.mouse.move(cell.x - 10, cell.y - 10);
+    await page.mouse.move(cell.x, cell.y, { steps: 3 });
+    const card = page.locator('#cell-info-card');
+    await expect(card.locator('.cell-info-value')).toHaveText(label);
+    await expect(card.locator('.cell-info-field')).toHaveText(fieldName);
+    // Whole: no line of the card is wider than its box, and the card is inside the window.
+    for (const part of ['.cell-info-value', '.cell-info-field']) {
+      expect(await card.locator(part).evaluate(element => element.scrollWidth <= element.clientWidth), part).toBe(true);
     }
-    return count;
-  }, cell);
-  await expect(card.locator('.cell-info-count')).toHaveText(`${expectedCount} cells`);
-  await expect(card).not.toContainText(/Cell \d/);
-  await expect(card).toHaveCSS('pointer-events', 'none');
+    const box = await card.boundingBox();
+    const viewport = page.viewportSize();
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
+    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
 
-  // Off the canvas, the card goes.
-  await page.locator('#sidebar').hover();
-  await expect(card).toBeHidden();
-
-  // Switching it off removes it at once, even under a resting pointer.
-  await page.mouse.move(cell.x, cell.y);
-  await expect(card).toBeVisible();
-  await page.locator('#cell-info-toggle').uncheck();
-  await expect(card).toBeHidden();
-});
-
-test('a continuous field shows its value on the color scale', async ({ page }) => {
-  await openDataset(page);
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await enable(page);
-  const cell = await findCell(page);
-  await page.mouse.move(cell.x - 10, cell.y - 10);
-  await page.mouse.move(cell.x, cell.y, { steps: 3 });
-  const card = page.locator('#cell-info-card');
-  await expect(card).toBeVisible();
-  const value = await page.evaluate(({ viewId, cellIndex }) => (
-    window._cellucidState.getFieldForView(viewId).values[cellIndex]
-  ), cell);
-  await expect(card.locator('.cell-info-field')).toHaveText('score');
-  expect(Number(await card.locator('.cell-info-value').textContent()))
-    .toBeCloseTo(value, 3);
-  await expect(card.locator('.cell-info-scale')).toBeVisible();
-  // Only the field the pane is colored by: nothing left over from the
-  // categorical field shown before, and no category count.
-  await expect(card).not.toContainText('cell_type');
-  await expect(card.locator('.cell-info-count')).toBeHidden();
-
-  // Show recent fields, when asked for, lists the loaded categorical field too.
-  await page.locator('#cell-info-categories-toggle').check();
-  await page.mouse.move(cell.x + 1, cell.y);
-  await page.mouse.move(cell.x, cell.y);
-  await expect(card.locator('.cell-info-rows dt')).toHaveText(['cell_type']);
-  await page.locator('#cell-info-categories-toggle').uncheck();
-  await page.mouse.move(cell.x + 1, cell.y);
-  await page.mouse.move(cell.x, cell.y);
-  await expect(card.locator('.cell-info-rows')).toBeHidden();
-});
-
-test('a long or unicode label and a long field name are shown whole, inside the window', async ({ page }) => {
-  // R9U-4: the card is aria-hidden and takes no pointer, so a label cut with
-  // an ellipsis could not be read anywhere on it.
-  await openDataset(page);
-  await enable(page);
-  const cell = await findCell(page);
-  const category = await expectedLabel(page, cell);
-  const label = 'CD4-positive, alpha-beta memory T cell, tissue-resident, expressing IL7R and CCR7 (naïve-like) — 記憶T細胞';
-  const fieldName = 'cell type as annotated by the second round of the consortium, with tissue of origin';
-  const dispatch = (type, params) => page.evaluate(async ({ type: kind, params: values }) => {
-    const { getActions } = await import('/assets/js/app/actions/index.js');
-    await getActions().dispatch(kind, values, { origin: 'user' });
-  }, { type, params });
-  await dispatch('category.rename', { field: { source: 'obs', key: 'cell_type' }, category, name: label });
-  await dispatch('field.rename', { field: { source: 'obs', key: 'cell_type' }, name: fieldName });
-  await page.mouse.move(cell.x - 10, cell.y - 10);
-  await page.mouse.move(cell.x, cell.y, { steps: 3 });
-  const card = page.locator('#cell-info-card');
-  await expect(card.locator('.cell-info-value')).toHaveText(label);
-  await expect(card.locator('.cell-info-field')).toHaveText(fieldName);
-  // Whole: no line of the card is wider than its box, and the card is inside the window.
-  for (const part of ['.cell-info-value', '.cell-info-field']) {
-    expect(await card.locator(part).evaluate(element => element.scrollWidth <= element.clientWidth), part).toBe(true);
-  }
-  const box = await card.boundingBox();
-  const viewport = page.viewportSize();
-  expect(box.x).toBeGreaterThanOrEqual(0);
-  expect(box.y).toBeGreaterThanOrEqual(0);
-  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
-  expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
-
-  // The other loaded fields' rows too.
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await page.locator('#cell-info-categories-toggle').check();
-  await page.mouse.move(cell.x + 1, cell.y);
-  await page.mouse.move(cell.x, cell.y);
-  await expect(card.locator('.cell-info-rows dt')).toHaveText([fieldName]);
-  await expect(card.locator('.cell-info-rows dd')).toHaveText([label]);
-  for (const part of ['.cell-info-rows dt', '.cell-info-rows dd']) {
-    expect(await card.locator(part).evaluate(element => element.scrollWidth <= element.clientWidth), part).toBe(true);
-  }
+    // The other loaded fields' rows too.
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    await page.locator('#cell-info-categories-toggle').check();
+    await page.mouse.move(cell.x + 1, cell.y);
+    await page.mouse.move(cell.x, cell.y);
+    await expect(card.locator('.cell-info-rows dt')).toHaveText([fieldName]);
+    await expect(card.locator('.cell-info-rows dd')).toHaveText([label]);
+    for (const part of ['.cell-info-rows dt', '.cell-info-rows dd']) {
+      expect(await card.locator(part).evaluate(element => element.scrollWidth <= element.clientWidth), part).toBe(true);
+    }
+  });
 });
 
 test.describe('in a short window', () => {
@@ -238,8 +255,8 @@ test.describe('in a short window', () => {
   test.use({ viewport: { width: 1280, height: 520 } });
 
   test('many loaded fields flow into columns as wide as their names, inside the window', async ({ page }) => {
-    // R9U-4: once rows could wrap, a card of several columns shrank to the
-    // narrowest its words allowed and broke "cell_type (copy 12)" mid-word.
+    // Once rows can wrap, a card of several columns must not shrink to the
+    // narrowest its words allow and break "cell_type (copy 12)" mid-word.
     await openDataset(page);
     await enable(page);
     await page.evaluate(async () => {
@@ -348,138 +365,131 @@ async function hoverAndRest(page, cell) {
   await expect(page.locator('#cell-info-card')).toBeVisible();
 }
 
-test('the card comes back after a selection tool has handled a press', async ({ page }) => {
+// One opening: each step finds its cell again, since drags and held keys move the camera.
+test('the card comes back after a press the selection tool handled, a drag ending off the plot, a held shortcut, a focus change and a lost release', async ({ page }) => {
   await openDataset(page);
-  const cell = await findCell(page);
-  // An Alt+click with the annotation tool: the tool owns that press and its
-  // release. The card used to stay suppressed for good after it.
-  await page.keyboard.down('Alt');
-  await page.mouse.click(cell.x, cell.y);
-  await page.keyboard.up('Alt');
-  await page.mouse.move(cell.x + 40, cell.y + 40);
-  await hoverAndRest(page, cell);
-  // A drag that started on the plot and ended off it, too. The drag pans the
-  // camera, so the cell is looked up again once it has settled.
-  await page.mouse.move(cell.x, cell.y);
-  await page.mouse.down();
-  // Off the plot onto the sidebar in a few moves. The pause before the release
-  // is what keeps it from reading as a fling (a release more than 50 ms after
-  // the last move hands the camera no inertia), and the pan is the total
-  // distance however it is divided: more steps would only add moves, each of
-  // which waits for a redrawn frame on a slow renderer.
-  const sidebar = await page.locator('#sidebar').boundingBox();
-  await page.mouse.move(sidebar.x + sidebar.width - 20, cell.y, { steps: 4 });
-  await page.waitForTimeout(100);
-  await page.mouse.up();
-  await expect.poll(() => cameraMotion(page)).toBe('still');
-  await hoverAndRest(page, await findCell(page));
-});
 
-test('a shortcut, a focus change or a lost release never leaves the card off', async ({ page }) => {
-  await openDataset(page);
-  const cell = await findCell(page);
-  const inMotion = () => page.evaluate(() => window._cellucidViewer.isCameraInMotion());
-  const keyEvent = (type, init) => page.evaluate(([eventType, eventInit]) => {
-    window.dispatchEvent(new KeyboardEvent(eventType, { bubbles: true, ...eventInit }));
-  }, [type, init]);
-  // Held keys and drags move the camera, so the cell is found again each time.
-  const rest = async () => {
-    await expect.poll(inMotion).toBe(false);
-    const target = await findCell(page);
-    await page.mouse.move(target.x + 40, target.y + 40);
-    await hoverAndRest(page, target);
-  };
-
-  // Cmd+Shift+4 on macOS: the screenshot overlay takes the keys, and no keyup
-  // arrives for a key pressed while Cmd was held, only Cmd's own.
-  await keyEvent('keydown', { key: 'Meta', code: 'MetaLeft', metaKey: true });
-  await keyEvent('keydown', { key: 'Shift', code: 'ShiftLeft', metaKey: true, shiftKey: true });
-  await keyEvent('keydown', { key: '$', code: 'Digit4', metaKey: true, shiftKey: true });
-  await keyEvent('keyup', { key: 'Meta', code: 'MetaLeft' });
-  expect(await inMotion()).toBe(false);
-  await rest();
-
-  // A movement key held while the window loses focus never sends its keyup.
-  await keyEvent('keydown', { key: 'w', code: 'KeyW' });
-  expect(await inMotion()).toBe(true);
-  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
-  await expect.poll(inMotion).toBe(false);
-  await rest();
-
-  // Shift only speeds a movement key up; held alone it moves nothing, and the
-  // selection modifiers it combines with must not hide the card.
-  await page.keyboard.down('Shift');
-  expect(await inMotion()).toBe(false);
-  await page.keyboard.up('Shift');
-  await rest();
-
-  // A drag released outside the page: the next move arrives with no button.
-  await page.mouse.move(cell.x, cell.y);
-  await page.mouse.down();
-  await page.mouse.move(cell.x + 6, cell.y + 4, { steps: 3 });
-  expect(await inMotion()).toBe(true);
-  await page.evaluate(({ x, y }) => {
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y, buttons: 0 }));
-  }, { x: cell.x + 8, y: cell.y + 5 });
-  await expect.poll(inMotion).toBe(false);
-  await page.mouse.up();
-  await rest();
-});
-
-test('in every pane the count follows that pane\'s filters, as selecting would', async ({ page }) => {
-  await openDataset(page);
-  await openCollapsedPanels(page);
-  await page.locator('#split-keep-view-btn').click();
-  await expect.poll(() => page.evaluate(() => (
-    window._cellucidViewer.getSnapshotViews().length
-  ))).toBe(1);
-  // The kept view is active: hide one category there only.
-  await page.locator('.legend-item').filter({ hasText: 'beta' }).locator('.legend-checkbox').uncheck();
-  for (const viewId of ['live', 'snap_1']) {
-    const cell = await findCell(page, viewId);
+  await test.step('the card comes back after a selection tool has handled a press', async () => {
+    const cell = await findCell(page);
+    // An Alt+click with the annotation tool: the tool owns that press and its
+    // release. The card does not stay suppressed after it.
+    await page.keyboard.down('Alt');
+    await page.mouse.click(cell.x, cell.y);
+    await page.keyboard.up('Alt');
+    await page.mouse.move(cell.x + 40, cell.y + 40);
     await hoverAndRest(page, cell);
-    const expected = await selectionCount(page, cell);
-    expect(expected).toBeGreaterThan(0);
-    await expect(page.locator('#cell-info-card .cell-info-count')).toHaveText(`${expected} cells`);
-    // A hidden cell is never the one under the pointer.
-    expect(await expectedLabel(page, cell)).not.toBe(viewId === 'snap_1' ? 'beta' : '');
-  }
+    // A drag that started on the plot and ended off it, too. The drag pans the
+    // camera, so the cell is looked up again once it has settled.
+    await page.mouse.move(cell.x, cell.y);
+    await page.mouse.down();
+    // Off the plot onto the sidebar in a few moves. The pause before the release
+    // is what keeps it from reading as a fling (a release more than 50 ms after
+    // the last move hands the camera no inertia), and the pan is the total
+    // distance however it is divided: more steps would only add moves, each of
+    // which waits for a redrawn frame on a slow renderer.
+    const sidebar = await page.locator('#sidebar').boundingBox();
+    await page.mouse.move(sidebar.x + sidebar.width - 20, cell.y, { steps: 4 });
+    await page.waitForTimeout(100);
+    await page.mouse.up();
+    await expect.poll(() => cameraMotion(page)).toBe('still');
+    await hoverAndRest(page, await findCell(page));
+  });
+
+  await test.step('a shortcut, a focus change or a lost release never leaves the card off', async () => {
+    // The selection the Alt+click of the step above began is let go first.
+    await page.locator('#annotation-cancel-btn').click();
+    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+    const cell = await findCell(page);
+    const inMotion = () => page.evaluate(() => window._cellucidViewer.isCameraInMotion());
+    const keyEvent = (type, init) => page.evaluate(([eventType, eventInit]) => {
+      window.dispatchEvent(new KeyboardEvent(eventType, { bubbles: true, ...eventInit }));
+    }, [type, init]);
+    // Held keys and drags move the camera, so the cell is found again each time.
+    const rest = async () => {
+      await expect.poll(inMotion).toBe(false);
+      const target = await findCell(page);
+      await page.mouse.move(target.x + 40, target.y + 40);
+      await hoverAndRest(page, target);
+    };
+
+    // Cmd+Shift+4 on macOS: the screenshot overlay takes the keys, and no keyup
+    // arrives for a key pressed while Cmd was held, only Cmd's own.
+    await keyEvent('keydown', { key: 'Meta', code: 'MetaLeft', metaKey: true });
+    await keyEvent('keydown', { key: 'Shift', code: 'ShiftLeft', metaKey: true, shiftKey: true });
+    await keyEvent('keydown', { key: '$', code: 'Digit4', metaKey: true, shiftKey: true });
+    await keyEvent('keyup', { key: 'Meta', code: 'MetaLeft' });
+    expect(await inMotion()).toBe(false);
+    await rest();
+
+    // A movement key held while the window loses focus never sends its keyup.
+    await keyEvent('keydown', { key: 'w', code: 'KeyW' });
+    expect(await inMotion()).toBe(true);
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    await expect.poll(inMotion).toBe(false);
+    await rest();
+
+    // Shift only speeds a movement key up; held alone it moves nothing, and the
+    // selection modifiers it combines with must not hide the card.
+    await page.keyboard.down('Shift');
+    expect(await inMotion()).toBe(false);
+    await page.keyboard.up('Shift');
+    await rest();
+
+    // A drag released outside the page: the next move arrives with no button.
+    await page.mouse.move(cell.x, cell.y);
+    await page.mouse.down();
+    await page.mouse.move(cell.x + 6, cell.y + 4, { steps: 3 });
+    expect(await inMotion()).toBe(true);
+    await page.evaluate(({ x, y }) => {
+      window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y, buttons: 0 }));
+    }, { x: cell.x + 8, y: cell.y + 5 });
+    await expect.poll(inMotion).toBe(false);
+    await page.mouse.up();
+    await rest();
+  });
 });
 
-test('with level of detail on, only drawn cells are read and counts still follow filters', async ({ page }) => {
-  await openDataset(page);
-  await openCollapsedPanels(page);
-  await page.locator('#hp-lod-enabled').check();
-  await expect(page.locator('#lod-force-container')).toBeVisible();
-  const cell = await findCell(page);
-  await hoverAndRest(page, cell);
-  await expect(page.locator('#cell-info-card .cell-info-value')).toHaveText(await expectedLabel(page, cell));
-  await expect(page.locator('#cell-info-card .cell-info-count'))
-    .toHaveText(`${await selectionCount(page, cell)} cells`);
-});
-
-test('in a grid, the card reads the pane under the pointer, naming its field once', async ({ page }) => {
+// One opening with a kept view. The category is hidden in the second step, after both panes
+// have been read with every cell shown.
+test("with a kept view: the card reads the pane under the pointer and names its field once, and its count follows that pane's filters", async ({ page }) => {
   await openDataset(page);
   await openCollapsedPanels(page);
   await page.locator('#split-keep-view-btn').click();
   await expect.poll(() => page.evaluate(() => (
     window._cellucidViewer.getSnapshotViews().length
   ))).toBe(1);
-  await enable(page);
-  const titles = page.locator('.view-title-chip');
-  await expect(titles).toHaveCount(2);
-  for (const viewId of ['live', 'snap_1']) {
-    const cell = await findCell(page, viewId);
-    await page.mouse.move(cell.x - 10, cell.y - 10);
-    await page.mouse.move(cell.x, cell.y, { steps: 3 });
-    const card = page.locator('#cell-info-card');
-    await expect(card).toBeVisible();
-    await expect(card.locator('.cell-info-value')).toHaveText(await expectedLabel(page, cell));
-    // The field, once: the pane's own title chip already names the pane.
-    await expect(card.locator('.cell-info-field')).toHaveText('cell_type');
-    await expect(card).toHaveText(/^[^]*cell_type$/);
-    expect((await card.innerText()).match(/cell_type/g)).toHaveLength(1);
-  }
+
+  await test.step('in a grid, the card reads the pane under the pointer, naming its field once', async () => {
+    await enable(page);
+    const titles = page.locator('.view-title-chip');
+    await expect(titles).toHaveCount(2);
+    for (const viewId of ['live', 'snap_1']) {
+      const cell = await findCell(page, viewId);
+      await page.mouse.move(cell.x - 10, cell.y - 10);
+      await page.mouse.move(cell.x, cell.y, { steps: 3 });
+      const card = page.locator('#cell-info-card');
+      await expect(card).toBeVisible();
+      await expect(card.locator('.cell-info-value')).toHaveText(await expectedLabel(page, cell));
+      // The field, once: the pane's own title chip already names the pane.
+      await expect(card.locator('.cell-info-field')).toHaveText('cell_type');
+      await expect(card).toHaveText(/^[^]*cell_type$/);
+      expect((await card.innerText()).match(/cell_type/g)).toHaveLength(1);
+    }
+  });
+
+  await test.step("in every pane the count follows that pane's filters, as selecting would", async () => {
+    // The kept view is active: hide one category there only.
+    await page.locator('.legend-item').filter({ hasText: 'beta' }).locator('.legend-checkbox').uncheck();
+    for (const viewId of ['live', 'snap_1']) {
+      const cell = await findCell(page, viewId);
+      await hoverAndRest(page, cell);
+      const expected = await selectionCount(page, cell);
+      expect(expected).toBeGreaterThan(0);
+      await expect(page.locator('#cell-info-card .cell-info-count')).toHaveText(`${expected} cells`);
+      // A hidden cell is never the one under the pointer.
+      expect(await expectedLabel(page, cell)).not.toBe(viewId === 'snap_1' ? 'beta' : '');
+    }
+  });
 });
 
 test.describe('touch', () => {
@@ -533,9 +543,8 @@ test('on a view of 250,000 cells or more the lookup is built off the main thread
   await openCollapsedPanels(page);
   // The card off while the cells open: a card that is on asks for a large
   // pane's tree itself, once the page is idle (`prepareCellPicking`), and a
-  // check after the opening found it built already on a slow runner (Web
-  // contracts run 41292953076, Linux WebKit: the check of the box took
-  // 370 ms). Off, nothing asks for it.
+  // check after the opening can find it built already on a slow runner.
+  // Off, nothing asks for it.
   await page.locator('#cell-info-toggle').uncheck();
   await loadSyntheticDataset(page, { pointCount: 300_000, pattern: 'uniform' });
   const hasTree = () => page.evaluate(() => {

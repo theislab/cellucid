@@ -66,7 +66,7 @@ import { joinFailure, markDamaged, sayFailure } from '../../utils/errors.js';
 export const LIBRARY_FILE_EXTENSION = '.cellucid-library';
 
 /** The library file format this release writes and reads. */
-export const LIBRARY_FORMAT_VERSION = 1;
+const LIBRARY_FORMAT_VERSION = 1;
 
 /** What an imported saved state's name ends with. */
 export const IMPORTED_SUFFIX = ' (imported)';
@@ -90,7 +90,7 @@ const SESSION_PREFIX = new TextDecoder('ascii').decode(SESSION_SIGNATURE.bytes).
  * @param {Uint8Array} magic
  * @returns {string}
  */
-export function librarySignatureRefusal(magic) {
+function librarySignatureRefusal(magic) {
   const text = new TextDecoder('ascii').decode(magic);
   if (text.startsWith(SESSION_PREFIX)) return SESSION_FILE_NOT_A_LIBRARY_MESSAGE;
   const match = text.startsWith(LIBRARY_SIGNATURE_PREFIX)
@@ -271,7 +271,7 @@ export async function exportLibrary({
  * @param {unknown} manifest
  * @returns {{createdAt: string, app: {version: string}, datasets: Object[], histories: Object[], chunks: Object[]}}
  */
-export function assertLibraryManifest(manifest) {
+function assertLibraryManifest(manifest) {
   if (!isPlainRecord(manifest) || !sameKeys(manifest, MANIFEST_KEYS)) throw damaged(`its manifest must be exactly {${MANIFEST_KEYS.join(', ')}}.`);
   if (typeof manifest.createdAt !== 'string' || Number.isNaN(Date.parse(manifest.createdAt))
     || new Date(manifest.createdAt).toISOString() !== manifest.createdAt) {
@@ -322,7 +322,7 @@ function sameKeys(record, keys) {
 }
 
 /** The name an imported saved state is kept under. */
-export function importedName(history) {
+function importedName(history) {
   return `${history.name ?? (history.dataset.name === null ? 'Autosave' : `Autosave of ${history.dataset.name}`)}${IMPORTED_SUFFIX}`;
 }
 

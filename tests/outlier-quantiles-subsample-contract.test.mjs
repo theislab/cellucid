@@ -1,5 +1,5 @@
 /**
- * Outlier quantiles under a subsample (decision F-K7):
+ * Outlier quantiles under a subsample:
  * - stored quantiles (`prepare(latent_key=...)`) describe the whole dataset:
  *   a subsample reads the file's, gathered for its open cells, under every
  *   method, never recomputed and never refused as "not fitting" (they rank

@@ -3,8 +3,8 @@
  *
  * The budget is the one bound: what the held values weigh against a share of
  * the device's memory (`data/memory-budget.js`). There is no entry count and
- * no age: a count cap evicted small results while memory was free, and an age
- * let go of results nothing had made stale (F123). An evicted result is
+ * no age: a count cap would evict small results while memory is free, and an age
+ * would let go of results nothing had made stale. An evicted result is
  * computed again.
  *
  * It keeps hit, miss and eviction statistics.

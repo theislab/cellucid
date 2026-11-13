@@ -23,17 +23,12 @@
  * are set aside; any other error in that window, and every error after it,
  * still counts. They stay in the test's trace.
  *
- * Measured on hosted Linux WebKit: a session saved, then `page.goto` 20 ms
- * later; the left document's lazy imports (`formats/zip/crc32.js`, a
- * worker's `formats/io/*`) were stopped and reported 19 to 34 ms after the
- * navigation began (Web contracts run 41213981681). A page that had turned
- * culling on 190 ms before `page.goto` was still loading its spatial-tree
- * worker's modules: `rendering/shader-quality.js` and `utils/radix-order.js`
- * were reported 19 ms after it began (run 41307458156). Reproduced on macOS
- * WebKit by leaving a page 10 to 24 ms after it started that worker: the
- * modules it asked for while the document was being left were reported 4 to
- * 12 ms after the navigation began, always before it returned. A worker the
- * page itself ends (`terminate()`) while its modules load reports nothing.
+ * The left document's lazy imports (`formats/zip/crc32.js`, a worker's
+ * `formats/io/*`, the modules of the spatial-tree worker) are stopped and
+ * reported within tens of milliseconds of the navigation's start, always
+ * before it returns. A worker the page itself ends (`terminate()`) while its
+ * modules load reports nothing (measured:
+ * 38_decisions_testing_and_hosted_runners.md).
  *
  * @module helpers/leaving-document
  */
@@ -73,9 +68,7 @@ async function leaveDocument(page, navigation) {
  * "ttp://… due to access control checks.", which no wording above matches;
  * the stack's first line is the sentence as WebKit said it. A page left
  * while its Stored listing read a kept file through a blob reported so
- * (`kept-gene-index.spec.mjs`, WebKit, 3 of 120 runs with one worker, on
- * main as well; 1,169 reports from 40 navigations of a page that reads such
- * files, each a page error).
+ * (`kept-gene-index.spec.mjs` meets it in WebKit).
  */
 function saidBy(error) {
   const first = typeof error?.stack === 'string' ? error.stack.split('\n', 1)[0] : null;

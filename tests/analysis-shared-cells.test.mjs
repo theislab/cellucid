@@ -1,6 +1,6 @@
 /**
- * Tests that compare groups of cells assume the groups share no cell
- * (audit F-5): differential expression refuses groups that do, and the
+ * Tests that compare groups of cells assume the groups share no cell:
+ * differential expression refuses groups that do, and the
  * Detailed view's tests (Welch, Mann-Whitney, ANOVA, Kruskal-Wallis, χ²,
  * Fisher) are not run on pages that do — one count of the shared cells
  * (`shared/page-overlap.js`) for every comparison.

@@ -57,10 +57,10 @@ export function clampFloatingPosition({
 /**
  * Place a new window so it covers no open window's header.
  *
- * Every window opened at one spot: a panel torn off beside its row and an
- * analysis window opened from a row a little above it landed on each other,
- * and the newer one covered the older one's header, where its dock, copy and
- * close buttons are. The new window steps down and to the right one header
+ * A window opened at the same spot as another would cover the older one's
+ * header, where its dock, copy and close buttons are (a panel torn off beside
+ * its row and an analysis window opened from a row a little above it). The new
+ * window steps down and to the right one header
  * at a time. On a short screen, where clamping stops the walk, it starts
  * under the lowest header it would cover and is made shorter to fit, as long
  * as it keeps its minimum height; otherwise the last position is used.

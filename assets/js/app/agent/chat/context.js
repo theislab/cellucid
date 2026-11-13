@@ -88,7 +88,7 @@ export function summaryInputOf(conversation, before, share = 1) {
   if (conversation.summary !== null) lines.push(`Earlier summary:\n${conversation.summary.text}`);
   const start = conversation.summary?.before ?? 0;
   for (const message of conversation.messages.slice(start, before)) {
-    // A turn the conversation received was another person's and their agent's (L24-10).
+    // A turn the conversation received was another person's and their agent's.
     const received = conversation.received.includes(message.turn);
     if (message.role === 'user') lines.push(`${received ? 'Another person (received with the conversation)' : 'Person'}: ${message.text}`);
     else if (message.role === 'assistant') {

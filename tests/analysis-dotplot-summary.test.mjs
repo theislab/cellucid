@@ -143,7 +143,7 @@ test('a stacked violin\'s bins: every grouped cell once, zeros in the bin holdin
   assert.equal(summarizeGenesByGroup(ctx, genes, 0).histogram.length, 0);
 });
 
-test('a cell without a value (NaN, an infinity) is out of the mean, the share and the violin, as DE leaves it out (NS-1)', () => {
+test('a cell without a value (NaN, an infinity) is out of the mean, the share and the violin, as DE leaves it out', () => {
   // Two groups of three cells; one unmeasured cell each.
   const dense = Float32Array.of(0, 2, NaN, 1, Infinity, 4);
   const ctx = createGroupSummaryContext(Int16Array.of(0, 0, 0, 1, 1, 1), 2);

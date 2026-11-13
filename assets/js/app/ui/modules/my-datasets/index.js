@@ -95,8 +95,8 @@ export function importLibraryFile(file) {
 }
 
 /** What the status line says of a list kept for this page only, or until the window closes. */
-export const KEPT_FOR_THIS_PAGE = 'Kept for this page only: this window keeps nothing for this site.';
-export const KEPT_UNTIL_WINDOW_CLOSES = 'Kept only until this window closes.';
+const KEPT_FOR_THIS_PAGE = 'Kept for this page only: this window keeps nothing for this site.';
+const KEPT_UNTIL_WINDOW_CLOSES = 'Kept only until this window closes.';
 
 /**
  * @param {{

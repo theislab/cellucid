@@ -39,7 +39,7 @@ import { LINEAR_TEXEL_GLSL } from '../../linear-texture.js';
  * Below this vector length (render space) a particle is not drawn: its cell
  * shows no motion (`PARTICLE_RENDER_VS` discards it). A field whose every
  * vector is shorter shows nothing at all, which the loader says when it reads
- * one (`ensureVectorField`, R9V-6).
+ * one (`ensureVectorField`).
  */
 export const VELOCITY_STILL_SPEED = 0.00001;
 
@@ -61,9 +61,8 @@ const CEILING_GLSL = `vec4(${TRAIL_ENERGY_CEILING.toFixed(1)})`;
  * `taps - 1` on each side, one texel step apart) from one Gaussian of width
  * `sigma` taps, normalized so the center plus both sides sum to exactly one:
  * a blur pass neither adds nor removes light. Every blur here takes its
- * weights from this one definition (R9V-11: the hand-typed bloom kernel summed
- * to 1.0008, a 0.08% gain each pass, and its zero last tap read two texels
- * for nothing).
+ * weights from this one definition, so no kernel drifts from a sum of one
+ * (a hand-typed kernel summing to 1.0008 gains 0.08% a pass).
  *
  * @param {number} sigma - in taps
  * @param {number} taps - the center and one side
@@ -773,7 +772,7 @@ void main() {
   vec2 offset = u_direction * texelSize * u_blurSize;
 
   // 11-tap Gaussian (BLOOM_BLUR_WEIGHTS, gaussianBlurWeights): normalized to
-  // one, no zero tap (times an infinite texel a zero tap was NaN).
+  // one, no zero tap (a zero tap times an infinite texel is NaN).
   ${glslWeights(BLOOM_BLUR_WEIGHTS)}
 
   vec4 result = texture(u_source, v_uv) * weights[0];
@@ -886,11 +885,11 @@ vec3 ACESFilmEnhanced(vec3 x) {
   return clamp(result, 0.0, 1.0);
 }
 
-// Hue-preserving tone mapping (R9V-11). The trail is an HDR sum of the
-// particles' colors; mapped channel by channel, a saturated color's largest
-// channels reached white first and its smallest lagged, so a purple flow
-// (viridis's slow end: G near 0) turned magenta before white and a teal one
-// cyan. The luminance is mapped instead and the color scaled with it, keeping
+// Hue-preserving tone mapping. The trail is an HDR sum of the particles'
+// colors; mapped channel by channel, a saturated color's largest channels
+// would reach white first and its smallest lag, so a purple flow (viridis's
+// slow end: G near 0) would turn magenta before white and a teal one cyan.
+// The luminance is mapped instead and the color scaled with it, keeping
 // its hue; a color brighter than the display shows moves toward white along
 // its own hue, as far as its brightest channel needs.
 const vec3 TONE_LUMA = vec3(0.2126, 0.7152, 0.0722);

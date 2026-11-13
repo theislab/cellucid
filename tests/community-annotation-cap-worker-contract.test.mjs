@@ -576,7 +576,7 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
     },
     ignoredPadding: 'secret'.repeat(10_000),
   });
-  // Results longer than the former per-field caps are kept whole.
+  // Results longer than a per-field cap would allow are kept whole.
   const long = validLookupItem({
     id: 'i'.repeat(65),
     fullName: 'F'.repeat(5_000),

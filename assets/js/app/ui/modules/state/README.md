@@ -1,13 +1,13 @@
 # `ui/modules/state/`: the State panel
 
-**Owns:** the sidebar's State section (History v2 §3.10): the session's **Share…** and **Load…**,
+**Owns:** the sidebar's State section: the session's **Share…** and **Load…**,
 and the history of the dataset shown as a **branch graph**, drawn from the page's current history
 (`app/history/current.js`). Header `History (i)  🔍 ↶ ↷ ⚙ ⋯`; status line
 `[● Recording] Main ▾ · 14 steps · ⚠ 2 stale`; everything else opens on demand.
 
 | Module | What it draws or does |
 | --- | --- |
-| `index.js` | `initStateSection`: follows the current history; the header (search, undo, redo, History settings, the menu), the status line (recording switch, branch picker, steps, stale, "Next change starts …" with Cancel), the menu's "Save AnnData with this state…" (`history.anndata.save`, whose progress, outcome and refusals the action tells itself), the graph and its rows' operations (`ops`: show, branch here, compare, rename, bookmark, revert, branch without, delete a step or branch, archive, main, lock, group, ungroup, merge into one step, undo a turn, trackers, clear keeping the state, the state at a time), each asked first when it loses work, each a history action; one operation at a time (`run`: busy, failures told once); while paused, Keep / Discard / Cancel before the history moves (§3.15.1); replays with their progress and report |
+| `index.js` | `initStateSection`: follows the current history; the header (search, undo, redo, History settings, the menu), the status line (recording switch, branch picker, steps, stale, "Next change starts …" with Cancel), the menu's "Save AnnData with this state…" (`history.anndata.save`, whose progress, outcome and refusals the action tells itself), the graph and its rows' operations (`ops`: show, branch here, compare, rename, bookmark, revert, branch without, delete a step or branch, archive, main, lock, group, ungroup, merge into one step, undo a turn, trackers, clear keeping the state, the state at a time), each asked first when it loses work, each a history action; one operation at a time (`run`: busy, failures told once); while paused, Keep / Discard / Cancel before the history moves; replays with their progress and report |
 | `history-source.js` | **The seam to the history core.** `trackerView` (the tracker in use as accessors and lazily derived facts: the path, branches by fork step, a branch's own steps, stale results, paused changes), `createHistoryActions` (the only way the panel acts: a `history.*` action as the person's), and the plans a confirmation is worded from (`branchDeletePlan`, `revertProblem`, `stepRun`, `groupRange`, `squashProblem`) |
 | `graph-layout.js` | pure: the graph's rows (laid out whole, or from the layout before when steps were only appended; the path, fork stubs, expanded branches, turns, groups, folded runs of view and layout steps, the paused marker, search folding), their lanes and line segments, aria places; selection ranges; what to open to reveal a step |
 | `graph.js` | the virtualised tree: rows in view (plus overscan, the focused row and the open details) kept by key and rewritten when they change; measured row heights (labels wrap, never truncate); click selects, Shift+click extends, double-click or a double tap shows, `›` opens details, ▸ expands; the tree keys; the hover hint; "Shown: step 12 ↑" |
@@ -50,14 +50,14 @@ step's view, the tour's cameras while camera moves are not recorded), and where 
   tells of a change, at most once a frame and only while the panel can be seen. A dataset switch
   publishes another history (or none) and the panel follows.
 - Every operation is a `history.*` catalog action dispatched as the person's, the path an agent, a
-  notebook and a replay take; the panel calls no history mutator (History v2 §6 test 3).
+  notebook and a replay take; the panel calls no history mutator.
 - The graph's DOM holds the rows in view, in the tree's order, never the whole history; a new step
   rewrites only the rows whose words changed, and is laid out from the layout before (only the path's
   last row and what follows it are laid out again).
 - One counting rule: steps are counted without the opening (status line, picker, map, stubs, the
   pill, accessible names, Compare); a step is named by its number (`Step 12`) everywhere.
 - Nothing truncates: names and labels wrap and rows grow.
-- Owner rule (§3.10): click selects, double-click shows, `›` opens details, in the sidebar, the branch
+- Click selects, double-click shows, `›` opens details, in the sidebar, the branch
   map and on a phone.
 - Undo keys never take a key that something else owns: text fields, open dialogs and menus, and a
   selection in progress (its own step undo, until Confirm).

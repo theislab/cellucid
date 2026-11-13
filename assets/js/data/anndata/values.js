@@ -76,6 +76,14 @@ export async function* readRowSlabs(array, rowStart, rowEnd, { columns = null, .
 }
 
 /**
+ * Where a slab's value rows belong (`readRowsInStoreOrder`): in runs, or
+ * (`rows` set) one row each.
+ *
+ * @typedef {{count?: number, starts?: ArrayLike<number>, offsets?: ArrayLike<number>,
+ *   rows?: ArrayLike<number>}} SlabRuns
+ */
+
+/**
  * Rows `[rowStart, rowEnd)` of an array in slabs, in whatever order the
  * store reads them fastest: a view's array presenting rows in another order
  * than stored (a subsample's priority order, `views/cell-subset.js`
@@ -95,7 +103,7 @@ export async function* readRowSlabs(array, rowStart, rowEnd, { columns = null, .
  * @param {number} rowStart
  * @param {number} rowEnd
  * @param {{columns?: [number, number]|null, signal?: AbortSignal|null, activity?: Object|null}} [options]
- * @returns {AsyncGenerator<{values: any, runs: {count: number, starts: ArrayLike<number>, offsets: ArrayLike<number>}}>}
+ * @returns {AsyncGenerator<{values: any, runs: SlabRuns}>}
  */
 export async function* readRowsInStoreOrder(array, rowStart, rowEnd, { columns = null, ...readOptions } = {}) {
   if (typeof array.readInSourceOrder !== 'function') {
@@ -150,9 +158,8 @@ function lengthMismatch(label) {
 
 /**
  * 64-bit integer arrays are converted through their 32-bit words, not a
- * BigInt per element: a 10x `.h5`'s int64 indices (44 million at 100,000
- * cells) took 0.5 s through BigInt comparisons and `Number()`, and take a
- * few tens of milliseconds this way. The word order is the host's (the
+ * BigInt per element, which is an order of magnitude slower (measured:
+ * 23_decisions_partial_reading.md). The word order is the host's (the
  * typed array holds host-order values).
  */
 const LOW_WORD = HOST_LITTLE_ENDIAN ? 0 : 1;
@@ -309,7 +316,7 @@ export function writeExactNumbers(values, output, offset, label) {
  * @param {Object} array
  * @param {number} start
  * @param {number} end
- * @param {new (length: number) => T} OutputType
+ * @param {import('../../utils/large-arrays.js').TypedArrayConstructor<T>} OutputType
  * @param {string} label
  * @param {(values: any, output: T, offset: number, label: string) => void} write
  * @param {{signal?: AbortSignal|null, activity?: Object|null}} [options] - Passed to every read
@@ -475,7 +482,7 @@ export const UNSAFE_INTEGERS_AS_TEXT = 'Read as text: it holds whole numbers pas
  * doubles); `'decide'` decides from these rows.
  *
  * @param {'decide'|'text'|'numbers'} [as]
- * @returns {Promise<{values: Float64Array}|{text: Array<string|null>}>}
+ * @returns {Promise<{values: Float64Array, text?: undefined}|{text: Array<string|null>, values?: undefined}>}
  */
 export async function readExactIntegers(array, start, end, label, options = {}, mask = null, as = 'decide') {
   const raw = await readStored(array, start, end, label, options);

@@ -1,5 +1,5 @@
 /**
- * @fileoverview The branch graph in the sidebar (History v2 §3.9, §3.10): a
+ * @fileoverview The branch graph in the sidebar: a
  * virtualised tree of the rows `graph-layout.js` lays out. Only the rows in
  * view (plus a few above and below, and the row with the keyboard focus)
  * exist in the page, so a history of any length opens, scrolls and takes a
@@ -10,7 +10,7 @@
  * row's height is measured when it is drawn (one line until then), and the
  * rows above the view keep their place while heights settle.
  *
- * **Interaction (owner rule, §3.10).** A click only selects a row (and gives
+ * **Interaction.** A click only selects a row (and gives
  * it the keyboard focus); Shift+click extends the selection over consecutive
  * rows of one line. A double-click (a double tap on a touch screen) shows
  * the step. The row's `›` button opens or closes its details, inline under
@@ -58,7 +58,7 @@ const MORE_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="tru
  * @param {object} options.handlers
  * @param {(row: object) => void} options.handlers.show - double-click, Enter
  * @param {(row: object, close: () => void) => HTMLElement} options.handlers.details - its details' content
- * @param {(row: object, anchor: Element, selection: {steps: string[], problem: string|null}, at: {x: number, y: number}|null) => void} options.handlers.menu -
+ * @param {(row: object, anchor: Element, selection: {steps: string[], problem: string|null}, at?: {x: number, y: number}|null) => void} options.handlers.menu -
  *   `at`: the pointer, for a context menu
  * @param {(row: object) => void} options.handlers.rename
  * @param {(row: object) => void} options.handlers.remove

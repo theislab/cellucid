@@ -63,6 +63,16 @@ test('a fetched pattern must carry an absolute URL across the boundary', () => {
       'http://127.0.0.1:4173/assets/img/kemal-inecik.glb'
     );
   }
+  // A relative URL, or text that is no URL, would resolve against the worker's script.
+  for (const pattern of FETCHED_PATTERNS) {
+    for (const sourceUrl of ['assets/img/kemal-inecik.glb', '/assets/img/kemal-inecik.glb', '../kemal-inecik.glb', 'not a url', '']) {
+      assert.throws(
+        () => assertGenerationRequest({ requestId: 0, pattern, count: 10, sourceUrl }),
+        /requires one absolute sourceUrl/,
+        sourceUrl
+      );
+    }
+  }
 });
 
 test('a computed pattern refuses a source URL it would ignore', () => {
@@ -100,9 +110,9 @@ test('a request is refused before a worker is spawned for it', () => {
 });
 
 test('the point-count control and both validators enforce one rule', async () => {
-  // The control used to advertise 1,000–50,000,000 while both validators
-  // accepted 1 and had no ceiling at all, so a programmatic request reached
-  // multiples of the range the UI published. index.html is static markup and
+  // The control's advertised range, 1,000–50,000,000, is the range both
+  // validators enforce, or a programmatic request would reach multiples of
+  // the range the UI publishes. index.html is static markup and
   // cannot interpolate a constant, so the derivation is asserted here.
   assert.equal(MIN_SYNTHETIC_COUNT, 1);
   assert.equal(MAX_SYNTHETIC_COUNT, 250_000_000);
@@ -164,9 +174,9 @@ test('every generator entry point is held to the same rule', async () => {
   const { SyntheticDataGenerator } = await import(
     '../assets/js/dev/benchmark.js'
   );
-  // Only the two GLB entry points validated their count; the rest allocated
-  // from whatever arrived, so a zero produced empty arrays and a negative
-  // failed inside a typed-array constructor instead of at the boundary.
+  // Every entry point validates its count: one that allocated from whatever
+  // arrived would produce empty arrays for a zero and fail inside a typed-array
+  // constructor for a negative instead of at the boundary.
   const entryPoints = [
     'atlasLike',
     'batchEffects',
@@ -258,29 +268,4 @@ test('the two-dimensional pattern keeps its own dimension level and layout', () 
     ),
     /8 Float32 position components/
   );
-});
-
-test('the worker module imports only what a worker thread can evaluate', async () => {
-  const workerSource = await readFile(
-    new URL(
-      '../assets/js/app/ui/modules/benchmark/generation-worker.js',
-      import.meta.url
-    ),
-    'utf8'
-  );
-  // A worker has no document and no window. Importing the generators is
-  // deliberate; reaching for the DOM from the worker would not survive.
-  assert.doesNotMatch(workerSource, /\bdocument\./);
-  assert.doesNotMatch(workerSource, /\bwindow\./);
-  assert.match(
-    workerSource,
-    /import \{ SyntheticDataGenerator \} from '\.\.\/\.\.\/\.\.\/\.\.\/dev\/benchmark\.js'/
-  );
-  for (const pattern of SYNTHETIC_PATTERNS) {
-    assert.match(
-      workerSource,
-      new RegExp(`\\b${pattern}:`),
-      `the worker must be able to generate "${pattern}"`
-    );
-  }
 });

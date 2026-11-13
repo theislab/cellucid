@@ -4,16 +4,17 @@
  * the generator writes from this checkout's catalog: an action added,
  * renamed or given another parameter fails here until the page is
  * regenerated. The page lives in the shared docs site (CELLUCID_PYTHON_DOCS,
- * else the sibling `cellucid-python/docs`); while it has not landed there the
- * comparison is skipped and says how to write it.
+ * else the sibling `cellucid-python/docs`); without that tree the comparison
+ * is skipped, and fails where siblings are required.
  */
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
-  ACTION_REFERENCE_PAGE, actionReferencePath, renderActionReference,
+  actionReferencePath, renderActionReference,
 } from '../scripts/generate-action-reference.mjs';
+import { pythonDocsRoot, skipAbsentSibling } from '../scripts/shared-files.mjs';
 import { defineAction } from '../assets/js/app/actions/catalog.js';
 import { ACTION_DEFINITIONS } from '../assets/js/app/actions/definitions/index.js';
 import { getActionCatalog } from '../assets/js/app/actions/index.js';
@@ -64,10 +65,7 @@ test('an action added to the catalogue is a new section of the reference', () =>
 
 test('the docs page is what the generator writes from this catalogue', t => {
   const target = actionReferencePath();
-  if (!existsSync(target)) {
-    t.skip(`${ACTION_REFERENCE_PAGE} is not in the docs tree yet (${target}); write it with node scripts/generate-action-reference.mjs and add it to the developer docs toctree`);
-    return;
-  }
+  if (skipAbsentSibling(t, existsSync(pythonDocsRoot()), `no docs tree at ${pythonDocsRoot()} (set CELLUCID_PYTHON_DOCS)`)) return;
   assert.equal(
     readFileSync(target, 'utf8'),
     renderActionReference(),

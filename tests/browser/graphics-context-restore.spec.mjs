@@ -7,8 +7,6 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
 import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 import { expectPerformance, recordFrameCost } from './helpers/frame-cost-log.mjs';
 import { labelProgramsBySource, recordSubmissions } from './helpers/gl-submissions.mjs';
-import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
-import { ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX } from './helpers/pixel-parity.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=graphics-context-restore-ci`;
@@ -26,9 +24,8 @@ const DATASET_URL =
  * sides, and what each submitted to the GPU is asserted equal before their
  * pixels (`helpers/gl-submissions.mjs`): the frame right after a restore is
  * drawn whole, a later pulse frame of a multisampled scene draws again only
- * under the rings (`pulse-sample-mask.js`), and the frame read once stood on
- * one side for the other (hosted macOS Firefox, full-matrix run
- * 42320991390: one pixel off by one, green 214 against 213).
+ * under the rings (`pulse-sample-mask.js`), and the frame read once can stand on
+ * one side for the other (a pixel off by one).
  */
 
 async function openWithKeptViewAndHighlights(page) {
@@ -54,10 +51,9 @@ async function openWithKeptViewAndHighlights(page) {
  * Nothing but the (pinned) highlight pulse still changes the frame, the last
  * change has been drawn, and every view is on its final geometry (trees
  * adopted). The cause of the last frame drawn says nothing of a frame still
- * owed: right after a restore it was still the pulse of the frames before the
- * loss, the restored context had drawn nothing yet, and Linux WebKit read
- * every pixel back as 0 (push run 41292953076; the first frame was drawn
- * 255 ms after that capture).
+ * owed: right after a restore it is still the pulse of the frames before the
+ * loss, the restored context has drawn nothing yet, and a capture then reads
+ * every pixel back as 0 (Linux WebKit).
  */
 async function settle(page) {
   await expect.poll(
@@ -124,21 +120,6 @@ function submittedDifference(page, left, right) {
   ), [left, right]);
 }
 
-/** Lit pixels (alpha not zero) of a capture, over its panes. */
-function litPixels(page, name) {
-  return page.evaluate(key => {
-    const { pixels, width, panes } = window.__restoreCaptures[key];
-    let lit = 0;
-    for (const pane of panes) {
-      const [x0, y0, paneWidth, paneHeight] = pane.rect;
-      for (let y = y0; y < y0 + paneHeight; y++) {
-        for (let x = x0; x < x0 + paneWidth; x++) if (pixels[(y * width + x) * 4 + 3] !== 0) lit += 1;
-      }
-    }
-    return lit;
-  }, name);
-}
-
 /** Where two captures differ, pane by pane (the first few pixels named). */
 function differences(page, left, right) {
   return page.evaluate(([a, b]) => {
@@ -190,7 +171,7 @@ function loseContext(page) {
 
 /**
  * The app's graphics-reset dialog (`app/graphics-reset-session.js`; the
- * renderer only reports the phases, F146): its words and shown buttons, or
+ * renderer only reports the phases): its words and shown buttons, or
  * null while closed. It is modal and keeps Escape: the page behind is inert.
  */
 function notice(page) {
@@ -205,7 +186,7 @@ function notice(page) {
 }
 
 for (const background of ['studio', 'black']) {
-test(`a lost context is restored in place: the same pixels, kept views, highlights and filters (${background} background)`, async ({ page, browserName }) => {
+test(`a lost context is restored in place: the same pixels, kept views, highlights and filters (${background} background)`, async ({ page }) => {
   test.setTimeout(180_000);
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
@@ -244,18 +225,7 @@ test(`a lost context is restored in place: the same pixels, kept views, highligh
   expect(after).toEqual(before);
   // The same draws with the same programs, ranges, viewports and uniforms.
   expect(await submittedDifference(page, 'before', 'after'), 'what the two frames submitted').toBeNull();
-  const differing = await differences(page, 'before', 'after');
-  if (isHostedMacosFirefox(browserName)) {
-    // Every GPU object of the restored context is new, holding the same
-    // bytes: hosted macOS Firefox has drawn such pairs a few pixels apart
-    // (`helpers/hosted-gl.mjs`). Everything above is held there exactly; of
-    // the pixels, that no more than rounding's share differs.
-    const count = differing.reduce((sum, pane) => sum + (pane.count ?? Infinity), 0);
-    expect(count, `pixels that differ ${JSON.stringify(differing)}`)
-      .toBeLessThanOrEqual((await litPixels(page, 'before')) * ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX);
-  } else {
-    expect(differing).toEqual([]);
-  }
+  expect(await differences(page, 'before', 'after')).toEqual([]);
 
   // The restored renderer works on: a click picks a cell, a new kept view is drawn.
   await page.evaluate(() => document.getElementById('split-keep-view-btn').click());
@@ -291,9 +261,8 @@ test('a restored context shows the backdrop look it had, moving by itself as bef
   // The look bakes again on the restored context and is shown as before, over
   // the same clear color. Waited for still, as before the loss: moving, every
   // frame draws the look again, and on hosted macOS Firefox a frame of it takes
-  // about a minute (`helpers/hosted-gl.mjs`: 55 to 69 s a 1024² pass), so its
-  // fade-in (0.35 s of frames) outlasted any wait there (nightly run
-  // 42334181105). What is restored is the same either way.
+  // about a minute (`helpers/hosted-gl.mjs`), so its
+  // fade-in (0.35 s of frames) outlasts any wait there. What is restored is the same either way.
   await page.evaluate(() => window._cellucidViewer.setBackdropAmbientMotion(false));
   await expect.poll(shown, { timeout: 60_000 }).toEqual(before);
   expect(pageErrors).toEqual([]);
@@ -324,8 +293,8 @@ test.describe('on a GPU that takes 500 ms a frame of every cell and 100 ms a cul
     await dismissWelcome(page);
     await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
     // The opening done, its published view applied: a camera set before
-    // it was undone by the sample's own view, and the zoomed framing was
-    // never measured (Linux and local WebKit, 2026-11-01).
+    // it is undone by the sample's own view, and the zoomed framing is
+    // never measured.
     await waitForPageAtRest(page);
     const kept = {
       culling: true,

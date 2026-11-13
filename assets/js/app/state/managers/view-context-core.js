@@ -130,7 +130,7 @@ function composeViewLabel(field, filters) {
   const labelParts = [];
   const filterText = firstFilter && !/No filters active/i.test(firstFilter) ? firstFilter : null;
   // A filter of the colored field names it already ("cell_type: hiding B1 cells"): the field is
-  // not said twice (found 2026-11-10: "cell_type • cell_type: hiding …").
+  // not said twice ("cell_type • cell_type: hiding …" would repeat it).
   // A gene's filter names it with its units ("Ins1 · log1p(norm.): 1 – 2", `geneValueLabel`).
   if (field && field.key && !(filterText !== null && (filterText.startsWith(`${field.key}:`) || filterText.startsWith(`${field.key} · `)))) labelParts.push(field.key);
   if (filterText !== null) labelParts.push(filterText);
@@ -167,6 +167,7 @@ function sameFieldIdentity(candidate, renamed) {
 }
 
 export const viewContextCoreMethods = {
+  /** @this {import('../core/data-state.js').DataState} */
   _removeLabelsForView(viewId) {
     if (!this.labelLayer) return;
     const target = String(viewId ?? this.activeViewId ?? 'live');
@@ -174,6 +175,7 @@ export const viewContextCoreMethods = {
     nodes.forEach((node) => node.remove());
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _cloneFieldState(field) {
     if (!field) return null;
     const clone = { ...field };
@@ -197,8 +199,8 @@ export const viewContextCoreMethods = {
     if (field._outlierThreshold != null) clone._outlierThreshold = field._outlierThreshold;
     if (field._categoryCounts) {
       // Copy the whole count record: every array (total/available/visible)
-      // and every scalar total. A partial copy left `available` behind and the
-      // Active filters row of a view read "N / 0 cells" after a view switch.
+      // and every scalar total. A partial copy would leave `available` behind and the
+      // Active filters row of a view would read "N / 0 cells" after a view switch.
       clone._categoryCounts = Object.fromEntries(
         Object.entries(field._categoryCounts).map(([key, value]) => [
           key,
@@ -212,6 +214,7 @@ export const viewContextCoreMethods = {
     return clone;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _cloneObsData(obsData) {
     if (!obsData) return null;
     const fields = (obsData.fields || []).map((f) => this._cloneFieldState(f));
@@ -219,6 +222,7 @@ export const viewContextCoreMethods = {
     return { ...obsData, fields };
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _cloneVarData(varData) {
     if (!varData) return null;
     const fields = (varData.fields || []).map((f) => this._cloneFieldState(f));
@@ -226,6 +230,7 @@ export const viewContextCoreMethods = {
     return { ...varData, fields };
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _buildContextFromCurrent(id, { cloneArrays = true } = {}) {
     const ctx = {
       id: String(id),
@@ -264,6 +269,7 @@ export const viewContextCoreMethods = {
    * a kept view costs no per-cell bytes until it actually diverges. The
    * centroid arrays are a few bytes per category and are written in place, so
    * they are copied.
+   * @this {import('../core/data-state.js').DataState}
    */
   _cloneViewContext(source, id) {
     if (
@@ -321,11 +327,12 @@ export const viewContextCoreMethods = {
    * The active context shares the state's per-cell arrays and its field
    * inventories instead of copying them: this runs after every coloring,
    * filtering and centroid change. A copy of four per-cell arrays each time
-   * was hundreds of megabytes of transient memory while one large dataset
-   * loaded, and a copy of every field object (8,192 genes) cost milliseconds
-   * on every gene pick. A context needs arrays and field objects of its own
+   * is hundreds of megabytes of transient memory while a large dataset
+   * loads, and a copy of every field object costs milliseconds on every
+   * gene pick on a dataset of thousands of genes. A context needs arrays and field objects of its own
    * only once its view stops being active, and `setActiveView` hands the
    * outgoing ones to it at exactly that point; no other view ever holds them.
+   * @this {import('../core/data-state.js').DataState}
    */
   _syncActiveContext() {
     const ctx = this.viewContexts.get(String(this.activeViewId));
@@ -344,6 +351,7 @@ export const viewContextCoreMethods = {
     ctx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: 0, total: 0 };
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _resetViewContexts() {
     this.viewContexts.clear();
     const liveCtx = this._buildContextFromCurrent('live', { cloneArrays: false });
@@ -351,6 +359,7 @@ export const viewContextCoreMethods = {
     this.activeViewId = 'live';
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _computeActiveViewLabel(filtersOverride) {
     const field = this.getActiveField();
     const filters = Array.isArray(filtersOverride)
@@ -366,6 +375,7 @@ export const viewContextCoreMethods = {
    * every other view's label and filter summary say. These are the same
    * strings the focused view publishes (`_computeActiveViewLabel`), which a
    * saved session replays and compares exactly.
+   * @this {import('../core/data-state.js').DataState}
    */
   _refreshInactiveViewLabels() {
     if (!this.viewer || !(this.viewContexts instanceof Map)) return;
@@ -399,13 +409,14 @@ export const viewContextCoreMethods = {
    * Carry a dataset-wide rename of one field into every stored view context.
    *
    * View contexts hold shallow clones of the field inventory, so a rename in
-   * the focused view reached only that view's objects: a kept view went on
-   * naming the field by its old key (and saved it so), and lacked the
+   * the focused view reaches only that view's objects: a kept view would go on
+   * naming the field by its old key (and save it so), and lack the
    * original key/categories a later revert needs. The rename-owned
    * properties are copied from the renamed field onto the same field in every
    * other view, and those views' centroid tables and labels follow a
    * category rename.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {'obs'|'var'} source
    * @param {object} renamed - The focused view's renamed field.
    * @param {{previousLabel: unknown, newLabel: unknown}|null} categoryRename
@@ -473,6 +484,7 @@ export const viewContextCoreMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _pushActiveViewLabelToViewer(filtersOverride) {
     if (!this.viewer) return;
     const { label, fieldKey, fieldKind, filtersText } =
@@ -493,6 +505,7 @@ export const viewContextCoreMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   setActiveView(viewId) {
     if (typeof viewId !== 'string' || viewId.trim().length === 0) {
       throw new TypeError('Active view id must be a non-empty string.');
@@ -571,9 +584,9 @@ export const viewContextCoreMethods = {
     if (this.viewer && typeof this.viewer.setViewLayout === 'function') {
       // Only the focus is ours to change. The layout mode belongs to the
       // viewer, so it is read back rather than asserted: forcing "grid" here
-      // silently overrode the mode a restore had just set one line earlier,
-      // and a session saved in "single" reached the viewer as a grid until a
-      // later refresh happened to correct it.
+      // would silently override the mode a restore had just set one line
+      // earlier, and a session saved in "single" would reach the viewer as a
+      // grid until a later refresh happened to correct it.
       const currentMode = typeof this.viewer.getViewLayout === 'function'
         ? this.viewer.getViewLayout().mode
         : 'grid';
@@ -630,6 +643,7 @@ export const viewContextCoreMethods = {
     return this.activeViewId;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _reinitializeActiveField() {
     const field = this.getActiveField();
     if (!field || !field.loaded) return;
@@ -646,6 +660,7 @@ export const viewContextCoreMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   createViewFromSource(sourceViewId, viewId) {
     for (const [label, value] of [
       ['Snapshot source view id', sourceViewId],
@@ -691,6 +706,7 @@ export const viewContextCoreMethods = {
     return ctx;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   createViewFromActive(viewId) {
     return viewContextCoreMethods.createViewFromSource.call(
       this,
@@ -699,6 +715,7 @@ export const viewContextCoreMethods = {
     );
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   applySnapshotConfigToView(viewId, config) {
     if (
       typeof viewId !== 'string' ||
@@ -774,6 +791,7 @@ export const viewContextCoreMethods = {
     return context;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   removeView(viewId) {
     if (
       typeof viewId !== 'string' ||
@@ -826,10 +844,12 @@ export const viewContextCoreMethods = {
     return contextRemoved;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   clearSnapshotViews() {
     viewContextCoreMethods.syncSnapshotContexts.call(this, []);
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   syncSnapshotContexts(snapshotIds) {
     const keep = new Set((snapshotIds || []).map((id) => String(id)));
     const failures = [];
@@ -860,10 +880,12 @@ export const viewContextCoreMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getActiveViewId() {
     return this.activeViewId;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _isLiveView() {
     return String(this.activeViewId) === 'live';
   }

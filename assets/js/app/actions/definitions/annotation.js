@@ -7,7 +7,7 @@
  * published together (`annotation.publish`, effect `outside`, asked as
  * `publishes`).
  *
- * One call is one commit (bug hunt F145: eight votes of one agent turn were
+ * One call is one commit (else eight votes of one agent turn would be
  * eight commits of the person's file, and eight questions): the person's own
  * file in the repository is written as it is published now plus the call's
  * votes and suggestions (or, when they cannot write to the repository, a
@@ -80,7 +80,7 @@ const GROUP = 'Community annotation';
 const COUNT = Object.freeze({ type: 'integer', minimum: 0 });
 
 /** A vote as the voting dialog casts it; `none` takes one back. */
-export const ANNOTATION_VOTES = Object.freeze(['up', 'down', 'none']);
+const ANNOTATION_VOTES = Object.freeze(['up', 'down', 'none']);
 
 const SUGGESTION = Object.freeze({
   type: 'object', additionalProperties: false, required: ['id', 'label', 'by', 'ontology_id', 'up', 'down', 'mine', 'mine_delegated'],

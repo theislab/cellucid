@@ -1,7 +1,7 @@
 /**
- * The one debounce (`utils/debounce.js`, round 9): it replaced 20 written by
- * hand (`clearTimeout(t); t = setTimeout(...)`), each with its own idea of
- * cancel and flush. `tests/one-implementation-contract.test.mjs` finds a new
+ * The one debounce (`utils/debounce.js`): a debounce written by hand
+ * (`clearTimeout(t); t = setTimeout(...)`) has its own idea of cancel and
+ * flush. `tests/one-implementation-contract.test.mjs` finds a new
  * copy.
  */
 

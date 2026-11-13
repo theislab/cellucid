@@ -306,7 +306,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
     const graph = runtime.connectivity.getConnectivityGraph();
     // The graph is of the earlier cells: the viewer drops it with them, and
     // so does the page, here, before anything of the commit asks for edges
-    // (the person's choices stay; the graph is read again in step 3, R9R-11).
+    // (the person's choices stay; the graph is read again in step 3).
     runtime.connectivity.retireGraphKeepingChoices();
     viewer.resetVectorFieldOverlay?.();
     const layouts = dimensionManager.resizeCells(to, read.positions);
@@ -390,7 +390,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
     // A selection under way names cells at their earlier positions.
     runtime.retireSelections();
     const graph = runtime.connectivity.getConnectivityGraph();
-    // As in a resize: the graph goes with the cells' earlier order (R9R-11).
+    // As in a resize: the graph goes with the cells' earlier order.
     runtime.connectivity.retireGraphKeepingChoices();
     viewer.resetVectorFieldOverlay?.();
     const positions = dimensionManager.reorderCells(order).get(liveLayout);

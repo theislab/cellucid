@@ -28,11 +28,7 @@ import { LOCAL_POLICY } from '../../io/byte-source.js';
  * Local file reads in flight at once: enough that chunk files arrive faster
  * than the decode workers consume them; more only buffers files ahead of the
  * decoders and takes the reader thread from the work it does on them. A
- * scheduling choice, measured in a Chromium worker on an Apple M1 Pro SSD
- * (best of three): the X chunk files of Suo (1,580 files, 99 MB) arrive in
- * 330 ms four at a time, 155 ms at 8 (640 MB/s), 124 ms at 16 (800 MB/s) and
- * 110 ms at 64, while the decode pool turns them into values at about
- * 670 MB/s of stored bytes (1,501 chunks in 140 ms).
+ * scheduling choice (measured: 21_decisions_decoders_and_codecs.md).
  */
 const LOCAL_CONCURRENCY = 16;
 

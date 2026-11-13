@@ -28,10 +28,10 @@ export async function countDrawsDuring(page, milliseconds, { mutate = false } = 
  *
  * A pulse paced to a slow renderer (`rendering/ambient-frame-pacing.js`)
  * draws one frame and then leaves the main thread free for as long, so a
- * window of a few animation frames falls between two pulse frames, and on
- * the Linux CI runners it did every time: an observation that starts after
- * a pulse frame is already in its wait. Polling a running count sees every
- * frame the pulse draws, however far apart.
+ * window of a few animation frames can fall between two pulse frames: an
+ * observation that starts after a pulse frame is already in its wait.
+ * Polling a running count sees every frame the pulse draws, however far
+ * apart.
  */
 export async function watchDraws(page) {
   await page.evaluate(() => {

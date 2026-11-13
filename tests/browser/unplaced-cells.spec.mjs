@@ -6,7 +6,7 @@ import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 /**
- * K-03: a 3D embedding that does not place 30% of 1M cells (NaN positions in
+ * A 3D embedding that does not place 30% of 1M cells (NaN positions in
  * every axis, `rendering/unplaced-positions.js`). The view draws exactly what
  * it draws with those cells hidden, picking never finds one, a tree holds
  * only the placed cells, levels of detail and culling draw, and no WebGL
@@ -19,10 +19,10 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
  * tree of the reference holds the hidden cells at the anchor and one of the
  * unplaced positions leaves them out, so their orders differ; source order is
  * the only one both frames share. The card is off, and each frame records
- * the order it was drawn in. Linux Chromium (push run 41292953076) drew the
- * reference in a lookup tree's order, the card's idle request having run
- * after the positions changed, and the second frame in source order: 82,845
- * pixels apart.
+ * the order it was drawn in. With the card on, the reference can be drawn in a
+ * lookup tree's order, the card's idle request having run after the positions
+ * changed, and the second frame in source order (the frames then differ in
+ * tens of thousands of pixels).
  */
 
 const POINT_COUNT = 1_000_000;

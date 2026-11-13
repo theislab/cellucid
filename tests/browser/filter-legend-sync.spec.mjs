@@ -30,159 +30,161 @@ function activeContinuousFilter(page) {
   });
 }
 
-test('removing a range filter from Active filters resets the legend sliders it drew', async ({ page }) => {
+test('filters, the Active filters list and the legend agree', async ({ page }) => {
   const productErrors = observeProductErrors(page);
-  await openPreparedFixture(page);
-
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  const sliders = page.locator('#legend .slider-row input[type="range"]');
-  await expect(sliders).toHaveCount(2);
-  await sliders.nth(1).fill('500');
-  await expect(page.locator('#active-filters')).toContainText('score:');
-  const narrowed = await activeContinuousFilter(page);
-
-  await page.locator('#active-filters .list-item-remove').click();
-  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-  await expect(sliders.nth(0)).toHaveValue('0');
-  await expect(sliders.nth(1)).toHaveValue('1000');
-
-  // Nudging Min must not resurrect the removed Max bound.
-  await sliders.nth(0).fill('10');
-  const nudged = await activeContinuousFilter(page);
-  const stats = await page.evaluate(() => {
-    const field = window._cellucidState.getActiveField();
-    return { ...field._continuousStats };
-  });
-  expect(nudged.max).toBe(stats.max);
-  expect(nudged.max).not.toBe(narrowed.max);
-
-  expect(productErrors).toEqual([]);
-});
-
-test('Filter is offered only while Live filtering is off, and applies the range once', async ({ page }) => {
-  // With Live filtering on every slider step applies the range, so a Filter
-  // button beside the switch (it used to be a grayed-out one) has nothing to do.
-  const productErrors = observeProductErrors(page);
-  await openPreparedFixture(page);
-
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  const block = page.locator('#legend .legend-filter');
-  const live = block.getByRole('switch', { name: 'Live filtering' });
-  const filter = block.getByRole('button', { name: 'Filter', exact: true });
-  const sliders = block.locator('.slider-row input[type="range"]');
-  await expect(live).toHaveAttribute('aria-checked', 'true');
-  await expect(filter).toBeHidden();
-  await expect(block.getByRole('button', { name: 'Reset', exact: true })).toBeVisible();
-
-  await live.click();
-  await expect(live).toHaveAttribute('aria-checked', 'false');
-  await expect(filter).toBeVisible();
-  await expect(filter).toBeEnabled();
-  await sliders.nth(1).fill('500');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-  await filter.click();
-  await expect(page.locator('#active-filters')).toContainText('score:');
-  await expect(page.locator('#filter-count')).not.toHaveText('Showing all 120 cells');
-
-  await live.click();
-  await expect(live).toHaveAttribute('aria-checked', 'true');
-  await expect(filter).toBeHidden();
-  expect(productErrors).toEqual([]);
-});
-
-test('removing a category filter from Active filters re-ticks its legend checkbox', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedFixture(page);
-
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  const alphaRow = page.locator('.legend-item', {
-    has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
-  });
-  await alphaRow.locator('.legend-checkbox').uncheck();
-  await expect(page.locator('#filter-count')).toHaveText('Showing 80 of 120 cells');
-
-  await page.locator('#active-filters .list-item-remove').click();
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-  await expect(alphaRow.locator('.legend-checkbox')).toBeChecked();
-
-  expect(productErrors).toEqual([]);
-});
-
-test('toggling or removing a filter from the keyboard keeps the focus in the list', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedFixture(page);
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await page.locator('.legend-item', {
-    has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
-  }).locator('.legend-checkbox').uncheck();
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await page.locator('#legend .slider-row input[type="range"]').nth(1).fill('500');
-  const rows = page.locator('#active-filters .list-item');
-  await expect(rows).toHaveCount(2);
-  const focusedIn = () => page.evaluate(() => {
-    const active = document.activeElement;
-    const row = active?.closest('.list-item');
-    return {
-      control: active?.classList.contains('list-item-remove') ? 'remove' : active?.type ?? active?.id ?? null,
-      row: row === null || row === undefined ? null : [...row.parentElement.children].indexOf(row),
-    };
-  });
-
-  // Toggling rebuilds the list: the focus stays on that checkbox.
-  await rows.nth(0).locator('input[type="checkbox"]').focus();
-  await page.keyboard.press('Space');
-  await expect(rows.nth(0).locator('input[type="checkbox"]')).not.toBeChecked();
-  expect(await focusedIn()).toEqual({ control: 'checkbox', row: 0 });
-
-  // Removing a filter moves the focus to the row now in its place.
-  await rows.nth(0).locator('.list-item-remove').focus();
-  await page.keyboard.press('Enter');
-  await expect(rows).toHaveCount(1);
-  expect(await focusedIn()).toEqual({ control: 'remove', row: 0 });
-
-  // The last one: the focus stays on the list, not the page.
-  await page.keyboard.press('Enter');
-  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
-  expect(await page.evaluate(() => document.activeElement?.id)).toBe('active-filters');
-  expect(productErrors).toEqual([]);
-});
-
-test('the annotation-mode highlight button follows the category checkbox', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
+  // The last step marks a field as annotated, which takes a connected repository.
   await page.addInitScript(() => {
     window._simulate_repo_connected = true;
   });
   await openPreparedFixture(page);
-  await page.evaluate(async () => {
-    const { getCommunityAnnotationSession } = await import(
-      '/assets/js/app/community-annotations/session.js'
+
+  await test.step('removing a range filter from Active filters resets the legend sliders it drew', async () => {
+
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    const sliders = page.locator('#legend .slider-row input[type="range"]');
+    await expect(sliders).toHaveCount(2);
+    await sliders.nth(1).fill('500');
+    await expect(page.locator('#active-filters')).toContainText('score:');
+    const narrowed = await activeContinuousFilter(page);
+
+    await page.locator('#active-filters .list-item-remove').click();
+    await expect(page.locator('#active-filters')).toHaveText('No filters active.');
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+    await expect(sliders.nth(0)).toHaveValue('0');
+    await expect(sliders.nth(1)).toHaveValue('1000');
+
+    // Nudging Min must not resurrect the removed Max bound.
+    await sliders.nth(0).fill('10');
+    const nudged = await activeContinuousFilter(page);
+    const stats = await page.evaluate(() => {
+      const field = window._cellucidState.getActiveField();
+      return { ...field._continuousStats };
+    });
+    expect(nudged.max).toBe(stats.max);
+    expect(nudged.max).not.toBe(narrowed.max);
+
+    // Put back: the nudged range leaves with its row.
+    await page.locator('#active-filters .list-item-remove').click();
+    await expect(page.locator('#active-filters')).toHaveText('No filters active.');
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('removing a category filter from Active filters re-ticks its legend checkbox', async () => {
+
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    const alphaRow = page.locator('.legend-item', {
+      has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
+    });
+    await alphaRow.locator('.legend-checkbox').uncheck();
+    await expect(page.locator('#filter-count')).toHaveText('Showing 80 of 120 cells');
+
+    await page.locator('#active-filters .list-item-remove').click();
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+    await expect(alphaRow.locator('.legend-checkbox')).toBeChecked();
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('toggling or removing a filter from the keyboard keeps the focus in the list', async () => {
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await page.locator('.legend-item', {
+      has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
+    }).locator('.legend-checkbox').uncheck();
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    await page.locator('#legend .slider-row input[type="range"]').nth(1).fill('500');
+    const rows = page.locator('#active-filters .list-item');
+    await expect(rows).toHaveCount(2);
+    const focusedIn = () => page.evaluate(() => {
+      const active = document.activeElement;
+      const row = active?.closest('.list-item');
+      return {
+        control: active?.classList.contains('list-item-remove') ? 'remove' : active?.type ?? active?.id ?? null,
+        row: row === null || row === undefined ? null : [...row.parentElement.children].indexOf(row),
+      };
+    });
+
+    // Toggling rebuilds the list: the focus stays on that checkbox.
+    await rows.nth(0).locator('input[type="checkbox"]').focus();
+    await page.keyboard.press('Space');
+    await expect(rows.nth(0).locator('input[type="checkbox"]')).not.toBeChecked();
+    expect(await focusedIn()).toEqual({ control: 'checkbox', row: 0 });
+
+    // Removing a filter moves the focus to the row now in its place.
+    await rows.nth(0).locator('.list-item-remove').focus();
+    await page.keyboard.press('Enter');
+    await expect(rows).toHaveCount(1);
+    expect(await focusedIn()).toEqual({ control: 'remove', row: 0 });
+
+    // The last one: the focus stays on the list, not the page.
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#active-filters')).toHaveText('No filters active.');
+    expect(await page.evaluate(() => document.activeElement?.id)).toBe('active-filters');
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('Filter is offered only while Live filtering is off, and applies the range once', async () => {
+    // With Live filtering on every slider step applies the range, so a Filter
+    // button beside the switch has nothing to do.
+
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    const block = page.locator('#legend .legend-filter');
+    const live = block.getByRole('switch', { name: 'Live filtering' });
+    const filter = block.getByRole('button', { name: 'Filter', exact: true });
+    const sliders = block.locator('.slider-row input[type="range"]');
+    await expect(live).toHaveAttribute('aria-checked', 'true');
+    await expect(filter).toBeHidden();
+    await expect(block.getByRole('button', { name: 'Reset', exact: true })).toBeVisible();
+
+    await live.click();
+    await expect(live).toHaveAttribute('aria-checked', 'false');
+    await expect(filter).toBeVisible();
+    await expect(filter).toBeEnabled();
+    await sliders.nth(1).fill('500');
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+    await filter.click();
+    await expect(page.locator('#active-filters')).toContainText('score:');
+    await expect(page.locator('#filter-count')).not.toHaveText('Showing all 120 cells');
+
+    await live.click();
+    await expect(live).toHaveAttribute('aria-checked', 'true');
+    await expect(filter).toBeHidden();
+    // Put back: the applied range leaves with its row.
+    await page.locator('#active-filters .list-item-remove').click();
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('the annotation-mode highlight button follows the category checkbox', async () => {
+    await page.evaluate(async () => {
+      const { getCommunityAnnotationSession } = await import(
+        '/assets/js/app/community-annotations/session.js'
+      );
+      getCommunityAnnotationSession().setFieldAnnotated('cell_type', true);
+    });
+
+    // An annotated field's option carries the voting badge before its key.
+    const annotatedOption = page.locator('#categorical-field option', {
+      hasText: /cell_type$/,
+    });
+    await expect(annotatedOption).toHaveCount(1);
+    await page.locator('#categorical-field').selectOption(
+      await annotatedOption.getAttribute('value'),
     );
-    getCommunityAnnotationSession().setFieldAnnotated('cell_type', true);
+    const alphaRow = page.locator('.legend-item', {
+      has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
+    });
+    const highlightButton = alphaRow.locator('.legend-highlight-btn');
+    await expect(highlightButton).toBeEnabled();
+
+    await alphaRow.locator('.legend-checkbox').uncheck();
+    await expect(page.locator('#filter-count')).toHaveText('Showing 80 of 120 cells');
+    await expect(highlightButton).toBeDisabled();
+
+    await alphaRow.locator('.legend-checkbox').check();
+    await expect(highlightButton).toBeEnabled();
+    await highlightButton.click();
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
+
+    expect(productErrors).toEqual([]);
   });
-
-  // An annotated field's option carries the voting badge before its key.
-  const annotatedOption = page.locator('#categorical-field option', {
-    hasText: /cell_type$/,
-  });
-  await expect(annotatedOption).toHaveCount(1);
-  await page.locator('#categorical-field').selectOption(
-    await annotatedOption.getAttribute('value'),
-  );
-  const alphaRow = page.locator('.legend-item', {
-    has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
-  });
-  const highlightButton = alphaRow.locator('.legend-highlight-btn');
-  await expect(highlightButton).toBeEnabled();
-
-  await alphaRow.locator('.legend-checkbox').uncheck();
-  await expect(page.locator('#filter-count')).toHaveText('Showing 80 of 120 cells');
-  await expect(highlightButton).toBeDisabled();
-
-  await alphaRow.locator('.legend-checkbox').check();
-  await expect(highlightButton).toBeEnabled();
-  await highlightButton.click();
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
-
-  expect(productErrors).toEqual([]);
 });

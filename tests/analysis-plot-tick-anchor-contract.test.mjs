@@ -1,11 +1,11 @@
 /**
- * CEL-0217 — a categorical axis is anchored at both ends, or not thinned at all.
+ * A categorical axis is anchored at both ends, or not thinned at all.
  *
  * `PlotFactory.fitCategoricalTickLabels` documents that "the first and the last
- * are always kept so the axis stays anchored at both ends". It did not hold at
- * the narrowest end of its own range: `horizontalTickCapacity` floors its answer
- * at one, and `spreadTickIndices(length, 1)` returns `[0]`, so the last label was
- * dropped and the axis was anchored at one end only.
+ * are always kept so the axis stays anchored at both ends". That holds at the
+ * narrowest end of its range too: `horizontalTickCapacity` floors its answer
+ * at two, because a capacity of one makes `spreadTickIndices(length, 1)` return
+ * `[0]`, the last label is dropped and the axis is anchored at one end only.
  *
  * `tests/analysis-plot-tick-fit-contract.test.mjs` cannot see this. Its fixture
  * is eighteen cell-type names, and eighteen categories make
@@ -15,18 +15,16 @@
  * nothing about it.
  *
  * The published pancreas dataset reaches it exactly. `cell_type` and `clusters`
- * each hold eight categories — one short of the rotation threshold — so the axis
+ * each hold eight categories - one short of the rotation threshold - so the axis
  * is drawn upright, and the longest name, `Pre-endocrine`, needs
- * 13 × 11 × 0.58 + 6 ≈ 89 px of slot. The sidebar preview measures 224 px wide
- * and the base layout reserves l:55 r:20, leaving 149 px: capacity one. The
- * committed screenshot
- * `cellucid-python/docs/_static/screenshots/analysis/detailed-categorical.png`
- * shows the result — eight bars under a single tick reading `Ductal`.
+ * 13 x 11 x 0.58 + 6 = 89 px of slot. The sidebar preview is 224 px wide
+ * and the base layout reserves l:55 r:20, leaving 149 px: capacity one without
+ * the floor, eight bars under a single tick reading `Ductal`.
  *
  * The geometry is why the floor is two rather than a qualified invariant. The
  * capacity model tiles fixed-width slots across the axis, but the thinner draws
  * at category positions: two labels at the ends of an eight-band axis sit
- * (7/8) × 149 ≈ 130 px apart, while `Ductal` and `Epsilon` need 41 px between
+ * (7/8) x 149 = 130 px apart, while `Ductal` and `Epsilon` need 41 px between
  * their centers to clear each other. Anchoring both ends is not a crowded
  * compromise here; it is three times the room the pair needs.
  */

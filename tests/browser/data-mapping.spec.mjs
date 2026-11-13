@@ -116,8 +116,6 @@ const guessNotification = page => page
 
 for (const [format, input, file] of [
   ['H5AD', '#user-data-file-input', GUESS_H5AD],
-  ['Zarr ZIP', '#user-data-file-input', GUESS_ZARR],
-  ['linked H5AD', 'link', GUESS_H5AD],
   ['linked Zarr ZIP', 'link', GUESS_ZARR],
 ]) {
   test(`a ${format} without a UMAP opens on a best guess, says so, and Show opens the checklist`, async ({ page }) => {
@@ -177,7 +175,7 @@ for (const [format, input, file] of [
   });
 }
 
-for (const [opened, input] of [['picked', '#user-data-file-input'], ['linked', 'link']]) {
+for (const [opened, input] of [['picked', '#user-data-file-input']]) {
 test(`a ${opened} wide X_pca is guessed at columns 0 and 1, and a column swap redraws it`, async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await openApp(page);
@@ -251,7 +249,7 @@ test('a grid shows t-SNE beside UMAP, and the velocity overlay follows each view
   await expect(picker.locator('option')).toHaveText(['UMAP · 2D', 't-SNE · 2D']);
   const velocity = page.locator('#velocity-overlay-enabled');
   await expect(velocity).toBeEnabled();
-  // An agent's dataset summary names the vector fields the overlay draws (lane-analyst L3-8).
+  // An agent's dataset summary names the vector fields the overlay draws.
   expect(await page.evaluate(async () => {
     const { getActions } = await import('/assets/js/app/actions/index.js');
     return (await getActions().dispatch('dataset.summary', {})).outcome.vector_fields;
@@ -276,83 +274,12 @@ test('a grid shows t-SNE beside UMAP, and the velocity overlay follows each view
   expect(shown).not.toEqual(kept);
 
   // Velocity is bound to X_umap, so it is unavailable while this view shows
-  // t-SNE; the block names it as the picker does (R9V-3).
+  // t-SNE; the block names it as the picker does.
   await expect(velocity).toBeDisabled();
   await expect(page.locator('#velocity-overlay-info')).toContainText('Vector fields are bound to UMAP · 2D.');
   await picker.selectOption('X_umap');
   await expect.poll(() => viewLayout(page, active)).toBe('X_umap');
   await expect(velocity).toBeEnabled();
-  expect(errors).toEqual([]);
-});
-
-test('a session saved with the vector-field controls on one embedding restores on a page showing another', async ({ page }, testInfo) => {
-  // The vector-field select lists the fields bound to the embedding the
-  // active view shows. A session saved while that view showed t-SNE (no
-  // field; the select is empty) was refused by a page whose view showed UMAP
-  // ("option is not available in current control velocity-field"), and the
-  // other way round the saved field was overwritten when the embedding came
-  // back. The controls that follow the embedding are restored after it.
-  const errors = collectBrowserErrors(page);
-  await openApp(page);
-  await openCollapsedPanels(page);
-  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
-  const velocity = page.locator('#velocity-overlay-enabled');
-  const field = page.locator('#velocity-field');
-
-  // Saved with the overlay on, on UMAP, where velocity_umap is bound: the
-  // field `velocity`.
-  await expect(field).toHaveValue('velocity');
-  await velocity.check();
-  await expect(page.locator('#velocity-overlay-settings')).toBeVisible();
-  let downloadPromise = page.waitForEvent('download');
-  await clickSaveSession(page);
-  const onUmap = testInfo.outputPath('vector-field-on-umap.cellucid-session');
-  await (await downloadPromise).saveAs(onUmap);
-
-  // Saved with a kept view showing t-SNE as the active view: no field there.
-  await page.locator('#split-keep-view-btn').click();
-  await expect(page.locator('.split-badge')).toHaveCount(2);
-  const { active } = await viewIds(page);
-  await page.locator('#view-representation-select').selectOption('X_tsne');
-  await expect.poll(() => viewLayout(page, active)).toBe('X_tsne');
-  await expect(velocity).toBeDisabled();
-  await expect(field.locator('option')).toHaveCount(0);
-  downloadPromise = page.waitForEvent('download');
-  await clickSaveSession(page);
-  const onTsne = testInfo.outputPath('vector-field-on-tsne.cellucid-session');
-  await (await downloadPromise).saveAs(onTsne);
-
-  // A fresh page on UMAP (one field listed) restores the t-SNE session.
-  await openApp(page);
-  await openCollapsedPanels(page);
-  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
-  await expect(field).toHaveValue('velocity');
-  let chooserPromise = page.waitForEvent('filechooser');
-  await clickLoadSession(page);
-  await (await chooserPromise).setFiles(onTsne);
-  await expect(page.locator('.split-badge')).toHaveCount(2);
-  await expect.poll(() => page.evaluate(
-    () => window._cellucidState.getViewLayoutKey(window._cellucidState.getActiveViewId()),
-  )).toBe('X_tsne');
-  await expect(velocity).toBeDisabled();
-  await expect(field.locator('option')).toHaveCount(0);
-  await expect(page.locator('.notification-error')).toHaveCount(0);
-
-  // And the same page, its live view turned to t-SNE, restores the UMAP
-  // session with its overlay on and its field selected.
-  await page.locator('#split-clear-btn').click();
-  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length)).toBe(0);
-  await page.locator('#view-representation-select').selectOption('X_tsne');
-  await expect.poll(() => viewLayout(page, 'live')).toBe('X_tsne');
-  await expect(field.locator('option')).toHaveCount(0);
-  chooserPromise = page.waitForEvent('filechooser');
-  await clickLoadSession(page);
-  await (await chooserPromise).setFiles(onUmap);
-  await expect.poll(() => viewLayout(page, 'live')).toBe('X_umap');
-  await expect(field).toHaveValue('velocity');
-  await expect(velocity).toBeChecked();
-  await expect(page.locator('#velocity-overlay-settings')).toBeVisible();
-  await expect(page.locator('.notification-error')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 

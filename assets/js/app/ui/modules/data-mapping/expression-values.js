@@ -24,7 +24,7 @@ import { setControlAvailability } from '../../core/control-availability.js';
 import { PLACES } from '../../place-names.js';
 
 /** The section id the panel and the tests find it by. */
-export const EXPRESSION_VALUES_SECTION = 'expression-values';
+const EXPRESSION_VALUES_SECTION = 'expression-values';
 
 /**
  * Build the section once.

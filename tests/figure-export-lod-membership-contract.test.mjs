@@ -940,7 +940,7 @@ test('figure-export source has no dense LOD mask API or hot-loop conversion', as
   for (const file of ['utils/webgl-point-rasterizer.js', 'utils/point-projector.js']) {
     const source = await readFile(new URL(file, figureExportRoot), 'utf8');
     assert.doesNotMatch(source, /lodMembership\?\.indices/, file);
-    // With the cells' colors: the layers come bottom first (UX-8, cells not
+    // With the cells' colors: the layers come bottom first (cells not
     // read); a marker's colors (an alpha byte of opacity) are not layered.
     assert.match(source, /drawnSequence\(lodMembership, drawOrder, (alphaIsLayer \? colors : null|alphaIsOpacity \? null : colors)(, [^)]*)?\)/, file);
   }
@@ -1085,7 +1085,7 @@ test('full detail packs points in the pane draw order, and a reduced level in it
   assert.equal(drawnSequence(membership, order), membership.indices);
 });
 
-test('a figure draws cells beneath the others (a field\'s no-value grey) first, each group in the pane\'s order (UX-8)', () => {
+test('a figure draws cells beneath the others (a field\'s no-value grey) first, each group in the pane\'s order', () => {
   const colors = new Uint8Array(6 * 4).fill(255);
   assert.equal(drawnSequence(null, null, colors), null, 'every cell opaque: the sequence as it is');
   // Cells 1 and 4 are gray, beneath.

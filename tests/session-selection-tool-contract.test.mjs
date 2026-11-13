@@ -1,7 +1,6 @@
 /**
  * The active selection tool is page chrome kept in sessions and saved
- * states, outside the history (CEL-0249, restored by the lead's decision of
- * 2026-11-04; History v2 §3.3.8).
+ * states, outside the history.
  *
  * The highlight toolbelt (Annotation based / KNN drag / Proximity drag /
  * Lasso) is the mode every drag on the canvas is read in: switching it

@@ -1,6 +1,6 @@
 /**
- * A dataset replaced under an open category editor or confirmation retires
- * it: what it would have done is never applied to the dataset shown after,
+ * A dataset replaced under an open category or field editor, or under a
+ * confirmation, retires it: what it would have done is never applied to the dataset shown after,
  * even one with the same fields at the same indices.
  *
  * - The inline category editor is no dialog: the person replaces the dataset
@@ -70,9 +70,10 @@ async function replaceUnderConfirmation(page) {
   const priorGeneration = await page.evaluate(
     () => window._cellucidState.getDatasetGeneration(),
   );
-  // An address the agent was not given in this tab is asked of the person first (F121); the question
-  // is answered over the open dialog, never left waiting under it (R9H-16).
   const opening = openDatasetAsAgent(page, { name: SAME_FILE_LINK });
+  // An address the agent was not given by the person is asked of the person
+  // first, each time; the question is answered over the open dialog, never
+  // left waiting under it.
   const card = page.locator('#agent-presence .agent-confirm');
   await expect(card).toHaveAttribute('data-asking', 'unseen-link');
   expect(await outOfReach(card)).toBe(false);
@@ -115,141 +116,176 @@ async function readObsFieldContract(page) {
   }));
 }
 
-test('dataset replacement retires a category editor before same-index reuse', async ({
+test('a dataset replaced under an open editor or confirmation retires it', async ({
   page,
 }) => {
   const productErrors = observeProductErrors(page);
   await openPreparedDataset(page);
-  await selectCellType(page);
 
-  await page.locator('.legend-rename-btn').first().click();
-  const editor = page.locator('.inline-rename-input');
-  await expect(editor).toHaveCount(1);
-  const staleEditor = await editor.elementHandle();
-  expect(staleEditor).not.toBeNull();
-  const priorGeneration = await page.evaluate(
-    () => window._cellucidState.getDatasetGeneration(),
-  );
+  await test.step('dataset replacement retires a category editor before same-index reuse', async () => {
+    await selectCellType(page);
 
-  await replaceFromPicker(page);
-  await selectCellType(page);
-  const before = await readObsFieldContract(page);
-  expect(before.generation).toBeGreaterThan(priorGeneration);
-  await staleEditor.evaluate(input => {
-    input.value = 'stale_dataset_category';
-    input.dispatchEvent(new KeyboardEvent('keydown', {
-      bubbles: true,
-      key: 'Enter',
-    }));
+    await page.locator('.legend-rename-btn').first().click();
+    const editor = page.locator('.inline-rename-input');
+    await expect(editor).toHaveCount(1);
+    const staleEditor = await editor.elementHandle();
+    expect(staleEditor).not.toBeNull();
+    const priorGeneration = await page.evaluate(
+      () => window._cellucidState.getDatasetGeneration(),
+    );
+
+    await replaceFromPicker(page);
+    await selectCellType(page);
+    const before = await readObsFieldContract(page);
+    expect(before.generation).toBeGreaterThan(priorGeneration);
+    await staleEditor.evaluate(input => {
+      input.value = 'stale_dataset_category';
+      input.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        key: 'Enter',
+      }));
+    });
+
+    const after = await readObsFieldContract(page);
+    expect(after.fields).toEqual(before.fields);
+    expect(productErrors).toEqual([]);
   });
 
-  const after = await readObsFieldContract(page);
-  expect(after.fields).toEqual(before.fields);
-  expect(productErrors).toEqual([]);
-});
+  await test.step('dataset replacement retires category deletion confirmation ownership', async () => {
+    await selectCellType(page);
 
-test('dataset replacement retires category deletion confirmation ownership', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedDataset(page);
-  await selectCellType(page);
+    await page.locator('.legend-delete-btn').first().click();
+    await expect(page.locator('.confirm-dialog-title')).toHaveText(
+      'Delete category label',
+    );
+    const staleConfirm = await page
+      .locator('.confirm-dialog-confirm')
+      .elementHandle();
+    expect(staleConfirm).not.toBeNull();
 
-  await page.locator('.legend-delete-btn').first().click();
-  await expect(page.locator('.confirm-dialog-title')).toHaveText(
-    'Delete category label',
-  );
-  const staleConfirm = await page
-    .locator('.confirm-dialog-confirm')
-    .elementHandle();
-  expect(staleConfirm).not.toBeNull();
+    await replaceUnderConfirmation(page);
+    await selectCellType(page);
+    const before = await readObsFieldContract(page);
+    await staleConfirm.evaluate(button => button.click());
 
-  await replaceUnderConfirmation(page);
-  await selectCellType(page);
-  const before = await readObsFieldContract(page);
-  await staleConfirm.evaluate(button => button.click());
-
-  expect(await readObsFieldContract(page)).toEqual(before);
-  expect(productErrors).toEqual([]);
-});
-
-test('dataset replacement retires category merge confirmation ownership', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedDataset(page);
-  await selectCellType(page);
-
-  const labels = page.locator('.legend-label');
-  expect(
-    await dispatchAppDrag(
-      labels.nth(0),
-      page.locator('.legend-item').nth(1),
-      {
-        expectedDataType: 'application/x-cellucid-category',
-      },
-    ),
-  ).toEqual({
-    dataTypes: ['application/x-cellucid-category'],
-    dragOverAccepted: true,
-    dropAccepted: true,
+    expect(await readObsFieldContract(page)).toEqual(before);
+    expect(productErrors).toEqual([]);
+    // Back on the catalog's dataset, so the link is another dataset again.
+    await replaceFromPicker(page);
   });
-  await expect(page.locator('.confirm-dialog-title')).toHaveText(
-    'Merge categories',
-  );
-  const staleConfirm = await page
-    .locator('.confirm-dialog-confirm')
-    .elementHandle();
-  expect(staleConfirm).not.toBeNull();
 
-  await replaceUnderConfirmation(page);
-  await selectCellType(page);
-  const before = await readObsFieldContract(page);
-  await staleConfirm.evaluate(button => button.click());
+  await test.step('dataset replacement retires category merge confirmation ownership', async () => {
+    await selectCellType(page);
 
-  expect(await readObsFieldContract(page)).toEqual(before);
-  expect(productErrors).toEqual([]);
-});
+    const labels = page.locator('.legend-label');
+    expect(
+      await dispatchAppDrag(
+        labels.nth(0),
+        page.locator('.legend-item').nth(1),
+        {
+          expectedDataType: 'application/x-cellucid-category',
+        },
+      ),
+    ).toEqual({
+      dataTypes: ['application/x-cellucid-category'],
+      dragOverAccepted: true,
+      dropAccepted: true,
+    });
+    await expect(page.locator('.confirm-dialog-title')).toHaveText(
+      'Merge categories',
+    );
+    const staleConfirm = await page
+      .locator('.confirm-dialog-confirm')
+      .elementHandle();
+    expect(staleConfirm).not.toBeNull();
 
-test('dataset replacement retires deleted-field purge confirmation ownership', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openPreparedDataset(page);
+    await replaceUnderConfirmation(page);
+    await selectCellType(page);
+    const before = await readObsFieldContract(page);
+    await staleConfirm.evaluate(button => button.click());
 
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await page.locator('#delete-continuous-field').click();
-  await page.locator('.confirm-dialog-confirm').click();
-  await expect(
-    page.locator('button[data-action="purge-field"][data-source="obs"]'),
-  ).toHaveCount(1);
+    expect(await readObsFieldContract(page)).toEqual(before);
+    expect(productErrors).toEqual([]);
+    // Back on the catalog's dataset, so the link is another dataset again.
+    await replaceFromPicker(page);
+  });
 
-  await page
-    .locator('#deleted-fields-accordion-item .disclosure-header')
-    .click();
-  await page
-    .locator('button[data-action="purge-field"][data-source="obs"]')
-    .click();
-  await expect(page.locator('.confirm-dialog-title')).toHaveText(
-    'Delete "score" for good?',
-  );
-  const staleConfirm = await page
-    .locator('.confirm-dialog-confirm')
-    .elementHandle();
-  expect(staleConfirm).not.toBeNull();
+  await test.step('dataset replacement retires deleted-field purge confirmation ownership', async () => {
 
-  await replaceUnderConfirmation(page);
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await page.locator('#delete-continuous-field').click();
-  await page.locator('.confirm-dialog-confirm').click();
-  // The deletion has landed (its purge button is listed) before the state is read:
-  // reading it straight after the click raced the deletion on WebKit.
-  await expect(
-    page.locator('button[data-action="purge-field"][data-source="obs"]'),
-  ).toHaveCount(1);
-  const before = await readObsFieldContract(page);
-  await staleConfirm.evaluate(button => button.click());
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    await page.locator('#delete-continuous-field').click();
+    await page.locator('.confirm-dialog-confirm').click();
+    await expect(
+      page.locator('button[data-action="purge-field"][data-source="obs"]'),
+    ).toHaveCount(1);
 
-  expect(await readObsFieldContract(page)).toEqual(before);
-  expect(productErrors).toEqual([]);
+    await page
+      .locator('#deleted-fields-accordion-item .disclosure-header')
+      .click();
+    await page
+      .locator('button[data-action="purge-field"][data-source="obs"]')
+      .click();
+    await expect(page.locator('.confirm-dialog-title')).toHaveText(
+      'Delete "score" for good?',
+    );
+    const staleConfirm = await page
+      .locator('.confirm-dialog-confirm')
+      .elementHandle();
+    expect(staleConfirm).not.toBeNull();
+
+    await replaceUnderConfirmation(page);
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    await page.locator('#delete-continuous-field').click();
+    await page.locator('.confirm-dialog-confirm').click();
+    // The deletion has landed (its purge button is listed) before the state is read:
+    // reading it straight after the click raced the deletion on WebKit.
+    await expect(
+      page.locator('button[data-action="purge-field"][data-source="obs"]'),
+    ).toHaveCount(1);
+    const before = await readObsFieldContract(page);
+    await staleConfirm.evaluate(button => button.click());
+
+    expect(await readObsFieldContract(page)).toEqual(before);
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('dataset replacement cancels stale field editors before same-index reuse', async () => {
+    await page.locator('#categorical-field').selectOption({
+      label: 'cell_type',
+    });
+    await expect(page.locator('#rename-categorical-field')).toBeEnabled();
+    await page.locator('#rename-categorical-field').click();
+    const editor = page.locator('.inline-rename-input');
+    await expect(editor).toHaveCount(1);
+    const staleEditor = await editor.elementHandle();
+    expect(staleEditor).not.toBeNull();
+
+    await page.locator('#dataset-select').selectOption('__none__');
+    await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
+    await expect(page.locator('.inline-rename-input')).toHaveCount(0);
+
+    await page.locator('#dataset-select').selectOption(
+      'dataset:local-demo:current-ui',
+    );
+    await expect(page.locator('#dataset-name')).toHaveText(
+      'Current UI fixture',
+    );
+    await staleEditor.evaluate(input => {
+      input.value = 'stale_replacement_name';
+      input.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        key: 'Enter',
+      }));
+    });
+
+    await expect(
+      page.locator('#categorical-field option', { hasText: 'cell_type' }),
+    ).toHaveCount(1);
+    await expect(
+      page.locator('#categorical-field option', {
+        hasText: 'stale_replacement_name',
+      }),
+    ).toHaveCount(0);
+    expect(productErrors).toEqual([]);
+  });
 });

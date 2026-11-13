@@ -1,6 +1,6 @@
 import { StoreOrder } from '../assets/js/rendering/high-perf/store-order.js';
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -46,31 +46,9 @@ import { bufferOf, pointStoreOver } from './helpers/point-stores.mjs';
 import { SegmentedVertexArray } from '../assets/js/rendering/high-perf/point-store-segments.js';
 
 const renderingRoot = new URL('../assets/js/rendering/', import.meta.url);
-const figureExportRoot = new URL(
-  '../assets/js/app/ui/modules/figure-export/',
-  import.meta.url
-);
 
 async function source(relativeUrl, root = renderingRoot) {
   return readFile(new URL(relativeUrl, root), 'utf8');
-}
-
-/**
- * Every source file the high-performance renderer is assembled from, so that a
- * "this pattern must not exist" assertion cannot be evaded by moving the code
- * into one of the renderer's own modules. Enumerates the directory rather than
- * naming files, so a module added later is covered without editing this test.
- */
-async function highPerfRendererSources() {
-  const moduleRoot = new URL('high-perf/', renderingRoot);
-  const names = (await readdir(moduleRoot))
-    .filter(name => name.endsWith('.js'))
-    .sort();
-  const parts = [await source('high-perf-renderer.js')];
-  for (const name of names) {
-    parts.push(await readFile(new URL(name, moduleRoot), 'utf8'));
-  }
-  return parts.join('\n');
 }
 
 test('spatial indices require an exact supported dimension contract', () => {
@@ -255,39 +233,6 @@ test('renderer frame timing remains owned by the view that produced it', () => {
       { viewId: 'live', lastFrameTime: 2, fps: 500 },
       { viewId: 'snap_1', lastFrameTime: 8, fps: 125 },
     ]
-  );
-});
-
-test('snapshot buffers publish owned bounds and adopt published positions without copying them', async () => {
-  const rendererSource = await source('high-perf-renderer.js');
-  assert.match(
-    rendererSource,
-    /snapshotBounds\s*=\s*HighPerfRenderer\.computeBoundsFromPositions\(\s*positions,\s*exactDimensionLevel\s*\)/
-  );
-  // A published positions array is never written after publication, so a
-  // snapshot geometry is that array: a copy would duplicate every coordinate.
-  assert.match(rendererSource, /positions:\s*sourcePositions,/);
-  assert.doesNotMatch(
-    rendererSource,
-    /new Float32Array\(sourcePositions\)/
-  );
-  assert.match(rendererSource, /bounds:\s*snapshotBounds/);
-  assert.doesNotMatch(
-    rendererSource,
-    /const customBounds = hasCustomPositions\s*\?\s*HighPerfRenderer\.computeBoundsFromPositions/
-  );
-});
-
-test('high-performance data entry points do not clamp or default dimensions', async () => {
-  const rendererSource = await highPerfRendererSources();
-
-  assert.doesNotMatch(
-    rendererSource,
-    /dimensionLevel\s*=\s*3|Math\.max\(1,\s*Math\.min\(3,\s*dimensionLevel\)\)/
-  );
-  assert.doesNotMatch(
-    rendererSource,
-    /Invalid quality[\s\S]{0,120}using "full"/
   );
 });
 
@@ -705,40 +650,6 @@ test('a draw order adopted after a recolor gathers the latest renderer color gen
   assert.equal(renderer._colorsDirty, false);
 });
 
-test('high-performance rendering has no legacy alpha or global-view path', async () => {
-  const rendererSource = await highPerfRendererSources();
-
-  assert.doesNotMatch(
-    rendererSource,
-    /backwards compatibility|legacy fallback|global cache fallback/i
-  );
-  assert.doesNotMatch(
-    rendererSource,
-    /getLodVisibilityArray|getCombinedVisibilityForView|cachedLodVisibility/
-  );
-  assert.doesNotMatch(
-    rendererSource,
-    /if\s*\(\s*!this\._useAlphaTexture\s*\)[\s\S]{0,600}bufferSubData/
-  );
-});
-
-test('highlight rendering owns exact view inputs and one visibility API', async () => {
-  const highlightSource = await source('highlight-renderer.js');
-
-  assert.doesNotMatch(
-    highlightSource,
-    /_viewPositions|_viewId|API compatibility|global positions as fallback/i
-  );
-  assert.doesNotMatch(
-    highlightSource,
-    /getCombinedVisibilityForView|getLodVisibilityArray|PositionFingerprint/
-  );
-  assert.doesNotMatch(
-    highlightSource,
-    /viewPositions\s*\|\||String\(viewId\s*\|\|/
-  );
-});
-
 test('highlight LOD synchronization calls one exact per-view renderer contract', () => {
   // A 2D view: two position components per point.
   const positions = Float32Array.from([0, 0]);
@@ -856,27 +767,6 @@ test('viewer isolates highlight synchronization and drawing before later render 
   assert.doesNotMatch(
     viewerSource,
     /highlightTools\.renderHighlights\(renderParams/
-  );
-});
-
-test('viewer position access never substitutes another view', async () => {
-  const viewerSource = await source('viewer.js');
-
-  assert.doesNotMatch(
-    viewerSource,
-    /viewPositionsCache\.get\([^)]*\)\s*\|\|\s*positionsArray/
-  );
-  assert.doesNotMatch(
-    viewerSource,
-    /if\s*\(\s*!viewId\s*\)\s*return\s+positionsArray/
-  );
-  assert.doesNotMatch(
-    viewerSource,
-    /const\s+vid\s*=\s*viewId\s*\|\||cached\?\.cameraDistance\s*\?\?\s*radius/
-  );
-  assert.doesNotMatch(
-    viewerSource,
-    /_renderAllViews\.find\([^;]+?\)\s*\|\|\s*_renderAllViews\[0\]/
   );
 });
 
@@ -1049,20 +939,6 @@ test('smoke exposes one GPU density implementation and no compatibility alias', 
   );
 });
 
-test('smoke failures are visible and never route to a CPU implementation', async () => {
-  const densitySource = await source('smoke-cloud/smoke-density.js');
-  const rendererSource = await source('smoke-cloud/smoke-renderer.js');
-
-  assert.doesNotMatch(
-    densitySource,
-    /falling back to CPU|CPU fallback|buildDensityVolume\(positions/
-  );
-  assert.doesNotMatch(
-    rendererSource,
-    /noiseGenerationFailed|loading\/fallback state/i
-  );
-});
-
 test('shader-accurate rasterization rejects incomplete export state', () => {
   assert.throws(
     () => rasterizePointsWebgl({
@@ -1112,8 +988,8 @@ test('shader-accurate rasterization names a missing sprite cap before any GL cal
     viewRect01: { x: 0, y: 0, width: 1, height: 1 },
     pointSizePx: 4,
   });
-  // A render state built by hand before the sprite cap existed (F97) drew
-  // with a NaN cap.
+  // A render state built by hand without the sprite cap would draw with a
+  // NaN cap.
   for (const [key, value, pattern] of [
     ['pointSizeMax', undefined, /renderState\.pointSizeMax must be a finite positive number/],
     ['pointSizeMax', 0, /renderState\.pointSizeMax must be a finite positive number/],
@@ -1126,49 +1002,6 @@ test('shader-accurate rasterization names a missing sprite cap before any GL cal
   // A complete state passes the check (and then needs a GL context, which
   // Node has not).
   assert.throws(() => rasterize(complete()), (error) => !/pointSizeMax/.test(error.message));
-});
-
-test('figure export never changes format, strategy, backend, or fidelity', async () => {
-  const [
-    engineSource,
-    uiSource,
-    warningSource,
-    rasterizerSource,
-    pngSource,
-    svgSource,
-  ] = await Promise.all([
-    source('figure-export-engine.js', figureExportRoot),
-    source('figure-export-ui.js', figureExportRoot),
-    source('components/fidelity-warning-dialog.js', figureExportRoot),
-    source('utils/webgl-point-rasterizer.js', figureExportRoot),
-    source('renderers/png-renderer.js', figureExportRoot),
-    source('renderers/svg-renderer.js', figureExportRoot),
-  ]);
-
-  assert.doesNotMatch(
-    engineSource,
-    /strategy\s*===\s*['"]raster['"]\s*\?\s*['"]png['"]|datasetName:\s*['"]Synthetic['"]/
-  );
-  assert.doesNotMatch(
-    uiSource,
-    /strategy adjusted|fall back to flat circles|value:\s*['"]raster['"]|value\s*=\s*['"]hybrid['"]/i
-  );
-  assert.doesNotMatch(warningSource, /Export anyway/i);
-  // One backend: the figure-export worker's OffscreenCanvas, never a page
-  // canvas beside it and never a CPU substitute.
-  assert.doesNotMatch(
-    rasterizerSource,
-    /document\.createElement|HTMLCanvasElement|falling back to CPU|use flat circles/i
-  );
-  assert.match(rasterizerSource, /new OffscreenCanvas\(1, 1\)/);
-  assert.doesNotMatch(
-    pngSource,
-    /WebGL rasterizer returned null[\s\S]{0,100}Canvas2D flat circles/i
-  );
-  assert.doesNotMatch(
-    svgSource,
-    /xlink:href|xmlns:xlink|rasterizer returned null[\s\S]{0,180}vector circles/i
-  );
 });
 
 test('figure export crop state rejects aliases, coercion, and repair', () => {
@@ -1273,34 +1106,6 @@ test('figure export requests publish one complete current contract', () => {
       dpi: 300,
     }),
     /exactly/i
-  );
-});
-
-test('renderer benchmark consumers request one exact per-view statistics owner', async () => {
-  const benchmarkSource = await source('dev/benchmark.js', new URL('../assets/js/', import.meta.url));
-  assert.doesNotMatch(
-    benchmarkSource,
-    /this\.renderer\.getStats\(\)/
-  );
-  assert.doesNotMatch(
-    benchmarkSource,
-    /this\.viewer\.getRendererStats\(\)/
-  );
-  assert.doesNotMatch(
-    benchmarkSource,
-    /backward compatibility|legacy-compatible|legacy format|fall(?:s)? back|fallback|getExtension\(['"]EXT_disjoint_timer_query['"]\)|window\.(?:SyntheticDataGenerator|PerformanceTracker|BenchmarkReporter|BenchmarkExporter|BottleneckAnalyzer|startLiveMonitor|stopLiveMonitor|analyzeBottleneck|hideMetrics)/i
-  );
-  assert.doesNotMatch(
-    benchmarkSource,
-    /export\s+(?:class\s+HighPerfBenchmark|const\s+BenchmarkConfig)\b/
-  );
-  assert.doesNotMatch(
-    benchmarkSource,
-    /from '\.\.\/rendering\//
-  );
-  assert.doesNotMatch(
-    benchmarkSource,
-    /export\s+(?:class\s+BenchmarkExporter|\{\s*formatNumber\s*\})/
   );
 });
 

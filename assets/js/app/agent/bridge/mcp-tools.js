@@ -32,8 +32,8 @@
  * **The list never changes with the person's settings**, for every way in
  * alike (the chat bar, the connector, a local agent): a model's reasoning is
  * bound to the exact tools it was given, and a changed list rewrites a
- * client's cached prompt (L26-9: a permission changed mid-session cost a
- * connector's next turn about four times its cached price and dropped its
+ * client's cached prompt (a permission changed mid-session would cost a
+ * connector's next turn about four times its cached price and drop its
  * earlier reasoning). What the person's permissions, the dataset's data
  * switch and their History settings make of the tools is told to the agent
  * apart: the chat bar's with the person's message, an outside agent's after
@@ -51,9 +51,8 @@ import { RELAY_STATUS_TOOL, VIEW_APP } from './relay-protocol.js';
 
 const OPEN_WORLD_CONFIRMS = new Set(['large-download', 'publishes']);
 /**
- * A detail the person's History settings leave out of the history (History
- * v2 §3.15.5: `offDomainsOf`), in the words an agent is told
- * (`notRecordedSentences`).
+ * A detail the person's History settings leave out of the history
+ * (`offDomainsOf`), in the words an agent is told (`notRecordedSentences`).
  */
 const NOT_RECORDED = Object.freeze({
   camera: 'Camera moves are not recorded in this history (the person\'s History settings)',
@@ -102,8 +101,8 @@ function descriptionOf(action) {
   else if (action.effect === 'dataset') sentences.push('Replaces the open dataset, whose history stays kept in this browser (Undo does not bring it back); records no step.');
   else if (action.effect === 'outside') sentences.push('Acts outside the dataset\'s state (a file, a publication, what this browser keeps); Undo does not take it back, and it records no step.');
   // Any other change is one undoable step: the instructions say so once
-  // (`instructions.js` CORE), so no description repeats it (~1,800 tokens a
-  // call over the ~95 changes, measured 2026-11-11).
+  // (`instructions.js` CORE), so no description repeats it (measured:
+  // 34_decisions_agents.md).
   return sentences.join(' ');
 }
 

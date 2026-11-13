@@ -1,6 +1,5 @@
 /**
- * One display rule for a category with no name (R9D-8, decided under the
- * owner's "fix all" direction): an empty category is shown as `(empty)` and
+ * One display rule for a category with no name: an empty category is shown as `(empty)` and
  * one of white space alone as `(blank)`, quietly, and one with white space at
  * an end in quotes, wherever a category is
  * named (legend, hover card, menus, filters, figure legends, analysis
@@ -40,7 +39,7 @@ test('a step names a category with no name by what it is shown as, unless a cate
   assert.throws(() => resolveCategory({ key: 'k', categories: ['lung'] }, 'liver'), /the categories are 'lung'|the categories are "lung"|lung/);
 });
 
-test('a missing value is "Missing" in the hover card, never NaN (R9D-9)', () => {
+test('a missing value is "Missing" in the hover card, never NaN', () => {
   assert.equal(formatCellValue(Number.NaN), 'Missing');
 });
 

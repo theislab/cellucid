@@ -10,7 +10,7 @@ const REPOSITORY_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 test('the complete CSS token inventory accepts every declared runtime custom property', () => {
   // A run takes about a second. A run that has not ended in a minute is hung
-  // (the validator once deadlocked inside process.exit()): it is killed and
+  // (a deadlock inside process.exit()): it is killed and
   // fails here with what it printed, instead of holding the suite.
   const result = spawnSync(process.execPath, [VALIDATOR_PATH], {
     cwd: REPOSITORY_ROOT,

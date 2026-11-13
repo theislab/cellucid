@@ -1,6 +1,5 @@
 /**
- * A dataset no longer shown keeps only what opens it again (round-2 audit
- * MB-4, MB-11): one rule for every source (`data-source-manager.js`):
+ * A dataset no longer shown keeps only what opens it again: one rule for every source (`data-source-manager.js`):
  *
  * - deactivating a source suspends the dataset it showed
  *   (`AnnDataFileSource.suspend`): its page caches are cleared, its reader

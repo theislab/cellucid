@@ -479,7 +479,7 @@ test('a remote body failure is reported by its own cause, never as bad JSON', as
   }
 });
 
-test('a server is asked through the one transport: its host\'s book hears it, and no answer is failed as one (RCD-2)', async t => {
+test('a server is asked through the one transport: its host\'s book hears it, and no answer is failed as one', async t => {
   installCanonicalServer(t, { origin: 'http://127.0.0.1:8781' });
   const source = new RemoteDataSource();
   await source.connect({ url: 'http://127.0.0.1:8781' });

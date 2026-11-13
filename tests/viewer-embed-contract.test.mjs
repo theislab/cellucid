@@ -151,7 +151,7 @@ test('the page says ready to its parent and accepts connect only from it, well f
   port1.close();
 });
 
-test('the notebook going away ends every request waiting on it, and every later one, as a closed cancellation that says what to do (CE-12)', async () => {
+test('the notebook going away ends every request waiting on it, and every later one, as a closed cancellation that says what to do', async () => {
   const { scope, parent } = embeddingPage();
   const connecting = connectEmbeddedHost({ scope });
   const { port1, port2 } = new MessageChannel();

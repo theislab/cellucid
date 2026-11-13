@@ -272,9 +272,9 @@ test('a gene field of a replaced list is located on the list in use: by position
 });
 
 test('a gene or a field with nothing to draw is refused before the active field changes: the view stays what it shows', async () => {
-  // Refused after the active gene was set, the refused gene stayed chosen:
-  // the selector showed it, and a later fill of its values drew it after an
-  // error had said it could not be shown.
+  // Refused only after the active gene was set, the refused gene would stay
+  // chosen: the selector would show it, and a later fill of its values would
+  // draw it after an error had said it could not be shown.
   const { state } = await makeState();
   const empty = state.varData.fields[0];
   empty.values = new Float32Array(N).fill(Number.NaN);

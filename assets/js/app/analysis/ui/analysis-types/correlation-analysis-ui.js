@@ -194,9 +194,10 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     this._pageSelector = new PageSelectorComponent({
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
-      onSelectionChange: pageIds => {
+      onSelectionChange: (pageIds, { byPerson }) => {
         this._assignPages(pageIds || []);
-        this._recordPersonChange('pages', { pageIds: [...this._selectedPages] });
+        // A page the selector let go as the pages changed is part of that change, not a step.
+        if (byPerson) this._recordPersonChange('pages', { pageIds: [...this._selectedPages] });
         this._updateRunRow();
         this._updateStale();
       },

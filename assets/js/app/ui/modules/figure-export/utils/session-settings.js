@@ -19,21 +19,13 @@ import { assertCropRect01 } from './crop.js';
 import { requireExactKeys } from '../../../../../utils/exact-record.js';
 import { parseDecimalText } from '../../../../../utils/format-units.js';
 import { HEX_COLOR } from '../../../../../utils/hex-color.js';
-import {
-  FIGURE_DEFAULT_WIDTH_PRESET,
-  FIGURE_WIDTH_PRESETS,
-  mmOfFigurePx,
-  ptOfFigurePx,
-} from './figure-size.js';
+import { FIGURE_DEFAULT_WIDTH_PRESET, FIGURE_WIDTH_PRESETS } from './figure-size.js';
 
 /**
- * The record's version: 3 (2026-11-11, F271) sizes the figure physically —
- * its width in millimetres (a journal column, `sizePreset`), which the figure
- * fills at its own height, and text in points; 2 held a box in pixels
- * (`width` × `height`) the figure was fitted in and text in pixels; 2 has an
- * SVG strategy always (full vector until another is chosen, F160), 1 held
- * null until one was chosen. A saved record of an earlier version is read by
- * `readSavedFigureExportSettings`.
+ * The record's version. It sizes the figure physically: its width in
+ * millimetres (a journal column, `sizePreset`), which the figure fills at its
+ * own height, and text in points. A saved record of any other version is
+ * refused whole by `readSavedFigureExportSettings`.
  */
 export const FIGURE_EXPORT_SESSION_SETTINGS_VERSION = 3;
 
@@ -51,7 +43,7 @@ export const FIGURE_EXPORT_COLORBLIND_MODES = Object.freeze(['none', 'deuteranop
 export const FIGURE_EXPORT_DOWNLOADS = Object.freeze(['svg', 'png', 'svg+png', 'png-multi', 'all']);
 export const FIGURE_EXPORT_DPIS = Object.freeze([150, 300, 600]);
 export const FIGURE_EXPORT_SVG_STRATEGIES = Object.freeze(['full-vector', 'optimized-vector', 'hybrid']);
-/** How an SVG draws its points until another is chosen: every point, editable (F160). */
+/** How an SVG draws its points until another is chosen: every point, editable. */
 export const FIGURE_EXPORT_DEFAULT_SVG_STRATEGY = 'full-vector';
 
 const KEYS = Object.freeze([
@@ -92,7 +84,7 @@ export const FIGURE_EXPORT_SETTING_RANGES = Object.freeze({
  * typed turns Auto text off): a burst of typing is one coalesced step.
  */
 export const FIGURE_EXPORT_LINKED_KEYS = Object.freeze([
-  // A preset is its own width (F271): the two are read, restored and recorded together.
+  // A preset is its own width: the two are read, restored and recorded together.
   Object.freeze(['sizePreset', 'width']),
   Object.freeze(['titleFollowsDataset', 'title']),
   Object.freeze(['autoTextSize', 'fontSizes']),
@@ -122,7 +114,8 @@ export function figureExportParamsOf(settings) {
  * The parameters of `figure-export.set` as settings (some keys of a record).
  *
  * @param {object} params
- * @returns {Partial<FigureExportSessionSettings>}
+ * @returns {Partial<Omit<FigureExportSessionSettings, 'frame'>> & {frame?: FigureExportSessionSettings['frame']|typeof FIGURE_EXPORT_FRAME_CELLS}}
+ *   `frame` may be the word that asks for the frame around the cells
  */
 export function figureExportSettingsOf(params) {
   return convertKeys(params, camelOf);
@@ -148,7 +141,7 @@ export function changedFigureExportSettings(before, after) {
 const FONT_SIZE = Object.freeze({
   type: 'number', minimum: FIGURE_EXPORT_SETTING_RANGES.fontSize[0], maximum: FIGURE_EXPORT_SETTING_RANGES.fontSize[1],
 });
-/** The text each font size sizes (L24-5: an agent took `title` for the panel titles). */
+/** The text each font size sizes, said in the schema so that a caller does not take `title` for the panel titles. */
 const FONT_SIZE_TEXT = Object.freeze({
   base: 'Panel titles of a multi-panel figure ("A. Cell type") and the other small labels (orientation, selection badge).',
   legend: 'The legend\'s title and entries.',
@@ -173,14 +166,14 @@ const FRAME_SETTING = Object.freeze({
   },
 });
 
-/** The value of `frame` that fits the frame to the cells (Fit the cells, F161). */
+/** The value of `frame` that fits the frame to the cells (Fit the cells). */
 export const FIGURE_EXPORT_FRAME_CELLS = 'cells';
 
 /**
  * The parameter schema of `figure-export.set` (`app/actions/definitions/settings.js`):
  * every setting of a record but its version, each optional, in the names
  * `figureExportParamsOf` gives them; `frame` also takes "cells" (the panel's
- * Fit the cells: the frame every cell drawn fills). `tests/figure-export-session-settings.test.mjs`
+ * Fit the cells: the frame every cell drawn fills). `tests/figure-export-session-settings-contract.test.mjs`
  * holds it to the record's keys, so a setting added to the record is a
  * parameter the day it lands. `FIGURE_EXPORT_SETTINGS` is the record as
  * `figure-export.get` reads it back.
@@ -193,8 +186,8 @@ export const FIGURE_EXPORT_PARAMS = Object.freeze({
       enum: [...FIGURE_EXPORT_SIZE_PRESETS],
       description: `The figure's width as a journal column: single-column (${FIGURE_WIDTH_PRESETS['single-column']} mm), one-and-half-column (${FIGURE_WIDTH_PRESETS['one-and-half-column']} mm), double-column (${FIGURE_WIDTH_PRESETS['double-column']} mm); custom is the width given. A preset sets width.`,
     },
-    // An agent set 1800 for "180 mm" (10 px a mm) and got a figure 476 mm wide at 300 dpi, and twice
-    // did px-to-pt arithmetic wrong (live-7 L25-10): the width is millimetres and text points, no pixels.
+    // The width is millimetres and text points, no pixels: an agent given pixels converts them wrongly
+    // (1800 for "180 mm" at 10 px a mm is a figure 476 mm wide at 300 dpi).
     width: {
       type: 'number', minimum: FIGURE_EXPORT_SETTING_RANGES.widthMm[0],
       description: 'The figure\'s width in millimetres; the figure is exactly this wide, at every resolution, and as tall as its plots make it (each keeps its view\'s shape, or its frame\'s: set a frame to change the shape). A width that is not a preset\'s makes size_preset custom.',
@@ -413,64 +406,17 @@ export function assertFigureExportSessionSettings(settings) {
  */
 
 /**
- * Each earlier version's record as the next one reads it: the one change
- * between them, made once here (the session reader), never in the panel.
- */
-const RECORD_UPGRADES = Object.freeze({
-  // 1 → 2: an SVG strategy not chosen yet is full vector, as the panel opens now (F160).
-  1: record => ({ ...record, version: 2, svgStrategy: record.svgStrategy ?? FIGURE_EXPORT_DEFAULT_SVG_STRATEGY }),
-  // 2 → 3: the figure physical (F271): `upgradeFigureSizeOfVersion2`.
-  2: record => upgradeFigureSizeOfVersion2(record),
-});
-
-/**
- * A version-2 record's size in version 3's terms: its box's width (CSS
- * pixels, 1/96 inch) is the figure's width in millimetres, a preset's when it
- * is one; the box's height goes (the figure is as tall as its plots make it);
- * text sizes in pixels become points (3/4 of a pixel each, to the half
- * point). The same conversion as the action's upgrader
- * (`figure-export.set` version 3, `app/actions/definitions/settings.js`).
- *
- * @param {object} record - a version-2 record (or a version-2 action's settings, without `version`)
- * @returns {object}
- */
-export function upgradeFigureSizeOfVersion2(record) {
-  const { height: _height, ...rest } = record;
-  const next = Object.hasOwn(record, 'version') ? { ...rest, version: 3 } : { ...rest };
-  // A size that followed the window ('screen', 'screen-half': version 2's
-  // default) was nobody's choice of a figure size: its box is the window's,
-  // so it becomes version 3's default (double column), never a custom width
-  // measured off whatever window saved it (found 2026-11-11: every sample's
-  // starting view, saved at 'screen-half' in a 1440 px window, came back as a
-  // custom 190.5 mm).
-  if (record.sizePreset === 'screen' || record.sizePreset === 'screen-half') {
-    delete next.sizePreset;
-    delete next.width;
-  } else if (Object.hasOwn(record, 'width') || Object.hasOwn(record, 'sizePreset')) {
-    const widthMm = Number.isFinite(record.width) ? Math.round(mmOfFigurePx(record.width) * 10) / 10 : null;
-    const preset = widthMm === null ? null : Object.keys(FIGURE_WIDTH_PRESETS).find(key => FIGURE_WIDTH_PRESETS[key] === widthMm) ?? null;
-    if (widthMm !== null) next.width = widthMm;
-    if (Object.hasOwn(record, 'sizePreset') || widthMm !== null) next.sizePreset = preset ?? 'custom';
-  }
-  if (record.fontSizes !== null && typeof record.fontSizes === 'object' && !Array.isArray(record.fontSizes)) {
-    next.fontSizes = Object.fromEntries(Object.entries(record.fontSizes)
-      .map(([key, px]) => [key, Number.isFinite(px) ? Math.max(1, Math.round(ptOfFigurePx(px) * 2) / 2) : px]));
-  }
-  return next;
-}
-
-/**
  * A saved record (a session's, a dataset's starting view's, a history
- * step's) read against the settings the panel holds now: an earlier
- * version's record upgraded first (`RECORD_UPGRADES`), then every setting
- * the current reader accepts is taken, and a setting it refuses (a value of
- * another version, out of range, unknown) keeps the panel's value and is
- * named in `unread`. One setting never fails the others: a session that saved
- * a value this version cannot use restores everything else (found 2026-11-11:
- * a dataset's starting view and an hour-old session lost every figure
- * setting to the SVG strategy's null). Settings that go together
- * (`FIGURE_EXPORT_LINKED_KEYS`) are taken together, and one that needs
- * another (a frame needs the preview) is tried again once the others are in.
+ * step's) read against the settings the panel holds now. A record of another
+ * version (or with none) is refused whole: the panel keeps its settings and
+ * `unread` names the record and its version. Otherwise every setting the
+ * current reader accepts is taken, and a setting it refuses (out of range,
+ * unknown) keeps the panel's value and is named in `unread`. One setting
+ * never fails the others: a session that saved a value this version cannot
+ * use restores everything else instead of losing every figure setting.
+ * Settings that go together (`FIGURE_EXPORT_LINKED_KEYS`) are taken together,
+ * and one that needs another (a frame needs the preview) is tried again once
+ * the others are in.
  *
  * @param {unknown} saved
  * @param {FigureExportSessionSettings} current - the panel's record now (valid)
@@ -479,12 +425,19 @@ export function upgradeFigureSizeOfVersion2(record) {
 export function readSavedFigureExportSettings(saved, current) {
   assertFigureExportSessionSettings(current);
   if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
-    return { settings: current, unread: [{ setting: 'figure export settings', reason: 'not a record of settings' }] };
+    return { settings: current, unread: [{ setting: 'settings', reason: 'not a record of settings' }] };
   }
-  let record = saved;
-  for (let version = record.version; Object.hasOwn(RECORD_UPGRADES, version); version = record.version) {
-    record = RECORD_UPGRADES[version](record);
+  if (saved.version !== FIGURE_EXPORT_SESSION_SETTINGS_VERSION) {
+    const saidVersion = Number.isSafeInteger(saved.version) ? `version ${saved.version}` : 'no version it can read';
+    return {
+      settings: current,
+      unread: [{
+        setting: 'settings',
+        reason: `they were saved as ${saidVersion}, and this version of Cellucid reads version ${FIGURE_EXPORT_SESSION_SETTINGS_VERSION}`,
+      }],
+    };
   }
+  const record = saved;
   const groups = [];
   for (const key of KEYS) {
     if (key === 'version' || groups.some(group => group.includes(key))) continue;

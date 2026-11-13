@@ -30,7 +30,7 @@ test('a point is a disc of the marker color at the marker opacity', () => {
       mass += a / 255 / 0.8;
     }
   }
-  // The disc's area, measured on 64 samples a pixel (8-bit alpha rounding).
+  // The disc's area, sampled 64 times a pixel (8-bit alpha rounding).
   assert.ok(Math.abs(mass - Math.PI * 4) < 0.25, String(mass));
   // Nothing beyond the radius.
   assert.equal(alphaAt(image, 14, 5), 0);

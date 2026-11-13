@@ -126,184 +126,190 @@ async function run(page, panel, modeId, options, runLabel) {
   }, { modeId, options });
   const button = panel.getByRole('button', { name: runLabel });
   await expect(button).toBeEnabled();
+  // The result of an earlier run of the same analysis is not this run's.
+  await page.evaluate(modeId => {
+    window.__resultBeforeRun = window._comparisonModule.getUI(modeId)._lastResult ?? null;
+  }, modeId);
   await button.click();
-  await expect.poll(() => page.evaluate(modeId => window._comparisonModule.getUI(modeId)._lastResult != null, modeId)).toBe(true);
+  await expect.poll(() => page.evaluate(modeId => {
+    const result = window._comparisonModule.getUI(modeId)._lastResult ?? null;
+    return result !== null && result !== window.__resultBeforeRun;
+  }, modeId)).toBe(true);
 }
 
 const mean = values => values.reduce((sum, value) => sum + value, 0) / values.length;
 const cellsOf = group => Array.from({ length: CELLS }, (_, cell) => cell).filter(cell => groupOf(cell) === group);
 
-test('marker genes, DE and dot plot read the matrix chosen for them; nothing shown changes', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openFromLink(page, fixture());
-
-  const matrices = await page.evaluate(() => window._comparisonModule.dataLayer.getExpressionMatrices());
-  expect(matrices).toEqual({
-    choices: [
-      // The mapped matrix named as the file names it (`expressionMatrixName`),
-      // and by its own value as well (`aliases`: `raw` picks the same choice).
-      { value: 'mapped', label: 'Mapped (raw.X)', aliases: ['raw'] },
-      { value: 'X', label: 'X', counts: false },
-      { value: 'layer:counts', label: "layers['counts']", counts: false },
-    ],
-    reason: null,
-  });
-
-  // Marker genes on X: X's own four genes, without EXTRA.
-  const markers = await openPanel(page, 'genesPanel');
-  await markers.locator('.analysis-more-options > .disclosure-header').click();
-  await markers.locator('.analysis-options-group > .disclosure-header-row > .disclosure-header', { hasText: 'Test' }).click();
-  const select = markers.getByLabel('Expression matrix', { exact: true });
-  await expect(select.locator('option')).toHaveText(['Mapped (raw.X)', 'X', "layers['counts']"]);
-  await select.selectOption('X');
-  await run(page, markers, 'genesPanel', { groupBy: 'cluster' }, 'Run marker genes');
-  const markerRun = await page.evaluate(() => {
-    const { stats, metadata } = window._comparisonModule.getUI('genesPanel')._lastResult;
-    return { genes: stats.genes, matrix: metadata.matrix, label: metadata.matrixLabel };
-  });
-  expect(markerRun).toEqual({ genes: GENES, matrix: 'X', label: 'X' });
-  await expect(markers.locator('.analysis-result-line')).toContainText('X');
-
-  // DE on the counts layer: its means are the layer's (ten times X's).
-  const de = await openPanel(page, 'differential');
-  await run(page, de, 'differential', {
-    compare: 'categories',
-    field: 'cluster',
-    categoriesA: { mode: 'subset', ids: ['T'] },
-    categoriesB: { mode: 'subset', ids: ['B'] },
-    matrix: 'layer:counts',
-  }, 'Run differential expression');
-  const deRun = await page.evaluate(() => {
-    const { full } = window._comparisonModule.getUI('differential')._lastResult;
-    const row = full.results.find(entry => entry.gene === 'CD3E');
-    return { matrix: full.summary.matrix, label: full.summary.matrixLabel, meanA: row.meanA, meanB: row.meanB, genes: full.results.length };
-  });
-  expect(deRun.matrix).toBe('layer:counts');
-  expect(deRun.label).toBe("layers['counts']");
-  expect(deRun.genes).toBe(GENES.length);
-  expect(deRun.meanA).toBeCloseTo(mean(cellsOf(0).map(cell => 10 * xValue(cell, 0))), 4);
-  expect(deRun.meanB).toBeCloseTo(mean(cellsOf(1).map(cell => 10 * xValue(cell, 0))), 4);
-
-  // Dot plot on X: CD3E is found there; EXTRA, which only raw has, is named.
-  await page.evaluate(() => window._comparisonModule.openAnalysis('dotplot', {
-    options: { groupBy: 'cluster', matrix: 'X', geneSets: [{ name: 'Set 1', genes: ['EXTRA', 'CD3E', 'NOPE'] }] }
-  }));
-  const dot = page.locator('#analysis-panel-dotplot');
-  await dot.getByRole('button', { name: 'Run dot plot' }).click();
-  await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('dotplot')._lastResult?.summary?.genes ?? null))
-    .toEqual(['CD3E']);
-  const dotRun = await page.evaluate(() => {
-    const { summary } = window._comparisonModule.getUI('dotplot')._lastResult;
-    return { unmatched: summary.unmatched, matrix: summary.matrix, groups: summary.groups, sum: [...summary.sum] };
-  });
-  expect(dotRun.unmatched).toEqual(['EXTRA', 'NOPE']);
-  expect(dotRun.matrix).toBe('X');
-  const tIndex = dotRun.groups.indexOf('T');
-  expect(dotRun.sum[tIndex]).toBeCloseTo(cellsOf(0).reduce((sum, cell) => sum + xValue(cell, 0), 0), 3);
-
-  // What is shown is untouched: the gene list is still raw's.
-  const shown = await page.evaluate(() => ({
-    genes: window._comparisonModule.dataLayer.getAvailableVariables('gene_expression').map(gene => gene.key),
-    expression: window._comparisonModule.state.getDataMapping().expression,
-  }));
-  expect(shown).toEqual({ genes: RAW_GENES, expression: 'raw' });
-  expect(errors).toEqual([]);
-});
-
-test('a result gene colors the cells, and the sidebar gene search names it', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openFromLink(page, fixture());
-  const markers = await openPanel(page, 'genesPanel');
-  await run(page, markers, 'genesPanel', { groupBy: 'cluster' }, 'Run marker genes');
-  await markers.locator('.analysis-result-controls').getByText('List', { exact: true }).click();
-  const gene = markers.locator('.marker-ranked-genes .analysis-gene-link').first();
-  await expect(gene).toBeVisible();
-  const name = await gene.textContent();
-  await gene.click();
-  await expect(page.locator('#gene-expression-search')).toHaveValue(name);
-  await expect.poll(() => page.evaluate(() => {
-    const state = window._comparisonModule.state;
-    return state.activeFieldSource === 'var' ? state.varData.fields[state.activeVarFieldIndex].key : null;
-  })).toBe(name);
-
-  // A gene the shown list lacks colors nothing and says so.
-  await page.evaluate(() => window._comparisonModule.colorByGene('NOPE'));
-  await expect(page.locator('#gene-expression-search')).toHaveValue(name);
-  expect(errors).toEqual([]);
-});
-
-test('a file opened from disk lists the same matrices and reads the same X values', async ({ page }) => {
+// One opening from the link. A later run names the mapped matrix itself, since an earlier step
+// chose another; the same file is chosen from disk last, which replaces the dataset shown.
+test('a file with several matrices: each analysis reads the one chosen for it, samples as replicates, a result gene colors the cells, and the same file from disk reads the same', async ({ page }) => {
   const errors = observeProductErrors(page);
   const bytes = fixture();
   await openFromLink(page, bytes);
-  const linked = await page.evaluate(() => window._cellucidState.getDatasetGeneration());
-  await chooseFiles(page.locator('#user-data-file-input'), { name: 'local-matrices.zarr.zip', mimeType: 'application/zip', buffer: bytes });
-  // The file from disk is the dataset shown now, its genes read.
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getDatasetGeneration())).toBeGreaterThan(linked);
-  await waitForDatasetReady(page, CELLS);
-  await expect.poll(() => page.evaluate(() => window._comparisonModule?.state?.getDataMapping?.()?.expression ?? null)).toBe('raw');
-  await expect.poll(() => page.evaluate(() => window._comparisonModule.dataLayer.getExpressionMatrices().choices.map(choice => choice.value)))
-    .toEqual(['mapped', 'X', 'layer:counts']);
-  // A matrix other than the mapped one, read from the source on its own axis.
-  const cd3e = await page.evaluate(async () => {
-    const layer = window._comparisonModule.dataLayer;
-    const keys = await layer.getGeneKeys('X');
-    const { values } = await layer.readGeneColumn('CD3E', { matrix: 'X' });
-    return { keys, length: values.length, indices: [...values.indices], values: [...values.values] };
-  });
-  const expected = Array.from({ length: CELLS }, (_, cell) => cell).filter(cell => xValue(cell, 0) !== 0);
-  expect(cd3e.keys).toEqual(GENES);
-  expect(cd3e.length).toBe(CELLS);
-  expect(cd3e.indices).toEqual(expected);
-  expect(cd3e.values).toEqual(expected.map(cell => xValue(cell, 0)));
-  expect(errors).toEqual([]);
-});
 
-test('differential expression with a sample field tests the samples, not the cells', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openFromLink(page, fixture());
-  const de = await openPanel(page, 'differential');
-  await run(page, de, 'differential', {
-    compare: 'categories',
-    field: 'cluster',
-    categoriesA: { mode: 'subset', ids: ['T'] },
-    categoriesB: { mode: 'subset', ids: ['B'] },
-    replicates: 'sample',
-  }, 'Run differential expression');
-  const result = await page.evaluate(() => {
-    const { full } = window._comparisonModule.getUI('differential')._lastResult;
-    const row = full.results.find(entry => entry.gene === 'CD3E');
-    return { method: full.summary.method, replicates: full.summary.replicates, row: { meanA: row.meanA, meanB: row.meanB, nA: row.nA, nB: row.nB, score: row.score, pValue: row.pValue } };
+  await test.step('marker genes, DE and dot plot read the matrix chosen for them; nothing shown changes', async () => {
+    const matrices = await page.evaluate(() => window._comparisonModule.dataLayer.getExpressionMatrices());
+    expect(matrices).toEqual({
+      choices: [
+        // The mapped matrix named as the file names it (`expressionMatrixName`),
+        // and by its own value as well (`aliases`: `raw` picks the same choice).
+        { value: 'mapped', label: 'Mapped (raw.X)', aliases: ['raw'] },
+        { value: 'X', label: 'X', counts: false },
+        { value: 'layer:counts', label: "layers['counts']", counts: false },
+      ],
+      reason: null,
+    });
+
+    // Marker genes on X: X's own four genes, without EXTRA.
+    const markers = await openPanel(page, 'genesPanel');
+    await markers.locator('.analysis-more-options > .disclosure-header').click();
+    await markers.locator('.analysis-options-group > .disclosure-header-row > .disclosure-header', { hasText: 'Test' }).click();
+    const select = markers.getByLabel('Expression matrix', { exact: true });
+    await expect(select.locator('option')).toHaveText(['Mapped (raw.X)', 'X', "layers['counts']"]);
+    await select.selectOption('X');
+    await run(page, markers, 'genesPanel', { groupBy: 'cluster' }, 'Run marker genes');
+    const markerRun = await page.evaluate(() => {
+      const { stats, metadata } = window._comparisonModule.getUI('genesPanel')._lastResult;
+      return { genes: stats.genes, matrix: metadata.matrix, label: metadata.matrixLabel };
+    });
+    expect(markerRun).toEqual({ genes: GENES, matrix: 'X', label: 'X' });
+    await expect(markers.locator('.analysis-result-line')).toContainText('X');
+
+    // DE on the counts layer: its means are the layer's (ten times X's).
+    const de = await openPanel(page, 'differential');
+    await run(page, de, 'differential', {
+      compare: 'categories',
+      field: 'cluster',
+      categoriesA: { mode: 'subset', ids: ['T'] },
+      categoriesB: { mode: 'subset', ids: ['B'] },
+      matrix: 'layer:counts',
+    }, 'Run differential expression');
+    const deRun = await page.evaluate(() => {
+      const { full } = window._comparisonModule.getUI('differential')._lastResult;
+      const row = full.results.find(entry => entry.gene === 'CD3E');
+      return { matrix: full.summary.matrix, label: full.summary.matrixLabel, meanA: row.meanA, meanB: row.meanB, genes: full.results.length };
+    });
+    expect(deRun.matrix).toBe('layer:counts');
+    expect(deRun.label).toBe("layers['counts']");
+    expect(deRun.genes).toBe(GENES.length);
+    expect(deRun.meanA).toBeCloseTo(mean(cellsOf(0).map(cell => 10 * xValue(cell, 0))), 4);
+    expect(deRun.meanB).toBeCloseTo(mean(cellsOf(1).map(cell => 10 * xValue(cell, 0))), 4);
+
+    // Dot plot on X: CD3E is found there; EXTRA, which only raw has, is named.
+    await page.evaluate(() => window._comparisonModule.openAnalysis('dotplot', {
+      options: { groupBy: 'cluster', matrix: 'X', geneSets: [{ name: 'Set 1', genes: ['EXTRA', 'CD3E', 'NOPE'] }] }
+    }));
+    const dot = page.locator('#analysis-panel-dotplot');
+    await dot.getByRole('button', { name: 'Run dot plot' }).click();
+    await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('dotplot')._lastResult?.summary?.genes ?? null))
+      .toEqual(['CD3E']);
+    const dotRun = await page.evaluate(() => {
+      const { summary } = window._comparisonModule.getUI('dotplot')._lastResult;
+      return { unmatched: summary.unmatched, matrix: summary.matrix, groups: summary.groups, sum: [...summary.sum] };
+    });
+    expect(dotRun.unmatched).toEqual(['EXTRA', 'NOPE']);
+    expect(dotRun.matrix).toBe('X');
+    const tIndex = dotRun.groups.indexOf('T');
+    expect(dotRun.sum[tIndex]).toBeCloseTo(cellsOf(0).reduce((sum, cell) => sum + xValue(cell, 0), 0), 3);
+
+    // What is shown is untouched: the gene list is still raw's.
+    const shown = await page.evaluate(() => ({
+      genes: window._comparisonModule.dataLayer.getAvailableVariables('gene_expression').map(gene => gene.key),
+      expression: window._comparisonModule.state.getDataMapping().expression,
+    }));
+    expect(shown).toEqual({ genes: RAW_GENES, expression: 'raw' });
+    expect(errors).toEqual([]);
   });
-  expect(result.method).toBe('pseudobulk');
-  // Every sample holds 20 cells of each side: none under the minimum, every
-  // gene measured in every sample.
-  expect(result.replicates).toMatchObject({
-    field: 'sample',
-    samplesA: 4,
-    samplesB: 4,
-    cellsLeftOut: 0,
-    minCellsPerSample: 10,
-    smallSamplesA: 0,
-    smallSamplesB: 0,
-    cellsInSmallSamples: 0,
-    genesWithUnmeasuredSamples: 0,
+
+  await test.step('differential expression with a sample field tests the samples, not the cells', async () => {
+    const de = await openPanel(page, 'differential');
+    await run(page, de, 'differential', {
+      compare: 'categories',
+      field: 'cluster',
+      categoriesA: { mode: 'subset', ids: ['T'] },
+      categoriesB: { mode: 'subset', ids: ['B'] },
+      matrix: 'mapped',
+      replicates: 'sample',
+    }, 'Run differential expression');
+    const result = await page.evaluate(() => {
+      const { full } = window._comparisonModule.getUI('differential')._lastResult;
+      const row = full.results.find(entry => entry.gene === 'CD3E');
+      return { method: full.summary.method, replicates: full.summary.replicates, row: { meanA: row.meanA, meanB: row.meanB, nA: row.nA, nB: row.nB, score: row.score, pValue: row.pValue } };
+    });
+    expect(result.method).toBe('pseudobulk');
+    // Every sample holds 20 cells of each side: none under the minimum, every
+    // gene measured in every sample.
+    expect(result.replicates).toMatchObject({
+      field: 'sample',
+      samplesA: 4,
+      samplesB: 4,
+      cellsLeftOut: 0,
+      minCellsPerSample: 10,
+      smallSamplesA: 0,
+      smallSamplesB: 0,
+      cellsInSmallSamples: 0,
+      genesWithUnmeasuredSamples: 0,
+    });
+    expect(result.replicates.model).toMatchObject({ design: '~ group', samples: 8 });
+    // The mapped matrix is raw.
+    const unitMeans = group => SAMPLES.map((_, sample) => mean(cellsOf(group).filter(cell => sampleOf(cell) === sample).map(cell => rawValue(cell, 0))));
+    const a = unitMeans(0);
+    const b = unitMeans(1);
+    expect(result.row.nA).toBe(4);
+    expect(result.row.nB).toBe(4);
+    if (!result.replicates.model.counts) {
+      // Values as stored: each side's mean of the samples' means.
+      expect(result.row.meanA).toBeCloseTo(mean(a), 5);
+      expect(result.row.meanB).toBeCloseTo(mean(b), 5);
+    }
+    expect(Math.sign(result.row.score)).toBe(Math.sign(mean(a) - mean(b)));
+    expect(result.row.pValue).toBeGreaterThanOrEqual(0);
+    expect(result.row.pValue).toBeLessThanOrEqual(1);
+    await expect(de.locator('.analysis-result-line')).toContainText('Pseudobulk limma');
+    expect(errors).toEqual([]);
   });
-  expect(result.replicates.model).toMatchObject({ design: '~ group', samples: 8 });
-  // The mapped matrix is raw.
-  const unitMeans = group => SAMPLES.map((_, sample) => mean(cellsOf(group).filter(cell => sampleOf(cell) === sample).map(cell => rawValue(cell, 0))));
-  const a = unitMeans(0);
-  const b = unitMeans(1);
-  expect(result.row.nA).toBe(4);
-  expect(result.row.nB).toBe(4);
-  if (!result.replicates.model.counts) {
-    // Values as stored: each side's mean of the samples' means.
-    expect(result.row.meanA).toBeCloseTo(mean(a), 5);
-    expect(result.row.meanB).toBeCloseTo(mean(b), 5);
-  }
-  expect(Math.sign(result.row.score)).toBe(Math.sign(mean(a) - mean(b)));
-  expect(result.row.pValue).toBeGreaterThanOrEqual(0);
-  expect(result.row.pValue).toBeLessThanOrEqual(1);
-  await expect(de.locator('.analysis-result-line')).toContainText('Pseudobulk limma');
-  expect(errors).toEqual([]);
+
+  await test.step('a result gene colors the cells, and the sidebar gene search names it', async () => {
+    const markers = await openPanel(page, 'genesPanel');
+    await run(page, markers, 'genesPanel', { groupBy: 'cluster', matrix: 'mapped' }, 'Run marker genes');
+    await markers.locator('.analysis-result-controls').getByText('List', { exact: true }).click();
+    const gene = markers.locator('.marker-ranked-genes .analysis-gene-link').first();
+    await expect(gene).toBeVisible();
+    const name = await gene.textContent();
+    await gene.click();
+    await expect(page.locator('#gene-expression-search')).toHaveValue(name);
+    await expect.poll(() => page.evaluate(() => {
+      const state = window._comparisonModule.state;
+      return state.activeFieldSource === 'var' ? state.varData.fields[state.activeVarFieldIndex].key : null;
+    })).toBe(name);
+
+    // A gene the shown list lacks colors nothing and says so.
+    await page.evaluate(() => window._comparisonModule.colorByGene('NOPE'));
+    await expect(page.locator('#gene-expression-search')).toHaveValue(name);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step('a file opened from disk lists the same matrices and reads the same X values', async () => {
+    const linked = await page.evaluate(() => window._cellucidState.getDatasetGeneration());
+    await chooseFiles(page.locator('#user-data-file-input'), { name: 'local-matrices.zarr.zip', mimeType: 'application/zip', buffer: bytes });
+    // The file from disk is the dataset shown now, its genes read.
+    await expect.poll(() => page.evaluate(() => window._cellucidState.getDatasetGeneration())).toBeGreaterThan(linked);
+    await waitForDatasetReady(page, CELLS);
+    await expect.poll(() => page.evaluate(() => window._comparisonModule?.state?.getDataMapping?.()?.expression ?? null)).toBe('raw');
+    await expect.poll(() => page.evaluate(() => window._comparisonModule.dataLayer.getExpressionMatrices().choices.map(choice => choice.value)))
+      .toEqual(['mapped', 'X', 'layer:counts']);
+    // A matrix other than the mapped one, read from the source on its own axis.
+    const cd3e = await page.evaluate(async () => {
+      const layer = window._comparisonModule.dataLayer;
+      const keys = await layer.getGeneKeys('X');
+      const { values } = await layer.readGeneColumn('CD3E', { matrix: 'X' });
+      return { keys, length: values.length, indices: [...values.indices], values: [...values.values] };
+    });
+    const expected = Array.from({ length: CELLS }, (_, cell) => cell).filter(cell => xValue(cell, 0) !== 0);
+    expect(cd3e.keys).toEqual(GENES);
+    expect(cd3e.length).toBe(CELLS);
+    expect(cd3e.indices).toEqual(expected);
+    expect(cd3e.values).toEqual(expected.map(cell => xValue(cell, 0)));
+    expect(errors).toEqual([]);
+  });
 });

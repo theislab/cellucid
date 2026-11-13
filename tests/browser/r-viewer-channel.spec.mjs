@@ -11,9 +11,10 @@
  *   binary frames, the cells R named, 0-based, in its order; a selection the page makes
  *   reaches R whole; stopping the viewer ends the page's channel.
  *
- * Needs CELLUCID_RSCRIPT set to an Rscript whose library (R_LIBS) has
- * cellucid and SingleCellExperiment installed; without it the file is skipped,
- * as the other live-server specs are.
+ * Needs CELLUCID_RSCRIPT set to an Rscript whose library (R_LIBS) has cellucid
+ * and SingleCellExperiment installed; without it the file is skipped, as the
+ * other live-server specs are, and CELLUCID_REQUIRE_VIEWERS=1 (set by the CI
+ * job that runs this spec) makes that a failure.
  */
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -22,8 +23,9 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 
 import { expect, test } from './helpers/test.mjs';
+import { viewerInterpreter } from './helpers/viewer-interpreters.mjs';
 
-const RSCRIPT = process.env.CELLUCID_RSCRIPT ?? null;
+const RSCRIPT = viewerInterpreter('CELLUCID_RSCRIPT');
 
 // The R side. It prints one JSON line per step and, before each next one,
 // waits for the file `go<n>` in its control folder, so the browser and R take

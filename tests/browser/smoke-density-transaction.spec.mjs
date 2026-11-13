@@ -628,7 +628,7 @@ test('failed GPU smoke builds restore exact GL state and release every resource'
   });
 });
 
-test('viewer publishes smoke atomically before completion and returns no owned texture', async ({
+test('the viewer publishes a smoke volume atomically, then gives it up when the WebGL context is lost', async ({
   page,
 }) => {
   const browserErrors = [];
@@ -651,156 +651,151 @@ test('viewer publishes smoke atomically before completion and returns no owned t
     'Current UI fixture',
   );
 
-  const proof = await page.evaluate(async () => {
-    const { getNotificationCenter } = await import(
-      '/assets/js/app/notification-center.js'
-    );
-    const viewer = window._cellucidViewer;
-    const canvas = document.querySelector('#glcanvas');
-    const gl = canvas?.getContext('webgl2');
-    if (!viewer || !(gl instanceof WebGL2RenderingContext)) {
-      throw new Error('Viewer smoke transaction fixture is unavailable');
-    }
-    const notifications = getNotificationCenter();
-    const originalComplete = notifications.completeCalculation;
-    let volumeVisibleAtCompletion = null;
-    notifications.completeCalculation = function (...args) {
-      volumeVisibleAtCompletion = viewer.hasSmokeVolume();
-      return Reflect.apply(originalComplete, this, args);
-    };
-    let summary;
-    try {
-      summary = viewer.buildSmokeVolumeGPU(
-        new Float32Array([0, 0, 0, 0.25, -0.25, 0.25]),
-        { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
+  await test.step('viewer publishes smoke atomically before completion and returns no owned texture', async () => {
+    const proof = await page.evaluate(async () => {
+      const { getNotificationCenter } = await import(
+        '/assets/js/app/notification-center.js'
       );
-    } finally {
-      notifications.completeCalculation = originalComplete;
-    }
-
-    const originalCopyTexSubImage3D = gl.copyTexSubImage3D;
-    let copyCalls = 0;
-    gl.copyTexSubImage3D = function (...args) {
-      copyCalls++;
-      if (copyCalls === 2) {
-        throw new Error('synthetic viewer smoke replacement failure');
+      const viewer = window._cellucidViewer;
+      const canvas = document.querySelector('#glcanvas');
+      const gl = canvas?.getContext('webgl2');
+      if (!viewer || !(gl instanceof WebGL2RenderingContext)) {
+        throw new Error('Viewer smoke transaction fixture is unavailable');
       }
-      return Reflect.apply(originalCopyTexSubImage3D, this, args);
-    };
-    let replacementFailure = null;
-    try {
-      viewer.buildSmokeVolumeGPU(
-        new Float32Array([-0.5, 0.5, 0, 0.5, -0.5, 0]),
-        { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
-      );
-    } catch (error) {
-      replacementFailure = error instanceof Error
-        ? error.message
-        : String(error);
-    } finally {
-      gl.copyTexSubImage3D = originalCopyTexSubImage3D;
-    }
-    await new Promise(resolve => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    });
-    return {
-      boundsMaxFrozen: Object.isFrozen(summary.boundsMax),
-      boundsMinFrozen: Object.isFrozen(summary.boundsMin),
-      hasOwnedTextureField: Object.hasOwn(summary, 'texture'),
-      replacementFailure,
-      summaryFrozen: Object.isFrozen(summary),
-      summaryKeys: Object.keys(summary).sort(),
-      summaryGridSize: summary.gridSize,
-      volumeRetainedAfterFailure: viewer.hasSmokeVolume(),
-      volumeVisibleAtCompletion,
-      webglError: gl.getError(),
-    };
-  });
+      const notifications = getNotificationCenter();
+      const originalComplete = notifications.completeCalculation;
+      let volumeVisibleAtCompletion = null;
+      notifications.completeCalculation = function (...args) {
+        volumeVisibleAtCompletion = viewer.hasSmokeVolume();
+        return Reflect.apply(originalComplete, this, args);
+      };
+      let summary;
+      try {
+        summary = viewer.buildSmokeVolumeGPU(
+          new Float32Array([0, 0, 0, 0.25, -0.25, 0.25]),
+          { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
+        );
+      } finally {
+        notifications.completeCalculation = originalComplete;
+      }
 
-  expect(proof).toEqual({
-    boundsMaxFrozen: true,
-    boundsMinFrozen: true,
-    hasOwnedTextureField: false,
-    replacementFailure: 'synthetic viewer smoke replacement failure',
-    summaryFrozen: true,
-    summaryKeys: ['boundsMax', 'boundsMin', 'gridSize'],
-    summaryGridSize: 8,
-    volumeRetainedAfterFailure: true,
-    volumeVisibleAtCompletion: true,
-    webglError: 0,
-  });
-  expect(browserErrors).toEqual([]);
-});
-
-test('viewer invalidates smoke resources and requires reload after WebGL context loss', async ({
-  page,
-}) => {
-  await page.goto(CURRENT_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture',
-  );
-  const proof = await page.evaluate(async () => {
-    const {
-      invalidateDensityPipelineResources,
-    } = await import('/assets/js/rendering/smoke-cloud/smoke-density.js');
-    const canvas = document.querySelector('#glcanvas');
-    const gl = canvas?.getContext('webgl2');
-    const viewer = window._cellucidViewer;
-    if (!(gl instanceof WebGL2RenderingContext) || !viewer) {
-      throw new Error('Viewer smoke context lifecycle is unavailable');
-    }
-    const loseContext = gl.getExtension('WEBGL_lose_context');
-    if (!loseContext) {
-      throw new Error('Smoke context lifecycle requires WEBGL_lose_context');
-    }
-    viewer.buildSmokeVolumeGPU(new Float32Array([0, 0, 0]), {
-      colors: new Uint8Array(4).fill(255),
-      dimension: 3,
-      gamma: 0.7,
-      gridSize: 8,
-    });
-    const lost = new Promise(resolve => {
-      canvas.addEventListener('webglcontextlost', event => {
-        resolve();
-      }, { once: true });
-    });
-    loseContext.loseContext();
-    await lost;
-    return {
-      cacheAlreadyInvalidated: !invalidateDensityPipelineResources(gl),
-    };
-  });
-
-  expect(proof).toEqual({
-    cacheAlreadyInvalidated: true,
-  });
-  // The context is away and the viewer waits for it back
-  // (graphics-context-restore.spec.mjs): restoring, no Reload.
-  await expect(page.locator('#graphics-reset-dialog')).toBeVisible();
-  await expect(page.locator('#graphics-reset-dialog')).toContainText(
-    'The graphics were reset by the browser. Restoring them',
-  );
-  await expect(
-    page.locator('#graphics-reset-dialog').getByRole('button', {
-      name: 'Reload',
-      exact: true,
-    }),
-  ).toBeHidden();
-  const retirementFailure = await page.evaluate(async () => {
-    try {
-      await window._cellucidDispose();
-      return null;
-    } catch (error) {
-      const serialize = value => ({
-        errors: value instanceof AggregateError
-          ? value.errors.map(serialize)
-          : [],
-        message: value?.message ?? String(value),
-        name: value?.name ?? null,
+      const originalCopyTexSubImage3D = gl.copyTexSubImage3D;
+      let copyCalls = 0;
+      gl.copyTexSubImage3D = function (...args) {
+        copyCalls++;
+        if (copyCalls === 2) {
+          throw new Error('synthetic viewer smoke replacement failure');
+        }
+        return Reflect.apply(originalCopyTexSubImage3D, this, args);
+      };
+      let replacementFailure = null;
+      try {
+        viewer.buildSmokeVolumeGPU(
+          new Float32Array([-0.5, 0.5, 0, 0.5, -0.5, 0]),
+          { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
+        );
+      } catch (error) {
+        replacementFailure = error instanceof Error
+          ? error.message
+          : String(error);
+      } finally {
+        gl.copyTexSubImage3D = originalCopyTexSubImage3D;
+      }
+      await new Promise(resolve => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
       });
-      return serialize(error);
-    }
+      return {
+        boundsMaxFrozen: Object.isFrozen(summary.boundsMax),
+        boundsMinFrozen: Object.isFrozen(summary.boundsMin),
+        hasOwnedTextureField: Object.hasOwn(summary, 'texture'),
+        replacementFailure,
+        summaryFrozen: Object.isFrozen(summary),
+        summaryKeys: Object.keys(summary).sort(),
+        summaryGridSize: summary.gridSize,
+        volumeRetainedAfterFailure: viewer.hasSmokeVolume(),
+        volumeVisibleAtCompletion,
+        webglError: gl.getError(),
+      };
+    });
+
+    expect(proof).toEqual({
+      boundsMaxFrozen: true,
+      boundsMinFrozen: true,
+      hasOwnedTextureField: false,
+      replacementFailure: 'synthetic viewer smoke replacement failure',
+      summaryFrozen: true,
+      summaryKeys: ['boundsMax', 'boundsMin', 'gridSize'],
+      summaryGridSize: 8,
+      volumeRetainedAfterFailure: true,
+      volumeVisibleAtCompletion: true,
+      webglError: 0,
+    });
+    expect(browserErrors).toEqual([]);
   });
-  expect(retirementFailure).toBeNull();
+
+  await test.step('viewer invalidates smoke resources and waits for the WebGL context after its loss', async () => {
+    const proof = await page.evaluate(async () => {
+      const {
+        invalidateDensityPipelineResources,
+      } = await import('/assets/js/rendering/smoke-cloud/smoke-density.js');
+      const canvas = document.querySelector('#glcanvas');
+      const gl = canvas?.getContext('webgl2');
+      const viewer = window._cellucidViewer;
+      if (!(gl instanceof WebGL2RenderingContext) || !viewer) {
+        throw new Error('Viewer smoke context lifecycle is unavailable');
+      }
+      const loseContext = gl.getExtension('WEBGL_lose_context');
+      if (!loseContext) {
+        throw new Error('Smoke context lifecycle requires WEBGL_lose_context');
+      }
+      viewer.buildSmokeVolumeGPU(new Float32Array([0, 0, 0]), {
+        colors: new Uint8Array(4).fill(255),
+        dimension: 3,
+        gamma: 0.7,
+        gridSize: 8,
+      });
+      const lost = new Promise(resolve => {
+        canvas.addEventListener('webglcontextlost', event => {
+          resolve();
+        }, { once: true });
+      });
+      loseContext.loseContext();
+      await lost;
+      return {
+        cacheAlreadyInvalidated: !invalidateDensityPipelineResources(gl),
+      };
+    });
+
+    expect(proof).toEqual({
+      cacheAlreadyInvalidated: true,
+    });
+    // The context is away and the viewer waits for it back
+    // (graphics-context-restore.spec.mjs): restoring, no Reload.
+    await expect(page.locator('#graphics-reset-dialog')).toBeVisible();
+    await expect(page.locator('#graphics-reset-dialog')).toContainText(
+      'The graphics were reset by the browser. Restoring them',
+    );
+    await expect(
+      page.locator('#graphics-reset-dialog').getByRole('button', {
+        name: 'Reload',
+        exact: true,
+      }),
+    ).toBeHidden();
+    const retirementFailure = await page.evaluate(async () => {
+      try {
+        await window._cellucidDispose();
+        return null;
+      } catch (error) {
+        const serialize = value => ({
+          errors: value instanceof AggregateError
+            ? value.errors.map(serialize)
+            : [],
+          message: value?.message ?? String(value),
+          name: value?.name ?? null,
+        });
+        return serialize(error);
+      }
+    });
+    expect(retirementFailure).toBeNull();
+  });
 });

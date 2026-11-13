@@ -58,7 +58,7 @@ export const OWNERS = Object.freeze({
 /**
  * The owner of a domain whose records `records.js` declares: every value it
  * restores or describes is read against them first (a record of before
- * filled in, a dropped key left out, a truly wrong one refused, naming where:
+ * filled in, a truly wrong one refused, naming where:
  * `record-keys.js`), and every value it captures is written as before (an
  * added key at its default left out, so a value that does not use it hashes
  * as it did). The history keeps values as they were saved, so a value is
@@ -91,7 +91,8 @@ export function readingRecords(owner, shape, id) {
  *   refreshUi: () => void,
  *   cinematicCamera: object|null,
  *   figureExport: object|null,
- *   analysis: () => Promise<{comparisonModule: object, analysisWindowManager: object}|null>,
+ *   analysis: () => {comparisonModule: object, analysisWindowManager: object}|null,
+ *   analysisArrived: () => Promise<{comparisonModule: object, analysisWindowManager: object}|null>,
  *   getDockable: () => object|null,
  *   openCells: object,
  *   sidebarLayout: object,
@@ -103,7 +104,7 @@ export function installStateDomains({ domains = getStateDomains(), ...context })
   for (const key of ['state', 'viewer', 'sidebar', 'openCells', 'sidebarLayout']) {
     if (context[key] === null || typeof context[key] !== 'object') throw new TypeError(`The state domains need the page's ${key}.`);
   }
-  for (const key of ['refreshUi', 'analysis', 'getDockable']) {
+  for (const key of ['refreshUi', 'analysis', 'analysisArrived', 'getDockable']) {
     if (typeof context[key] !== 'function') throw new TypeError(`The state domains need ${key}().`);
   }
   const withdraw = DOMAIN_IDS.map(id => {

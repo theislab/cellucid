@@ -23,10 +23,8 @@ import { escapeHtml } from '../../../utils/dom-utils.js';
 /**
  * Kernel terms below which a curve is summed on the calling thread: about
  * 40 ms of work, within one main-thread task. Past it the sum is handed to
- * the analysis workers even where that is not faster end to end (a
- * 25,000-value page drew in 66 ms on the main thread and 105 ms through the
- * workers), because the main thread stays free: a 100,000-value continuous
- * page held it for 135 ms at the earlier threshold of 20 million terms.
+ * the analysis workers even where that is not faster end to end, because the
+ * main thread stays free (measured: 37_decisions_analysis.md).
  */
 const PARALLEL_MIN_KERNEL_TERMS = 3_000_000;
 
@@ -34,8 +32,8 @@ const PARALLEL_MIN_KERNEL_TERMS = 3_000_000;
  * Density curves already computed, per page-values array and bandwidth
  * multiplier. A curve depends on nothing else, while the plot is redrawn for
  * every option change — fill, mean line, log axes — and once more for CSV
- * export; each redraw used to re-run the kernel sum, a full pass of 100
- * kernel evaluations per cell. Page-data arrays are never edited once
+ * export; without it each redraw would re-run the kernel sum, a full pass of
+ * 100 kernel evaluations per cell. Page-data arrays are never edited once
  * published, and the map holds them weakly.
  * @type {WeakMap<ArrayLike<number>, Map<number, {x: number[], y: number[]}>>}
  */
@@ -87,8 +85,9 @@ function pageDensity(pageValues, bandwidthMult) {
 
 /**
  * Compute every page's density curve before the plot is drawn. A large page's
- * kernel sum (a hundred evaluations per distinct value: 1.4 s on the main
- * thread for a million-cell continuous field) is split by evaluation point
+ * kernel sum (a hundred evaluations per distinct value: seconds on the main
+ * thread for a million-cell continuous field; measured:
+ * 37_decisions_analysis.md) is split by evaluation point
  * across the analysis workers; each point is the same `kernelDensityAt` loop
  * wherever it runs, so the curve is identical to the one-thread sum.
  *

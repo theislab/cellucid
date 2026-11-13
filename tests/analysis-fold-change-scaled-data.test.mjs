@@ -105,7 +105,7 @@ test('marker worker fold change on scaled data matches DE and keeps its sign', a
   }
 });
 
-test('markers against a reference group shift a stored fold change by the two groups\' minimum, as DE does (NS-15)', async () => {
+test('markers against a reference group shift a stored fold change by the two groups\' minimum, as DE does', async () => {
   const { createGroupingContext, geneSampleOf, groupMarkers } = await import('../assets/js/app/analysis/compute/gene-statistics.js');
   // Scaled data: group 2 (not compared) holds the lowest value.
   const a = ramp(-0.5);

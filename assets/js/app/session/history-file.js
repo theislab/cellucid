@@ -1,5 +1,5 @@
 /**
- * @fileoverview Session format 4: a history in one file (History v2 §3.8).
+ * @fileoverview Session format 4: a history in one file.
  *
  * A `.cellucid-session` file holds what a Save or a Share chose of the
  * dataset's history (`scope`): trackers, each a tree of steps with its
@@ -18,7 +18,7 @@
  * journal chunk (or null) and `chats` its conversation chunks.
  *
  * **Chunks**, each stored with gzip where gzip saves at least a sixteenth of
- * its bytes (measured per chunk: skeletons shrink 5-8×, float arrays and
+ * its bytes (per chunk: skeletons shrink 5-8×, float arrays and
  * cell sets barely), else as they are; every eager chunk before any lazy one:
  *
  * - `steps` (eager; `tracker`): a run of one tracker's steps, JSON, in id
@@ -34,7 +34,7 @@
  *
  * JSON chunks (`steps`, `parts`, `values`) are cut where their text passes
  * {@link CHUNK_TEXT_CHARS}, so no single string nears the page's longest
- * (saving a 100k-step history once failed there) and a reader inflates one
+ * (a 100k-step history held in one fails there) and a reader inflates one
  * piece at a time.
  *
  * **Eager and lazy.** The steps, the values the active head shows and the
@@ -168,7 +168,7 @@ export function assertSessionHeader(header) {
  * Check the page chrome a session carries outside its history (`chrome`):
  * `{pressed: {<group id>: <button id>}}`, the button pressed in each
  * pressed-button group of the sidebar (`data-state-serializer-pressed-group`,
- * today the selection tool `highlight-mode`, CEL-0249), which decides what
+ * today the selection tool `highlight-mode`), which decides what
  * the next drag does and which the history does not record. Kept in every
  * form a file takes (it is not private). The page puts back the groups and
  * buttons it has and says which it does not (`state-serializer/ui-controls.js`
@@ -220,7 +220,7 @@ function modelCheck(check) {
 
 /**
  * Check the session as read, tracker by tracker (`validateSession`'s
- * `unreadable`, F164): each tracker as this version holds it
+ * `unreadable`): each tracker as this version holds it
  * (`knownDomainsOnly`: a state domain it does not have is left for the
  * history to leave out), one this version cannot read left for the history
  * to leave out (`history.js` `readSaved` names both). Returns the ids of the
@@ -376,7 +376,7 @@ function isStrictlyIncreasing(array) {
  * of the history's values is never changed (its digest is cached the same
  * way, `value-pool.js`), and the autosave, a named save and a session file
  * each store the same arrays: measuring the cell-set encodings was half of a
- * named save (`tests/stress/RESULTS.md` §15). Callers only read the bytes.
+ * named save (measured: 33_decisions_actions_domains_and_history.md). Callers only read the bytes.
  */
 const cellSetBytes = new WeakMap();
 

@@ -74,22 +74,6 @@ test('community-annotation/dom.js owns its helpers for the whole annotation UI',
   );
 });
 
-test('the voting modal builds its DOM through the shared owner', () => {
-  const source = read(path.join(MODULES_DIR, 'community-annotation-voting-modal.js'));
-  const importMatch = source.match(
-    /import \{([^}]*)\} from '\.\/community-annotation\/dom\.js';/
-  );
-  assert.ok(
-    importMatch,
-    'the voting modal must import its DOM helpers from community-annotation/dom.js'
-  );
-  const imported = importMatch[1]
-    .split(',')
-    .map((name) => name.trim())
-    .filter(Boolean);
-  assert.ok(imported.includes('el'), 'the voting modal must import el rather than define its own');
-});
-
 test('community annotation has one toCleanString (utils/clean-string.js)', () => {
   const owner = fileURLToPath(new URL('../assets/js/utils/clean-string.js', import.meta.url));
   assert.match(read(owner), /^export function toCleanString\(/m);

@@ -1,21 +1,23 @@
 /**
- * A share never does more gene-index work than every cell (the owner's
- * share rule, `AnnDataReader._restrictsWhole`), counted, never timed:
+ * A share never does more gene-index work than every cell (the share
+ * rule, `AnnDataReader._restrictsWhole`), counted, never timed:
  *
  * - **Spread rows holding at least the share of the entries that makes
  *   their own pass more work read through every stored row's index**,
  *   restricted to them (`restrictedAccess`): the entries indexed are every
  *   cell's, the view does no work of its own (no kept row's pointer read, no
  *   entry gathered), the matrix's reads are every cell's, and the values are the
- *   rows' own, bit for bit. A 50% uniform share of a 4M-cell file took
- *   1.4x every cell's first gene on a link faster than decoding: its pass in
- *   store order gathered each kept row's entries out of the decoded chunks.
+ *   rows' own, bit for bit. A pass in store order gathers each kept row's
+ *   entries out of the decoded chunks, which costs a 50% uniform share of a
+ *   4M-cell file more than every cell's first gene on a link faster than
+ *   decoding (measured: 23_decisions_partial_reading.md).
  * - **The choice weighs the work measured on the source** (`PassRates`,
  *   `wholeIsCheaper`): the index's own work per entry, the view's, and a
  *   gene's placement in open order on either path; before any is measured,
- *   a share keeping at least two thirds of the entries. A 50% uniform
- *   share's first gene and marker genes took 1.3-1.7x on every stored row's
- *   index what they took on its own pass (Chromium, 10M cells).
+ *   a share keeping at least two thirds of the entries. Where the index's
+ *   work per entry exceeds the share's own, a 50% uniform share's first gene
+ *   and marker genes are cheaper on the share's own pass (measured:
+ *   23_decisions_partial_reading.md).
  * - **Every stored row's index is kept as every cell's**: an opening of
  *   every cell later takes it, and the share takes one every cell kept.
  */

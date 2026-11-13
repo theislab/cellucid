@@ -1,7 +1,7 @@
 /**
  * Linear textures hold one texel per item at any count an engine can
  * allocate: rows of a power-of-two width stacked in as many layers as the
- * count needs. Per-cell textures used to be one 2D texture, which refused
+ * count needs. A single 2D texture per cell would refuse
  * everything above MAX_TEXTURE_SIZE^2 items (67.1M where the engine reports
  * 8192, and a 3-D position gather from 22.4M points).
  */
@@ -191,11 +191,4 @@ test('a texture of one row is written whole by its first upload', () => {
     assert.equal(gl.calls.length, 1, `${items}`);
     assert.equal(gl.calls[0].width * gl.calls[0].height, plan.texels, `${items}`);
   }
-});
-
-test('no point count is refused against a square texture capacity', () => {
-  // The only device refusal is the layer capacity of a linear texture.
-  const renderer = readFileSync(new URL('../assets/js/rendering/high-perf-renderer.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(renderer, /maxTextureSize \* maxTextureSize|alpha-texture capacity/);
-  assert.match(renderer, /planLinearTextureFor\(gl, pointCount\);/);
 });

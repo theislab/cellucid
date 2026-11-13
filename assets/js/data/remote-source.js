@@ -34,7 +34,7 @@ import {
   requireServedAnnData,
   servedStoreKey
 } from './served-anndata.js';
-import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
+import { requireKeys } from '../utils/exact-record.js';
 import { abortReason, isCancellation, cancel, cancelled, throwIfAborted, requireSignal } from '../utils/abort.js';
 
 /**
@@ -345,10 +345,10 @@ async function requestJson(url, signal, label) {
   //
   // The size refusal is not re-labeled here: `readBoundedBody()` owns the
   // ceiling and already publishes TOO_LARGE, so it arrives as a DataSourceError
-  // and passes straight through. Naming it a second time here is how it came to
-  // be reported as a failed contract validation, which reaches the user as
+  // and passes straight through. Naming it a second time here would report it
+  // as a failed contract validation, which reaches the user as
   // "re-export it with cellucid prepare" — advice that reproduces the identical
-  // file and meets the identical ceiling (CEL-0219).
+  // file and meets the identical ceiling.
   try {
     return await readBoundedJson(response, { label, signal });
   } catch (error) {

@@ -265,7 +265,7 @@ export const LOCAL_APP_NAME = 'An app on this computer';
  * history's steps): Claude or ChatGPT when their host vouches for them, else
  * the host that vouches for the app (its client document's, or its https
  * redirect's), else `LOCAL_APP_NAME`; never the name an app gives itself,
- * since anyone can register an app called "Claude" (LG-W4, F122). `name`:
+ * since anyone can register an app called "Claude". `name`:
  * that self-given name, shown in quotes as what it calls itself; `known`:
  * Claude or ChatGPT. Also where the answer goes and whether the app runs on
  * this computer.

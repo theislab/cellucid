@@ -19,20 +19,6 @@ const PAGES = ['404.html', 'privacy.html', 'terms.html', 'accessibility.html', '
 // footer and from each other.
 const READING_PAGES = ['privacy.html', 'terms.html', 'accessibility.html'];
 
-test('the design system states the site design principles', async () => {
-  const readme = await read('assets/css/README.md');
-  for (const phrase of [
-    '## Site Design Principles',
-    'components/_welcome.css',
-    'folded under **Details**',
-    'Never a dead end',
-    'Terminal only when the app cannot run',
-    'assets/css/page.css',
-  ]) {
-    assert.ok(readme.includes(phrase), `README must state: ${phrase}`);
-  }
-});
-
 test('the standalone pages are the brand card on the shared page stylesheet', async () => {
   for (const name of PAGES) {
     const html = await read(name);

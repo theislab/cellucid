@@ -322,7 +322,7 @@ test('Drive: Google\'s per-file download quota and Google documents are refused 
   await assert.rejects(drive.open(DRIVE_ID), /Google Drive folder/);
 });
 
-test('Drive: a refused file registers no access; one is registered only for a file described (F123, LC-4)', async t => {
+test('Drive: a refused file registers no access; one is registered only for a file described', async t => {
   // The accesses the page holds for Drive, counted by a sign-out's reach.
   const heldForDrive = () => {
     let heard = 0;
@@ -726,7 +726,7 @@ const GRAPH_ITEM = {
 /**
  * Graph's answer for one drive item, as Graph gives it: a `$select` keeps
  * only the plain fields it names and drops `@microsoft.graph.downloadUrl`
- * even when it names it (seen on a personal OneDrive, 2026-10-25).
+ * even when it names it (as a personal OneDrive answers).
  */
 function graphAnswer(url, item) {
   const select = new URL(url).searchParams.get('$select');

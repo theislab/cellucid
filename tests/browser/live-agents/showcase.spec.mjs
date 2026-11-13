@@ -96,7 +96,7 @@ for (const run of RUNS) {
     test('a guided first look: the dataset read, a sensible first coloring, one click undoes it', async ({ page }) => {
       test.setTimeout(15 * 60_000);
       await openLiveChat(page, run);
-      // The dataset opens colored by its cell types (F21): the person cleared that, so a first coloring is the agent's to choose.
+      // The dataset opens colored by its cell types: the person cleared that, so a first coloring is the agent's to choose.
       await page.evaluate(async () => {
         const { getActions } = await import('/assets/js/app/actions/index.js');
         await getActions().dispatch('color.by', { field: null });

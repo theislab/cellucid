@@ -223,10 +223,9 @@ test('marker genes: Cancel from the notification stops discovery, keeps nothing,
 
 test('Run stays where it is while the page turns level of detail on and off by itself', async ({ page }) => {
   // With level of detail on, the highlight count says how many highlighted
-  // cells the level draws, a longer line; it wrapped beside CSV, .h5ad and
-  // Clear (Run moved 43 px, Web contracts run 41292953076, Linux WebKit),
-  // and the force-level row appeared and went (40 px here before it
-  // stayed). The page opens on a fast GPU (the fixture's device), so
+  // cells the level draws, a longer line; it must not wrap beside CSV, .h5ad
+  // and Clear (which would move Run), and the force-level row must not appear
+  // and go. The page opens on a fast GPU (the fixture's device), so
   // nothing is turned on until Run is watched; then the GPU takes 500 ms a
   // frame whatever is drawn (far above any frame's own script), and the
   // framing is measured afresh: too slow, the page turns level of detail on

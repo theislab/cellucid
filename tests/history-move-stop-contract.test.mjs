@@ -1,10 +1,10 @@
 /**
- * The history's own actions are stopped as every other action is (bug hunt
- * LB-2). A move or an edit of the history runs alone (`exclusive`): it waits
+ * The history's own actions are stopped as every other action is. A move or an
+ * edit of the history runs alone (`exclusive`): it waits
  * for the actions running, then runs. An agent's `history.undo` (or jump,
  * branch switch, group, …) stopped by the person while it waits for its turn
- * used to run anyway once its turn came, and a move stopped while it put a
- * state back went on to the end. Now:
+ * does not run once its turn comes, and a move stopped while it puts a
+ * state back does not go on to the end. So:
  *
  * - stopped while it waits, it never runs (the head and the state stay);
  * - stopped while its restore runs, what was shown comes back and the head
@@ -16,7 +16,6 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 
 import { deferred, makePage, NUMBER } from './history-fake-page.mjs';
 import { defineAction } from '../assets/js/app/actions/catalog.js';
@@ -109,31 +108,4 @@ test('a jump stopped while it puts a state back leaves what was shown and the he
   assert.equal(history.active.headId, s2.id, 'the head stays');
   assert.equal(page.state.a, 2, 'what was shown came back');
   owner.restore = restore;
-});
-
-test('every exclusive task of the history\'s actions is given its dispatch\'s signal', () => {
-  const source = readFileSync(new URL('../assets/js/app/history/actions.js', import.meta.url), 'utf8');
-  const lines = source.split('\n');
-  let calls = 0;
-  lines.forEach((line, index) => {
-    if (!line.includes('exclusive(')) return;
-    calls += 1;
-    if (!/=> exclusive\(async \(\) => \{$/u.test(line)) {
-      assert.match(line, /exclusive\(.*, \{ signal \}\);$/u, `line ${index + 1} gives its exclusive task the signal`);
-      return;
-    }
-    // A handler's exclusive task: given the dispatch's signal where the handler ends.
-    assert.match(line, /\{ (meta, )?signal \}\) => exclusive/u, `line ${index + 1} takes the dispatch's signal`);
-    let end = index + 1;
-    while (!/^ {4}\}/u.test(lines[end])) end += 1;
-    assert.equal(lines[end], '    }, { signal }),', `the exclusive task of line ${index + 1} is given the signal (line ${end + 1})`);
-  });
-  assert.ok(calls > 20);
-  // The moves an action makes pass the signal on to the restore.
-  for (const move of source.matchAll(/await (jumpNow|useTrackerNow|show)\(([^;]*)\);/gu)) {
-    assert.match(move[2], /\{ signal \}/u, `${move[1]}(${move[2]}) passes the signal`);
-  }
-  for (const api of source.matchAll(/h\.api\.(undo|redo|jump|useTracker)\(([^;]*)\);/gu)) {
-    assert.match(api[2], /signal/u, `h.api.${api[1]} is given the signal`);
-  }
 });

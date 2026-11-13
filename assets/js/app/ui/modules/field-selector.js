@@ -32,12 +32,13 @@ import {
   unshownChoiceReason,
 } from './field-interaction-owner.js';
 import { useOpenCells } from '../../../data/open-cells-work.js';
-import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { requireExactKeys } from '../../../utils/exact-record.js';
 import { getActions } from '../../actions/index.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { markReported } from '../../../utils/errors.js';
 import { requireNewName, resolveField } from '../../actions/targets/fields.js';
 import { dispatchFromControl, isQuietFailure, reportActionFailure } from '../../actions/control-dispatch.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 const NONE_FIELD_VALUE = '-1';
 const INIT_KEYS = new Set(['state', 'dom', 'dataSourceManager', 'callbacks']);
@@ -1165,7 +1166,7 @@ export function initFieldSelector(options) {
   async function colorByAction({ field }, { signal }) {
     assertAlive();
     // A choice that ends unshown is refused with the sentence the person is
-    // told, never answered with a bare null an agent takes for done (F95).
+    // told, never answered with a bare null an agent takes for done.
     // The person has heard all they need (that sentence, or nothing after
     // their own newer choice or Cancel), so the refusal is marked reported
     // and no control says it again.
@@ -1518,12 +1519,8 @@ export function initFieldSelector(options) {
   function destroy() {
     if (destroyPromise !== null) return destroyPromise;
     destroyed = true;
-    let resolveDestruction;
-    let rejectDestruction;
-    destroyPromise = new Promise((resolve, reject) => {
-      resolveDestruction = resolve;
-      rejectDestruction = reject;
-    });
+    const { promise, resolve: resolveDestruction, reject: rejectDestruction } = promiseWithResolvers();
+    destroyPromise = promise;
     const interactionDestruction = interactionOwner.destroy();
     const errors = [];
     const cleanups = [

@@ -1,5 +1,5 @@
 /**
- * @fileoverview One tracker held live: the History v2 records (`model.js`)
+ * @fileoverview One tracker held live: the history's records (`model.js`)
  * by id, with the indexes that keep every read and move from growing with
  * the whole history. Pure data, no page.
  *
@@ -189,7 +189,7 @@ export function depthOf(tracker, stepId) {
 }
 
 /** The ancestor of `stepId` at `depth` (itself at its own depth). */
-export function ancestorAt(tracker, stepId, depth) {
+function ancestorAt(tracker, stepId, depth) {
   let id = stepId;
   for (let d = depthOf(tracker, stepId); d > depth; d--) id = stepOf(tracker, id).parent;
   return id;

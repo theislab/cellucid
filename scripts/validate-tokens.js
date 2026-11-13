@@ -158,9 +158,9 @@ const FONT_FACE_FILE = path.join(PROJECT_ROOT, 'assets', 'css', 'base', '_fonts.
 /**
  * A component names its typeface through `--font-sans`, `--font-display` or
  * `--font-mono`, never by spelling a stack out: a spelled-out stack drifts
- * from the tokens (one panel fell back to Georgia while every other read Inter)
- * and a theme can no longer change the face in one place. `@font-face` in
- * `base/_fonts.css` is where the families are declared, so it is exempt.
+ * from the tokens and a theme can no longer change the face in one place.
+ * `@font-face` in `base/_fonts.css` is where the families are declared, so it
+ * is exempt.
  *
  * @param {string} filePath
  * @returns {Array<{ file: string; token: string }>}
@@ -184,8 +184,7 @@ function validateFontFamilies(filePath) {
 // A failure sets process.exitCode and returns rather than calling
 // process.exit(): Node can deadlock in process.exit(), joining a V8 background
 // compile thread that waits for a garbage collection only the exiting main
-// thread could run (7 of 60 failing runs hung on Node 26.11; none of 120 with
-// exitCode), and the contract suite waited on such a run for over an hour.
+// thread could run (measured: 38_decisions_testing_and_hosted_runners.md).
 function main() {
   const defined = collectDefinedTokens();
   if (defined.size === 0) {

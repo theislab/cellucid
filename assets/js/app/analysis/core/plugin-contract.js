@@ -19,10 +19,12 @@ import {
 } from './analysis-types.js';
 import { filterFiniteNumbers, getFiniteMinMax, mean } from '../shared/number-utils.js';
 import { formatCompactCount } from '../../../utils/format-units.js';
-import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
+import { debugWarn, debugError } from '../shared/debug-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { getPageColor, PAGE_COLORS } from '../../utils/page-colors.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
+
+/** @typedef {import('./analysis-types.js').ValidationResult} ValidationResult */
 
 // =============================================================================
 // BASE REGISTRY CLASS

@@ -26,7 +26,7 @@ const COUNT = Object.freeze({ type: 'integer', minimum: 0 });
 const NULLABLE_COUNT = Object.freeze({ type: ['integer', 'null'], minimum: 0 });
 
 /** Whether an open tab uses a kept item (then it stays until that tab closes). */
-export const STORED_HELD = Object.freeze(['none', 'this-tab', 'other-tab']);
+const STORED_HELD = Object.freeze(['none', 'this-tab', 'other-tab']);
 
 const ITEM = Object.freeze({
   type: 'object', additionalProperties: false, required: ['id', 'kind', 'what', 'bytes', 'last_used', 'in_use', 'saves'],

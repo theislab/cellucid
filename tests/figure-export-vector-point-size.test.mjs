@@ -1,13 +1,13 @@
 /**
- * L6-1 (2026-11-11): the vector strategies draw each cell at the size the
- * viewer draws it.
+ * The vector strategies draw each cell at the size the viewer draws it.
  *
  * The point shaders take `u_pointSize` as a scale: with size attenuation the
  * sprite is `mix(u_pointSize, u_pointSize · pointScale / eyeDepth, a)` pixels.
  * Full Vector and Optimized Vector circles (and the centroid discs of every
- * format) took `u_pointSize` as the pixel diameter, so at the default
- * attenuation of 0.8 a 3-D figure drew specks where the screen drew spheres
- * several times larger, and near and far cells the same size.
+ * format) follow that formula. Taking `u_pointSize` as the pixel diameter
+ * would, at the default attenuation of 0.8, draw specks in a 3-D figure where
+ * the screen draws spheres several times larger, and near and far cells the
+ * same size.
  */
 
 import assert from 'node:assert/strict';
@@ -125,7 +125,7 @@ test('full and optimized vector circles, and centroid discs, are the sprites the
     onPoint: (_x, _y, _r, _g, _b, _a, radius, index) => radii.set(index, radius),
   });
   for (const index of [0, 1]) assert.ok(Math.abs(radii.get(index) - expected[index]) < 1e-6, `cell ${index}`);
-  // Before the fix both were 1.25 (5 / 2 · 0.5): three to four times too
+  // Not 1.25 (5 / 2 · 0.5): three to four times too
   // small, and near and far alike.
   assert.ok(radii.get(0) > 3 * 1.25 && radii.get(1) > radii.get(0));
 
@@ -170,9 +170,8 @@ test('full and optimized vector circles, and centroid discs, are the sprites the
 
 test('a cell near the camera is in every vector figure whole, opaque and at the cap (no near fade)', async () => {
   // The camera is 3 from the origin: cells at 0.13, 0.3 and 0.52 of that
-  // distance from it, beside the origin's cell. A near fade (F97, removed on
-  // the owner's decision 2026-11-11) left the first out and the second
-  // translucent; every one is drawn whole.
+  // distance from it, beside the origin's cell. No near fade leaves the
+  // first out or the second translucent; every one is drawn whole.
   const state = renderState();
   const plotRect = { x: 0, y: 0, width: 720, height: 450 };
   const depths = [0.39, 0.9, 1.56];

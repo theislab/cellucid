@@ -5,23 +5,22 @@
  * them plus `k` times it. Its meaning is that prediction's: what a cell
  * adds to the time from the moment an opening's cells are in the page
  * (read, their GPU stores about to be made) until the first frame that
- * draws them (`recordFirstFrame`, from `app/main.js` on every opening of a
+ * draws them (`recordFirstFrame`, from `app/dataset/reload.js` on every opening of a
  * dataset, a progressive opening's first view among them). Work on the
  * cells shown already is not an opening and is not recorded: an in-place
  * resize (`app/open-cells-resize.js`) keeps the GPU stores of the cells it
  * keeps, appends only the cells it adds and makes every open cell's
  * colors and filters again, so its time is neither its added cells' cost
- * nor its open cells' on an opening (measured, a 20M-cell store in
- * Chromium: raising 10M cells to 20M took 340-380 ms to its first frame,
- * 34-38 ns an added cell, against an opening's 9 ns a cell below).
+ * nor its open cells' on an opening (an added cell costs several times
+ * what a cell of an opening does; measured: 23_decisions_partial_reading.md).
  *
  * An opening also costs what showing any dataset costs, whatever its
- * cells (its controls made again, its first frame begun): measured in
- * Chromium, 10K cells took 27 ms to their first frame, 100K 23 ms, 1M 31 ms
- * and 5M 70 ms, about 25 ms and 9 ns a cell. So the measure is the cost a
+ * cells (its controls made again, its first frame begun): a fixed cost
+ * beside a cost a cell (measured: 23_decisions_partial_reading.md). So the
+ * measure is the cost a
  * cell adds, the slope of the line through the records (time against
- * cells, least squares), not their ratio, which would make a cell of the
- * 10K-cell opening cost 300 times one of the 5M. Each earlier record counts
+ * cells, least squares), not their ratio, which would make a cell of a
+ * small opening cost hundreds of times one of a large one. Each earlier record counts
  * half as much as the one after it, so an odd record (a slow moment) fades
  * as later ones come and no single record keeps sizing later openings.
  * While the records hold one size only (one opening, or several of the
@@ -154,9 +153,8 @@ export function resetShownCells() {
  * (`utils/machine.js`): held, it is the held cost (null: nothing measured),
  * this browser's storage is not read and the page's own records
  * (`recordFirstFrame`) are not made -- on a runner whose software GL draws a
- * first frame slowly, the page's own record of its start dataset made a
- * later opening progressive, at a time the runner decided (Web contracts
- * run 41307458156).
+ * first frame slowly, the page's own record of its start dataset would make a
+ * later opening progressive, at a time the runner decided.
  */
 export function shownMsPerCell() {
   return measureOf('shownCellMs', measuredMsPerCell);

@@ -19,7 +19,7 @@ const EMPTY = Object.freeze({
 });
 
 /** How long a provider that offers it keeps the cached prompt: five minutes (the default) or an hour. */
-export const CACHE_LENGTHS = Object.freeze(['5m', '1h']);
+const CACHE_LENGTHS = Object.freeze(['5m', '1h']);
 
 /** The key of a model's effort (`provider:model`). */
 export function effortKey(providerId, modelId) {

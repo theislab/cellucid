@@ -1,5 +1,5 @@
 /**
- * History v2: a domain that follows another (`DERIVED_DOMAINS`: the analyses'
+ * A domain that follows another (`DERIVED_DOMAINS`: the analyses'
  * page selections follow the highlight pages) is captured with it, after an
  * action and after a restore. A page made joins the step that made it, its
  * undo puts the selection back with it, and nothing is ever recorded as a

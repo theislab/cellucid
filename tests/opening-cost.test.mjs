@@ -93,7 +93,7 @@ test('no cells, or no start, record nothing', async () => {
 
 test('the measure is what a cell adds, apart from what any opening costs', () => {
   resetShownCells();
-  // Measured in Chromium: about 25 ms whatever the cells, and 9 ns a cell.
+  // About 25 ms whatever the cells, and 9 ns a cell (measured: 23_decisions_partial_reading.md).
   for (const [cells, ms] of [[10_000, 27.4], [100_000, 23.1], [1_000_000, 30.9], [5_000_000, 69.8]]) recordShownCells(cells, ms);
   const slope = shownMsPerCell();
   assert.ok(slope > 7e-6 && slope < 1e-5, `about 9 ns a cell (${slope * 1e6} ns)`);

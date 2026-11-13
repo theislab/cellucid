@@ -89,7 +89,7 @@ export function authorizationServerMetadata(site) {
  * `value` when it names this relay's resource, its origin (scheme and host in
  * any case, with or without the trailing slash: MCP clients send the canonical
  * form without it, RFC 3986 normalizes to it), else null. Any other path,
- * including the retired `/mcp`, names another resource.
+ * `/mcp` included, names another resource.
  */
 export function resourceOf(value, site) {
   let url;

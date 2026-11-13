@@ -1,8 +1,8 @@
 /**
  * The messages retired from the card stack to make room are the session's
  * log, listed under the stack. While that list is open, a message retired
- * adds its own row at the top; the list was rebuilt from every message so far
- * on each one, a cost that grew with the session.
+ * adds its own row at the top; the list is not rebuilt from every message so far
+ * on each one (a cost that would grow with the session).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -88,7 +88,7 @@ function fakeCenter(t) {
   return center;
 }
 
-test('work held back takes no place on screen: it makes room only when it is shown (F71)', t => {
+test('work held back takes no place on screen: it makes room only when it is shown', t => {
   const center = fakeCenter(t);
   center.maxNotifications = 2;
   const opening = center.show({ type: 'progress', message: 'Opening the file', progress: 0 });

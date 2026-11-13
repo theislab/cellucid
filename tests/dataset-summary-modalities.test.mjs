@@ -1,8 +1,8 @@
 /**
- * L18-9 (live pass 5): an agent opening a CITE-seq `.h5mu` said "I have no
- * tool that lists the modalities or their features": `dataset.summary` named
- * the genes of the modality shown only. It names the modality shown and every
- * modality as Data mapping › Modality lists them; one modality, nulls.
+ * An agent opening a CITE-seq `.h5mu` must not say "I have no tool that lists
+ * the modalities or their features": `dataset.summary` names the modality
+ * shown and every modality as Data mapping › Modality lists them (not the
+ * genes of the modality shown only); one modality, nulls.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -49,11 +49,10 @@ test('one modality (or none to choose) is nulls', () => {
   }
 });
 
-// L21-6 (agent-loop lane): an agent asked to show a 1D embedding read the summary, which named the
-// embeddings shown by their label only ("UMAP", 2), then guessed obsm keys for mapping_set ("X_umap",
-// "UMAP") and was refused: no read named a stored array and its columns, so mapping_set and
-// view_embedding_set (both name {key, columns}) could not be called by name. Every embedding the data
-// mapping offers is listed, on or off, with what those actions take.
+// An agent asked to show a 1D embedding must not have to guess obsm keys for mapping_set ("X_umap",
+// "UMAP") from a summary that names the embeddings shown by their label only ("UMAP", 2): mapping_set
+// and view_embedding_set both name {key, columns}, so a read names a stored array and its columns.
+// Every embedding the data mapping offers is listed, on or off, with what those actions take.
 test('the summary lists every embedding the data mapping offers, on or off, by the key and columns the actions take', () => {
   const state = {
     ...stateWith(null),

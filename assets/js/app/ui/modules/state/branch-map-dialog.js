@@ -1,5 +1,5 @@
 /**
- * @fileoverview The branch map (History v2 §3.9, §3.10): the overview and
+ * @fileoverview The branch map: the overview and
  * the bulk tool, so the sidebar stays compact. On the left, every branch as
  * a lane graph (the sidebar's graph with every branch expanded, the same
  * rows, keys and row rule: click selects, double-click shows, `›` details);

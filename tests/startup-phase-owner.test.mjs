@@ -124,9 +124,14 @@ test('every network await of the bootstrap runs through the startup owner', asyn
     afterUi,
     /startupOutcome = await ui\.loadStartupDataset\(startupSelection\);/
   );
-  const reload = main.slice(
-    main.indexOf('async function reloadActiveDatasetInPlace'),
-    main.indexOf('async function clearActiveDatasetInPlace')
+  // The startup selection's load is a dataset change (`app/dataset/reload.js`).
+  const changes = await readFile(
+    new URL('../assets/js/app/dataset/reload.js', import.meta.url),
+    'utf8'
+  );
+  const reload = changes.slice(
+    changes.indexOf('async function reloadActiveDatasetInPlace'),
+    changes.indexOf('async function clearActiveDatasetInPlace')
   );
   assert.match(
     reload,
@@ -140,8 +145,13 @@ test('every network await of the bootstrap runs through the startup owner', asyn
     reload,
     /requestStep: isStartupLoad\s*\? \(url, operation\) => startup\.step\('session', url, operation\)/
   );
+  // The published sample view's restore (`app/dataset/published-state.js`).
+  const publishedState = await readFile(
+    new URL('../assets/js/app/dataset/published-state.js', import.meta.url),
+    'utf8'
+  );
   assert.match(
-    main,
+    publishedState,
     /if \(classified !== null\) return classified;\n(?:\s+\/\/.*\n)+\s+if \(error\?\.code === STARTUP_STALL_CODE\) throw error;/
   );
   assert.match(main, /startup\.enter\('ui'\);\n    ui = initUI\(\{/);
@@ -197,8 +207,8 @@ test('a step that reports progress stalls only when progress stops, however long
 
 test('waiting on the person stops the deadline; it starts over, whole, once the person answered', async () => {
   // A sign-in window left open for minutes is the person's time, not a
-  // request's silence (seen: an open failed as "nothing arrived for 60 s"
-  // while its owner was still in Google's sign-in window).
+  // request's silence (an open must not fail as "nothing arrived for 60 s"
+  // while its owner is still in Google's sign-in window).
   const time = virtualTime();
   const listeners = new Set();
   let waiting = false;
@@ -264,10 +274,9 @@ test('the page waits on the person while a sign-in step, the picker or a choice 
   assert.equal(isWaitingOnPerson(), false);
   assert.deepEqual(heard, [false, true, false]);
   stop();
-  // Every wait on the person registers: the sign-in steps (Google, Microsoft),
+  // Every wait on the person registers: the sign-in steps (held in source-sign-in-contract),
   // Google's picker and an R file's question which object to open.
   const read = path => readFile(new URL(`../assets/js/${path}`, import.meta.url), 'utf8');
-  assert.match(await read('data/sources/auth/sign-in.js'), /return whileWaitingOnPerson\(promise\);/);
   assert.match(await read('data/sources/auth/google.js'), /return whileWaitingOnPerson\(new Promise\(\(resolve, reject\) => \{\n\s+const view = new pickerApi\.DocsView/);
   assert.match(await read('data/opening-progress.js'), /choose: \(\{ question, options \}\) => whileWaitingOnPerson\(/);
   // The startup owner listens by default, and a data link's step says what it does.

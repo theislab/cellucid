@@ -3,7 +3,7 @@
 // Based on techniques from Horizon Zero Dawn, Frostbite, and Guerrilla Games
 //
 // All noise generation is performed on the GPU using fragment shaders.
-// This is ~100-200x faster than CPU generation.
+// This is far faster than CPU generation (measured: 28_decisions_rendering_layers.md).
 
 import { startCloudNoiseGenerationGPU } from './gpu-noise-generator.js';
 import {

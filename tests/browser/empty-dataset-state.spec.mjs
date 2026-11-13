@@ -3,13 +3,11 @@
  * zero cells, no fields, no genes. Every dataset-dependent action must then be
  * either unavailable with a short reason, or refuse truthfully; none may throw.
  *
- * These assertions come from defects found by driving the running app after
- * None: Keep view, Figure export and Save session threw on the empty runtime;
- * Differential expression and Marker genes threw on the zero point count while
- * building their forms; Analyze
- * performance raised a page error waiting for renderer statistics no empty
- * frame publishes; and Load quoted "0 cells and 0 genes now" as if an empty
- * runtime were a dataset.
+ * Without these assertions Keep view, Figure export and Save session throw on
+ * the empty runtime; Differential expression and Marker genes throw on the zero
+ * point count while building their forms; Analyze performance waits for
+ * renderer statistics no empty frame publishes; and Load quotes "0 cells and 0
+ * genes now" as if an empty runtime were a dataset.
  */
 import { SESSION_BUNDLE_MAGIC_BYTES } from '../../assets/js/app/session/bundle/format.js';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -26,7 +24,7 @@ const APP_URL =
 const SAMPLE_OPTION = 'dataset:local-demo:current-ui';
 const SAMPLE_NAME = 'Current UI fixture';
 const NO_CELLS_TO_MEASURE = 'Open a dataset or load synthetic data first.';
-// What every analysis mode says with no dataset open (R9E-8): the same line,
+// What every analysis mode says with no dataset open: the same line,
 // never "Requires gene expression data.".
 const NO_DATASET_TO_ANALYZE = 'No dataset is open. Open one in Session › Open data to analyze it.';
 const GENE_MODES = Object.freeze(['differential', 'signature', 'genesPanel']);
@@ -159,7 +157,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
 
   await page.locator('#dataset-select').selectOption('__none__');
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
-  // The empty viewer says what it waits for (R9E-10).
+  // The empty viewer says what it waits for.
   await expect(page.locator('.opening-overlay[data-state="empty"] .opening-title')).toHaveText('No dataset open');
   await openSections(page);
 
@@ -207,7 +205,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
       .click();
     await expectInfo(page, NO_DATASET_TO_ANALYZE);
   }
-  // Camera path: nothing to clear is dimmed (R9E-9).
+  // Camera path: nothing to clear is dimmed.
   await expect(page.locator('#cinematic-clear-btn')).toBeDisabled();
   await expect(
     page.locator('#floating-panels-root .analysis-window-panel'),
@@ -234,7 +232,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
     await page.locator(`#highlight-mode-${tool}`).click();
     await selectAcrossCanvas(page);
   }
-  // KNN drag says there is no dataset, not that a dataset has no graph (R9E-8).
+  // KNN drag says there is no dataset, not that a dataset has no graph.
   await expect(page.locator('.notification', {
     hasText: 'No dataset is open. Open one in Session › Open data to select cells by their neighbors.',
   })).not.toHaveCount(0);

@@ -26,6 +26,7 @@ import { analysisViewSizes } from '../../shared/analysis-view-sizes.js';
 import { capturePointer } from '../../../ui/pointer-capture.js';
 import { wireAppDialog } from '../../../ui/components/app-dialog.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { promiseWithResolvers } from '../../../../utils/promise-resolvers.js';
 
 // =============================================================================
 // CONSTANTS
@@ -178,8 +179,8 @@ export function createAnalysisModal(options = {}) {
   // The expanded view is a modal dialog: its backdrop covers the page and
   // closes it, so the page behind is out of use. It is a `<dialog>` opened
   // through `wireAppDialog`, as every modal of the app: the browser makes
-  // the page inert, holds Tab and gives Escape (it said `aria-modal` with a
-  // hand-made Tab trap, and the page behind stayed reachable).
+  // the page inert, holds Tab and gives Escape (`aria-modal` with a
+  // hand-made Tab trap leaves the page behind reachable).
   const modal = document.createElement('dialog');
   modal.className = 'analysis-modal';
   const modalId = ++analysisModalIdCounter;
@@ -460,9 +461,9 @@ function writeContentBox(content, rect) {
 /**
  * A view keeps the size it was given; a smaller window only cuts it to the
  * screen less the margins, as a floating panel is (`_accordion.css`), so
- * widening the window again gives the size back. Its cap was `none` (to lift
- * the stylesheet's 860 px), and a view sized on a large window ran past a
- * smaller one's edges (bug hunt F126). The phone layout's full screen
+ * widening the window again gives the size back. A cap of `none` (to lift
+ * the stylesheet's 860 px) would let a view sized on a large window run past
+ * a smaller one's edges. The phone layout's full screen
  * overrides it (`_modals.css`).
  */
 function capContentToViewport(content) {
@@ -1191,8 +1192,8 @@ function initializeModalDrag(modal, content, header) {
 
   // A smaller window moves the view inside it, whole (its size is cut to the
   // screen by its cap), once per frame; a view still inside stays where it
-  // is. Without this a view placed on a large window was left past a smaller
-  // one's edges, its header and close button out of reach (bug hunt F126).
+  // is. Without this a view placed on a large window would be left past a smaller
+  // one's edges, its header and close button out of reach.
   let reclampFrame = null;
   const onWindowResize = () => {
     if (reclampFrame !== null) return;
@@ -1256,8 +1257,11 @@ function applyRememberedSizes(modal, content, size) {
 // =============================================================================
 
 /**
- * Open the analysis modal
+ * Open the analysis modal.
  * @param {HTMLElement} modal - Modal element to open
+ * @returns {boolean} Whether it is open: false when it closed while it
+ *   opened (its close has begun, and `beforeClose` may have run), so the
+ *   caller draws nothing into it.
  */
 export function openModal(modal) {
   if (!modal || typeof modal !== 'object') {
@@ -1293,6 +1297,8 @@ export function openModal(modal) {
   // the view to close (`requestModalClose`, a no-op once closing began).
   modal._appDialog = wireAppDialog(modal, { onClose: () => requestModalClose(modal) });
   modal._appDialog.open(modal._previouslyFocusedElement);
+  // Closed while it opened (`wireAppDialog`): its close has begun already.
+  if (!modal.open) return false;
   const content = modal.querySelector('.analysis-modal-content');
   const remembered = modal._sizeKey === null
     ? null
@@ -1322,6 +1328,7 @@ export function openModal(modal) {
 
   const focusableEls = getFocusableElements(modal);
   (focusableEls[0] ?? modal).focus();
+  return true;
 }
 
 function combineErrors(errors, message) {
@@ -1466,12 +1473,7 @@ async function settleModalCleanup(
 }
 
 function createClosePromiseOwner(modal) {
-  let rejectClose;
-  let resolveClose;
-  const closePromise = new Promise((resolve, reject) => {
-    resolveClose = resolve;
-    rejectClose = reject;
-  });
+  const { promise: closePromise, resolve: resolveClose, reject: rejectClose } = promiseWithResolvers();
   modal._closePromise = closePromise;
   // Some event-driven close callers cannot observe a returned Promise. Keep
   // the rejection handled here while preserving it for every explicit await.

@@ -16,7 +16,8 @@
  * every coloring, filter pass or legend draw. A field of 1M categories
  * (clone or lineage ids, a text column of one label per cell) holds 4 MB,
  * shared by every view, where an RGB array per category and an object keyed
- * by index held ~90 MB per view and took ~50 ms to check on every action.
+ * by index would hold about 90 MB per view and be checked on every action
+ * (measured: 33_decisions_actions_domains_and_history.md).
  *
  * Colors enter and leave as `[r, g, b]` channels from 0 to 1 (the color
  * picker's, a palette's, a session's): `categoryRgbAt` gives a category's as

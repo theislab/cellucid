@@ -8,7 +8,7 @@
  * document that the page opens in its own window, where the person reads,
  * prints or saves it as PDF.
  *
- * No picture is stored in a history (History v2 §3.15.7): the caller draws
+ * No picture is stored in a history: the caller draws
  * the picked steps from the live view at print time and passes them in
  * (`pictures`); `reportPictureDefaults` names the default picks (the
  * bookmarks and the last step of each group).

@@ -22,7 +22,6 @@
  */
 
 import {
-  DataSourceError,
   DataSourceErrorCode,
   explainedFailure,
   validateDatasetIdentity,
@@ -100,8 +99,6 @@ import { isContinuousValues } from './continuous-values.js';
 /** Each shared gene read's key, for a job that joins it to adopt it (`getGeneValues`). */
 let nextGeneReadKey = 1;
 
-const CONNECTIVITY_EDGE_LABEL = 'Direct AnnData connectivity edge loading';
-const CONNECTIVITY_ROW_LABEL = 'Direct AnnData connectivity row reading';
 /** Bytes a JavaScript array slot takes, for an obs field held as an Array. */
 const JS_ARRAY_ELEMENT_BYTES = 8n;
 

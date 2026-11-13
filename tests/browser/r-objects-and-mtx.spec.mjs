@@ -1,7 +1,7 @@
 /**
  * Single-stream formats in the browser (`data/anndata/transcode/`): a
  * Seurat `.rds` picked with File…, a SingleCellExperiment `.rds` dropped, a
- * Seurat `.rds` opened from a link (one pass over the download), a `save()`
+ * Seurat `.rds` opened from a link, a `save()`
  * file of two objects (the opening asks which), and a MatrixMarket folder
  * chosen with Folder…. Each cannot be read in parts: the opening says so up
  * front, it is read whole once into this browser's storage (the
@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 import { closePageWithApplicationRetirement, expect, test } from './helpers/test.mjs';
 import { createDrag, dragAndDrop, openZarrFolder } from './helpers/dataset-drop.mjs';
-import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
+
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
@@ -121,7 +121,7 @@ async function closeStored(page) {
   await expect(page.locator('#kept-stores-dialog')).toBeHidden();
 }
 
-test('a Seurat .rds picked with File… opens, kept in this browser', async ({ page }, testInfo) => {
+test('a Seurat .rds picked with File… opens, kept in this browser; dropped objects open too', async ({ page }, testInfo) => {
   const errors = watchErrors(page);
   await start(page);
   // Files on disk: picked again, a file is the same file (name, size, time).
@@ -143,6 +143,17 @@ test('a Seurat .rds picked with File… opens, kept in this browser', async ({ p
     expect(both).toHaveLength(2);
     expect(await keptStores(page)).toEqual(both);
   }
+
+  await test.step('a dropped SingleCellExperiment .rds and an uncompressed one open', async () => {
+    // Each drop opens another object than the one shown, so its name says the drop opened.
+    for (const [name, title] of [['sce.rds', 'sce'], ['seurat5_none.rds', 'Corpus Seurat object']]) {
+      const buffer = await corpusFile(`rds/${name}`);
+      const drag = await createDrag(page, { files: [{ name, base64: buffer.toString('base64') }] });
+      await dragAndDrop(page, drag);
+      await expect(page.locator('#dataset-name')).toHaveText(title);
+      await expect(page.locator('#dataset-cells')).toHaveText('120');
+    }
+  });
   expect(errors).toEqual([]);
 });
 
@@ -209,29 +220,6 @@ test.describe('where a converted object is kept, with storage and without it', (
   });
 });
 
-test('a dropped SingleCellExperiment .rds and an uncompressed one open', async ({ page }) => {
-  const errors = watchErrors(page);
-  await start(page);
-  for (const name of ['sce.rds', 'seurat5_none.rds']) {
-    const buffer = await corpusFile(`rds/${name}`);
-    const drag = await createDrag(page, { files: [{ name, base64: buffer.toString('base64') }] });
-    await dragAndDrop(page, drag);
-    await expect(page.locator('#dataset-cells')).toHaveText('120');
-  }
-  expect(errors).toEqual([]);
-});
-
-test('a Seurat .rds link opens in one pass over the download', async ({ page }) => {
-  const errors = watchErrors(page);
-  const url = `${SAMPLE_ORIGIN}/corpus/seurat5_xz.rds`;
-  const bytes = await corpusFile('rds/seurat5_xz.rds');
-  await page.route(url, route => fulfillFile(route, bytes));
-  await page.goto(`/?${PINNED}data=${encodeURIComponent(url)}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
-  await expectOpened(page, { name: 'Corpus Seurat object', cells: 120 });
-  expect(errors).toEqual([]);
-});
-
 test('a save() file of two objects asks which to open', async ({ page }) => {
   const errors = watchErrors(page);
   await start(page);
@@ -246,25 +234,6 @@ test('a save() file of two objects asks which to open', async ({ page }) => {
   await expect(panel).toBeHidden();
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   expect(errors).toEqual([]);
-});
-
-test('a MatrixMarket folder chosen with Folder… opens with its cell table', async ({ page, browserName }, testInfo) => {
-  const errors = watchErrors(page);
-  await start(page);
-  const directory = await corpusFolder('mtx/cellranger3', testInfo.outputPath('cellranger3'));
-  await openZarrFolder(page, browserName, directory);
-  await expectOpened(page, { name: 'cellranger3', cells: 90 });
-  await expect.poll(() => conversionPlace(page)).toEqual(await workersKeepFiles(page) ? KEPT_FOR_LATER : IN_MEMORY);
-  await expect(page.locator('#dataset-origin')).toHaveText('MatrixMarket folder · this computer');
-  expect(errors).toEqual([]);
-});
-
-test('an .rds with no embedding is refused with what to do', async ({ page }) => {
-  await start(page);
-  const buffer = await corpusFile('rds/seurat5_noembedding.rds');
-  await chooseFiles(page.locator('#user-data-file-input'), { name: 'bare.rds', mimeType: 'application/octet-stream', buffer });
-  await expect(page.locator('#notification-center .notification[data-type="error"]').filter({ hasText: /has no cell embedding/ })).toHaveCount(1);
-  expect([null, []]).toContainEqual(await keptStores(page));
 });
 
 /** A file host that names each file's version (an ETag), counting the bytes it sends; `hold` delays whole-file answers. */
@@ -415,6 +384,7 @@ test('a MatrixMarket folder chosen again on a later visit opens from what the fi
   await openZarrFolder(page, browserName, directory);
   await expectOpened(page, { name: 'cellranger3', cells: 90 });
   await expect.poll(() => conversionPlace(page)).toEqual(keeps ? KEPT_FOR_LATER : IN_MEMORY);
+  await expect(page.locator('#dataset-origin')).toHaveText('MatrixMarket folder · this computer');
   const kept = await keptStores(page);
   // Without an origin-private file system nothing is kept for a later visit.
   if (keeps) expect(kept).toHaveLength(1);

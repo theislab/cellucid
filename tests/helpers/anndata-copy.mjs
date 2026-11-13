@@ -209,9 +209,4 @@ function copiedNames(group, placed) {
   return names;
 }
 
-/** Every array of a copy's store is chunked within the specification's sizes, and compressed. */
-export function zarrayDocuments(consolidated) {
-  return Object.entries(consolidated.metadata).filter(([key]) => key.endsWith('.zarray'));
-}
-
 export { isArrayNode, isGroup };

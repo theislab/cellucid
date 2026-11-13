@@ -63,6 +63,7 @@ import { sameJson } from '../../utils/same-json.js';
 import { awaitWithSignal, cancelled, isCancellation, throwIfAborted } from '../../../utils/abort.js';
 import { RAW_VALUES } from '../../../data/expression-transform.js';
 import { NO_DATASET_OPEN } from '../../ui/no-dataset.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /** Where the current mapping came from. */
 export const MAPPING_ORIGINS = Object.freeze(['default', 'best_guess', 'session', 'user', 'notebook']);
@@ -122,6 +123,7 @@ export class DataStateMappingMethods {
    * representations and defaults go to the dimension manager, which must
    * already hold the dataset's layouts. Silent: see the module comment.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{
    *   mapping: Object|null,
    *   candidates: Object|null,
@@ -173,7 +175,7 @@ export class DataStateMappingMethods {
    * cells grown or cut in place (`app/open-cells-resize.js`: the same arrays,
    * listed at the cells open now, an `obsp` graph's shape the open count), or
    * the catalog completed after the first view with what the matrices'
-   * values tell (whether each holds counts: `app/main.js`
+   * values tell (whether each holds counts: `app/dataset/publication.js`
    * `completePublishedMapping`). The mapping in use and what was found
    * unusable stay; a choice made or restored is never changed by it.
    *
@@ -185,6 +187,7 @@ export class DataStateMappingMethods {
    * that has not read the values (a resize's, before it is completed) never
    * sets it back.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} candidates
    */
   adoptMappingCandidates(candidates) {
@@ -211,6 +214,7 @@ export class DataStateMappingMethods {
    * read, its dtype and the cell total its log1p undone implies), while the
    * mapping takes the default log1p; [] otherwise.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Array<{matrix: string, value: number, dtype: string, total: number|null}>}
    */
   getLog1pRefuted() {
@@ -220,6 +224,7 @@ export class DataStateMappingMethods {
   }
 
   /**
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Object|null} The canonical DataMapping of the loaded dataset.
    */
   getDataMapping() {
@@ -227,6 +232,7 @@ export class DataStateMappingMethods {
   }
 
   /**
+   * @this {import('../core/data-state.js').DataState}
    * @returns {'default'|'best_guess'|'session'|'user'|null}
    */
   getDataMappingOrigin() {
@@ -239,6 +245,7 @@ export class DataStateMappingMethods {
    * show, how many it enables, and how many vector-field bindings it draws.
    * Never a key name.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {{origin: 'default'|'best_guess', embeddingCandidates: number, enabledRepresentations: number, vectorFields: number}|null}
    */
   getMappingAnalytics() {
@@ -264,6 +271,7 @@ export class DataStateMappingMethods {
    * `obsm` arrays (`representationName`): what every menu, the Data mapping
    * checklist, the agents' reads and a figure's title call it.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{label: string, layoutKey: string, provenance: Object|null, width?: number}} layout
    * @returns {string}
    */
@@ -276,6 +284,7 @@ export class DataStateMappingMethods {
    * The AnnData candidate catalog of the loaded dataset, or null when none
    * is loaded.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Object|null}
    */
   getMappingCandidates() {
@@ -289,6 +298,7 @@ export class DataStateMappingMethods {
    * from Scanpy's `uns['log1p']`) and the `'highlyVariable'` column, each until
    * it is changed.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {string[]}
    */
   getGuessedMappingGroups() {
@@ -314,6 +324,7 @@ export class DataStateMappingMethods {
    * (`defaultExpression`: `raw-more-genes`, `x-scaled`), while the mapping
    * still reads the default matrix; null otherwise.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {string|null}
    */
   getExpressionReason() {
@@ -326,6 +337,7 @@ export class DataStateMappingMethods {
    * Whether this dataset's source can plot any `obsm` array on request, so
    * any array can be enabled as a representation.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {boolean}
    */
   canMapAnyEmbedding() {
@@ -335,6 +347,7 @@ export class DataStateMappingMethods {
   /**
    * Why an embedding key cannot be plotted this session, or null.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} key - An obsm key.
    * @returns {string|null}
    */
@@ -347,6 +360,7 @@ export class DataStateMappingMethods {
    * dimension, highest first; within a dimension its default first, then the
    * mapping's order.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Array<{
    *   layoutKey: string,
    *   dimension: number,
@@ -395,6 +409,7 @@ export class DataStateMappingMethods {
    * file's real 2D UMAP. Embeddings are listed before wider arrays. A wide
    * array can be enabled at any further selection of 1 to 3 columns.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Array<{
    *   ref: {key: string, columns: number[]|null},
    *   name: string,
@@ -477,6 +492,7 @@ export class DataStateMappingMethods {
   /**
    * The embedding reference of the representation a view shows.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @returns {{key: string, columns: number[]}}
    */
@@ -487,6 +503,7 @@ export class DataStateMappingMethods {
   /**
    * What one view shows, for its badge and its Compare-views row.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @returns {{dimension: number, name: string, label: string, layoutKey: string, isDefault: boolean}|null}
    *   Null while no dataset layout is published for the view.
@@ -510,6 +527,7 @@ export class DataStateMappingMethods {
    * load-time check is marked unusable for the session and the view keeps
    * what it showed.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @param {{key: string, columns: number[]}} ref
    * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
@@ -530,6 +548,7 @@ export class DataStateMappingMethods {
    * null when it can. A layout it names is registered on demand (metadata
    * only); nothing is loaded.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{key: string, columns: number[]}} ref
    * @returns {string|null}
    */
@@ -559,6 +578,7 @@ export class DataStateMappingMethods {
    * plot. Layouts the embeddings name are registered (metadata only); nothing
    * is loaded.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} next - A canonical DataMapping.
    * @returns {string|null}
    */
@@ -591,6 +611,7 @@ export class DataStateMappingMethods {
    * default), else to the dataset's opening representation; a view that
    * follows its dimension's default moves with it. Other views stay.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{enabled: string[], defaults: Map<number, string>}} next
    * @returns {Array<{viewId: string, from: string, to: string, followsDefault: boolean}>}
    */
@@ -627,6 +648,7 @@ export class DataStateMappingMethods {
    * (see `planRepresentationMoves`). Layouts it names are registered
    * (metadata only); nothing is loaded.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} next - A DataMapping that `describeDataMappingRefusal` accepts.
    * @returns {number}
    */
@@ -663,11 +685,12 @@ export class DataStateMappingMethods {
    * with it (a restore's, put back with the mapping), else the ones asked
    * now: a matrix is summed only for the values it ends up shown in.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} next - A DataMapping of the loaded dataset's kind.
    * @param {{origin: 'session'|'user'|'notebook', heavy?: ((estimate: Object) => Promise<void>)|null,
    *   expression?: import('../../../data/expression-transform.js').ExpressionTransform,
    *   signal?: AbortSignal|null}} options - `signal`: the action's or the history move's
-   *   Stop (F147): every wait and read ends with it, nothing is published once it
+   *   Stop: every wait and read ends with it, nothing is published once it
    *   aborts, and a commit under way is rolled back
    * @returns {Promise<boolean>} Whether anything changed.
    */
@@ -710,16 +733,15 @@ export class DataStateMappingMethods {
     const requireCurrent = () => {
       if (this.getDatasetGeneration() !== generation) throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
     };
-    let unlock = null;
-    this._mappingChangeLock = new Promise(resolve => {
-      unlock = resolve;
-    });
+    const { promise: lock, resolve: unlock } = promiseWithResolvers();
+    this._mappingChangeLock = lock;
     return trackCellWork(this._applyLockedDataMapping(canonical, origin, requireCurrent, unlock, { heavy, expression, signal }));
   }
 
   /**
    * The steps of `applyDataMapping`, holding its lock (released by `unlock`
    * when they end).
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   async _applyLockedDataMapping(canonical, origin, requireCurrent, unlock, { heavy, expression, signal = null }) {

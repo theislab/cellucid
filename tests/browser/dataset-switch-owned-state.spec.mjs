@@ -107,71 +107,74 @@ async function describeShownDataset(page) {
   });
 }
 
-test('a dataset opened while edges are shown replaces the one with edges', async ({ page }) => {
+test('a dataset opened over one in use replaces it', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await openLarger(page);
-  await showEdges(page);
-  await keepView(page);
 
-  await openFile(page, SMALLER, 8);
-  await settleFrames(page);
-  // The new dataset opens colored by its own first coloring (`app/first-coloring.js`): its
-  // cell_type, the seventh of its fields (the larger file's is its first), and no gene.
-  expect(await describeShownDataset(page)).toEqual({
-    activeField: { source: 'obs', key: 'cell_type' },
-    activeFieldIndex: 6,
-    activeVarFieldIndex: -1,
-    activeView: 'live',
-    contexts: ['live'],
-    edgesChecked: false,
-    pointCount: 8,
-    rendererPoints: 8,
-    snapshots: 0,
-    errors: [],
-  });
-  // The new dataset's own graph is read when its edges are turned on.
-  await showEdges(page);
-  expect(await page.evaluate(
-    () => window._cellucidViewer.getEdgeSelectionStatsForView('live').current
-  )).toBe(true);
-  expect(errors).toEqual([]);
-});
+  await test.step('a dataset opened while edges are shown replaces the one with edges', async () => {
+    await showEdges(page);
+    await keepView(page);
 
-test('a dataset opened while a gene colors a kept view and the live view replaces both', async ({ page }) => {
-  const errors = collectBrowserErrors(page);
-  await openLarger(page);
-  const colored = await colorByLastGene(page);
-  expect(colored).toEqual({ index: 7, source: 'var' });
-  await keepView(page);
-  // The kept view is focused; color it by an obs field so the two views
-  // index both inventories.
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect.poll(() => page.evaluate(() => window._cellucidState.activeFieldSource)).toBe('obs');
-  await showEdges(page);
-
-  await openFile(page, SMALLER, 8);
-  await settleFrames(page);
-  // The new dataset opens colored by its own first coloring (`app/first-coloring.js`): its
-  // cell_type, the seventh of its fields (the larger file's is its first), and no gene.
-  expect(await describeShownDataset(page)).toEqual({
-    activeField: { source: 'obs', key: 'cell_type' },
-    activeFieldIndex: 6,
-    activeVarFieldIndex: -1,
-    activeView: 'live',
-    contexts: ['live'],
-    edgesChecked: false,
-    pointCount: 8,
-    rendererPoints: 8,
-    snapshots: 0,
-    errors: [],
+    await openFile(page, SMALLER, 8);
+    await settleFrames(page);
+    // The new dataset opens colored by its own first coloring (`app/first-coloring.js`): its
+    // cell_type, the seventh of its fields (the larger file's is its first), and no gene.
+    expect(await describeShownDataset(page)).toEqual({
+      activeField: { source: 'obs', key: 'cell_type' },
+      activeFieldIndex: 6,
+      activeVarFieldIndex: -1,
+      activeView: 'live',
+      contexts: ['live'],
+      edgesChecked: false,
+      pointCount: 8,
+      rendererPoints: 8,
+      snapshots: 0,
+      errors: [],
+    });
+    // The new dataset's own graph is read when its edges are turned on.
+    await showEdges(page);
+    expect(await page.evaluate(
+      () => window._cellucidViewer.getEdgeSelectionStatsForView('live').current
+    )).toBe(true);
+    expect(errors).toEqual([]);
   });
 
-  // And back: the larger dataset opens again over the smaller one.
-  await colorByLastGene(page);
-  await openFile(page, LARGER, 300);
-  await settleFrames(page);
-  expect((await describeShownDataset(page)).errors).toEqual([]);
-  expect(errors).toEqual([]);
+  await test.step('a dataset opened while a gene colors a kept view and the live view replaces both', async () => {
+    // The larger file again, over the smaller one with its edges shown.
+    await openFile(page, LARGER, 300);
+    const colored = await colorByLastGene(page);
+    expect(colored).toEqual({ index: 7, source: 'var' });
+    await keepView(page);
+    // The kept view is focused; color it by an obs field so the two views
+    // index both inventories.
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await expect.poll(() => page.evaluate(() => window._cellucidState.activeFieldSource)).toBe('obs');
+    await showEdges(page);
+
+    await openFile(page, SMALLER, 8);
+    await settleFrames(page);
+    // The new dataset opens colored by its own first coloring (`app/first-coloring.js`): its
+    // cell_type, the seventh of its fields (the larger file's is its first), and no gene.
+    expect(await describeShownDataset(page)).toEqual({
+      activeField: { source: 'obs', key: 'cell_type' },
+      activeFieldIndex: 6,
+      activeVarFieldIndex: -1,
+      activeView: 'live',
+      contexts: ['live'],
+      edgesChecked: false,
+      pointCount: 8,
+      rendererPoints: 8,
+      snapshots: 0,
+      errors: [],
+    });
+
+    // And back: the larger dataset opens again over the smaller one.
+    await colorByLastGene(page);
+    await openFile(page, LARGER, 300);
+    await settleFrames(page);
+    expect((await describeShownDataset(page)).errors).toEqual([]);
+    expect(errors).toEqual([]);
+  });
 });
 
 test('a replaced dataset is released: nothing keeps its cells, fields or genes', async ({ page, browserName }) => {

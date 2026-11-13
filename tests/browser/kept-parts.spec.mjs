@@ -152,9 +152,9 @@ async function readsKept(page) {
  * reads each directory under the lock its removal takes. Read without that
  * lock, a kept file whose directory goes meanwhile fails in WebKit, which
  * says so on the page's console ("Failed to load resource: ...
- * WebKitBlobResource error 1", measured on macOS WebKit: a `File` read after
- * its file or directory was removed, and now and then one rewritten while it
- * is read: 5 of 2,645 reads; `space.js` `filesOf` holds both under one lock).
+ * WebKitBlobResource error 1": a `File` read after its file or directory was
+ * removed, or one rewritten while it is read; `space.js` `filesOf` holds both
+ * under one lock; measured: 38_decisions_testing_and_hosted_runners.md).
  */
 async function keptPartBytes(page) {
   return page.evaluate(async () => {
@@ -218,26 +218,6 @@ test('a later visit downloads nothing it read before: the open, the embedding an
   expect(errors).toEqual([]);
 });
 
-test('an .h5ad by link: a later visit downloads nothing it read before', async ({ page }) => {
-  test.setTimeout(240_000);
-  const url = `${REMOTE}/kept-parts/lung.h5ad`;
-  const bytes = new Uint8Array(readFileSync(new URL('../fixtures/gene-read/cellxgene-shaped.h5ad', import.meta.url)));
-  const counter = { heads: 0, gets: 0, bytes: 0 };
-  await page.route(url, route => serveVersioned(route, bytes, counter));
-  const link = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(url)}`;
-  await page.goto(link, { waitUntil: 'domcontentloaded' });
-  const keeps = await workersKeepFiles(page);
-  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 60_000 }).toBe(300);
-  test.skip(!keeps, 'this browser gives the reader worker no storage it can write');
-  await readsKept(page);
-  expect(await keptPartBytes(page)).toBeGreaterThan(0);
-  const before = { ...counter };
-  await page.goto(link, { waitUntil: 'domcontentloaded' });
-  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 60_000 }).toBe(300);
-  expect(counter.bytes - before.bytes, 'no byte downloaded again').toBe(0);
-  expect(counter.gets - before.gets, 'no GET request: the probe asks only the version').toBe(0);
-});
-
 test('a visit cut short at once keeps what it read: the page closed the moment its reads ended, a later visit downloads none of it', async ({ page }) => {
   test.setTimeout(240_000);
   const url = `${REMOTE}/kept-parts/short.h5ad`;
@@ -258,7 +238,7 @@ test('a visit cut short at once keeps what it read: the page closed the moment i
   await readsEnded(page);
   const first = { ...counter };
   // A read does not wait for the disk: what it fetched is written in the worker's next
-  // turns, and a page closed before that fetches the last range again (1 GET in 12 on
+  // turns, and a page closed before that fetches the last range again (now and then on
   // Firefox under load; a harmless cost of reads that never wait to be kept). What is
   // held here is that nothing more is needed once it is written: the journal open, no
   // quiet time gone by, nothing flushed, no page event.

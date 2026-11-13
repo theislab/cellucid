@@ -1,5 +1,5 @@
 /**
- * A folder of this computer is listed concurrently (audit ST-9): as many
+ * A folder of this computer is listed concurrently: as many
  * calls in flight as pays, found by doubling while the calls answered per
  * millisecond rise by at least half, then back to the last level that paid;
  * every directory walked at once, one directory's batches in turn; the files

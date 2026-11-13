@@ -35,8 +35,8 @@ const ICON_STOP = `<svg width="14" height="14" viewBox="0 0 24 24" fill="current
 
 /**
  * @param {Object} options
- * @param {import('./playback-controller.js').ReturnType<typeof import('./playback-controller.js').createPlaybackController>} options.playbackController
- * @param {import('./keyframe-store.js').ReturnType<typeof import('./keyframe-store.js').createKeyframeStore>} options.keyframeStore
+ * @param {ReturnType<typeof import('./playback-controller.js').createPlaybackController>} options.playbackController
+ * @param {ReturnType<typeof import('./keyframe-store.js').createKeyframeStore>} options.keyframeStore
  * @param {() => Object} options.getInterpolationOptions Returns { autoPaceSpeed, ... }.
  */
 export function createTransportBar({ playbackController, keyframeStore, getInterpolationOptions }) {
@@ -348,14 +348,14 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
       marker.style.left = `${pct}%`;
       markersEl.appendChild(marker);
     }
-    // Stopped, the readout says the path's length from the moment it is ready (found 2026-11-10:
-    // "0:00 / 0:00" until the first Play), and where the film stopped (R9R-7).
+    // Stopped, the readout says the path's length from the moment it is ready (not
+    // "0:00 / 0:00" until the first Play), and where the film stopped.
     if (playbackController.getState() === 'STOPPED') showStoppedPosition(total);
   }
 
   /**
    * Stopped: where the film stopped (the camera stays there; Play goes on
-   * from it), 0 after the bar's own Stop or a change of the path (R9R-7).
+   * from it), 0 after the bar's own Stop or a change of the path.
    */
   function showStoppedPosition(total) {
     const progress = playbackController.getProgress();

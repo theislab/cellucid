@@ -1,9 +1,9 @@
 /**
- * R9V-9 (bug hunt round 9): the overlay's numeric-input contract named
- * `#velocity-trail-fade` "Trail fade" while the control, the history and the
- * docs say "Trail persistence", so a rejected value named a control the
- * person cannot find; and Particle size read "12" at 11.5 and at 12. Each
- * contract entry carries its control's label and range from `index.html`.
+ * The overlay's numeric-input contract names `#velocity-trail-fade` as the
+ * control, the history and the docs do ("Trail persistence"), so a rejected
+ * value names a control the person can find; and Particle size does not read
+ * "12" at both 11.5 and 12. Each contract entry carries its control's label
+ * and range from `index.html`.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

@@ -1,7 +1,7 @@
 /**
  * What real public links taught (`scripts/efficiency-floor/public-links.*`):
- * each case here is a defect a published dataset met on its first opening,
- * pinned in a small synthetic copy of the shape that met it.
+ * each case here is a shape a published dataset has on its first opening,
+ * pinned in a small synthetic copy of it.
  */
 
 import assert from 'node:assert/strict';
@@ -17,9 +17,9 @@ const CACHE_BYTES = 8 * 1024 * 1024;
 const text = rows => new TextEncoder().encode(rows.map(row => row.join('\t')).join('\n') + '\n');
 
 test('a multiome MatrixMarket sample with more peaks than the engine takes as arguments opens', async () => {
-  // GEO GSE336826 (Cell Ranger ARC: 32,058 genes and 239,160 peaks) failed
-  // after its whole download: the MuData var index joined each modality's
-  // features with one spread call, past the call stack.
+  // GEO GSE336826 (Cell Ranger ARC: 32,058 genes and 239,160 peaks) opens:
+  // the MuData var index must not join each modality's features with one
+  // spread call, which goes past the call stack.
   const genes = 3;
   const peaks = 300_000;
   const features = [];
@@ -103,7 +103,7 @@ test('auto-fit prices the first gene of the matrix genes are read from, not X', 
   // Blocks align to the chunks genes are read from: raw.X's (600 values,
   // 120 a cell: 5 cells a chunk, 20 a block), not X's 1,200-row strips.
   assert.equal(defaultBlockSize(root, nObs, 'raw/X'), 20);
-  // Priced by X (the defect), every cell's raw.X was read for the first gene.
+  // Priced by X, every cell's raw.X would be read for the first gene.
   const byX = await resolveCellSubset(root, { mode: 'auto' }, { ...context, expression: 'X' });
   assert.equal(byX.genes, null);
 });
@@ -310,9 +310,9 @@ test('a Zenodo file whose parts this browser keeps is not head-read again beside
 });
 
 test('a file whose host stops answering readably is left unasked for a doubling while after two lost rounds, and its first answer ends that', async () => {
-  // Zenodo answered this machine with an HTML "unusual traffic" page (HTTP
-  // 403) without CORS headers for a while after many requests (2026-10-28):
-  // a page sees only failed requests.
+  // Zenodo answers with an HTML "unusual traffic" page (HTTP 403) without
+  // CORS headers for a while after many requests: a page sees only failed
+  // requests.
   const { createHostBook, HostNotAnswering } = await import('../assets/js/formats/io/hosts.js');
   let at = 0;
   const book = createHostBook({ now: () => at, after: () => () => {}, epoch: () => 1_800_000_000_000 + at, channel: null });
@@ -572,8 +572,8 @@ function countingReader(bytes, name) {
 }
 
 test('an .rds whose object is not an S4 object is refused from its first bytes, not after its whole download', async () => {
-  // GEO GSE131907's raw_UMI_matrix.rds.gz (a 604 MB data frame) was refused
-  // after 194 s and its whole download; its first word says it is a list.
+  // GEO GSE131907's raw_UMI_matrix.rds.gz (a 604 MB data frame) is refused
+  // from its first word, which says it is a list, not after its whole download.
   const { gzipSync } = await import('node:zlib');
   const { readRFile } = await import('../assets/js/formats/rds/index.js');
   const { rObjectPlan } = await import('../assets/js/data/anndata/transcode/r-object.js');
@@ -619,8 +619,9 @@ test('a save() file passes its objects that are not S4 objects over as they stre
 });
 
 test('a stream read for its start only asks a few small parts of the file and cancels the rest', async () => {
-  // A MatrixMarket size line read the first 12 MB of a 7.6 GB GEO matrix
-  // (three 4 MB requests), and its decompressor and reads went on after it.
+  // A MatrixMarket size line must not read the first 12 MB of a 7.6 GB GEO
+  // matrix (three 4 MB requests), nor leave its decompressor and reads going
+  // after it.
   const { gzipSync } = await import('node:zlib');
   const { textPieces, forEachLine } = await import('../assets/js/formats/text/lines.js');
   const lines = ['%%MatrixMarket matrix coordinate integer general', '3 800000 800000'];
@@ -645,8 +646,9 @@ test('a stream read for its start only asks a few small parts of the file and ca
 });
 
 test('a GEO matrix named by any last word is paired with its lists, so it opens or is refused for what it lacks', async () => {
-  // GSE158055 (1.46M cells): `…_covid19_counts.mtx.gz` was "not a file
-  // Cellucid opens from a link"; GSE132044 names its lists `_cell`/`_gene`.
+  // GSE158055 (1.46M cells): `…_covid19_counts.mtx.gz` is a matrix Cellucid
+  // opens from a link, not "not a file Cellucid opens from a link";
+  // GSE132044 names its lists `_cell`/`_gene`.
   const { geoDatasets } = await import('../assets/js/data/sources/providers/geo.js');
   const { isMatrixMarketMatrix } = await import('../assets/js/data/matrix-market-files.js');
   const listing = (accession, names) => names.map(name => ({ name, url: `u/${name}`, path: `${accession}/${name}` }));
@@ -708,7 +710,7 @@ test('a MatrixMarket folder none of whose tables names an embedding is refused f
 // ---------------------------------------------------------------------------
 
 /**
- * Chromium's off-the-record storage, as measured (2026-10-29): once a site's
+ * Chromium's off-the-record storage: once a site's
  * share is spent, a synchronous access handle's `write` reports every byte
  * and keeps the ones that fit; `getSize` and `read` then show what was kept.
  */
@@ -743,10 +745,10 @@ function keepingAtMost(capacity) {
 }
 
 test('a write the storage reports whole and keeps in part is refused as the full storage it is, never read back short', async t => {
-  // A 10M-cell Seurat object by link in Chromium's off-the-record context:
-  // a payload of 40,000,000 bytes kept as 29,060,298, then the UMAP read
-  // back as 94,031,122 of its 160,000,000 bytes: "Offset is outside the
-  // bounds of the DataView".
+  // In Chromium's off-the-record context a payload of 40,000,000 bytes can be
+  // kept as 29,060,298, and the UMAP of a 10M-cell Seurat object read back as
+  // 94,031,122 of its 160,000,000 bytes: "Offset is outside the bounds of the
+  // DataView".
   const { writeWhole, readWhole, KeptBytesMissing } = await import('../assets/js/formats/io/sync-access.js');
   let stored = new Uint8Array(0);
   const short = {

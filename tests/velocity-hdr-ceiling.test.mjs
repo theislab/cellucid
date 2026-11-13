@@ -1,14 +1,14 @@
 /**
- * R9V-11 (bug hunt round 9): a flow blown out at the dials' far ends drew
- * magenta and cyan rims on a light backdrop. Read back in the app, the trail
- * held no NaN or infinity there: the composite tone-mapped channel by channel,
- * so a bright purple (viridis's slow end, green near 0) clipped red and blue
- * first and passed through magenta, a teal through cyan; its contrast curve
- * and the bloom's screen blend assumed display values on HDR ones. The
- * composite maps the luminance and keeps the hue. Beside it: every pass
- * reading the trail clamps it to a finite ceiling (a half-float sum can
- * overflow), and every blur takes its weights from one normalized Gaussian
- * (the bloom's hand-typed kernel summed to 1.0008 and read a zero tap).
+ * A flow blown out at the dials' far ends must not draw magenta and cyan rims
+ * on a light backdrop. The trail holds no NaN or infinity there; a composite
+ * that tone-maps channel by channel would clip red and blue of a bright
+ * purple (viridis's slow end, green near 0) first and pass through magenta, a
+ * teal through cyan, and a contrast curve and a screen blend would assume
+ * display values on HDR ones. The composite maps the luminance and keeps the
+ * hue. Beside it: every pass reading the trail clamps it to a finite ceiling
+ * (a half-float sum can overflow), and every blur takes its weights from one
+ * normalized Gaussian (a hand-typed kernel can sum to other than 1 and read a
+ * zero tap).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

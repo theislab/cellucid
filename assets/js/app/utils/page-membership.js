@@ -47,8 +47,8 @@ function requirePages(pages, pointCount) {
  * The key of a combination of pages: their positions among the field's
  * pages, ascending, joined by "+" (`"0+1"`, `"3+17+41"`). A session records
  * each intersection's label under it. It names any number of pages: an
- * intersection field combines as many pages as the person gives (bug hunt
- * F269: a 32-bit mask per cell once refused a 33rd page).
+ * intersection field combines as many pages as the person gives (a 32-bit
+ * mask per cell would refuse a 33rd page).
  *
  * @param {ArrayLike<number>} positions - Ascending page positions
  * @returns {string}

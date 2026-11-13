@@ -84,7 +84,7 @@ export function markdownInlineSafe(text) {
  *
  * The structure is the chat's own, written in a form every CommonMark
  * renderer reads one way; guessing a renderer's structure from the text
- * (where a code span or a fence ends) is what let raw HTML through before.
+ * (where a code span or a fence ends) is what lets raw HTML through.
  * @param {string} text
  */
 export function markdownSafe(text) {

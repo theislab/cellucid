@@ -14,7 +14,7 @@
  * Anyone else changing what is shown while it plays (the person's step, an
  * agent's move, another tracker or a load, an edit that removed steps) ends
  * the tour where they are, without returning: its next jump would move away
- * from what they just did (bug hunt LB-3). A note, a bookmark or a rename
+ * from what they just did. A note, a bookmark or a rename
  * changes nothing shown and the tour plays on.
  *
  * The bar sits over the top of the viewer, like the camera path's transport
@@ -55,7 +55,7 @@ function flightPlan(from, to, seconds) {
  * @param {(playing: boolean) => void} [options.onChange]
  * @param {(stepId: string) => object|null} [options.recordedCamera] - the focused view's camera as a
  *   step kept it, while camera moves are not recorded (a jump then leaves the camera; the tour, asked
- *   for, still shows each step's view, History v2 §3.15.5); null while they are recorded
+ *   for, still shows each step's view); null while they are recorded
  * @param {(listener: (event: {kind: string, head?: string}) => void) => (() => void)} [options.subscribe] - the
  *   history's events (`history.subscribe`): one that leaves another step or tracker shown than the
  *   tour's own jump, or an edit that removed steps, ends it
@@ -166,8 +166,9 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
    * hears it begin (what it shows), before its first step is shown: the
    * history action `history.tour.start` answers then.
    *
-   * @param {{onStart?: (started: {tracker: {id: string, name: string}, branch: {id: string, name: string},
-   *   steps: number, returnsTo: string}) => void}} [options]
+   * @typedef {{onStart?: (started: {tracker: {id: string, name: string}, branch: {id: string, name: string},
+   *   steps: number, returnsTo: string}) => void}} TourPlayOptions
+   * @param {TourPlayOptions} [options]
    */
   function play(options = {}) {
     if (session !== null) return running;
@@ -179,6 +180,7 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
     return run;
   }
 
+  /** @param {TourPlayOptions} [options] */
   async function playTour({ onStart = () => {} } = {}) {
     const tracker = view();
     if (tracker === null || session !== null) return;

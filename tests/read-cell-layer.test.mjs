@@ -1,9 +1,8 @@
-// How a gene read for a sample of the open cells is drawn (owner decision
-// 2026-10-29): cells not read faded from the background, distinct from the
-// grey for 0; the read cells on top, larger by their density on screen,
-// zeros beneath the expressing cells; every surface by the same rule. And
-// the grey for 0 (and every missing value) made from the background at a
-// fixed contrast (owner decision 2026-10-30).
+// How a gene read for a sample of the open cells is drawn: cells not read
+// faded from the background, distinct from the grey for 0; the read cells on
+// top, larger by their density on screen, zeros beneath the expressing cells;
+// every surface by the same rule. And the grey for 0 (and every missing
+// value) made from the background at a fixed contrast.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';

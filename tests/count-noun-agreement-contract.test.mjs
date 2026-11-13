@@ -3,8 +3,8 @@
  *
  * Every count written with a noun goes through `formatCountOf` (or, for a
  * count written another way, `countNoun`) in `utils/format-units.js`. A
- * template that writes `${n} cells` reads "1 cells" the day `n` is one, and
- * the legend once did exactly that; hand-rolled `n === 1 ? '' : 's'` copies
+ * template that writes `${n} cells` reads "1 cells" the day `n` is one (the legend
+ * would); hand-rolled `n === 1 ? '' : 's'` copies
  * drift from the shared rule. Both are refused here, for the whole source.
  *
  * What is not a count is not refused: a label before a plural noun

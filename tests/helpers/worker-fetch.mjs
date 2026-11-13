@@ -4,7 +4,7 @@
  *
  * Node accepts every standard `redirect` mode, but workerd rejects
  * `redirect: 'error'` with a TypeError before any request is sent. A mock that
- * accepted it let a Worker that could never reach its upstream pass every test.
+ * accepts it lets a Worker that could never reach its upstream pass every test.
  */
 const WORKERD_REDIRECT_MODES = new Set(['follow', 'manual']);
 

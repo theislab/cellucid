@@ -111,7 +111,7 @@ export class DerivedResultsRegistry {
    * Replace every entry `owner` holds with `geneSets` and `scores`: what an
    * analysis shows now (empty lists when it shows nothing).
    *
-   * @param {'markers'|'signature'} owner
+   * @param {string} owner - `'markers'` or `'signature'`; any other owner is refused
    * @param {{geneSets?: Array<{name: string, description: string, genes: string[]}>,
    *   scores?: Array<{key: string, cells: Uint32Array, values: Float32Array}>}} entries
    */

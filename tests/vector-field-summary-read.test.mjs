@@ -1,8 +1,8 @@
 /**
- * L18-1 (live pass 5): asked "where are the cells heading … evidence from the
- * data", an agent answered "the tools don't give me the velocity numbers".
  * `vector-field.summary` reads, per category, the speed, alignment, direction
- * and where its arrows lead, from the vectors as drawn in a view's embedding.
+ * and where its arrows lead, from the vectors as drawn in a view's embedding,
+ * so an agent asked "where are the cells heading … evidence from the data"
+ * has the velocity numbers to answer from.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -157,7 +157,7 @@ test('the read names categories, the view and the embedding; refuses a view whos
   await assert.rejects(reads.summary({ by: { source: 'obs', key: 'stage' }, vector_field: 'drift' }, {}), /no vector field "drift".*velocity/);
 });
 
-test('with no field named, the read takes the one the overlay shows, else the default, else the only one; among several it refuses (R9V-5)', async () => {
+test('with no field named, the read takes the one the overlay shows, else the default, else the only one; among several it refuses', async () => {
   const two = [
     { id: 'drift', label: 'drift', layoutKeys: ['X_umap'] },
     { id: 'velocity', label: 'velocity', layoutKeys: ['X_umap'] },
@@ -190,7 +190,7 @@ test('with no field named, the read takes the one the overlay shows, else the de
   }
 });
 
-test('a field the overlay cannot draw is refused as unavailable, in its own words (R9V-7)', async () => {
+test('a field the overlay cannot draw is refused as unavailable, in its own words', async () => {
   const failure = new MappingLoadError('velocity_umap', "every cell's vector is missing (NaN or infinite)", "Vector field 'velocity_umap' cannot be drawn: every cell's vector is missing (NaN or infinite).");
   const state = { ...fakeState(), getVectorFieldManager: () => ({ loadField: async () => { throw failure; } }) };
   await assert.rejects(

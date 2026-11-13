@@ -19,7 +19,7 @@ import {
   categoriesWords, fieldArgument, fieldCoalesceKey, fieldWords,
 } from './params.js';
 
-export const FILTER_KINDS = Object.freeze(['category', 'continuous', 'outlier']);
+const FILTER_KINDS = Object.freeze(['category', 'continuous', 'outlier']);
 
 const KIND_WORDS = Object.freeze({
   category: 'category filter',

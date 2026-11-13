@@ -9,7 +9,7 @@
  * at once (`utils/indexed-db-database.js` says why writes awaited one after
  * another are not all or none when the page goes away). Each store holds
  * one record per thing that changes on its own, so a write costs what
- * changed (History v2 §3.6), not the history:
+ * changed, not the history:
  *
  * - `entries` (key: the saved state's id): one record per saved state
  *   ({@link SAVED_STATE_SCHEMA}): its kind (`autosave` or `named`), name,
@@ -35,8 +35,8 @@
  *   several values share, written once (`value-parts.js`).
  * - `arrays` (key: the array's digest): `{encoding, data}`: `raw` (the typed
  *   array) or `cell-set` (a strictly increasing Uint32Array in the session
- *   file's cell-set encoding, where that is smaller: a ~1M-cell brush is a
- *   few kilobytes, not 4 MB).
+ *   file's cell-set encoding, where that is smaller: a brush of a million cells
+ *   is a few kilobytes, not megabytes).
  *
  * A value, part or array no saved state refers to any more is removed by
  * `collect` (with a removal, and once a page has started its history), in
@@ -45,7 +45,7 @@
  * **One writer per saved state.** A write names its `owner` (the page's
  * autosave); a saved state another page has taken over since is refused
  * ({@link SavedStateTaken}) and nothing of the write is kept, so two pages
- * can never mix their steps into one history (§3.7, edge case 27). Taking
+ * can never mix their steps into one history. Taking
  * one over (`claim`) rewrites it whole.
  *
  * @module app/history/autosave-store

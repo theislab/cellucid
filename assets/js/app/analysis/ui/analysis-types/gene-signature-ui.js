@@ -186,9 +186,10 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     this._pageSelector = new PageSelectorComponent({
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
-      onSelectionChange: pageIds => {
+      onSelectionChange: (pageIds, { byPerson }) => {
         this._assignPages(pageIds || []);
-        this._recordPersonChange('pages', { pageIds: [...this._selectedPages] });
+        // A page the selector let go as the pages changed is part of that change, not a step.
+        if (byPerson) this._recordPersonChange('pages', { pageIds: [...this._selectedPages] });
         this._updateRunRow();
         this._updateStale();
       },
@@ -669,8 +670,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * How the scores were made and compared: the method, each set's genes used
    * and left out, and the expanded view's tests between the pages (t-test
    * and Mann–Whitney for two, ANOVA and Kruskal–Wallis for more; none when
-   * the pages share cells): an agent had means alone and could not say
-   * whether a difference between pages held.
+   * the pages share cells), so a reader can say whether a difference between
+   * pages holds, not only compare means.
    */
   _resultAbout(result) {
     const raw = result?.raw;

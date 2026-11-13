@@ -4,8 +4,8 @@
  * first, then from what the caller was told, then from its name; the
  * container is opened, and a layout view (`views/`) presents a root it
  * recognizes (`presentStore`), every other root being AnnData as stored.
- * Formats that Phase 1 adds plug in here: a registry entry
- * (`input-formats.js`) and a view or a transcoder.
+ * A format plugs in here with a registry entry (`input-formats.js`) and a
+ * view or a transcoder.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -102,7 +102,7 @@ test('a layout view presents a root it recognises; any other root is the contain
   assert.deepEqual([stored.format, stored.root, stored.readerFormat], ['h5ad', plain, H5AD_FORMAT]);
   assert.equal((await presentStore(plain, { container: 'zarr', layout: 'zip', name: 'x.zarr.zip' })).format, 'zarr');
   // A root with no AnnData mark (no encoding, no obs, var or X) is none of
-  // the formats, not AnnData to be refused for a part it lacks (F115).
+  // the formats, not AnnData to be refused for a part it lacks.
   const unmarked = viewGroup({ path: '/', attrs: {}, children: new Map() });
   await assert.rejects(
     presentStore(unmarked, { container: 'hdf5', layout: 'file', name: 'x.h5ad' }, { formats, views }),

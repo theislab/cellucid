@@ -1,10 +1,10 @@
 /**
- * `cells.open` whose reading fails (R9M-9): the dataset controls say the
- * failure where it happened ("could not be read again with these cells …
- * The cells open before are still open.") and answer `shown: false`; the
- * action resolved as if the cells were open, so the history recorded "Opened
- * 50% of the cells" and an agent or a notebook was told it was done. It now
- * fails with an error already said (no second notice), and no step.
+ * `cells.open` whose reading fails: the dataset controls say the failure
+ * where it happened ("could not be read again with these cells … The cells
+ * open before are still open.") and answer `shown: false`; the action fails
+ * with an error already said (no second notice), and records no step. A
+ * resolved action would make the history record "Opened 50% of the cells" and
+ * tell an agent or a notebook it was done.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,7 +27,7 @@ function element(extra = {}) {
   };
 }
 
-test('cells.open whose reading fails ends as a failure already said, with no step (R9M-9)', async () => {
+test('cells.open whose reading fails ends as a failure already said, with no step', async () => {
   const previous = { window: globalThis.window, Option: globalThis.Option };
   globalThis.window = { location: { href: 'https://www.cellucid.com/', search: '' }, history: { replaceState() {} } };
   globalThis.Option = class { constructor(text, value) { this.text = text; this.value = value; } };
@@ -72,7 +72,7 @@ test('cells.open whose reading fails ends as a failure already said, with no ste
   }
 });
 
-test('the spatial Embedding menu and cells.open offer only what the data mapping shows in 2D or 3D, its 2D default first (R9M-13)', async () => {
+test('the spatial Embedding menu and cells.open offer only what the data mapping shows in 2D or 3D, its 2D default first', async () => {
   const previous = { window: globalThis.window, Option: globalThis.Option };
   globalThis.window = { location: { href: 'https://www.cellucid.com/', search: '' }, history: { replaceState() {} } };
   globalThis.Option = class { constructor(text, value) { this.text = text; this.value = value; } };

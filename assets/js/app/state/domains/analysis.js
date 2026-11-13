@@ -12,7 +12,7 @@
  *
  * Where each window stands, its size, whether it is folded, and the sizes
  * remembered per analysis are page layout: the `layout` domain holds them
- * (`layout.analysis`, History v2 §3.15.5), so "Panels, windows and theme"
+ * (`layout.analysis`), so "Panels, windows and theme"
  * covers them as every other panel's geometry.
  *
  * Each `result` is null or `{kind, version, payload}`: JSON values and typed
@@ -21,12 +21,17 @@
  * `{kind, leftOut: true, provenance}`, a result a shared session left out
  * (restored as no result, and captured as the same record until the
  * analysis has a result again; opening the file runs it again,
- * `session/recompute-results.js`). Null parts: the analysis code never
- * loaded on this page, so nothing was ever opened.
+ * `session/recompute-results.js`). `docked: null` with no window is the
+ * analyses with nothing opened: before their code has arrived, on a page
+ * where it could not load, and where it has and no analysis was opened, which
+ * is one value, so the code's arrival changes nothing the history holds.
  *
  * A result's typed arrays are kept by reference (an analysis makes a new
  * result each run and never writes one in place), so capturing an unchanged
  * result again hashes nothing new; the settings around them are copied.
+ *
+ * Capture never waits for the analysis code: the history starts, and records
+ * every change, while it loads. Restore waits for it only to show analyses.
  *
  * Restore closes the windows and opens the value's again, from their
  * descriptors (`createFromSessionDescriptor`), when the windows differ: the
@@ -51,9 +56,8 @@ import { formatCountOf } from '../../../utils/format-units.js';
  * how this device's reads were tuned for it (`metadata.tuning`) and whether it
  * came from this page's cache (`metadata.cached`). A replay or a run elsewhere
  * computes the same result with other values of these, so a comparison of
- * analyses leaves them out (`canonicalAnalyses`): Verify said every branch
- * with an analysis was "not reproduced" (L24-12), then every branch with
- * marker genes (live-7 L25-16: `computedAt`, `computeDuration`, `tuning`).
+ * analyses leaves them out (`canonicalAnalyses`): otherwise Verify would
+ * call every branch with an analysis "not reproduced".
  */
 export const RUN_RECORD_KEYS = Object.freeze(['duration', 'durationMs', 'cached', 'computedAt', 'computeDuration', 'tuning']);
 
@@ -94,11 +98,22 @@ function clonePlain(value) {
   return out;
 }
 
+/** The docked panel with nothing opened, as it exports itself. */
+const NOTHING_DOCKED = Object.freeze({ openMode: null, modes: Object.freeze({}) });
+
+/** Whether two values show the same analyses (`docked: null` is the panel with nothing opened). */
+function sameAnalyses(a, b) {
+  return sameValue(a.windows, b.windows) && sameValue(a.docked ?? NOTHING_DOCKED, b.docked ?? NOTHING_DOCKED);
+}
+
 /**
- * @param {{analysis: () => Promise<{comparisonModule: object, analysisWindowManager: object}|null>}} options -
- *   The analysis module once its code arrived, or null when it could not load.
+ * @param {{analysis: () => {comparisonModule: object, analysisWindowManager: object}|null,
+ *   analysisArrived: () => Promise<{comparisonModule: object, analysisWindowManager: object}|null>}} options -
+ *   `analysis`: the analyses now, null before their code has arrived and when
+ *   it could not load; `analysisArrived`: settles with them once the code has
+ *   arrived, or with null once it could not load.
  */
-export function createAnalysisDomain({ analysis }) {
+export function createAnalysisDomain({ analysis, analysisArrived }) {
   /** The value captured last: given back as the same object while the analyses are unchanged (see `capture`). */
   let previous = null;
 
@@ -111,12 +126,13 @@ export function createAnalysisDomain({ analysis }) {
    * hash of its results.
    */
   async function capture() {
-    const refs = await analysis();
+    const refs = analysis();
     if (refs === null) return { windows: [], docked: null };
     const { comparisonModule, analysisWindowManager } = refs;
+    const docked = clonePlain(comparisonModule.exportSessionState());
     const value = {
       windows: clonePlain(analysisWindowManager.exportSessionWindows()),
-      docked: clonePlain(comparisonModule.exportSessionState()),
+      docked: sameValue(docked, NOTHING_DOCKED) ? null : docked,
     };
     if (previous !== null && sameValue(previous, value)) return previous;
     previous = value;
@@ -132,14 +148,17 @@ export function createAnalysisDomain({ analysis }) {
         || !Object.hasOwn(value, 'docked') || (value.docked !== null && typeof value.docked !== 'object')) {
         throw new TypeError('The analyses to restore must be exactly their windows and the docked analysis.');
       }
-      const refs = await analysis();
-      if (refs === null) {
-        if (value.windows.length === 0 && value.docked === null) return;
-        throw new Error('The analysis tools could not load on this page, so its analyses cannot be shown.');
+      let current = await capture();
+      if (sameAnalyses(current, value)) return;
+      // Analyses to show while their code is still loading are shown once it has arrived.
+      if (analysis() === null) {
+        if (await analysisArrived() === null) {
+          throw new Error('The analysis tools could not load on this page, so its analyses cannot be shown.');
+        }
+        current = await capture();
+        if (sameAnalyses(current, value)) return;
       }
-      const current = await capture();
-      if (sameValue(current, value)) return;
-      const { comparisonModule, analysisWindowManager } = refs;
+      const { comparisonModule, analysisWindowManager } = analysis();
       if (!sameValue(current.windows, value.windows)) {
         const places = analysisWindowManager.exportWindowPlaces();
         await analysisWindowManager.closeAll();
@@ -147,8 +166,9 @@ export function createAnalysisDomain({ analysis }) {
           await analysisWindowManager.createFromSessionDescriptor(clonePlain(descriptor), places[index] ?? null);
         }
       }
-      if (value.docked !== null && !sameValue(current.docked, value.docked)) {
-        await comparisonModule.importSessionState(clonePlain(value.docked));
+      const docked = value.docked ?? NOTHING_DOCKED;
+      if (!sameValue(current.docked ?? NOTHING_DOCKED, docked)) {
+        await comparisonModule.importSessionState(clonePlain(docked));
       }
     },
     describe(a, b) {

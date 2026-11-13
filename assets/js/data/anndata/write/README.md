@@ -2,12 +2,12 @@
 
 The web app's AnnData writers: the element layer its Zarr writers share
 (the transcoders' kept stores and the copy; the highlighted cells' `.h5ad`
-export, `app/exports/cell-exports.js`, still builds its HDF5 tree itself:
-an HDF5 subclass of `AnnDataElementWriter` is the follow-up), and the copy
+export, `app/exports/cell-exports.js`, builds its HDF5 tree itself), and the copy
 of an open dataset as a **Cellucid-ready AnnData `.zarr.zip`**, with
-changes written in. No control of the page calls the copy yet (the history's
-apply plan that would hand it the changes is not built); its way in is
-`BaseAnnDataAdapter.writeAnnDataCopy`.
+changes written in. The page reaches the copy through the State panel's "Save AnnData
+with this state…" (the action `history.anndata.save`, `app/history/anndata-copy-save.js`,
+which plans the changes from the state shown with `app/history/exports/anndata-copy.js`);
+its way in is `BaseAnnDataAdapter.writeAnnDataCopy`.
 
 Three layers, each its own module, so another container or format plugs in
 at its own level:
@@ -76,11 +76,12 @@ is the source's and is refused). Column kinds are `element-writer.js`
 - Names: kept exactly as stored (never normalized); every name a change
   makes a path follows the portable rule (`names.js`); a source holding one
   name in two Unicode forms is refused (`changes.js`).
-- `formats/zarr/format-v2.js` and `element-writer.js` are in the
-  transcoders' source closure, and what the transcoders write through them
-  is pinned by the digests of four corpus stores: a change to either raises
-  `KEPT_STORE_REVISION` (`tests/transcode-cache-contract.test.mjs`, both
-  guards). `formats/zarr/writer.js` and the ZIP writer are not.
+- `formats/zarr/format-v2.js` and `element-writer.js` are what the
+  transcoders write a kept store with, so the code fingerprint of converted
+  stores covers them (`scripts/kept-code-fingerprints.mjs`): a change to
+  either makes browsers convert kept R objects and MatrixMarket folders
+  again on their next opening. `formats/zarr/writer.js` and the ZIP writer
+  are a copy's alone, and in no fingerprint.
 
 ## Tests
 

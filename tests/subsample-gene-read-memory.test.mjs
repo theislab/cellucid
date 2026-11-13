@@ -13,12 +13,13 @@
  * ArrayBuffer bytes are sampled: their peak growth must stay within the kept
  * entries' worth and the decoded-chunk budget, whatever the file's size.
  *
- * Regression: a segment of the subsample's matrix (`rowRangeMatrix`) is a
- * gather of the subsample's gathered `indices` and `data`; read through the
- * inner gather's estimated chunks (a few kept rows each), every slab became
- * tens of thousands of reads at once, which held about 1 KB each for every
- * stored chunk of the file (HLCA: gigabytes for 20 MB of entries). A gather
- * of a gather is now one gather of the stored array (`composedRuns`).
+ * A segment of the subsample's matrix (`rowRangeMatrix`) is a gather of the
+ * subsample's gathered `indices` and `data`; read through the inner gather's
+ * estimated chunks (a few kept rows each), every slab would become tens of
+ * thousands of reads at once, each holding about 1 KB per stored chunk of the
+ * file (gigabytes on a dataset of HLCA's size; measured:
+ * 23_decisions_partial_reading.md). A gather of a gather is one gather of the
+ * stored array (`composedRuns`).
  *
  * The lookups a cell subset reads through hold its cells, not every row of
  * the file: an induced `obsp` graph's (`KeptPositions`) and a gene-major

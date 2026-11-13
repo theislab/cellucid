@@ -909,7 +909,7 @@ for (const [label, UIClass] of [
         return gate.promise;
       };
 
-      const staleRun = ui._runAnalysis();
+      const staleRun = ui._runForm();
       await started.promise;
       const staleJob = ui._shownJob;
       const currentRequest = ui._startAnalysisRequest();

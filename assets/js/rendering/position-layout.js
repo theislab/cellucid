@@ -25,7 +25,7 @@ const POSITION_BYTES_PER_COMPONENT = Float32Array.BYTES_PER_ELEMENT;
  * @param {string} [label]
  * @returns {1|2|3}
  */
-export function requirePositionDimension(dimension, label = 'Position dimension') {
+function requirePositionDimension(dimension, label = 'Position dimension') {
   if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
     throw new RangeError(`${label} must be exactly 1, 2, or 3.`);
   }
@@ -92,8 +92,8 @@ export function readPositionXYZ(positions, dimension, index, out) {
  * A published positions array is never written (a changed embedding is a new
  * array), so its bounds are a pure function of the array and its dimension.
  * The viewer, the projectile system, the renderer and every snapshot of the
- * same geometry used to scan the same array separately: three to four full
- * passes on each dataset publication, 100 ms at 10,000,000 2-D cells.
+ * same geometry share one scan: a full pass over a 10,000,000-cell 2-D array
+ * is a noticeable pause (measured: 28_decisions_rendering_layers.md).
  */
 const POSITION_BOUNDS = new WeakMap();
 

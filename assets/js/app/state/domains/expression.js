@@ -33,7 +33,7 @@ export function createExpressionDomain({ state, refreshUi }) {
       const asked = state.getExpressionTransform?.() ?? RAW_VALUES;
       return { normalize: asked.normalize, log1p: asked.log1p };
     },
-    // A saved state without the field means the values as stored (plan §3):
+    // A saved state without the field means the values as stored:
     // restored onto an open dataset, it puts them back (`history.js` `readSaved`).
     absent() {
       return { normalize: false, log1p: false };

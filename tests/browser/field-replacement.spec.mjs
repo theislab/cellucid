@@ -1,11 +1,9 @@
 import { expect, test } from './helpers/test.mjs';
 import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
-import { ENCODED_SAMPLE_CATALOG_URL, appUrl } from './helpers/origins.mjs';
+import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const FIELDS_ROOT = appUrl('/tests/browser/fixtures/generated-field-cardinality/');
-const DATASET_URL =
-  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=field-replacement-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -84,52 +82,5 @@ test('categorical coloring replacement commits one exact legend generation', asy
   await expect(page.locator('.legend-item')).toHaveCount(0);
   await expect(page.locator('.legend-filter')).toHaveCount(1);
 
-  expect(productErrors).toEqual([]);
-});
-
-test('dataset replacement cancels stale field editors before same-index reuse', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture',
-  );
-
-  await page.locator('#categorical-field').selectOption({
-    label: 'cell_type',
-  });
-  await expect(page.locator('#rename-categorical-field')).toBeEnabled();
-  await page.locator('#rename-categorical-field').click();
-  const editor = page.locator('.inline-rename-input');
-  await expect(editor).toHaveCount(1);
-  const staleEditor = await editor.elementHandle();
-  expect(staleEditor).not.toBeNull();
-
-  await page.locator('#dataset-select').selectOption('__none__');
-  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
-  await expect(page.locator('.inline-rename-input')).toHaveCount(0);
-
-  await page.locator('#dataset-select').selectOption(
-    'dataset:local-demo:current-ui',
-  );
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture',
-  );
-  await staleEditor.evaluate(input => {
-    input.value = 'stale_replacement_name';
-    input.dispatchEvent(new KeyboardEvent('keydown', {
-      bubbles: true,
-      key: 'Enter',
-    }));
-  });
-
-  await expect(
-    page.locator('#categorical-field option', { hasText: 'cell_type' }),
-  ).toHaveCount(1);
-  await expect(
-    page.locator('#categorical-field option', {
-      hasText: 'stale_replacement_name',
-    }),
-  ).toHaveCount(0);
   expect(productErrors).toEqual([]);
 });

@@ -49,31 +49,21 @@ and removes connections, forgets the browser).
   after any result once they changed (`bridge/agent-calls.js`, from the presence's
   `permissionFor`).
 - The chat and the history know each other only through `history-link.js`.
-- Either way in works alone and both work at once: the chat bar needs no connector, the presence
-  needs no key or chat bar, and a failure of one (a refused key, a provider down, the relay down,
-  a tab never paired) leaves the other working and says in one line what to do.
+- Either way in works alone and both work at once; a failure of one leaves the other working and
+  says in one line what to do.
 - The instructions name capabilities in words; a tool name they use (in backticks) is a tool of
   the catalog (`tests/agent-bridge.test.mjs`).
 - The relay's copy of the catalog, instructions and wire protocol is generated
   (`scripts/generate-relay-bundle.mjs`; `tests/relay-bundle-contract.test.mjs`).
 - An API key stays in this browser and goes only to its provider (`chat/keys.js`).
-- **What agents are sent of the data.** Free reading is the default: names, counts, summaries
-  and, when an agent asks, values of cells and pictures of the plot go to its provider with the
-  conversation; the dataset's files never leave. The presence says so once per dataset, with the
-  switch "Agents see names and summaries only" (also in the permission settings, for the dataset
-  shown): when the chat opens or sends, or when a connector's agent first acts. With it on, the
-  one tool call (`bridge/tool-call.js`, so the chat and the connector alike) refuses a read of
-  cells' values or a picture, and a value summary over groups an agent shaped by naming cells
-  (`data-scope.js` `createShapeTracker`, by origin, through fields and pages made from them),
-  before it runs and after (when switched on meanwhile); what runs is sent without its pictures
-  and without statistics that are one cell's own value (a minimum, a maximum, a median), and the
-  chat sends earlier results read before the switch withheld (`bridge/data-guard.js`). Every
-  action that answers with data is classified there; one nobody classified is refused while the
-  switch is on, and `tests/agent-data-guard.test.mjs` fails until it is classified. The switch is
-  the person's, never an action. **It is not anonymization:** a summary of a very small group the
-  data or the person defines (a narrow range, a filter, a rare category) can still reveal its
-  cells' values; the notice, the settings and the docs say so (`SUMMARIES_ONLY_CAVEAT`), and no
-  group size is made up.
+- **What agents are sent of the data.** Free reading is the default: what an agent reads goes to its
+  provider with the conversation, and the dataset's files never leave. The switch "Agents see names and summaries only"
+  is the person's, never an action; with it on, the one tool call (`bridge/tool-call.js`, so the
+  chat and the connector alike) refuses what `bridge/data-guard.js` classifies as cell-level, and
+  every action that answers with data is classified there (`tests/agent-data-guard.test.mjs`). It
+  is not anonymization (`SUMMARIES_ONLY_CAVEAT`). What it refuses, withholds and says is developer
+  doc 32, "What agents are sent of the data"
+  (`cellucid-python/docs/user_guide/web_app/p_developer_docs/32_agents_in_the_tab.md`).
 - **Text written by others is data.** Every tool result's JSON is between the data tags
   (`<cellucid-data>…</cellucid-data>`, `bridge/relay-protocol.js` `RESULT_DATA_TAGS`; every `<`
   inside escaped, so nothing in it can close them), the relay's own status too, and so are the

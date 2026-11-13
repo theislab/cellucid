@@ -20,7 +20,8 @@ import { createListenerSet } from '../utils/listener-set.js';
  *
  * Reports are taken in at once and acted on once per frame: a run over every
  * gene reports thousands of operations, and describing, freezing and
- * announcing each as it arrived cost the page 83–129 ms per run. A flush
+ * announcing each as it arrived costs the page too much per run (measured:
+ * 23_decisions_partial_reading.md). A flush
  * keeps each operation's latest report, tells subscribers about it once, and
  * writes the operations that ended quietly as one debug entry. Reading the
  * log (`entries`, `totals`) flushes first, so it is always current; what an

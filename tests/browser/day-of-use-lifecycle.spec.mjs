@@ -29,10 +29,7 @@
  * - the listeners on `window` and `document`, by event (DevTools' own view).
  *
  * A difference names what grew and where it was made: the first thing to
- * read when a lifecycle regresses. Measured 2026-11-11 (lens-lifecycle, LC
- * lane): every count equal between rounds of the same dataset from the
- * fourth round on; the heap grew only by compiled code and the browser's own
- * performance timeline.
+ * read when a lifecycle regresses.
  *
  * Fixtures: the demo catalog's `synthetic-cell-types-2d` and
  * `synthetic-development-3d` (`fixtures/demo-catalog/`), opened in turn.
@@ -53,8 +50,8 @@ const ANALYSES = Object.freeze(['markers', 'differential', 'dotplot', 'signature
 const ROUNDS = 6;
 const COMPARED = Object.freeze([4, 6]);
 // Fences and timer queries (`WebGLSync`, `WebGLQuery`) are not counted: one
-// is in flight or not at a given moment as the GPU answers it (measured: a
-// fence present after one round and not the round before, nothing else
+// is in flight or not at a given moment as the GPU answers it (a
+// fence can be present after one round and not the round before, nothing else
 // differing); what makes them owns them to their answer.
 const OBJECT_KINDS = Object.freeze([
   'WebGLBuffer', 'WebGLTexture', 'WebGLFramebuffer', 'WebGLRenderbuffer', 'WebGLProgram', 'WebGLShader',

@@ -317,7 +317,7 @@ export function createControlsPanel(controller) {
         }));
       } else if (getUrlAnnotationRepo() !== null && !introError) {
         // A link naming a repository is connected once GitHub knows who you
-        // are: said, not left silent (R9E-12); one naming none is the link's.
+        // are: said, not left silent; one naming none is the link's.
         const named = getUrlAnnotationRepo();
         const valid = parseCanonicalGitHubRepositoryReference(named) !== null;
         introBlock.appendChild(el('p', {

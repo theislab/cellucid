@@ -31,7 +31,7 @@
  * A link, an accession or a server the person has not seen in this tab
  * (`seen-addresses.js`: typed or pasted in the address bar or the chat, open
  * now, or one of My datasets) is asked about before anything is requested
- * (`ctx.confirmLink`, F121): the request alone could carry to any host what
+ * (`ctx.confirmLink`): the request alone could carry to any host what
  * an agent misled by text it read put in the address. Declined, nothing is
  * opened or fetched.
  *

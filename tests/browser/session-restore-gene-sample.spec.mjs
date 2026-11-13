@@ -126,8 +126,8 @@ async function applyShare(page, percent, cells) {
   // Apply stays where the pointer found it, every frame it is shown from the
   // click until the dataset is read again and its read line settles (every
   // cell open again, it goes): the Dataset box above keeps its room
-  // (`dataset-card.js`). It moved up 15 px under the pointer on macOS WebKit
-  // (Web contracts run 41255961977) and the click did nothing.
+  // (`dataset-card.js`): a button that moves under the pointer between its
+  // press and its release takes no click.
   await page.evaluate(() => {
     const apply = document.getElementById('subsample-apply');
     const tops = [];

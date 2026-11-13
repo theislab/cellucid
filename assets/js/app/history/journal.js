@@ -1,8 +1,7 @@
 /**
  * @fileoverview The journal: every structural edit of a tracker kept as the
  * exact records it replaced and made, so it can be undone (Recently
- * deleted / changed; History v2 §3.3.9, contract decisions 3 and 4). Pure
- * data, no page.
+ * deleted / changed). Pure data, no page.
  *
  * An edit is opened (`beginEdit`), told each record before it changes one
  * (`edit.step(id)`, `edit.branch(id)`, `edit.group(id)`, `edit.turn(id)`,
@@ -37,7 +36,7 @@ import { activeBranchAt } from './branches.js';
 const KINDS = Object.freeze({ step: 'steps', branch: 'branches', group: 'groups', turn: 'turns' });
 
 /** The run of steps a group holds now, `{group, from, to}`, or null for a group with no step. */
-export function membershipOf(tracker, groupId) {
+function membershipOf(tracker, groupId) {
   let from = null;
   let to = null;
   for (const step of tracker.steps.values()) {
@@ -61,7 +60,7 @@ function runSteps(tracker, { from, to }) {
 }
 
 /** Set the groups' runs as `memberships` say, after clearing the runs `clearing` names. */
-export function applyMemberships(tracker, clearing, memberships) {
+function applyMemberships(tracker, clearing, memberships) {
   for (const membership of clearing) {
     for (const step of runSteps(tracker, membership)) if (step.group === membership.group) step.group = null;
   }
@@ -120,7 +119,7 @@ export function beginEdit(tracker, { op, by, at, label }) {
 }
 
 /** Whether the edit changed anything at all. */
-export function editChanged(edit) {
+function editChanged(edit) {
   const { tracker } = edit;
   for (const [kind, kept] of Object.entries(edit.kept)) {
     for (const [id, before] of kept) {
@@ -227,9 +226,9 @@ export function exactRestorable(tracker, entry) {
  * now, of each run its patches name (before and after). A group edit records
  * the runs, never the member steps (`edit.membership`), so whatever writes
  * steps out as they change (the autosave, told by the history's `edited`
- * event) learns of them here; without them a grouped step was kept without
- * its group, and the history kept in this browser no longer opened ("a group
- * cuts the run of turn …").
+ * event) learns of them here; without them a grouped step would be kept without
+ * its group, and the history kept in this browser would no longer open ("a
+ * group cuts the run of turn …").
  * @param {object} tracker - live
  * @param {{before: {memberships: object[]}, after: {memberships: object[]}}} entry
  * @returns {Set<string>}
@@ -317,7 +316,7 @@ export function rollbackEdit(edit) {
  */
 export function restoreExactly(tracker, entry, { by, at, validate }) {
   const edit = beginEdit(tracker, { op: 'journal.undo', by, at, label: `Restored: ${entry.label}` });
-  for (const [kind, tell] of [['steps', edit.step], ['branches', edit.branch], ['groups', edit.group], ['turns', edit.turn]]) {
+  for (const [kind, tell] of /** @type {const} */ ([['steps', edit.step], ['branches', edit.branch], ['groups', edit.group], ['turns', edit.turn]])) {
     for (const record of entry.after[kind]) tell(record.id);
     for (const record of entry.before[kind]) tell(record.id);
   }

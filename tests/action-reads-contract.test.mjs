@@ -1,5 +1,5 @@
 /**
- * Declared inputs (History v2 §3.4, §6 test 2): every action of the
+ * Declared inputs: every action of the
  * catalog says what its result is computed from beyond its parameters and
  * the domains it touches (`reads`, its result inputs) and where its
  * parameters' names resolve (`context`, its name context), so a step's

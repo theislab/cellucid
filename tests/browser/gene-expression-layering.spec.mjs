@@ -6,7 +6,7 @@ import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 /**
- * UX-8: a gene's cells that do not express it are the neutral no-value gray
+ * A gene's cells that do not express it are the neutral no-value gray
  * (`writeContinuousColors`, alpha byte BENEATH_ALPHA_BYTE), and they are
  * drawn beneath the expressing cells (`HighPerfRenderer`, two passes over the
  * same points): in 2D by blending order, in 3D at every depth tie. Held

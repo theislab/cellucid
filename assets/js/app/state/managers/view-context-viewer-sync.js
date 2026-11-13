@@ -165,6 +165,7 @@ function recordLiveViewerTransparency(state, transparency) {
 }
 
 export const viewContextViewerSyncMethods = {
+  /** @this {import('../core/data-state.js').DataState} */
   _pushColorsToViewer() {
     if (this._isLiveView()) {
       this.viewer.updateColors(this.colorsArray);
@@ -175,6 +176,7 @@ export const viewContextViewerSyncMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _pushTransparencyToViewer() {
     if (this._isLiveView()) {
       const held = this._liveViewerTransparency;
@@ -196,7 +198,7 @@ export const viewContextViewerSyncMethods = {
     // alpha texture optimization
     // and causing stuttering on large datasets during filter changes.
     // The updateTransparency/updateAlphas path handles both:
-    // - Alpha texture case: just updates texture (fast, ~16x faster than buffer rebuild)
+    // - Alpha texture case: just updates texture (much faster than a buffer rebuild)
     // - Alpha-buffer case: uses an alpha-only dirty flag for efficient partial updates
     try {
       if (this._isLiveView()) {
@@ -236,6 +238,7 @@ export const viewContextViewerSyncMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _pushCentroidsToViewer() {
     if (this._isLiveView()) {
       this.viewer.setCentroids({
@@ -254,13 +257,17 @@ export const viewContextViewerSyncMethods = {
     }
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _getCentroidsForActiveLayout(field) {
     if (!field || !(field.centroidsByLayout instanceof Map)) return [];
     const layoutKey = this.getViewLayoutKey(this.activeViewId);
     return field.centroidsByLayout.get(layoutKey) || [];
   },
 
-  /** Whether `viewId` shows centroid labels (they are elements only then). */
+  /**
+   * Whether `viewId` shows centroid labels (they are elements only then).
+   * @this {import('../core/data-state.js').DataState}
+   */
   _centroidLabelsShown(viewId) {
     return this.viewer?.getCentroidFlags?.(String(viewId))?.labels === true;
   },
@@ -268,12 +275,14 @@ export const viewContextViewerSyncMethods = {
   /**
    * The active view's labels made when it starts showing them (`overlay`
    * changes of the viewer): built only while shown (`buildCentroidsForField`).
+   * @this {import('../core/data-state.js').DataState}
    */
   _syncCentroidLabelsShown(viewId) {
     if (String(viewId) !== String(this.activeViewId || 'live')) return;
     if (this._centroidLabelsShown(viewId) && this.centroidLabels.length === 0) this._rebuildLabelLayerFromCentroids();
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _rebuildLabelLayerFromCentroids() {
     if (!this.labelLayer || !this.viewer) return;
     const viewKey = String(this.activeViewId || 'live');
@@ -307,6 +316,7 @@ export const viewContextViewerSyncMethods = {
     this.viewer.setCentroidLabels(this.centroidLabels, viewKey);
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   initScene(positions, obs) {
     // The active field indexes the inventories this replaces. It is retired
     // first, before an inventory, the renderer or any listener sees the new
@@ -450,6 +460,7 @@ export const viewContextViewerSyncMethods = {
    * renderer or DataState is touched. The renderer is restored from the
    * current DataState payload if its new-data publication rejects.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{
    *   colors: Uint8Array,
    *   dimensionLevel: number,
@@ -612,6 +623,7 @@ export const viewContextViewerSyncMethods = {
    * that names a cell outside the app (the viewer channel, exports) names it
    * by original position through this identity.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {import('../../../data/cell-identity.js').CellIdentity} identity
    */
   setCellIdentity(identity) {
@@ -632,6 +644,7 @@ export const viewContextViewerSyncMethods = {
    * first pass from. A scene starts with every cell ranked under the default
    * seed; its source says otherwise right after it is published.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Readonly<{seed: number|null, originals: Uint32Array|null}>} priority
    */
   setCellPriority(priority) {
@@ -640,16 +653,19 @@ export const viewContextViewerSyncMethods = {
     this.cellPriority = exact;
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _notifyVisibilityChange() {
     this._invalidateHighlightCountCache(true);
     this.emit('visibility:changed');
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   _notifyFieldChange(source, fieldIndex, changeType, detail = null) {
     const event = { source, fieldIndex, changeType, detail };
     this.emit('field:changed', event);
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getSmokeDensitySource() {
     const positions = this.positionsArray;
     const dimension = this.positionsDimension;

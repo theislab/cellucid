@@ -2,11 +2,10 @@
  * What an analysis reads changes outside it in two ways: highlights (its
  * pages) and filters (its "Visible cells"). Every built analysis hears both:
  * - the shown mode at once; a mode not shown records the change and catches
- *   up when shown. Only the active mode heard highlight changes, so a result
- *   kept in another mode was never marked stale, and its groups were cached
- *   against the old highlights;
+ *   up when shown (a mode that did not hear them would keep a result never
+ *   marked stale, its groups cached against the old highlights);
  * - a filter change marks stale, and reads the groups again for, an analysis
- *   scoped to "Visible cells" only. Nothing heard filter changes before.
+ *   scoped to "Visible cells" only.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

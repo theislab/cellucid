@@ -7,10 +7,8 @@
  * publishes one too on Chromium, and it is the one that actually bites: a LOD
  * build whose peak exceeds `jsHeapSizeLimit` produces no error at all. The
  * engine collects a multi-GiB heap for as long as the tab is open -- alive,
- * busy, nothing returned, nothing logged. That was measured: 40M points with
- * LOD enabled did not return after 26 minutes on Chromium, while WebKit
- * rendered the same load and Firefox refused it with a stated WebGL
- * `OUT_OF_MEMORY`.
+ * busy, nothing returned, nothing logged (measured:
+ * 27_decisions_memory_model.md: 40M points with LOD enabled on Chromium).
  *
  * These tests hold the admission check to the curve it was fitted from, and to
  * the boundary bytes of its own arithmetic, without ever running the size that
@@ -39,7 +37,7 @@ const RENDERER_SOURCE_PATH = path.resolve(
 const MIB = 1024 * 1024;
 
 // The published coefficients the admission check is built on, fitted from a
-// 5M/10M/20M/30M curve measured on Chromium (ANGLE Metal, Apple M1 Pro).
+// 5M/10M/20M/30M curve (measured: 27_decisions_memory_model.md).
 // Retained by the build: 79.8 - 51.9 B a point. Transient scratch live at the
 // same time: 12 (hierarchical ordering) + 8.6 (leaves and child chain) + 16
 // (the calibration-time packing scratch, kept as margin).
@@ -49,8 +47,8 @@ const BUILD_FIXED_BYTES = 4 * MIB;
 const PEAK_BYTES_PER_POINT =
   RETAINED_BYTES_PER_POINT + TRANSIENT_BYTES_PER_POINT;
 
-// Measured on the same run: the renderer process's own cap, and the heap the
-// dataset already occupies before any LOD work begins.
+// The renderer process's own cap, and the heap the dataset already occupies
+// before any LOD work begins (measured: 27_decisions_memory_model.md).
 const MEASURED_CHROMIUM_HEAP_LIMIT_BYTES = 4_395_630_592;
 const PRE_BUILD_BYTES_PER_POINT = 51.9;
 const PRE_BUILD_FIXED_BYTES = 20 * MIB;
@@ -435,11 +433,10 @@ test('every LOD tree construction is admitted first', async () => {
 test(
   'a build in the tree worker is admitted against what this thread receives, not the worker\'s scratch',
   (t) => {
-    // Measured on Chromium (ANGLE Metal, Apple M1 Pro): 100M synthetic 3D
-    // points loaded, 2,121 MiB of heap in use against a 4,192 MiB cap. The
-    // whole-build projection refused it; the build runs in the worker, and
-    // this thread receives typed arrays and about one tree node per thousand
-    // points.
+    // A 100M-point 3D load is admitted (measured: 27_decisions_memory_model.md):
+    // the whole-build projection would refuse it, but the build runs in the
+    // worker, and this thread receives typed arrays and about one tree node per
+    // thousand points.
     const pointCount = 100_000_000;
     const used = 2_121 * MIB;
     const limit = 4_192 * MIB;

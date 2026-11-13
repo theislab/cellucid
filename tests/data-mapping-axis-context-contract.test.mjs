@@ -7,14 +7,14 @@
  * - `describeMappingChoiceRefusal(group, value, mapping)` and the refusal of
  *   a whole mapping (`describeDataMappingRefusal`) read each value on its own
  *   mapping's axis, so a mapping keeping `highly_variable` while moving to
- *   raw is refused, not applied with a column raw.var does not have (R9M-2);
+ *   raw is refused, not applied with a column raw.var does not have;
  * - a session saved on X with `highly_variable` restores onto the same file
- *   opened on raw (R9M-1), and one naming a column only the other axis has
+ *   opened on raw, and one naming a column only the other axis has
  *   is refused with the column named;
  * - `followMappingChanges` is the one rule the panel's menus and
  *   `mapping.set` apply to the groups a change of matrix or modality does
  *   not name: a column the new axis has is kept, else the new axis's
- *   default (R9M-2, R9M-3).
+ *   default.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -126,7 +126,7 @@ test('a mapping that keeps the shown value while its matrix moves to another axi
 test('the groups a change of matrix does not name follow it: kept where the new axis has them, else its default', () => {
   const state = scanpyState();
   const shown = state.getDataMapping();
-  // raw (none) to X: X's var has highly_variable, as opening on X would take it (R9M-3).
+  // raw (none) to X: X's var has highly_variable, as opening on X would take it.
   assert.deepEqual(
     pick(state.followMappingChanges(shown, { expression: 'X' })),
     { expression: 'X', geneNames: 'index', highlyVariable: 'highly_variable' }
@@ -137,7 +137,7 @@ test('the groups a change of matrix does not name follow it: kept where the new 
   // raw named by gene_ids to X: var has no gene_ids, so its index.
   const ids = { ...shown, geneNames: 'column:gene_ids' };
   assert.equal(state.followMappingChanges(ids, { expression: 'X' }).geneNames, 'index');
-  // X with highly_variable to raw: raw.var has none (R9M-2).
+  // X with highly_variable to raw: raw.var has none.
   const onX = { ...shown, expression: 'X', highlyVariable: 'highly_variable', geneNames: 'column:only_in_var' };
   assert.deepEqual(
     pick(state.followMappingChanges(onX, { expression: 'raw' })),

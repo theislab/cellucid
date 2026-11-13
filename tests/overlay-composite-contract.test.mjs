@@ -2,7 +2,7 @@
  * The full-window selection overlay canvas (lasso, proximity and KNN
  * indicators, the projectile charge ring) is hidden whenever nothing is drawn
  * on it, so a transparent layer the size of the window is not composited over
- * the scene every frame (GX-4).
+ * the scene every frame.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -23,7 +23,7 @@ test('the overlay starts hidden, shows while drawn and hides when cleared', () =
 });
 
 test('legend counts refresh only while the legend can be seen', () => {
-  // A visibility frame used to recount every category even with the legend's
+  // A visibility frame does not recount every category with the legend's
   // panel collapsed; the gate defers it until the panel is shown.
   const legend = readFileSync(new URL('../assets/js/app/ui/modules/legend-renderer.js', import.meta.url), 'utf8');
   assert.match(legend, /countsGate \?\?= createVisibilityGatedRender\(legendEl,/);

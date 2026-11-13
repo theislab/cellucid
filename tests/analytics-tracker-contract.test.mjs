@@ -2,7 +2,7 @@
  * What the tracker actually hands to `gtag`, driven through its real entry
  * points with a recorded `gtag`.
  *
- * The owner needs the data for development decisions and Google's terms forbid
+ * The data serves development decisions and Google's terms forbid
  * personal data, so every assertion here is about content: a local dataset is
  * described by shape only, an error by its stable code, a control by the id a
  * developer declared. The fixture strings are what a real user would have -
@@ -100,7 +100,7 @@ const LOCAL_METADATA = Object.freeze({
   },
 });
 
-// DATA_CONFIG is computed once, when data-source.js first evaluates, from the
+// DATA_CONFIG is computed once, when sample-catalog-config.js first evaluates, from the
 // page this installs: no `sampleCatalog` query, the canonical meta element.
 installBrowser({ hostEnabled: true });
 const tracker = await import('../assets/js/analytics/tracker.js');

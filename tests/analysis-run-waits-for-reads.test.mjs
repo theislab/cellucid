@@ -1,9 +1,8 @@
 /**
  * A reason Run cannot start may be a read still under way ("Reading the
  * groups…"). The Run row says that to a person until it goes. An agent or a
- * notebook runs right after setting the options, and was refused with that
- * sentence when the read had not ended (CI run 42156372622, WebKit,
- * `analysis.run` of the markers): `runNow` waits for the read, and refuses only
+ * notebook runs right after setting the options, and is not refused with that
+ * sentence when the read has not ended: `runNow` waits for the read, and refuses only
  * with a reason a read cannot change.
  */
 import assert from 'node:assert/strict';
@@ -24,7 +23,7 @@ const turn = () => new Promise(resolve => setImmediate(resolve));
 function running(ui, options) {
   const ran = [];
   ui._requireOptions = () => options;
-  ui._runAnalysis = async () => { ran.push('ran'); ui._lastResult = { ran: true }; };
+  ui._runForm = async () => { ran.push('ran'); ui._lastResult = { ran: true }; };
   ui._lastResult = null;
   return ran;
 }
@@ -122,15 +121,15 @@ test('a run that ends without a result is said as stopped or cancelled, never as
   stopped._ensureController = () => ({ scopeOf: () => null, describeGroups: async () => ({ groups: [] }), plan: () => ({ blocker: null, testedCount: 2 }) });
   const stop = new AbortController();
   stopped._lastResult = null;
-  stopped._runAnalysis = async () => { stop.abort(new DOMException('The person stopped Claude.', 'AbortError')); };
+  stopped._runForm = async () => { stop.abort(new DOMException('The person stopped Claude.', 'AbortError')); };
   stopped.cancelRun = () => {};
   await assert.rejects(stopped.runNow({ signal: stop.signal }), /The person stopped Claude\./);
-  // Canceled by a person (Cancel in the panel): nothing kept, said so (lane-analyst L3-14).
+  // Canceled by a person (Cancel in the panel): nothing kept, said so.
   const cancelledRun = markers(deferred());
   cancelledRun._requireOptions = () => MARKERS;
   cancelledRun._ensureController = stopped._ensureController;
   cancelledRun._lastResult = null;
-  cancelledRun._runAnalysis = async () => {};
+  cancelledRun._runForm = async () => {};
   await assert.rejects(cancelledRun.runNow(), error => {
     assert.equal(error.name, 'AbortError');
     assert.equal(error.message, 'Marker genes was canceled before it finished; nothing was kept.');

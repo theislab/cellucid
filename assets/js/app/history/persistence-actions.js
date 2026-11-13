@@ -1,6 +1,6 @@
 /**
- * @fileoverview The history's actions that write it down or read it out
- * (History v2 §4): one path for the State panel, agents, Python and R.
+ * @fileoverview The history's actions that write it down or read it out:
+ * one path for the State panel, agents, Python and R.
  *
  * - `history.methods`, `history.pseudocode`: a branch (main when left out) in
  *   words (`exports/methods.js`, `exports/pseudocode.js`), the methods with

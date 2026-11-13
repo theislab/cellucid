@@ -28,7 +28,7 @@ import { resultJson } from './helpers/agent-chat.mjs';
 import { plainText } from '../../assets/js/app/agent/bridge/mcp-content.js';
 
 const UNKNOWN_APP = Object.freeze({
-  // As the relay names an app no host vouches for (F122): as an app on this computer, its own name only quoted.
+  // As the relay names an app no host vouches for: as an app on this computer, its own name only quoted.
   agent: 'An app on this computer', name: 'Notes helper', host: null, redirectHost: '127.0.0.1', loopback: true, known: false, registration: 'registered',
 });
 
@@ -212,8 +212,8 @@ test('a tool call through the relay runs as the agent: a dataset opened by name,
   expect(picture.result.content[1].mimeType).toBe('image/png');
   const body = resultJson(picture.result.content[0].text);
   expect(body.png).toMatchObject({ image: 1, mimeType: 'image/png' });
-  // The size asked for is the box the plot fits in (F78, as in a figure export): one side fills it,
-  // the other fits inside, and the plot keeps the view's shape as framed on screen (F150).
+  // The size asked for is the box the plot fits in (as in a figure export): one side fills it,
+  // the other fits inside, and the plot keeps the view's shape as framed on screen.
   expect(body.plot.width).toBeLessThanOrEqual(320);
   expect(body.plot.height).toBeLessThanOrEqual(240);
   expect(body.plot.width === 320 || body.plot.height === 240).toBe(true);

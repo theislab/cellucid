@@ -6,8 +6,7 @@
  * ends without it. "Without it" is the subject, not "within so many turns of
  * the event loop": a module imported for the first time on the way, or any
  * other real I/O, takes as long as the machine takes, and on a fast runner
- * fifty immediates pass before one file is read (found 2026-11-12: Ubuntu's
- * push CI failed two stop contracts that macOS and Windows passed). The bound
+ * fifty immediates pass before one file is read. The bound
  * here is real time, generous, and only reached when the promise really waits
  * for the held work, which never ends by itself.
  */

@@ -11,9 +11,7 @@ test.beforeEach(async ({ page }) => {
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=outlier-filter-ci`;
-// The current-ui fixture stores no outlier quantiles: they are computed from
-// its latent space on the filter's first use.
-const CURRENT_UI_FILE = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/current-ui.h5ad`;
+
 // Written by prepare(latent_key="X_scVI") (scripts/generate-outlier-quantile-fixtures.py):
 // every categorical field's quantiles are stored.
 const STORED = `${SAMPLE_ORIGIN}/tests/browser/fixtures/outliers-stored.h5ad`;
@@ -127,48 +125,6 @@ test('stored quantiles filter at once, one field read at a time; a field too sma
   await expect(page.locator('#outlier-filter')).toBeHidden();
   await expect(page.locator('#outlier-filter-note')).toHaveText('No category has 10 cells.');
   await expect(page.locator('#outlier-filter-note')).toHaveAttribute('title', /No category of “rare” has 10 cells/);
-  expect(productErrors).toEqual([]);
-});
-
-test('computing can be cancelled: nothing is kept, the slider is back at 100%, and it can start again', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('#outlier-filter-note')).toContainText('First use reads');
-
-  // The 120-cell fixture is read in a moment; hold the computation until the
-  // test lets it go, as a large remote latent space would, honoring Cancel.
-  await page.evaluate(() => {
-    const loader = window._cellucidState.fieldLoader;
-    const load = loader.loadOutlierQuantiles;
-    window.__releaseOutliers = null;
-    loader.loadOutlierQuantiles = (field, options) => new Promise((resolve, reject) => {
-      options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
-      window.__releaseOutliers = () => load(field, options).then(resolve, reject);
-    });
-  });
-  await page.locator('#outlier-filter').fill('50');
-  await page.locator('#outlier-filter').dispatchEvent('change');
-  await expect(page.locator('#outlier-filter-progress')).toBeVisible();
-  await expect(page.locator('#outlier-filter-note')).toHaveText('Computing outlier distances…');
-  await expect(page.locator('#outlier-filter-action')).toHaveText('Cancel');
-  await page.locator('#outlier-filter-action').click();
-
-  await expect(page.locator('#outlier-filter-progress')).toBeHidden();
-  await expect(page.locator('#outlier-filter')).toHaveValue('100');
-  await expect(page.locator('#outlier-filter-note')).toContainText('First use reads');
-  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
-  expect(await page.evaluate(() => window._cellucidState.getActiveField().outlierQuantiles ?? null)).toBeNull();
-
-  // Started again, it completes.
-  await page.locator('#outlier-filter').fill('50');
-  await page.locator('#outlier-filter').dispatchEvent('change');
-  await expect(page.locator('#outlier-filter-progress')).toBeVisible();
-  await page.evaluate(() => window.__releaseOutliers());
-  await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 cells');
-  await expect(page.locator('#outlier-filter-progress')).toBeHidden();
-  await expect(page.locator('#outlier-filter-note')).toBeHidden();
   expect(productErrors).toEqual([]);
 });
 

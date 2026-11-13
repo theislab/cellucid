@@ -20,8 +20,8 @@ const SHARD_PATTERN = /^(?<current>[1-9][0-9]*)\/(?<total>[1-9][0-9]*)$/;
 const PROJECT_PATTERN = /^[A-Za-z0-9_-]+$/;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 
-// A process per whole shard retained native GPU state long enough to degrade
-// hosted macOS Firefox. A process per file fixed that but exhausted WinSock
+// A process per whole shard retains native GPU state long enough to degrade
+// hosted macOS Firefox. A process per file exhausts WinSock
 // resources late in Windows shards. Those are opposing host-level limits, not
 // one universal batch size. On ordinary and native-GPU-vulnerable hosts, bound
 // every browser lifetime to six files and forty tests. Windows instead keeps a
@@ -669,7 +669,7 @@ const PROBE_TIMEOUT_MS = 10_000;
  *
  * A probe is not a reservation: something else may take a port between the
  * probe and the batch. That is why `reuseExistingServer: false` and the
- * server's `EADDRINUSE` exit both stay exactly as they were. This removes the
+ * server's `EADDRINUSE` exit both stay. This removes the
  * *predictable* collision — a fixed ladder meeting a host that already uses one
  * of its rungs — and does not pretend to remove the racy one.
  *
@@ -701,8 +701,8 @@ function probeFreeLoopbackPorts(ports) {
   );
   if (result.status !== 0 || typeof result.stdout !== 'string') {
     // A probe that cannot run must not stop a run that would otherwise work.
-    // Falling through to the unprobed ladder is exactly the previous behavior,
-    // and the server still refuses a taken port loudly.
+    // Falling through to the unprobed ladder keeps the run going, and the
+    // server still refuses a taken port loudly.
     return new Set(ports);
   }
   try {
@@ -718,13 +718,13 @@ function probeFreeLoopbackPorts(ports) {
  * Playwright output directory. A failed batch's evidence cannot be overwritten
  * by a later batch, and a failed server teardown cannot strand the next one.
  *
- * The ladder used to be assumed rather than discovered: 4173-4189, fixed, with
- * `reuseExistingServer: false` turning any occupied rung into a hard stop for
- * all nine batches. On a container, a self-hosted runner, or a developer
- * machine with a leftover server from an interrupted run, every batch failed
- * identically and the only recovery was a human setting an environment
- * variable. Each pair is now probed before it is planned, and an occupied pair
- * is stepped over exactly like a Fetch-blocked one.
+ * The ladder is discovered, not assumed: a fixed ladder (4173-4189) with
+ * `reuseExistingServer: false` would turn any occupied rung into a hard stop
+ * for all nine batches. On a container, a self-hosted runner, or a developer
+ * machine with a leftover server from an interrupted run, every batch would
+ * fail identically until a human set an environment variable. Each pair is
+ * probed before it is planned, and an occupied pair is stepped over exactly
+ * like a Fetch-blocked one.
  *
  * An explicitly configured start port is still honored as a start: a caller
  * who names a port is choosing where to look, not asserting what is free.

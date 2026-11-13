@@ -1,8 +1,8 @@
 /**
  * The worker's tree reply crosses as typed arrays (`encodeSpatialTree`), not
  * as node objects: a structured clone of a 10M-point octree's 38,568 nodes
- * took 35 ms in one main-thread task. The decoded tree must be the built
- * tree, node for node.
+ * would take one long main-thread task (measured: 28_decisions_rendering_layers.md).
+ * The decoded tree must be the built tree, node for node.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';

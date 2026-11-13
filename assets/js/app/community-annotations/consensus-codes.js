@@ -25,7 +25,7 @@ import { categoricalStorageForCount, isCategoricalCodes, missingCategoryCode } f
 import { exactLabelForCompare } from './wire-contract.js';
 
 /** The categories a status is shown as, unless an agreed label already has that name. */
-export const CONSENSUS_STATUS_NAMES = Object.freeze({ disputed: 'Disputed', pending: 'Pending' });
+const CONSENSUS_STATUS_NAMES = Object.freeze({ disputed: 'Disputed', pending: 'Pending' });
 
 /**
  * The category name of a status, beside the agreed labels `labels`.

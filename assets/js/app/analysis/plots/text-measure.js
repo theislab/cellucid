@@ -11,7 +11,7 @@
  */
 
 /** Plotly's spacing of the lines of one text (`svg_text_utils` LINE_SPACING). */
-export const PLOTLY_LINE_SPACING = 1.3;
+const PLOTLY_LINE_SPACING = 1.3;
 
 /** @type {CanvasRenderingContext2D|null} */
 let context = null;
@@ -38,10 +38,9 @@ export function textWidth(text, { size, family, weight = 'normal' }) {
  * font's ascent and descent as this engine draws them, never less than
  * Plotly's spacing of a line. What a label takes beside another (a name
  * turned to run down, a row's name): each engine sizes the box its own way
- * (found 2026-11-10: a 7 px gene name was 9 px wide turned in Chromium and
- * 10.8 px in Firefox, where the names overlapped). Measured as Plotly draws
- * it, the box an SVG label takes on the page: neither the canvas's font box
- * nor the label's `getBBox()` (9 px and 9.1 px in Firefox) is it.
+ * (measured: 37_decisions_analysis.md). Measured as Plotly draws it, the box
+ * an SVG label takes on the page: neither the canvas's font box nor the
+ * label's `getBBox()` is it.
  *
  * @param {{size: number, family: string, weight?: 'normal'|'bold'}} font
  * @returns {number}

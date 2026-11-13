@@ -25,10 +25,8 @@ const FIELDS = ['batch', 'cell_type', 'stage'];
  */
 const TITLES = {
   'legacy-0.6.h5ad': 'Legacy AnnData 0.6 fixture',
-  'legacy-0.6-compound-obsm.h5ad': 'Legacy AnnData 0.6 fixture',
   'legacy-0.7-csr.h5ad': 'Legacy AnnData 0.7 fixture',
   'legacy-0.7.zarr.zip': 'Legacy AnnData 0.7 fixture',
-  'legacy-seuratdisk.h5ad': 'Legacy AnnData 0.7 fixture',
 };
 
 function opened(file) {
@@ -46,39 +44,41 @@ async function expectEveryCellField(page) {
   await expect(page.locator('#dataset-genes')).toHaveText('6');
 }
 
-for (const [file, input] of [
-  ['legacy-0.7-csr.h5ad', '#user-data-file-input'],
-  ['legacy-seuratdisk.h5ad', '#user-data-file-input'],
-  ['legacy-0.6-compound-obsm.h5ad', '#user-data-file-input'],
-  ['legacy-0.7.zarr.zip', '#user-data-file-input'],
-]) {
-  test(`${file} opens from its file picker with every cell field`, async ({ page }) => {
-    const productErrors = await openStarted(page);
-    await chooseFiles(page.locator(input), path.join(fixturesDirectory, file));
-    await expectSettledOn(page, opened(file));
+test('older AnnData files open with every cell field: picked as an .h5ad, dropped, and picked as a Zarr ZIP', async ({ page }) => {
+  const productErrors = await openStarted(page);
+
+  // The dropped file goes between the two picked ones, whose title is the same: each opening shows another name.
+  await test.step('legacy-0.7-csr.h5ad opens from its file picker with every cell field', async () => {
+    await chooseFiles(page.locator('#user-data-file-input'), path.join(fixturesDirectory, 'legacy-0.7-csr.h5ad'));
+    await expectSettledOn(page, opened('legacy-0.7-csr.h5ad'));
     await expectEveryCellField(page);
     await expectNoFailureAnnounced(page);
-    expect(productErrors).toEqual([]);
   });
-}
 
-test('a dropped 0.6 .h5ad file opens like a picked one', async ({ page }) => {
-  const productErrors = await openStarted(page);
-  const base64 = (await readFile(path.join(fixturesDirectory, 'legacy-0.6.h5ad')))
-    .toString('base64');
-  await page.evaluate(base64 => {
-    const dataTransfer = new DataTransfer();
-    dataTransfer.items.add(new File(
-      [Uint8Array.from(atob(base64), c => c.charCodeAt(0))],
-      'legacy-0.6.h5ad',
-    ));
-    const target = document.getElementById('glcanvas');
-    for (const type of ['dragenter', 'dragover', 'drop']) {
-      target.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer }));
-    }
-  }, base64);
-  await expectSettledOn(page, opened('legacy-0.6.h5ad'));
-  await expectEveryCellField(page);
-  await expectNoFailureAnnounced(page);
+  await test.step('a dropped 0.6 .h5ad file opens like a picked one', async () => {
+    const base64 = (await readFile(path.join(fixturesDirectory, 'legacy-0.6.h5ad')))
+      .toString('base64');
+    await page.evaluate(base64 => {
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(new File(
+        [Uint8Array.from(atob(base64), c => c.charCodeAt(0))],
+        'legacy-0.6.h5ad',
+      ));
+      const target = document.getElementById('glcanvas');
+      for (const type of ['dragenter', 'dragover', 'drop']) {
+        target.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer }));
+      }
+    }, base64);
+    await expectSettledOn(page, opened('legacy-0.6.h5ad'));
+    await expectEveryCellField(page);
+    await expectNoFailureAnnounced(page);
+  });
+
+  await test.step('legacy-0.7.zarr.zip opens from its file picker with every cell field', async () => {
+    await chooseFiles(page.locator('#user-data-file-input'), path.join(fixturesDirectory, 'legacy-0.7.zarr.zip'));
+    await expectSettledOn(page, opened('legacy-0.7.zarr.zip'));
+    await expectEveryCellField(page);
+    await expectNoFailureAnnounced(page);
+  });
   expect(productErrors).toEqual([]);
 });

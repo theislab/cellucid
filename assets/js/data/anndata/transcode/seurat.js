@@ -71,7 +71,7 @@ export function isSeuratV2(node) {
 }
 
 /** The SeuratObject version that wrote an object (`@version`), or null. */
-export function seuratVersion(node) {
+function seuratVersion(node) {
   const version = attribute(node, 'version');
   const numbers = version?.kind === 'list' ? version.items?.[0]?.values : version?.values;
   return numbers ? Array.from(numbers).join('.') : null;
@@ -105,7 +105,7 @@ async function readAssay(name, assay, context, notes) {
     layers.push({ name: layer, build: () => cellsByFeatures(matrix, context) });
   }
   if (layers.length === 0) {
-    refuseExternal(name, [data, counts], context.root);
+    refuseExternal(name, [data, counts]);
   }
   const frame = await dataFrameOf(attribute(assay, 'meta.features'), context);
   const variable = new Set(strings(attribute(assay, 'var.features')) ?? []);
@@ -162,7 +162,7 @@ async function readAssay5(name, assay, context, notes) {
     built.push({ kind, matrices });
   }
   if (built.length === 0) {
-    if (external.length > 0) refuseExternal(name, external.map(({ matrix }) => matrix), context.root);
+    if (external.length > 0) refuseExternal(name, external.map(({ matrix }) => matrix));
     refuseMoved(name, context.root);
   }
   const allCells = cells.rows;
@@ -204,7 +204,7 @@ function rank(layer) {
 }
 
 /** Refuse an assay none of whose matrices are in the file. */
-function refuseExternal(name, matrices, root) {
+function refuseExternal(name, matrices) {
   const outside = matrices.find(matrix => matrix.kind === 'external');
   if (outside === undefined) return;
   throw new RObjectRefusal(
@@ -213,7 +213,6 @@ function refuseExternal(name, matrices, root) {
     'or open it with cellucid::cellucid_view(seu).',
     { slot: `assays$${name}`, reason: 'external-matrix' }
   );
-  void root;
 }
 
 /** Refuse an assay whose layers `SaveSeuratRds(move = TRUE)` moved out. */

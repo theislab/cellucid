@@ -55,7 +55,7 @@ async function routeProduction(context) {
     } catch (error) {
       // A page navigated away (the next viewer URL) lets go of the requests
       // it still had in flight, and their fetched responses with them
-      // (Web contracts run 41269083996, Windows Chromium: "Fetch response
+      // (Windows Chromium: "Fetch response
       // has been disposed"). Nothing waits for them; anything else fails.
       if (!/has been disposed|has been closed/.test(String(error?.message))) throw error;
     }

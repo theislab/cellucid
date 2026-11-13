@@ -38,8 +38,8 @@
 /** @typedef {'correlation'|'euclidean'|'cosine'} DistanceMetric */
 /** @typedef {'average'|'complete'|'single'} LinkageMethod */
 
-export const DISTANCE_METRICS = Object.freeze(['correlation', 'euclidean', 'cosine']);
-export const LINKAGE_METHODS = Object.freeze(['average', 'complete', 'single']);
+const DISTANCE_METRICS = Object.freeze(['correlation', 'euclidean', 'cosine']);
+const LINKAGE_METHODS = Object.freeze(['average', 'complete', 'single']);
 
 /**
  * Bytes clustering `itemCount` items holds at its peak: the condensed

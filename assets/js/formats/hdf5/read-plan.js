@@ -40,8 +40,6 @@ import { CHUNK_GROUP_BYTES } from './context.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
-const MiB = 1024 * 1024;
-
 /**
  * Stored bytes of neighboring chunks decoded as one group: a group's fetched
  * bytes stay alive until all its chunks are decoded, so groups stay small.
@@ -66,7 +64,7 @@ function stridesOf(shape) {
  * global coordinates `blockStart`) inside the selection into `target` (the
  * selection's row-major bytes).
  */
-export function copyIntersection(source, blockStart, blockShape, target, selection, elementSize) {
+function copyIntersection(source, blockStart, blockShape, target, selection, elementSize) {
   const rank = blockShape.length;
   if (rank === 0) {
     target.set(source.subarray(0, elementSize), 0);

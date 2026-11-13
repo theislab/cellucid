@@ -37,9 +37,8 @@
  *
  * Each case is its own process (`efficiency-floor/run.mjs`), `--parallel` at
  * a time; each prints one JSON line, appended to `--out`. `--report` turns
- * the lines into the tables of `cellucid-private/plans/efficiency-floor-*.md`
- * (element x format x source x share: actual and floor bytes, requests and
- * time, their ratio and a verdict).
+ * the lines into tables (element x format x source x share: actual and
+ * floor bytes, requests and time, their ratio and a verdict).
  */
 
 import { spawn } from 'node:child_process';

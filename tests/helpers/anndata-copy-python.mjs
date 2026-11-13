@@ -1,7 +1,7 @@
 /**
  * Python's side of the copy tests (`data/anndata/write/copy.js`): where this
- * machine has a Python with anndata, mudata and zarr (the workspace's
- * environment, `.environments/python/venv`, or `python3`) and the
+ * machine has a Python with anndata, mudata and zarr (`CELLUCID_PYTHON`, the
+ * workspace's environment, `.environments/python/venv`, or `python3`) and the
  * cellucid-python checkout (`CELLUCID_PYTHON_ROOT`, else the one beside this
  * checkout), `compareInPython(cases)` reads each copy with anndata (mudata
  * for a MuData), compares every element with what Python reads from its
@@ -24,7 +24,7 @@ const WORKSPACE = (() => {
   return path.resolve(REPOSITORY, '..');
 })();
 export const PYTHON_ROOT = process.env.CELLUCID_PYTHON_ROOT ?? path.join(WORKSPACE, 'cellucid-python');
-export const PYTHON = [path.join(WORKSPACE, '.environments/python/venv/bin/python'), 'python3'].find(candidate => {
+export const PYTHON = [process.env.CELLUCID_PYTHON, path.join(WORKSPACE, '.environments/python/venv/bin/python'), 'python3'].filter(Boolean).find(candidate => {
   if (candidate.includes('/') && !existsSync(candidate)) return false;
   return spawnSync(candidate, ['-c', 'import anndata, mudata, zarr'], { encoding: 'utf8' }).status === 0;
 });
@@ -32,6 +32,11 @@ export const PYTHON = [path.join(WORKSPACE, '.environments/python/venv/bin/pytho
 export const SKIP = PYTHON === undefined
   ? 'no Python with anndata, mudata and zarr on this machine'
   : !existsSync(path.join(PYTHON_ROOT, 'src/cellucid/__init__.py')) ? `no cellucid-python checkout at ${PYTHON_ROOT}` : false;
+// The CI job that runs the viewer against the real packages sets
+// `CELLUCID_REQUIRE_VIEWERS=1`: there a Python that cannot run these checks is a failure.
+if (SKIP !== false && process.env.CELLUCID_REQUIRE_VIEWERS === '1') {
+  throw new Error(`${SKIP}, and CELLUCID_REQUIRE_VIEWERS=1 asks for it`);
+}
 
 /** Run `script` with the JSON `input` on stdin and cellucid-python's sources first on the path; its JSON answer. */
 export function python(script, input) {

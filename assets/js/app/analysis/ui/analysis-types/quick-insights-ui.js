@@ -48,7 +48,7 @@ import {
   createDisclosure,
   createStatusLine
 } from '../../../ui/components/controls.js';
-import { formatCells, formatCount, formatCountOf, formatPercent, formatSignificant, countNoun } from '../../../../utils/format-units.js';
+import { formatCells, formatCountOf, formatPercent, formatSignificant, countNoun } from '../../../../utils/format-units.js';
 import { PageSelectorComponent, PAGE_MODE } from '../shared/page-selector.js';
 import { createDomId } from '../../../ui/components/dom-id.js';
 import { isHexColor } from '../../../../utils/hex-color.js';
@@ -571,7 +571,7 @@ export class QuickInsights extends BaseAnalysisUI {
     const requestId = this._beginUpdateIntent();
 
     // No dataset open: said as every analysis says it
-    // (`validateDataRequirements`), with no page choice to make (R9E-8).
+    // (`validateDataRequirements`), with no page choice to make.
     const data = this.validateDataRequirements();
     this._container?.querySelector('.insights-page-selector-section')?.toggleAttribute('hidden', !data.valid);
     if (!data.valid) {
@@ -1061,8 +1061,8 @@ export class QuickInsights extends BaseAnalysisUI {
     // Both passes walk every selected cell on this thread, so they hand the
     // event loop back between slices of a large selection.
     const yieldIfSliceSpent = createSlicedYield();
-    // As the reader gives a continuous field (`BaseAnnDataAdapter`): float32 or float64 (found
-    // 2026-11-10: Suo's n_genes, float64, failed Quick insights).
+    // As the reader gives a continuous field (`BaseAnnDataAdapter`): float32 or float64:
+    // a check for float32 alone would refuse a float64 field.
     if (!(rawValues instanceof Float32Array) && !(rawValues instanceof Float64Array)) {
       throw new TypeError(
         `Continuous field "${fieldName}" requires a Float32Array or Float64Array values payload`
@@ -1552,9 +1552,10 @@ export class QuickInsights extends BaseAnalysisUI {
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId?.(pageId) || 0,
 
       // Callbacks
-      onSelectionChange: pageIds => {
+      onSelectionChange: (pageIds, { byPerson }) => {
         this._handlePageChange(pageIds);
-        this._recordPersonChange('pages', { pageIds: [...(pageIds || [])] });
+        // A page the selector let go as the pages changed is part of that change, not a step.
+        if (byPerson) this._recordPersonChange('pages', { pageIds: [...(pageIds || [])] });
       },
       onModeChange: this._handleModeChange.bind(this),
       onColorChange: this._handlePageColorChange

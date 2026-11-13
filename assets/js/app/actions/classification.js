@@ -688,12 +688,16 @@ export const MUTATION_OWNERS = Object.freeze([
     why: 'the viewer implements its API, and its own parts call it',
   },
   {
-    module: 'assets/js/app/main.js',
+    module: 'assets/js/app/dataset/publication.js',
+    methods: ['clearActiveField', 'clearSnapshotViews', 'setViewName'],
+    why: 'publishes a dataset (no field shown, no kept view, the live view unnamed: the state its history starts from)',
+  },
+  {
+    module: 'assets/js/app/ui/modules/connectivity-controls.js',
     methods: [
-      'clearActiveField', 'clearSnapshotViews', 'setViewName', 'setShowConnectivity', 'setConnectivityColor', 'setConnectivityAlpha',
-      'setConnectivityLineWidth', 'setEdgeVisibleTarget',
+      'setShowConnectivity', 'setConnectivityColor', 'setConnectivityAlpha', 'setConnectivityLineWidth', 'setEdgeVisibleTarget',
     ],
-    why: 'publishes a dataset (no field shown, no kept view, the live view unnamed: the state its history starts from) and owns the connectivity controls, whose changes are recorded by observation (`setting.set`)',
+    why: 'owns the connectivity controls, whose changes are recorded by observation (`setting.set`)',
   },
   {
     module: 'assets/js/app/cell-subset-carry.js',

@@ -142,7 +142,7 @@ test('form-based analysis requires concrete result rendering and propagates exec
   const originalError = console.error;
   console.error = (...args) => errors.push(args);
   try {
-    await ui._runAnalysis();
+    await ui._runForm();
   } finally {
     console.error = originalError;
   }

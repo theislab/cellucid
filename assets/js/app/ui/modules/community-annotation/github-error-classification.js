@@ -80,7 +80,7 @@ export function isWorkerCompatibilityFailure(err) {
  * through `fetchOnce`, which names `fetch`'s own rejection so). A bare
  * `TypeError` is never one: it is the code's own broken contract
  * (`utils/errors.js` `isInternalFailure`), and asking again cannot mend it
- * (round 9: one read as "GitHub unreachable" and was retried).
+ * (a bare `TypeError` read as "GitHub unreachable" would be retried).
  */
 export function isWorkerUnreachable(err) {
   return err?.code === WORKER_UNREACHABLE || isUnanswered(err);

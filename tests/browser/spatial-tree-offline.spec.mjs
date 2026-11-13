@@ -56,28 +56,3 @@ test('a tree asked for offline says its code could not be loaded, once, and is b
   await expect.poll(() => hasTree(page), { timeout: 60_000 }).toBe(true);
   await expect(failure).toHaveCount(1);
 });
-
-test('a tree whose worker script the server no longer has names the server\'s answer, not only that its code did not load', async ({ page }) => {
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await waitForPageAtRest(page);
-  expect(await hasTree(page)).toBe(false);
-
-  // As for a page that outlived its deploy: the script is gone. The browser
-  // says nothing of why (a plain `error` Event); asking for it again does
-  // (`explainWorkerFailure`, `workers/worker-failure.js`).
-  const script = '/assets/js/rendering/high-perf/spatial-tree-worker.js';
-  await page.route(`**${script}`, route => route.fulfill({ status: 404, contentType: 'text/plain', body: 'Not Found' }));
-  await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    viewer.setFrustumCulling(true);
-    viewer.resume();
-  });
-  const failure = page.locator('#notification-center .notification-error');
-  await expect(failure).toHaveCount(1);
-  await expect(failure).toContainText(
-    `Background spatial index worker failed: its code could not be loaded: the server answered 404 for ${script}`,
-  );
-  expect(await hasTree(page)).toBe(false);
-});

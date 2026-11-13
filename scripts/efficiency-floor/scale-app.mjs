@@ -27,8 +27,8 @@
  *
  * The store is served over loopback with ranges (a web host), or chosen as a
  * file or folder (`--pick`), or a public link is opened (`--link`). The app
- * is served on this lane's ports (`CELLUCID_BROWSER_TEST_PORT`, default
- * 4583). Run it alone (`heavy.sh`). Each step also records the requests and
+ * is served on the browser tests' ports (`CELLUCID_BROWSER_TEST_PORT`, default
+ * 4583). Run it alone. Each step also records the requests and
  * response bytes of every data request (the store server's own count, and
  * the browser's for a link), and the grid steps (`share-grid.mjs`): the next
  * gene, frame times while the view turns, a highlight, the highlighted
@@ -101,7 +101,7 @@ const storeServer = createServer((request, response) => {
   headers.ETag = `"${size}-${Math.round(statSync(file).mtimeMs)}"`;
   // A range `bytes=a-b` or `bytes=a-`, or a suffix `bytes=-n` (a Zarr
   // shard's index at its end), as every web host answers them: a suffix
-  // answered with the whole file read a 10M-cell store's shards whole.
+  // answered with the whole file would read a store's shards whole.
   const plain = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? '');
   const suffix = /^bytes=-(\d+)$/.exec(request.headers.range ?? '');
   const range = plain ?? suffix;
@@ -132,8 +132,8 @@ const cdp = engine === 'chromium';
 // points or edges is seconds of main-thread wait.
 // Launched here, not through a browser server: a browser Playwright reaches
 // over a connection is taken for a remote one, and a picked store (`--pick`)
-// is then streamed into it through the protocol (about 30 s for 700 MB)
-// instead of handed over by its path, as a person's pick is.
+// is then streamed into it through the protocol instead of handed over by
+// its path, as a person's pick is.
 const browser = await playwright[engine].launch(browserLaunchOptions(engine, cdp ? { args: [`--remote-debugging-port=${cdpPort}`] } : {}));
 // Firefox under Playwright is the newest process started with its pipe.
 const rootPid = Number(execSync(cdp ? `pgrep -f -- "--remote-debugging-port=${cdpPort}" | head -1` : 'pgrep -n -f -- "-juggler-pipe"').toString().trim());
@@ -373,8 +373,7 @@ async function gpuMB() {
 /**
  * Wait for the dataset to show (`pointCount` past `before`), or fail as soon
  * as the app says the opening failed: a refused or failed opening otherwise
- * held the run until the step's timeout (20 minutes of a 50M run spent on a
- * link the app had refused at once).
+ * holds the run until the step's timeout.
  */
 async function opened(before, since, { name = false } = {}) {
   let failed = null;
@@ -414,8 +413,8 @@ async function step(name, operation, { timeout = 600_000 } = {}) {
   const started = performance.now();
   let detail = null;
   let failure = null;
-  // The step's deadline is cleared when it ends: a pending 30-minute timer
-  // kept the run alive that long after its last step.
+  // The step's deadline is cleared when it ends: a pending timer would
+  // keep the run alive after its last step.
   let deadline = null;
   const tracing = traceDir !== null && engine === 'chromium' && traceSteps.has(name);
   if (tracing) {
@@ -471,8 +470,7 @@ async function analysis(id, options, buttonName, extra = {}) {
     // The page's own module instance: its path, which the page's import map
     // resolves to the URL the app imported (a resource entry is no way to
     // find it: the page's resource timing buffer holds its first 250
-    // entries, and a 10M-cell page fills it before this module loads, so the
-    // costs were never cleared and runs after the first took a first pass).
+    // entries, which a 10M-cell page fills before this module loads).
     // The kinds cleared are recorded with the run (`costsCleared`): after a
     // first run, the kinds it measured (the app's instance, not another).
     costsCleared = await page.evaluate(async () => {
@@ -930,8 +928,8 @@ try {
   await step('velocity', async () => {
     await setControl('#velocity-overlay-enabled', true);
     await page.waitForTimeout(1000);
-    // Until the field has loaded: a step ended on long tasks alone left a
-    // field still loading, its reads counted in the next step.
+    // Until the field has loaded: a step that ended on long tasks alone would
+    // leave a field still loading, its reads counted in the next step.
     await page.waitForFunction(() => !/^Loading/.test(document.getElementById('velocity-overlay-info')?.textContent?.trim() ?? ''), null, { timeout: 600_000 });
     await quiet(2500);
     return { info: (await page.locator('#velocity-overlay-info').textContent().catch(() => '')).trim().slice(0, 200) };
@@ -963,7 +961,7 @@ try {
     // A PNG of the view (the format a person exports a large dataset in),
     // edges and velocity off first (a figure draws the point layer only).
     // Each control is waited for, never passed over by a timed-out
-    // optional call: one such call held every PNG step 30 s.
+    // optional call, which would hold every PNG step for its time-out.
     const result = await figure('png');
     return { ...result, failure: null };
   }, { timeout: 300_000 });

@@ -196,6 +196,81 @@ node scripts/validate-tokens.js
 
 ---
 
+### Comments say what the code does; history goes to the decision records
+
+A comment says what the code does and why it must be so: the invariant it keeps, the failure it
+prevents, the unit of a number, the module that owns the other half. It is written in the
+present tense and stays true for as long as the code below it is unchanged.
+
+A comment never holds:
+
+1. a CI run number or address;
+2. a finding, audit or plan id, or a path into a repository the reader cannot open;
+3. a date of our own work (a date of an outside version the code depends on, such as a protocol
+   revision or a browser release, stays);
+4. who decided, or their words;
+5. what the code used to do, what was tried, what was found or fixed;
+6. numbers measured on a machine, with the machine, engine or dataset.
+
+Each of these goes, in the same change, to the decision record of the subsystem (the table in
+`assets/js/ARCHITECTURE.md` says which): a decision to "Decisions and why", numbers to
+"Measurements that justify it", an attempt to "Tried and reverted". The record tells the story
+in plain words, with its date and its numbers; it holds no finding, audit or plan id either.
+Where a constant or a design rests on one, the comment keeps the reason in one clause and names
+the page: `(measured: 24_decisions_graph_edges_at_scale.md)`.
+
+What stays: the failure the code prevents, told as a condition ("offline, a back-off would
+outlast the outage, so the read waits for the connection"); pointers to tests, modules and
+pages that exist; facts about outside versions.
+
+Tests follow the same rule. A test's name says what it pins and holds no id. A test file's
+header says what the file pins and what breaks without it; the incident that led to it goes to
+the record. `tests/comment-history-contract.test.mjs` holds items 1 and 2 (and a round or a bug
+hunt named as a label) in every comment, test title, workflow comment and Markdown page of the code, tests,
+scripts, workflows and `docs/`, in the stylesheets, in the HTML comments of the pages the site ships, and in
+the `about` and `description` fields of JSON fixtures; items 3 to 6 are for review.
+
+**Before and after: a reason told through an incident** (`assets/js/formats/io/byte-source.js`).
+
+```js
+// Before
+// This computer is offline: no host refuses anything. The read waits
+// for the connection, not a back-off, and is asked again the moment
+// it is back (round 9: a read waited up to 20 s more after an
+// 18 s outage ended).
+
+// After
+// This computer is offline: no host refuses anything. The read waits
+// for the connection, not a back-off (which would outlast the outage),
+// and is asked again the moment it is back.
+```
+
+Record 22, "Decisions and why", gains the row: its date; "Offline, a read waits for the
+connection and not a back-off"; why: a read waited up to 20 s more after an 18 s outage ended;
+rules out: a back-off while the browser reports no connection.
+
+**Before and after: a measurement that justifies a constant** (`assets/js/app/ui/modules/connectivity-controls.js`).
+
+```js
+// Before
+/**
+ * Edges a millisecond one pass of `forwardEdgeRows` walks, before this page
+ * has timed one (`knnRowReader`): about 100,000, measured in Node on an
+ * Apple M-series laptop (20M edges: 183 ms for a 65,536-cell frontier). A
+ * prior replaced by the first pass's own rate, never a limit.
+ */
+
+// After
+/**
+ * Edges a millisecond one pass of `forwardEdgeRows` walks, before this page
+ * has timed one (`knnRowReader`): a prior replaced by the first pass's own
+ * rate, never a limit (measured: 24_decisions_graph_edges_at_scale.md).
+ */
+```
+
+Record 24, "Measurements that justify it", gains the row: 20M edges, 65,536-cell frontier,
+183 ms, Node, Apple M-series.
+
 ## Testing & validation
 
 Node.js 22.15 or newer is required (`package.json` sets `engines.node`): the
@@ -205,11 +280,69 @@ the suites:
 
 ```bash
 npm ci
+npm run check               # the type check of assets/js: about 12 seconds, 4 when run again
+npm run test:core           # the core contract tests: every layer, about 15 seconds
+npm run test:browser:smoke  # the smoke specs: one walk from start to export, each engine
 npm test                    # every web contract in tests/*.test.mjs
 npm run test:browser        # Playwright suites in tests/browser/
 npm run test:browser:repeat # the browser specs a change touches, 5 times in every engine
 npm run test:worker-bundle  # dry-run build of the community-annotation Cloudflare Worker
 ```
+
+What to run when:
+
+| When | Run | About |
+|---|---|---|
+| After a change, while working | `npm run check`, `npm run test:core`, the contract files and specs of what you changed, then `npm run test:browser:smoke -- --project=chromium` | 15 seconds, then about 6 minutes |
+| Before the change is called done | `npm run test:browser:smoke` (every engine) | about 20 minutes with one worker |
+| When a piece of work is complete | `npm test` and `npm run test:browser -- --project=chromium` | 2 minutes, then every spec in one engine |
+| Before `main` is pushed | `npm run test:browser` in Firefox and WebKit too | CI runs the same on every push |
+
+`npm test` and the full browser suite are the gate; the two short sets only
+answer first. Both are lists in `scripts/test-suites.mjs`, held to the tree by
+`tests/test-suites-contract.test.mjs`: the core tests are, for each layer, the
+files that run that layer's modules and say the most for their time; the smoke
+specs walk start, open each format, color, filter, select, analyze, undo, save
+and export. A new test joins a short set only when it replaces one there or
+covers a layer or a step that has none.
+
+### The type check
+
+`npm run check` (`scripts/check-types.mjs`) reads `assets/js` with the
+TypeScript compiler as JavaScript with JSDoc (`tsconfig.json`; nothing is
+emitted, and no page loads a compiled file). `npm test` runs it too
+(`tests/type-check-contract.test.mjs`), so CI does. It is not strict typing.
+A line fails it when it is:
+
+- a syntax error;
+- a diagnostic that means a defect whatever the typing style, by its code
+  (`DEFECT_FAMILIES` in the script): a name that is not defined or not
+  imported, an import of something a module does not export, a call with the
+  wrong number of arguments, a call or `new` of something that is neither,
+  the same name declared twice, an assignment to a constant or an import, a
+  comparison that can never hold, a `@private` member reached from outside
+  its class, a JSDoc that does not match its function, unreachable code, a
+  name declared and never used, a member newer than ES2023 (the `lib` of
+  `tsconfig.json`: raise it there, on purpose, to use one);
+- any diagnostic at all in a fully checked folder (`FULLY_CHECKED` in the
+  script).
+
+Every other diagnostic is typing style in a folder that is not fully checked
+yet: counted in the last line, never a failure. There is no baseline and no
+directive comment: `@ts-ignore`, `@ts-expect-error`, `@ts-nocheck` and
+`@ts-check` are refused under `assets/js`. A reported line is fixed where it
+is wrong. When the code is right, its JSDoc is not: add the parameter to the
+callee's signature, import the type (`import('./module.js').Name`), type a
+value checked at run time by what may arrive, write a list of pairs as
+`/** @type {const} */ ([...])`, take `@private` off a member another class
+reaches. A global a classic script defines is declared in
+`types/globals.d.ts`.
+
+A folder becomes fully checked when it has no diagnostic left:
+`node scripts/check-types.mjs --folder <path under assets/js>` prints the
+ones it has, with a count by code (`--all` prints every diagnostic of the
+tree). Fix them, then add the folder to `FULLY_CHECKED`. A new folder starts
+there.
 
 After changing any shipped file (`index.html`, `assets/`, root assets), run
 `node scripts/generate-web-asset-inventory.mjs` (after `npm ci`: it builds the
@@ -251,6 +384,24 @@ way, and bundles that are not exactly what the sources build
 `CELLUCID_BROWSER_TEST_APP_HOST=deployed.localhost npm run test:browser -- <specs>`
 to run browser specs as a deployed site (a spec that holds a module a worker
 imports by its source path runs from `127.0.0.1` only).
+
+The same run writes the **code fingerprints of kept data**,
+`assets/js/data/anndata/transcode/kept-code-fingerprints.js`. The app keeps
+four kinds of data in the browser between visits (converted stores, gene
+indexes, files downloaded whole, the downloaded parts of files), and stamps
+each kept directory with a digest of the code that decides what it holds; a
+directory stamped by other code is removed, never read, and made again on
+the next opening. `scripts/kept-code-fingerprints.mjs` names the modules each
+kind's fingerprint covers and why. There is no number to raise and no digest
+to update in a test: change covered code, run the generator, commit the new
+module (`npm test` and `--check` refuse a stale one,
+`tests/kept-code-fingerprints-contract.test.mjs`). Comments and layout do
+not count, so a comment-only change changes no fingerprint. A code change
+there does make every browser convert, index or download again, so keep
+the five modules a download's and a file's parts' fingerprints cover
+(`kept-format.js`, `kept-journal.js`, `formats/io/page-checks.js`,
+`data/sources/identity.js`, `data/sources/link-credentials.js`) to what a
+kept directory is.
 
 What search engines and link previews read — the `<head>` metadata, the JSON-LD
 block and its hash in the Content-Security-Policy, the visually hidden "About

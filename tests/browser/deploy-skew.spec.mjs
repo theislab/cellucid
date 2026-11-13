@@ -2,10 +2,10 @@
  * Deploys and the module graph.
  *
  * A host that caches by path (GitHub Pages answers every file with
- * `max-age=600`, and ignores the query string) once let a page run a cached
- * module of one build beside a freshly fetched one of the next; the app then
- * stopped on "does not provide an export named …" with only a console error.
- * Every script URL now names its bytes (index.html, CELLUCID_MODULE_VERSIONS),
+ * `max-age=600`, and ignores the query string) can let a page run a cached
+ * module of one build beside a freshly fetched one of the next, and the app
+ * would stop on "does not provide an export named …" with only a console
+ * error. So every script URL names its bytes (index.html, CELLUCID_MODULE_VERSIONS),
  * and what can still meet a deploy (a page open across it importing a part it
  * had not loaded) says so with a Reload button.
  *
@@ -37,7 +37,7 @@ const NEXT_INDEX_HTML = INDEX_HTML.replace(
   `$1${NEXT_BUILD}$2`,
 );
 // A lazily imported module of the next build that imports an export the page's
-// already-loaded build does not have: the shape of the reported failure.
+// already-loaded build does not have: the shape of that failure.
 const LAZY_MODULE = 'assets/js/app/ui/modules/benchmark/generation-contract.js';
 const NEXT_LAZY_MODULE =
   "import { EXPORT_OF_THE_NEXT_BUILD } from '../../../../data/data-mapping.js';\n" +

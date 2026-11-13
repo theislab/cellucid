@@ -39,6 +39,7 @@ import { PLACES } from '../../../ui/place-names.js';
 import { analysisCostKind, runProgressively } from '../../shared/progressive-cells.js';
 import { failureDetails, joinFailure, sayFailure } from '../../../../utils/errors.js';
 import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
+import { promiseWithResolvers } from '../../../../utils/promise-resolvers.js';
 
 /** A variable's kind in words, for a refusal. */
 const VARIABLE_WORDS = Object.freeze({
@@ -259,9 +260,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    *
    * The selector owns a state this panel's config cannot express: a type
    * chosen while its variable is still unchosen. Changing the type reports
-   * `('', '')`, which this panel read as "selection cleared" — it wiped
-   * `dataSource.type` and rebuilt the selector from that empty config, so the
-   * type the user had just chosen was replaced by "None". The selector is
+   * `('', '')`, which this panel would read as "selection cleared": wiping
+   * `dataSource.type` and rebuilding the selector from that empty config would
+   * replace the type the user had just chosen by "None". The selector is
    * built once and re-attached across rebuilds instead, so the control that
    * raises a change is never destroyed by it.
    */
@@ -335,9 +336,10 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._pageSelector = new PageSelectorComponent({
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
-      onSelectionChange: pageIds => {
+      onSelectionChange: (pageIds, { byPerson }) => {
         this._handlePageChange(pageIds);
-        this._recordPersonChange('pages', { pageIds: [...(pageIds || [])] });
+        // A page the selector let go as the pages changed is part of that change, not a step.
+        if (byPerson) this._recordPersonChange('pages', { pageIds: [...(pageIds || [])] });
       },
       onColorChange: this._handlePageColorChange,
       showColorPicker: true,
@@ -496,7 +498,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       if (!applied()) this._applyVariable(variable);
     }
     // Applied, not reported as the person's (the action's own step holds it): a person's change
-    // is a step of its own even while an action runs (dispatcher `recordObserved`, R9W-5).
+    // is a step of its own even while an action runs (dispatcher `recordObserved`).
     if (plot !== undefined && plot !== this._currentConfig.plotType) {
       this._applyPlotType(plot);
       this._renderControls();
@@ -1061,7 +1063,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     });
     this._modal = modal;
     this._renderModalHeading(modal, committed.config, committed.pageData);
-    openModal(modal);
+    // Closed while it opened: its close has begun and its plot owner is
+    // gone, so nothing is drawn into it.
+    if (!openModal(modal)) return;
     if (modal._plotContainer) {
       await this._whileBusy(
         modal._body,
@@ -1075,6 +1079,15 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const { config, pageData, layoutEngine } = committed;
     try {
       await loadPlotly();
+      // Closed while Plotly loaded: its close took its plot owner, and a
+      // slot made now would hold a plot nothing purges.
+      if (
+        this._isDestroyed ||
+        this._modal !== modal ||
+        generation !== this._modalRenderGeneration
+      ) {
+        return;
+      }
 
       const plotType = PlotRegistry.get(config.plotType);
       if (!plotType) {
@@ -1237,12 +1250,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   destroy() {
     if (this._destroyPromise != null) return this._destroyPromise;
 
-    let rejectDestroy;
-    let resolveDestroy;
-    const destroyTask = new Promise((resolve, reject) => {
-      resolveDestroy = resolve;
-      rejectDestroy = reject;
-    });
+    const { promise: destroyTask, resolve: resolveDestroy, reject: rejectDestroy } = promiseWithResolvers();
     this._destroyPromise = destroyTask;
 
     const errors = [];

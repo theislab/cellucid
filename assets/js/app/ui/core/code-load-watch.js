@@ -31,6 +31,15 @@
  * then asks the server which build it serves now: when that is not this
  * page's build, the page was loaded across an update and the screen says to
  * reload it.
+ *
+ * A page being left stops the loads it still has going, and WebKit fails
+ * each as the navigation starts, before the page hides: a page reloaded
+ * while its code loads would show this screen as it goes. From
+ * `beforeunload` (the first thing every engine says when the page is
+ * navigated away from) a failure is held until the page hides (left: nothing
+ * said) or shows it stays (a key or a pointer pressed on it, back from the
+ * back/forward cache, or a navigation the browser reports failed: said), as `app/app-code.js` holds the parts loaded
+ * later; this file imports nothing, so it watches for itself.
  */
 (() => {
   const statusId = 'data-source-status';
@@ -133,8 +142,36 @@
     showFailureScreen(kind, message, detail);
   }
 
+  // Whether the page is being left, and the failure held meanwhile.
+  let leaving = false;
+  let held = null;
+  const stays = () => {
+    if (!leaving) return;
+    leaving = false;
+    const say = held;
+    held = null;
+    say?.();
+  };
+  window.addEventListener('beforeunload', () => { leaving = true; });
+  window.addEventListener('pagehide', event => {
+    if (event.persisted) return;
+    leaving = true;
+    held = null;
+  });
+  window.addEventListener('pageshow', event => {
+    if (event.persisted) stays();
+  });
+  for (const type of ['pointerdown', 'keydown']) window.addEventListener(type, stays, { capture: true });
+  window.navigation?.addEventListener('navigateerror', stays);
+
   window.addEventListener('cellucid-code-load-failed', event => {
-    const { entry, error, stylesheet } = event.detail ?? {};
+    const detail = event.detail;
+    if (leaving) held = () => sayLoadFailure(detail);
+    else sayLoadFailure(detail);
+  });
+
+  function sayLoadFailure(detail) {
+    const { entry, error, stylesheet } = detail ?? {};
     if (stylesheet === true) {
       fail('download', `Cellucid's stylesheet (${entry} or one it imports) did not download.`);
       return;
@@ -145,7 +182,7 @@
     } else {
       fail('run', message);
     }
-  });
+  }
 
   // The startup failure screen of app/startup-failure.js, which never loaded:
   // the brand card (components/_welcome.css) over the app (layouts/_page.css),

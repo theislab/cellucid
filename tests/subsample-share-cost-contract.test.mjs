@@ -111,8 +111,9 @@ test('blocks read about their share of the chunks; a uniform share reads nearly 
   assert.equal(scatteredShareCost(subset, { method: 'uniform', seed: null, fraction: 1 }), null);
   // A priority-ordered file: uniform under its own seed is its first rows;
   // another seed, and blocks of original positions, lie throughout it
-  // (measured: 10% blocks of a 10M-cell priority-ordered .h5ad read 380 MB
-  // of the 385 MB every cell reads); the file's own order is offered.
+  // (a 10% blocks share of a priority-ordered file reads nearly all of what
+  // every cell reads; measured: 23_decisions_partial_reading.md); the file's
+  // own order is offered.
   const priority = { ...subset, prioritySeed: 3 };
   assert.equal(scatteredShareCost(priority, { method: 'uniform', seed: 3, fraction: 0.01 }), null);
   assert.equal(scatteredShareCost(priority, { method: 'uniform', seed: null, fraction: 0.01 }), null);
@@ -288,9 +289,9 @@ test(`${layout}: a 0.7 share's first gene is one pass, every cell's: no per-row 
   const names = await reader.readObsNames();
   const rows = names.length;
   // The work of the gene's plan and pass, counted: rows sorted by
-  // comparison (the pass priced over the rows in open order sorted every
-  // row's run: 3 s of a 50% share of 5M cells) and row pointers looked up
-  // one by one (the kept values counted a row at a time: 1.3 s there).
+  // comparison (a pass priced over the rows in open order must not sort every
+  // row's run: seconds of a 50% share of 5M cells) and row pointers looked up
+  // one by one (kept values must not be counted a row at a time).
   const sort = Float64Array.prototype.sort;
   const indexOf = RowPointers.prototype.indexOf;
   let sorted = 0;

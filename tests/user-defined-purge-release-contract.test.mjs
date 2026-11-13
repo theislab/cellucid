@@ -8,7 +8,7 @@
  * to every session file on a dataset the size of the published `suo` sample,
  * for a column the user has explicitly and permanently discarded.
  *
- * These tests pin both halves of the fix together, because either one alone
+ * These tests pin both halves together, because either one alone
  * leaves the cost in place: the purge must release the payload, and the
  * `field-overlays` state domain (`app/state/domains/field-overlays.js`), which
  * the history and the session file save, must hold a tombstone for it (its

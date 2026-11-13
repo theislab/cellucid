@@ -74,7 +74,7 @@ export function tokensText(usage) {
 /**
  * What left this browser in a turn, as one sentence (`conversation.js` `sentOf`). A turn the
  * conversation received (a shared session or a saved state opened) was sent by the browser it
- * came from, not this one: said so, never "your message … left this browser" (L24-9).
+ * came from, not this one: said so, never "your message … left this browser".
  */
 export function sentText(sent, provider, { received = false } = {}) {
   const parts = [received ? 'the message' : 'your message'];
@@ -183,7 +183,7 @@ export function createTranscriptView({ log, onUndoTurn, onSuggestion, onRevealSt
   }
 
   /*
-   * Where the log stands (F99). While the person leaves it alone it follows
+   * Where the log stands. While the person leaves it alone it follows
    * what the agent writes, until the first line of the agent's latest words
    * reaches the top: from then those words are held from their start (a long
    * answer is read from its first line, as the best assistants show it, never
@@ -574,8 +574,8 @@ export function createTranscriptView({ log, onUndoTurn, onSuggestion, onRevealSt
     const messages = conversation.messages;
     // The calls' results are kept in one message as each comes (`agent-loop.js`
     // `answered`): their count is part of what was drawn, or a result that
-    // came after the first stayed "running" (WebKit on CI, run 43106620008:
-    // the refused call of a reply of two, until the turn ended).
+    // came after the first stays "running" (the refused call of a reply of
+    // two, until the turn ended).
     const last = messages.at(-1);
     const from = { conversation, count: messages.length, last, results: last?.role === 'tool' ? last.results.length : null, running, turnSteps, suggestions, empty: messages.length === 0 && live === null };
     const same = drawnFrom !== null && Object.keys(from).every(key => drawnFrom[key] === from[key]);

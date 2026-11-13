@@ -1,5 +1,5 @@
 /**
- * No near fade (owner decision 2026-11-11, reverting F97's fade): a cell near
+ * No near fade: a cell near
  * the camera is drawn whole and opaque at its perspective size, up to the
  * 160 px cap (within the GPU's own largest point, rendering/point-sprite.js),
  * is picked, and is in the figure, however near the camera comes and in
@@ -68,9 +68,8 @@ async function open(page) {
   // Flat discs, no lighting or fog: a cell's pixels are its color.
   await dispatch(page, 'setting.set', { setting: 'hp-shader-quality', value: 'ultralight' });
   // And nothing else drawn in a cell's color: the orbit anchor's compass has
-  // a red mark, which showed as one red pixel beside the near cell once the
-  // target came close to the eye (WebKit, CI run 43120770230: "310 px
-  // against the cap 160").
+  // a red mark, which shows as one red pixel beside the near cell once the
+  // target comes close to the eye (WebKit: "310 px against the cap 160").
   await dispatch(page, 'setting.set', { setting: 'show-orbit-anchor', value: false });
   await dispatch(page, 'setting.set', { setting: 'size-attenuation', value: 100 });
 }
@@ -156,7 +155,7 @@ async function gpuCap(page) {
   });
 }
 
-test('a cell near the camera is drawn whole at the cap, picked and in the figure, at every distance from 0.13 to 0.54 of the orbit radius', async ({ page }) => {
+test('a cell near the camera is drawn whole at the cap, picked and in the figure, at every distance from 0.13 to 0.54 of the orbit radius, in every shader quality', async ({ page }) => {
   const errors = observeErrors(page);
   await open(page);
   const view = (await dispatch(page, 'views.state', {})).active;
@@ -188,24 +187,18 @@ test('a cell near the camera is drawn whole at the cap, picked and in the figure
   const screenShare = onScreen.red / (canvas.width * canvas.height);
   const figureShare = figure.red / (640 * 400);
   expect(figureShare / screenShare, `figure ${figureShare} against screen ${screenShare}`).toBeGreaterThan(0.5);
-  expect(errors).toEqual([]);
-});
 
-test('every shader quality draws and picks a cell near the camera whole', async ({ page }) => {
-  const errors = observeErrors(page);
-  await open(page);
-  const view = (await dispatch(page, 'views.state', {})).active;
-  await dispatch(page, 'setting.set', { setting: 'point-size', value: 60 });
-  const cap = await gpuCap(page);
-  await dispatch(page, 'camera.set', { view, camera: await cameraOnTheLine(page, 1) });
-  for (const quality of ['full', 'sculpted', 'light', 'ultralight']) {
-    await dispatch(page, 'setting.set', { setting: 'hp-shader-quality', value: quality });
-    const frame = await screen(page);
-    // A disc covers pi/4 of its square; Ultra-light draws the square.
-    const whole = quality === 'ultralight' ? cap * cap : (Math.PI / 4) * cap * cap;
-    expect(frame.red / whole, `${quality}: the near cell's share drawn (${frame.red} px)`).toBeGreaterThan(0.9);
-    expect(Math.abs(frame.redWidth - cap), `${quality}: ${frame.redWidth} px against the cap ${cap}`).toBeLessThanOrEqual(2);
-    expect(await pickAtCentre(page), `${quality}: the near cell is picked`).toBe(NEAR_INDEX);
-  }
+  await test.step('every shader quality draws and picks a cell near the camera whole', async () => {
+    await dispatch(page, 'camera.set', { view, camera: await cameraOnTheLine(page, 1) });
+    for (const quality of ['full', 'sculpted', 'light', 'ultralight']) {
+      await dispatch(page, 'setting.set', { setting: 'hp-shader-quality', value: quality });
+      const frame = await screen(page);
+      // A disc covers pi/4 of its square; Ultra-light draws the square.
+      const whole = quality === 'ultralight' ? cap * cap : (Math.PI / 4) * cap * cap;
+      expect(frame.red / whole, `${quality}: the near cell's share drawn (${frame.red} px)`).toBeGreaterThan(0.9);
+      expect(Math.abs(frame.redWidth - cap), `${quality}: ${frame.redWidth} px against the cap ${cap}`).toBeLessThanOrEqual(2);
+      expect(await pickAtCentre(page), `${quality}: the near cell is picked`).toBe(NEAR_INDEX);
+    }
+  });
   expect(errors).toEqual([]);
 });

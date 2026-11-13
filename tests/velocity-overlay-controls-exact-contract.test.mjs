@@ -693,29 +693,6 @@ test('runtime velocity failure settlement remains coherent when cleanup retry fa
   );
 });
 
-test('velocity controls expose no clamp, coercion, or first-field substitution path', async () => {
-  const source = await readFile(
-    new URL(
-      '../assets/js/app/ui/modules/velocity-overlay-controls.js',
-      import.meta.url
-    ),
-    'utf8'
-  );
-  assert.doesNotMatch(
-    source,
-    /\b(?:Number\.)?parse(?:Int|Float)\s*\(|\bclamp(?:Int|Float)?\b/
-  );
-  // The first field is taken only when it is the only one bound to the
-  // embedding shown (R9V-4); among several, none is guessed.
-  assert.deepEqual(
-    source.match(/.*fieldsForDim\[0\].*/g).map(line => line.trim()),
-    ['if (fieldsForDim.length === 1) return fieldsForDim[0].id;'],
-  );
-  assert.doesNotMatch(source, /Boolean\(syncLodCheckbox\.checked\)/);
-  assert.doesNotMatch(source, /\?\./);
-  assert.doesNotMatch(source, /console\.warn|err\?\.message/);
-});
-
 test('the overlay loads a field once for every representation an open view shows that the field is bound to', async t => {
   const previousDocument = globalThis.document;
   globalThis.document = {

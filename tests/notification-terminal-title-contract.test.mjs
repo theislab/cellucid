@@ -3,11 +3,11 @@
  *
  * Work in progress is published with a title that names the work while it
  * runs — "Downloading", "Processing", "Generating data". Completing or failing
- * that notification replaced its message and its type but kept the title, so a
- * finished download stayed on screen as "DOWNLOADING — 2D cell positions (960 B
- * in 15ms)" and a failed figure export read "PROCESSING — <error>". The same
- * tracker also follows files read from disk, where "Downloading" was never
- * true: a broken session file failed as "DOWNLOADING — Loading session: …".
+ * that notification replaces its message, its type and its title: a finished
+ * download must not stay on screen as "DOWNLOADING — 2D cell positions (960 B
+ * in 15ms)", nor a failed figure export read "PROCESSING — <error>". The same
+ * tracker also follows files read from disk, where "Downloading" is never
+ * true: a broken session file must not fail as "DOWNLOADING — Loading session: …".
  *
  * The rule now lives in the one place every terminal transition passes through:
  * settling active work retires its in-progress title unless the settling call
@@ -187,7 +187,7 @@ test('a failed load keeps the failure\'s own words under Details, out of its sen
   assert.throws(() => center.failDownload(center.startDownload('x'), 'failed', { details: 3 }), /details must be a string/);
 });
 
-test('a broken invariant\'s sentence says its words are under Details, where the card has them (F141)', async t => {
+test('a broken invariant\'s sentence says its words are under Details, where the card has them', async t => {
   const { failureDetails, sayFailure, failureSentence, INTERNAL_FAILURE, INTERNAL_FAILURE_WITH_DETAILS } = await import('../assets/js/utils/errors.js');
   const bug = new TypeError('values.get is not a function');
   const center = createCenter(t);

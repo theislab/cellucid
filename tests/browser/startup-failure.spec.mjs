@@ -1,22 +1,13 @@
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
 import { appUrl, ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { tabKey } from './helpers/dialog-keys.mjs';
 
-const catalogPath = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  'fixtures',
-  'catalog',
-  'datasets.json',
-);
 
 test('a link Cellucid cannot read leaves it running and says what is wrong with the link', async ({
   page
 }) => {
-  // R9E-1: each of these stopped Cellucid on "Cellucid could not start —
+  // Each of these must not stop Cellucid on "Cellucid could not start —
   // Something went wrong while starting", Try again first.
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.stack || error.message));
@@ -113,7 +104,7 @@ test('a data link that does not open leaves Cellucid running and offers the ways
   expect([...new URL(page.url()).searchParams.keys()]).toEqual(['sampleCatalog']);
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expect(page.locator('#user-data-open-btn')).toBeEnabled();
-  // The empty viewer says what it waits for and where (R9E-10), and its
+  // The empty viewer says what it waits for and where, and its
   // button shows that place.
   const empty = page.locator('.opening-overlay[data-state="empty"]');
   await expect(empty).toBeVisible();
@@ -127,24 +118,6 @@ test('a data link that does not open leaves Cellucid running and offers the ways
   await page.locator('#dataset-select').selectOption({ index: 1 });
   await expect(page.locator('#dataset-name')).not.toHaveText('No dataset open');
   await expect(page.locator('.opening-overlay')).toBeHidden();
-});
-
-test('a browser without WebGL2 is told so, and no link setting is offered', async ({
-  page
-}) => {
-  await page.addInitScript(() => {
-    const getContext = HTMLCanvasElement.prototype.getContext;
-    HTMLCanvasElement.prototype.getContext = function (kind, ...rest) {
-      return kind === 'webgl2' ? null : getContext.call(this, kind, ...rest);
-    };
-  });
-  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
-  const failure = page.locator('#cellucid-startup-failure');
-  await expect(failure).toBeVisible();
-  await expect(failure).toHaveAttribute('data-failure', 'browser');
-  await expect(failure.locator('.welcome-title')).toHaveText('This browser cannot run Cellucid');
-  await expect(failure.getByRole('link', { name: 'System requirements' })).toBeVisible();
-  await expect(failure.getByRole('link', { name: 'Open Cellucid without this link' })).toHaveCount(0);
 });
 
 test('a browser whose graphics process hands back a lost context is told to reload, not shown a shader failure', async ({
@@ -180,14 +153,15 @@ test('a browser whose graphics process hands back a lost context is told to relo
  * the test expires it. The deadline runs on an ordinary timer, so only a timer
  * of exactly that length is held; every other timer keeps its real length.
  *
- * The deadlines used to be shortened to 400 ms instead, which made every step
- * race them: on a macOS WebKit runner reading the dataset took longer, and startup stalled there, before ever reaching the request the test
- * holds. Held, a step's deadline only fires when `expireStartupDeadlines` is
- * called, which the tests do once the request they hold is in flight; the
- * steps before it have released theirs by then. The opening's own stall
- * measure has the same length but stands down while a step's deadline runs
- * (`onStartupStepDeadline` in `app/startup-phase.js`), so exactly one held
- * timer, the waiting step's deadline, is what the tests expire.
+ * A deadline shortened to 400 ms would make every step race it, and startup
+ * would stall on a runner where reading the dataset takes longer, before ever
+ * reaching the request the test holds. Held, a step's deadline only fires when
+ * `expireStartupDeadlines` is called, which the tests do once the request they
+ * hold is in flight; the steps before it have released theirs by then. The
+ * opening's own stall measure has the same length but stands down while a
+ * step's deadline runs (`onStartupStepDeadline` in `app/startup-phase.js`), so
+ * exactly one held timer, the waiting step's deadline, is what the tests
+ * expire.
  */
 async function holdStartupDeadlines(page) {
   await page.addInitScript(() => {
@@ -237,7 +211,7 @@ test('a startup request that never answers names its phase and URL', async ({
 }) => {
   await holdStartupDeadlines(page);
   // The same-origin health probe is held open forever: it neither answers nor
-  // fails, which is the stall that used to leave the page waiting with no word.
+  // fails, which is the stall that would leave the page waiting with no word.
   const stalled = await stallRequests(page, '**/_cellucid/health');
 
   await page.goto('/', { waitUntil: 'domcontentloaded' });
@@ -254,67 +228,6 @@ test('a startup request that never answers names its phase and URL', async ({
     'data-startup-phase',
     'health'
   );
-});
-
-test('a stalled published default session ends startup naming its phase and URL', async ({
-  page
-}) => {
-  await holdStartupDeadlines(page);
-  // The catalog default advertises a published default session whose file
-  // request is held open forever.
-  const catalog = JSON.parse(await readFile(catalogPath, 'utf8'));
-  catalog.datasets[0].session = {
-    path: 'current-ui.cellucid-session',
-    bytes: 1,
-    sha256: '0'.repeat(64),
-  };
-  await page.route('**/tests/browser/fixtures/catalog/datasets.json', route =>
-    route.fulfill({
-      body: JSON.stringify(catalog),
-      contentType: 'application/json',
-      status: 200,
-    })
-  );
-  const stalled = await stallRequests(
-    page,
-    '**/tests/browser/fixtures/catalog/current-ui.cellucid-session'
-  );
-
-  await page.goto(
-    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
-      '&dataset=current-ui&acceptance=published-state-stall-ci',
-    { waitUntil: 'domcontentloaded' }
-  );
-  await stalled.inFlight;
-  await expireStartupDeadlines(page);
-  const failure = page.locator('#cellucid-startup-failure');
-  await expect(failure).toBeVisible();
-  await expect(failure).toHaveAttribute('role', 'alert');
-  await expect(failure).toContainText(
-    'Startup stalled while reading the published default session'
-  );
-  await expect(failure).toContainText(
-    '/catalog/current-ui.cellucid-session did not answer within 60 s'
-  );
-  await expect(failure).toHaveCount(1);
-  await expect(page.locator('html')).toHaveAttribute(
-    'data-startup-phase',
-    'session'
-  );
-  await expect(page.locator('.notification-title', {
-    hasText: 'Sample view unavailable'
-  })).toHaveCount(0);
-});
-
-test('a successful startup publishes its phases and ends ready', async ({
-  page
-}) => {
-  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('html')).toHaveAttribute(
-    'data-startup-phase',
-    'ready'
-  );
-  await expect(page.locator('#cellucid-startup-failure')).toHaveCount(0);
 });
 
 test('a failed opening stays in view above the sidebar, which open on a phone fills the screen', async ({

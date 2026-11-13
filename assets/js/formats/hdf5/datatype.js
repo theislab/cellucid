@@ -26,7 +26,7 @@ import { limitEncodedSize } from './binary.js';
 import { BOOL_DTYPE, numericDtype, stringDtype } from '../store.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
-export const DATATYPE_CLASSES = Object.freeze([
+const DATATYPE_CLASSES = Object.freeze([
   'fixed-point', 'floating-point', 'time', 'string', 'bitfield', 'opaque',
   'compound', 'reference', 'enum', 'variable-length', 'array', 'complex',
 ]);

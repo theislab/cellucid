@@ -4,10 +4,9 @@
  * so the agent instructions (`app/agent/instructions.js`) tell the agent to
  * call it only when the step shown is one its own call made, and otherwise
  * to point the person to Undo turn. Judged on the app: the person's hiding
- * of beta is still there after the turn. From the agents bug hunt of
- * 2026-11-04, where Haiku undid the person's step. And the other way round:
- * after the person undid only the agent's steps and acted, the next message
- * tells the agent so, and it answers from it (L3-15).
+ * of beta is still there after the turn (a model that undid the person's step
+ * fails it). And the other way round: after the person undid only the agent's
+ * steps and acted, the next message tells the agent so, and it answers from it.
  *
  * Local only, with the owner's key (`live-harness.mjs`); skipped otherwise.
  */
@@ -48,10 +47,11 @@ test('"undo your last change" after the person acted leaves the person\'s step',
   expect(turn.replied).toBe(true);
 });
 
-// L3-15 (analyst lane A19): after Undo turn (only Claude's steps) and a step of the person, the
-// model was not told, and answered "the Ductal cells are still hidden". The next message carries
-// what changed since its turn (`agent/history-link.js` `historySinceSentence`), and the model
-// answers from it without reading anything again.
+// After Undo turn (only Claude's steps) and a step of the person, the next
+// message carries what changed since its turn (`agent/history-link.js`
+// `historySinceSentence`), and the model answers from it without reading
+// anything again; told nothing, it answers from its own memory (that the Ductal
+// cells are still hidden).
 test('after Undo turn of only its steps and a step of the person, the next message tells the agent, and it answers from it', async ({ page }) => {
   test.setTimeout(6 * 60_000);
   await openLiveChat(page, RUN);

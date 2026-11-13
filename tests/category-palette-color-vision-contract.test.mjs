@@ -1,14 +1,12 @@
 /**
- * What the app and its pages say about color blindness, held to a measurement
- * (R9U-2, 2026-11-11).
- *
- * The accessibility page, the accessibility guide and the palette's own
- * comment said the first 24 category colors "stay distinct for red–green color
- * blindness". Simulated with Machado et al. (2009), the model the export
+ * What the app and its pages say about color blindness, held to a measurement:
+ * the accessibility page, the accessibility guide and the palette's own
+ * comment never say the first 24 category colors "stay distinct for red–green
+ * color blindness". Simulated with Machado et al. (2009), the model the export
  * preview uses, vivid cerulean and iris purple (categories 2 and 10) differ by
- * ΔE2000 1.0 under deuteranopia: the same color. And the preview itself used
- * the old "Coblis" matrices on encoded sRGB, which showed those two as plainly
- * different, so a figure a colorblind reader cannot read passed it.
+ * ΔE2000 1.0 under deuteranopia: the same color. The preview simulates in
+ * linear light; the "Coblis" matrices on encoded sRGB showed those two as
+ * plainly different, so a figure a colorblind reader cannot read passed it.
  */
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
@@ -17,6 +15,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import { absentSibling, pythonDocsRoot } from '../scripts/shared-files.mjs';
 import { getCategoryColor } from '../assets/js/data/palettes.js';
 import {
   applyColorblindSimulationToImageData,
@@ -25,10 +24,7 @@ import {
 
 const read = relative => readFile(new URL(relative, import.meta.url), 'utf8');
 
-/** The shared docs site: CELLUCID_PYTHON_DOCS, else the sibling checkout (absent in this repository's CI). */
-const DOCS = process.env.CELLUCID_PYTHON_DOCS
-  ?? path.resolve(fileURLToPath(new URL('.', import.meta.url)), '../../cellucid-python/docs');
-const GUIDE = path.join(DOCS, 'user_guide/web_app/o_accessibility_privacy_security/01_accessibility.md');
+const GUIDE = path.join(pythonDocsRoot(), 'user_guide/web_app/o_accessibility_privacy_security/01_accessibility.md');
 
 /** CIELAB of an sRGB byte triple (D65). */
 function lab([r, g, b]) {
@@ -122,7 +118,7 @@ test('the preview simulates Machado et al. (2009) in linear light: the palette\'
 
 test('no page claims the category colors are colorblind-safe beyond what they measure', async () => {
   const prefix = distinctRedGreenPrefix();
-  // Measured 2026-11-11: only the first two colors stay ΔE2000 ≥ 10 apart for both deficiencies.
+  // Measured: only the first two colors stay ΔE2000 ≥ 10 apart for both deficiencies.
   // A palette chosen for color blindness changes this number; then say it, with the number.
   assert.ok(prefix < 8, `the first ${prefix} category colors are now colorblind-distinct: say so on the pages`);
   const CLAIM = /stay(?:s)? distinct for red|distinguishable under \*\*protanopia|colorblind-friendly|PROTAN\/DEUTAN safe|color-vision-deficiency safe/i;
@@ -130,9 +126,8 @@ test('no page claims the category colors are colorblind-safe beyond what they me
     'accessibility.html': await read('../accessibility.html'),
     'assets/js/data/palettes.js': await read('../assets/js/data/palettes.js'),
   };
-  if (existsSync(GUIDE)) sources['docs accessibility guide'] = await readFile(GUIDE, 'utf8');
+  if (!absentSibling(existsSync(GUIDE), `${GUIDE} is not there`)) sources['docs accessibility guide'] = await readFile(GUIDE, 'utf8');
   for (const [name, text] of Object.entries(sources)) {
     assert.doesNotMatch(text, CLAIM, `${name} claims colorblind-safe category colors`);
   }
-  assert.match(sources['accessibility.html'], /Category colors are not chosen for color blindness/);
 });

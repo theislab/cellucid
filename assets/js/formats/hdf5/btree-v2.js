@@ -44,7 +44,7 @@ function nodeGeometry(nodeSize, recordSize, depth, offsetSize) {
  *
  * @returns {Promise<{address: number, type: number, nodeSize: number, recordSize: number, depth: number, root: number|null, rootRecords: number, totalRecords: number}>}
  */
-export async function readBtreeV2Header(file, address, signal) {
+async function readBtreeV2Header(file, address, signal) {
   const what = 'Version 2 B-tree header';
   const size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + file.offsetSize + 2 + file.lengthSize + 4;
   const bytes = await file.meta(address, size, what, signal);

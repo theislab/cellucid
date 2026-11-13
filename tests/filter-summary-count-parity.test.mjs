@@ -182,7 +182,7 @@ test('category counts match the per-cell rule for every code width and the missi
     owner.categoryTransparency = alpha;
     const total = new Array(categoryCount).fill(0);
     const visible = new Array(categoryCount).fill(0);
-    // The cells without a category: the legend's Missing row (K-06).
+    // The cells without a category: the legend's Missing row.
     const missingRow = { total: 0, available: 0, visible: 0 };
     for (let cell = 0; cell < pointCount; cell++) {
       if (codes[cell] === missing) {

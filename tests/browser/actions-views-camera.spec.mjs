@@ -274,7 +274,7 @@ test('each view and camera action dispatched directly leaves the exact state; na
     out.refusals.clear = await refusal('view.clear', {});
     out.refusals.removeLive = await refusal('view.remove', { view: 'View 1' });
     // With one kept view, removing View 1 (the live view) hides it and keeps the kept view, which is
-    // then View 1 and the last view (F144); Clear shows the live view again.
+    // then View 1 and the last view; Clear shows the live view again.
     await actions.dispatch('view.keep', { name: 'Kept' });
     out.removeLiveOfTwo = (await actions.dispatch('view.remove', { view: 'View 1' })).outcome;
     out.afterRemoveLive = {

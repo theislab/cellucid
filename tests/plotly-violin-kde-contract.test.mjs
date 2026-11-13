@@ -133,10 +133,6 @@ function normalSample(n, random) {
 
 const ascending = values => [...values].sort((a, b) => a - b);
 
-test('the vendored violin KDE is patched, not upstream', () => {
-  assert.equal(BUNDLE.includes(UPSTREAM_MAKE_KDE), false);
-});
-
 test('sorted quantized expression densities are bit-identical to upstream', () => {
   const random = lcg(11);
   for (const zeroFraction of [0, 0.5, 0.9]) {

@@ -25,6 +25,7 @@
 
 import { onHeldChange, setOtherInstances } from './memory-budget.js';
 import { createOpaqueId } from '../utils/opaque-id.js';
+import { promiseWithResolvers } from '../utils/promise-resolvers.js';
 
 const CHANNEL = 'cellucid-memory';
 const LOCK_PREFIX = 'cellucid-memory:';
@@ -49,8 +50,7 @@ export function joinMemoryCensus(environment = globalThis) {
   let left = false;
 
   // This page's lock, held until it is left.
-  let releaseOwn = null;
-  const own = new Promise(resolve => { releaseOwn = resolve; });
+  const { promise: own, resolve: releaseOwn } = promiseWithResolvers();
   void locks.request(`${LOCK_PREFIX}${id}`, { mode: 'exclusive' }, () => own).catch(() => {});
 
   const publish = () => {

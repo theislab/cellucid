@@ -1,10 +1,10 @@
-// A keyframe's hold (F91, owner decision 2026-11-11): the camera reaches each
+// A keyframe's hold (`hold`): the camera reaches each
 // keyframe at its time, rests there for its hold, then moves on; every
 // transition keeps its own time, the path's length includes the holds, and
 // the transport bar's marks show where each keyframe is reached and how long
 // the camera rests (`interpolation-engine.js` `resolvePathTiming`,
 // `keyframe-store.js`). A hold is no `hold` key when it is 0, so a path
-// without holds is the value it was before holds (session format 4).
+// without holds keeps the stored form of session format 4.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 

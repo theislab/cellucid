@@ -1,9 +1,7 @@
 /**
- * One answer to "is this an AbortSignal" (`utils/abort.js`, round 9): eleven
- * validators said it differently, and the duck-typed ones (gzip, cell sets,
- * bundles, community annotation) took any object with an `aborted` boolean
- * for a signal. The platform's brand check decides: a real signal from any
- * window of the site is one, a look-alike never.
+ * One answer to "is this an AbortSignal" (`utils/abort.js`): the platform's
+ * brand check decides, so a real signal from any window of the site is one
+ * and a look-alike (any object with an `aborted` boolean) never is.
  */
 
 import assert from 'node:assert/strict';

@@ -1,12 +1,11 @@
 /**
  * @fileoverview "Fit the cells": the frame (`crop.js`) that holds every cell a
  * view draws, with a small margin, so the plot takes the cells' shape instead
- * of the pane's (F161). A figure keeps exactly what the screen frames (F62),
+ * of the pane's. A figure keeps exactly what the screen frames,
  * so a pane narrowed by the chat or a grid gives narrow plots of a wide
  * embedding, the cells in a band with empty space above and below; the frame
- * cuts that space away without the screen being rearranged (an agent once hid
- * the person's sidebar to widen the panes). It never widens the view: only
- * cells the pane shows count, and the frame stays inside the viewport.
+ * cuts that space away without the screen being rearranged. It never widens
+ * the view: only cells the pane shows count, and the frame stays inside the viewport.
  *
  * For several panels (Export all views) the frame is the union of each
  * panel's, in each panel's own viewport fractions: one frame applies to every
@@ -121,8 +120,8 @@ export function unionCellsFrames(frames) {
 }
 
 /**
- * How far a plot's shape may be from its cells' before the preview says so
- * (F119): 1.5, the cells filling at most two thirds of the plot's other side.
+ * How far a plot's shape may be from its cells' before the preview says so:
+ * 1.5, the cells filling at most two thirds of the plot's other side.
  */
 export const SHAPE_FAR = 1.5;
 
@@ -130,7 +129,7 @@ export const SHAPE_FAR = 1.5;
  * Whether the figure's panels are far from the shape of the cells they draw:
  * each panel's source aspect (its pane's, or the frame's) against its cells'
  * (the frame that holds them on that pane, `cellsFrameRect01`, in its pane's
- * pixels), and the farthest one's side. A plot takes its pane's shape (F62)
+ * pixels), and the farthest one's side. A plot takes its pane's shape
  * and the figure fills its width at the height that shape gives
  * (`utils/figure-size.js`), so a narrow pane of a wide embedding is a tall
  * figure with the cells in a band: Fit the cells frames them instead.

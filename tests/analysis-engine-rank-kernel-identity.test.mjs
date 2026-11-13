@@ -317,8 +317,8 @@ test('sample moments equal the two-pass definition and drive Welch unchanged', (
       referenceA.mean, referenceA.variance, n1,
       referenceMoments(group2).mean, referenceMoments(group2).variance, n2
     );
-    // welchTTest subtracts the means less one pivot (the first value, audit
-    // NS-14): the definition's numbers to their last bits.
+    // welchTTest subtracts the means less one pivot (the first value): the
+    // definition's numbers to their last bits.
     const actual = welchTTest(group1, group2);
     assertRelative(actual.statistic, expected.statistic, 1e-12, `trial ${trial} welch statistic`, 1);
     assertRelative(actual.df, expected.df, 1e-12, `trial ${trial} welch df`);
@@ -343,7 +343,7 @@ test("Welch's t-test wrapper reports the same statistic, p and Cohen's d", () =>
       referenceA.mean, referenceA.variance, group1.length,
       referenceB.mean, referenceB.variance, group2.length
     );
-    // The wrapper subtracts the means less one pivot (audit NS-14).
+    // The wrapper subtracts the means less one pivot.
     assertRelative(displayed.statistic, core.statistic, 1e-12, `trial ${trial} t`, 1);
     assertRelative(displayed.pValue, core.pValue, 1e-9, `trial ${trial} p`);
     assertRelative(displayed.df, core.df, 1e-12, `trial ${trial} df`);
@@ -483,8 +483,8 @@ test('differential expression reports the same numbers through the operation han
         assert.ok(Object.is(result.pValue, expected.pValue), `trial ${trial} ${method} p`);
         assert.ok(Object.is(result.statistic, expected.statistic), `trial ${trial} ${method} statistic`);
       } else {
-        // Welch's sums of squares add the zeros' terms in one product (O(nnz),
-        // audit NS-2): t to its last bits; p through the incomplete beta,
+        // Welch's sums of squares add the zeros' terms in one product (O(nnz)):
+        // t to its last bits; p through the incomplete beta,
         // whose continued fraction stops within 1e-10.
         assertRelative(result.statistic, expected.statistic, 1e-12, `trial ${trial} ${method} statistic`);
         assertRelative(result.pValue, expected.pValue, 1e-9, `trial ${trial} ${method} p`);
@@ -540,8 +540,8 @@ test('the displayed Mann-Whitney wrapper still filters non-finite values', () =>
 });
 
 test('numeric array validation still rejects every non-numeric container', () => {
-  // TypedArray inputs no longer walk every element, so the rejections that scan
-  // used to provide have to be proven to survive.
+  // TypedArray inputs do not walk every element, so the rejections that scan
+  // would provide are proven here.
   const holed = new Array(4);
   holed[0] = 1;
   holed[1] = 2;

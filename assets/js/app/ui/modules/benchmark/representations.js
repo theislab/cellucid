@@ -13,10 +13,9 @@
  * @module ui/modules/benchmark/representations
  */
 
-import { allocateLargeArray } from '../../../../utils/large-arrays.js';
 
 /** The choices of the benchmark's Representations select. */
-export const SYNTHETIC_REPRESENTATION_SETS = Object.freeze(['one', 'five']);
+const SYNTHETIC_REPRESENTATION_SETS = Object.freeze(['one', 'five']);
 
 function rotation3D(positions, n, { yaw, pitch }) {
   const out = new Float32Array(n * 3);

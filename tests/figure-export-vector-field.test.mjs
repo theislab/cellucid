@@ -1,10 +1,8 @@
 /**
- * R9V-10 (bug hunt round 9): a figure of a view with the vector field shown
- * refused to export ("Velocity overlay not exported") and could never carry
- * the flow. It now draws a still picture of it, arrows on a grid as scVelo's
- * `velocity_embedding_grid`, from the same cells, vectors, camera, filters
- * and color scheme as the screen, in SVG and PNG alike, with a key, and its
- * provenance names the field.
+ * A figure of a view with the vector field shown draws a still picture of the
+ * flow, arrows on a grid as scVelo's `velocity_embedding_grid`, from the same
+ * cells, vectors, camera, filters and color scheme as the screen, in SVG and
+ * PNG alike, with a key, and its provenance names the field.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -141,7 +139,7 @@ test('the view\'s filter is the figure\'s: cells it hides draw no arrow; cells w
   assert.deepEqual(none.arrows, []);
 });
 
-test('the key stays inside a narrow plot, its text at its size: the field\'s line wraps at its words (F271)', () => {
+test('the key stays inside a narrow plot, its text at its size: the field\'s line wraps at its words', () => {
   const thePlan = plan();
   const measure = (text, size) => text.length * size * 0.62;
   // A single-column figure's plot (35 mm, 134 figure pixels) at 7 pt (the key at 0.85 of 9 1/3 px).
@@ -254,7 +252,7 @@ test('the payload holds one vector a cell, and its provenance names the field th
   assert.throws(() => assertFigureExportPayload(unnamed), /must name the vector field its view draws/);
 });
 
-test('with the legend on, the key is the legend\'s rows, laid out with it; only a figure without a legend draws it in the plot (RCB-7)', async () => {
+test('with the legend on, the key is the legend\'s rows, laid out with it; only a figure without a legend draws it in the plot', async () => {
   const { computeFigureLayout } = await import('../assets/js/app/ui/modules/figure-export/utils/layout.js');
   const { figureWidthPxOf, figurePxOfPt } = await import('../assets/js/app/ui/modules/figure-export/utils/figure-size.js');
   // A single-column figure (89 mm) in print sizes: the key in its plot covered the cells.

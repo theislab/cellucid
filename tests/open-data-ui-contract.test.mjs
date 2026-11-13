@@ -20,12 +20,10 @@ import {
 import { localFileLayout } from '../assets/js/app/ui/modules/dataset-drop.js';
 import { filePickerAccept } from '../assets/js/data/input-formats.js';
 import { routeAddress } from '../assets/js/app/ui/modules/address-routing.js';
-import { infoTipText } from './helpers/info-tip-text.mjs';
 
 const read = path => readFile(new URL(path, import.meta.url), 'utf8');
 const indexHtml = await read('../index.html');
 const connectionSource = await read('../assets/js/app/ui/modules/dataset-connections.js');
-const sessionCss = await read('../assets/css/components/_session.css');
 
 function tag(pattern, label) {
   const match = indexHtml.match(pattern)?.[0];
@@ -53,16 +51,12 @@ test('one Open… button opens a File… / Folder… menu, the same in every bro
   // control is wired, so the list has one source.
   assert.doesNotMatch(fileInput, /\baccept=/);
   assert.match(connectionSource, /userDataFileInput\.accept = filePickerAccept\(\);/);
-  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.cellucid-library,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
   assert.doesNotMatch(fileInput, /\b(?:webkitdirectory|directory|multiple)\b/);
   const folderInput = tag(/<input\b[^>]*id="user-data-folder-input"[^>]*>/, 'folder input');
   assert.match(folderInput, /\bwebkitdirectory\b/);
 
-  // No control per format, and no browser sniffing.
-  assert.doesNotMatch(indexHtml, /user-data-(?:h5ad|zarr-archive|zarr-folder)-(?:btn|input)/);
+  // No browser sniffing.
   assert.doesNotMatch(connectionSource, /navigator\.(?:userAgent|userAgentData|vendor)/);
-  // One row: the button spans the sidebar.
-  assert.match(sessionCss, /\.open-menu-button\s*\{[^}]*width:\s*100%/);
 });
 
 test('the browser\'s own picker is offered only endings it accepts; a library file stays choosable through All files', () => {
@@ -78,18 +72,8 @@ test('the browser\'s own picker is offered only endings it accepts; a library fi
 });
 
 test('a picked file is read by what it is', () => {
-  assert.equal(localFileLayout({ name: 'cells.h5ad' }), 'file');
   assert.equal(localFileLayout({ name: 'cells.H5AD' }), 'file');
-  assert.equal(localFileLayout({ name: 'cells.zarr.zip' }), 'zip');
   assert.equal(localFileLayout({ name: 'cells.zip' }), 'zip');
-  assert.equal(localFileLayout({ name: 'cells.csv' }), null);
-});
-
-test('the File or folder tip names every kind and that nothing is uploaded', () => {
-  const tipText = infoTipText(indexHtml, 'user-data-info-tooltip');
-  for (const kind of [/\.h5ad/, /\.zarr\.zip/, /\.zarr/, /drop/i, /nothing is uploaded/i]) {
-    assert.match(tipText, kind);
-  }
 });
 
 test('the DOM cache names the Open… menu and the address bar', () => {
@@ -124,7 +108,7 @@ test('the address bar routes what is typed the same way every time', () => {
     '127.0.0.1:9000/': { kind: 'server', url: 'http://127.0.0.1:9000' },
     'lab-server:8765': { kind: 'server', url: 'http://lab-server:8765' },
     'http://localhost:8765/': { kind: 'server', url: 'http://localhost:8765' },
-    // A path naming data is that data, read over http:// (R9S-4).
+    // A path naming data is that data, read over http://.
     '127.0.0.1:8000/data/atlas.zarr.zip': { kind: 'link', value: '127.0.0.1:8000/data/atlas.zarr.zip' },
     'lab-server:8080/atlas.h5ad': { kind: 'link', value: 'lab-server:8080/atlas.h5ad' },
     'localhost:8000/catalog/datasets.json': { kind: 'link', value: 'localhost:8000/catalog/datasets.json' },

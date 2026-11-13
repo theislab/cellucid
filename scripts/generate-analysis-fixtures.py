@@ -5,8 +5,7 @@ AnnData and what scanpy, SciPy and numpy compute from it; the analysis
 contract tests compute the same in the browser's code and compare
 (``tests/analysis-scanpy-rank-genes-parity.test.mjs``,
 ``analysis-score-genes-parity``, ``analysis-ucell-parity``, and the
-composition and dot plot tests). ``scanpy-reference.json.sha256`` is its
-SHA-256, so a fixture edited by hand is caught.
+composition and dot plot tests).
 
 Run it isolated, with the pinned versions below installed (never into a
 repository environment)::
@@ -247,9 +246,7 @@ def main() -> None:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(reference, indent=1, sort_keys=True) + '\n'
     OUT.write_text(text)
-    digest = hashlib.sha256(text.encode()).hexdigest()
-    OUT.with_name(OUT.name + '.sha256').write_text(f'{digest}  {OUT.name}\n')
-    print(f'wrote {OUT.relative_to(ROOT)} ({len(text):,} bytes, sha256 {digest[:12]})')
+    print(f'wrote {OUT.relative_to(ROOT)} ({len(text):,} bytes)')
 
 
 # --- composition and dot plot ---

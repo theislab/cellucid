@@ -1,46 +1,12 @@
-import { test } from '@playwright/test';
-
-import { isHostedMacosFirefox } from './hosted-gl.mjs';
-
 /**
- * When two captures count as the same picture.
+ * When two captures count as the same picture: when every byte of every
+ * pixel is equal.
  *
- * Two draws of identical data give identical pixels on every hardware
- * rasterizer this suite runs on, and the suite asserts exactly that. One
- * hosted renderer does not: Firefox on GitHub's macOS runner draws WebGL
- * through a software path (about 2,500 times slower than Metal) that rounds
- * the last bit of a few edge pixels differently from one GPU object to the
- * next. Measured there on 2026-10-21: 3 of 1.4 million pixels off by 1 after
- * a kept view's stores were rebuilt from identical bytes; 11 pixels between
- * two views of one geometry drawn with equal cameras; a PNG export that
- * differed from an identical export while the SVG of the same figure was
- * byte-identical. The same bytes drawn twice from the same objects stayed
- * identical every time. That is rounding, not data: a wrong point, color,
- * order or camera moves whole points, dozens of pixels with deltas far
- * above one.
- *
- * So a capture is the same picture as another when no channel of any pixel
- * differs by more than one unit and no more than one pixel in twenty
- * thousand of the lit pixels differs at all. Anything else is a defect and
- * is reported with where and by how much. The inputs a draw depends on
- * (camera, viewport, draw order, GPU stores) are asserted equal, exactly, by
- * each spec on its own.
- *
- * That renderer also went past this measure with the asserted inputs equal
- * (13 of 921,600 pixels, a delta of 2: `snapshot-compact-lod-parity`, nightly
- * run 41382954122), so there a capture is the same picture while no more
- * than one lit pixel in a thousand differs, by any amount
- * (`helpers/hosted-gl.mjs`, which also says what that bound cannot show):
- * the most measured is 13 in a million; a wrong order, color, camera or
- * missing cells moves far more. Every other cell holds the measure above.
+ * Two draws of identical inputs (data, camera, viewport, draw order, GPU
+ * stores) through the same drawing path give identical pixels, so a parity
+ * spec asserts exactly that and allows no tolerance. A pixel that differs is
+ * a defect, reported with how many differ, by how much, and where.
  */
-export const ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX = 1 / 1000;
-
-export const RASTERIZER_ROUNDING = Object.freeze({
-  maxDelta: 1,
-  // One pixel in twenty thousand of the lit pixels, at least one.
-  pixelsPerLitPixel: 1 / 20_000,
-});
 
 /**
  * Compare two RGBA buffers of the same size: how many pixels differ, by how
@@ -77,29 +43,15 @@ export function comparePixels(left, right, width) {
 }
 
 /**
- * Null when `report` ({lit, mismatched, maxDelta, first}) is within the
- * rasterizer's rounding, otherwise one line saying what exceeded it. A
- * report with any mismatch is also printed, so a CI log shows where rounding
- * occurred even when the capture passed.
+ * Null when `report` ({lit, mismatched, maxDelta, first}) shows no pixel that
+ * differs, otherwise one line saying how many differ, by how much at most and
+ * the first few with both values.
  */
 export function pixelParityVerdict(report, label = 'capture') {
   const { lit, mismatched, maxDelta } = report;
   if (mismatched === 0) return null;
-  if (isHostedMacosFirefox(test.info().project.name)) {
-    const detail = `${label}: ${mismatched} of ${lit} lit pixels differ, max delta ${maxDelta}`;
-    console.log(`[pixel-parity] ${detail}`);
-    return mismatched > lit * ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX ? `${detail}: too many for rounding on this renderer` : null;
-  }
-  const allowed = Math.max(1, Math.ceil(lit * RASTERIZER_ROUNDING.pixelsPerLitPixel));
-  const detail =
+  return (
     `${label}: ${mismatched} of ${lit} lit pixels differ, max delta ${maxDelta}, ` +
-    `first ${JSON.stringify(report.first ?? [])}`;
-  console.log(`[pixel-parity] ${detail}`);
-  if (maxDelta > RASTERIZER_ROUNDING.maxDelta) {
-    return `${detail}: a channel differs by more than ${RASTERIZER_ROUNDING.maxDelta}, which is not rasterizer rounding`;
-  }
-  if (mismatched > allowed) {
-    return `${detail}: more than ${allowed} pixels differ, which is not rasterizer rounding`;
-  }
-  return null;
+    `first ${JSON.stringify(report.first ?? [])}`
+  );
 }

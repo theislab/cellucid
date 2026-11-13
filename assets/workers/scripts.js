@@ -5,26 +5,26 @@
 import { workerScript } from '../js/workers/worker-script.js';
 
 /** @returns {URL} assets/js/data/anndata-reader-worker.js */
-export const annDataReaderWorkerScript = () => workerScript(import.meta.url, '../js/data/anndata-reader-worker.js', './anndata-reader-worker.8b30e8a00b6d.js');
+export const annDataReaderWorkerScript = () => workerScript(import.meta.url, '../js/data/anndata-reader-worker.js', './anndata-reader-worker.cd75b901c5ae.js');
 /** @returns {URL} assets/js/app/ui/modules/benchmark/generation-worker.js */
-export const benchmarkGenerationWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/benchmark/generation-worker.js', './generation-worker.015f46687ff4.js');
+export const benchmarkGenerationWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/benchmark/generation-worker.js', './generation-worker.6fc00613f42f.js');
 /** @returns {URL} assets/js/app/analysis/compute/data-worker.js */
-export const dataWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/compute/data-worker.js', './data-worker.aa78b4ff17e0.js');
+export const dataWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/compute/data-worker.js', './data-worker.ddeaa02ebb6e.js');
 /** @returns {URL} assets/js/formats/io/decode-worker.js */
-export const decodeWorkerScript = () => workerScript(import.meta.url, '../js/formats/io/decode-worker.js', './decode-worker.6f58d7974a95.js');
+export const decodeWorkerScript = () => workerScript(import.meta.url, '../js/formats/io/decode-worker.js', './decode-worker.4d42f68b5723.js');
 /** @returns {URL} assets/js/app/ui/modules/figure-export/utils/figure-export-worker.js */
-export const figureExportWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/figure-export/utils/figure-export-worker.js', './figure-export-worker.d11cc924d24c.js');
+export const figureExportWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/figure-export/utils/figure-export-worker.js', './figure-export-worker.57ecbe5dda80.js');
 /** @returns {URL} assets/js/formats/rds/gunzip-worker.js */
-export const gunzipWorkerScript = () => workerScript(import.meta.url, '../js/formats/rds/gunzip-worker.js', './gunzip-worker.1570154d01b1.js');
+export const gunzipWorkerScript = () => workerScript(import.meta.url, '../js/formats/rds/gunzip-worker.js', './gunzip-worker.70ea28391739.js');
 /** @returns {URL} assets/js/formats/text/matrix-market-entries.js */
-export const matrixMarketEntriesScript = () => workerScript(import.meta.url, '../js/formats/text/matrix-market-entries.js', './matrix-market-entries.5f1457fa6557.js');
+export const matrixMarketEntriesScript = () => workerScript(import.meta.url, '../js/formats/text/matrix-market-entries.js', './matrix-market-entries.bc009352d635.js');
 /** @returns {URL} assets/js/app/analysis/plots/point-raster-worker.js */
-export const pointRasterWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/plots/point-raster-worker.js', './point-raster-worker.70368d8ed712.js');
+export const pointRasterWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/plots/point-raster-worker.js', './point-raster-worker.cf4b350ae719.js');
 /** @returns {URL} assets/js/rendering/high-perf/spatial-tree-worker.js */
-export const spatialTreeWorkerScript = () => workerScript(import.meta.url, '../js/rendering/high-perf/spatial-tree-worker.js', './spatial-tree-worker.77bc0a8de978.js');
+export const spatialTreeWorkerScript = () => workerScript(import.meta.url, '../js/rendering/high-perf/spatial-tree-worker.js', './spatial-tree-worker.63392bd8b168.js');
 /** @returns {URL} assets/js/data/anndata/subset-entries.js */
 export const subsetEntriesScript = () => workerScript(import.meta.url, '../js/data/anndata/subset-entries.js', './subset-entries.831137776222.js');
 /** @returns {URL} assets/js/formats/zarr/encode-task.js */
-export const zarrEncodeTaskScript = () => workerScript(import.meta.url, '../js/formats/zarr/encode-task.js', './encode-task.5fe710f25013.js');
+export const zarrEncodeTaskScript = () => workerScript(import.meta.url, '../js/formats/zarr/encode-task.js', './encode-task.d0f2f224af11.js');
 /** @returns {URL} assets/wasm/codecs.wasm */
 export const codecsWasm = () => new URL('../wasm/codecs.wasm?v=e19ba7156cb8', import.meta.url);

@@ -9,7 +9,7 @@
  * (`popovertarget`), so the browser shows it in the top layer, puts it next in
  * the focus order after the button, and closes it on Escape or a press
  * outside. It is no modal dialog: the page stays usable while it is open
- * (F146; it used to state `aria-modal` and hold Tab in a hand-made trap).
+ * (no `aria-modal`, no hand-made Tab trap).
  */
 
 import {

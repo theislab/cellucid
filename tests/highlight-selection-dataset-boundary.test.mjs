@@ -24,17 +24,17 @@ import { getActionCatalog } from '../assets/js/app/actions/index.js';
 import { provideHighlightActions } from '../assets/js/app/ui/modules/highlight/highlight-actions.js';
 
 const MAIN_SOURCE_URL = new URL(
-  '../assets/js/app/main.js',
+  '../assets/js/app/dataset/publication.js',
   import.meta.url
 );
 
 // ---------------------------------------------------------------------------
-// main.js source ownership
+// The publication's source ownership (`app/dataset/publication.js`)
 // ---------------------------------------------------------------------------
 
 function sliceSource(source, startNeedle, endNeedle) {
   const start = source.indexOf(startNeedle);
-  assert.ok(start >= 0, `expected ${startNeedle} in main.js`);
+  assert.ok(start >= 0, `expected ${startNeedle} in the publication`);
   const end = source.indexOf(endNeedle, start);
   assert.ok(end > start, `expected ${endNeedle} after ${startNeedle}`);
   return source.slice(start, end);
@@ -50,7 +50,7 @@ function datasetReplacementRetirements(mainSource) {
   const retirement = sliceSource(
     mainSource,
     'function retireInProgressHighlightSelection',
-    '\n    function '
+    '\n  function '
   );
   const names = [
     ...retirement.matchAll(/viewer\.(\w+)\(\)/g)
@@ -537,7 +537,7 @@ test(
   async () => {
     const { state } = await runCrossDatasetLasso([]);
 
-    // CEL-AUDIT-0026 exactly: the renderer intersects dataset-B hits with
+    // The renderer intersects dataset-B hits with
     // dataset-A rows, every survivor is inside dataset B's bounds, and a
     // highlight group nobody selected is saved without a single rejection.
     assert.equal(state.savedGroups.length, 1);

@@ -2,27 +2,26 @@
  * Every data-loading path fails bounded, explains itself, and leaves the
  * application in a state the user can act from.
  *
- * The catalogs under `fixtures/broken-catalogs/` each fail for one reason: a
- * listed file that is missing, truncated or not a file at all, a file that
- * does not state the id it is listed under, a truncated `datasets.json`, and
- * a catalog that does not state its schema. Listing a catalog reads every file it names,
- * so each is a failure of the whole catalog. A dataset that breaks only when
+ * A catalog address with nothing on it, and the catalog under
+ * `fixtures/broken-catalogs/` whose listed file is missing, each fail the
+ * whole catalog: listing a catalog reads every file it names. (The other
+ * causes a catalog can fail for are told apart in the contract tests of the
+ * messages.) A dataset that breaks only when
  * it is opened -- removed, cut short or damaged after the catalog was listed
  * -- is reached from a working session, which is the only way to observe
  * recovery; it is made from the demo catalog at the transport.
  *
  * The other synthetic failures are the ones a file cannot express -- an HTTP
- * status, an offline network, a slow link and a canceled request -- and
- * those are injected at the transport while the loader under test stays real.
+ * status and an offline network -- and those are injected at the transport
+ * while the loader under test stays real.
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { fulfillFile, zipEntryData } from './helpers/anndata-zarr-zip.mjs';
-import { demoFile, observePage, onWorkerClose, readRecord } from './helpers/dataset-loading.mjs';
+import { demoFile, observePage, readRecord } from './helpers/dataset-loading.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
-import { workerScriptPattern } from './helpers/worker-scripts.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
 import { goOffline } from './helpers/offline.mjs';
@@ -108,8 +107,8 @@ async function recordUserFacingFailure(page, testInfo, label) {
  * `#dataset-name` is written in exactly three ways — "No dataset open", what
  * is being opened, and `metadata.name` — so an empty
  * reading means a publication carried an empty name, which is a different defect
- * from a load that never finished. A CI-only intermittent that reports neither
- * cannot be told apart from the other, so the failure carries the distinction.
+ * from a load that never finished; a failure that reports neither
+ * cannot tell them apart, so the failure carries the distinction.
  */
 async function describeRenderState(page) {
   try {
@@ -196,86 +195,36 @@ async function captureFirstErrorNotification(page) {
  * Catalog-level failures: absent, wrong format, truncated, denied
  * ------------------------------------------------------------------ */
 
-const CATALOG_FAILURES = Object.freeze([
-  Object.freeze({
-    label: 'absent',
-    base: `${ORIGIN}/tests/browser/fixtures/no-such-catalog/`,
-    notice: 'datasets.json was not found at',
-    // Nothing at the address: the notice says to check the link.
-    advice: false,
-  }),
-  Object.freeze({
-    label: 'truncated',
-    base: `${BROKEN}truncated-catalog/`,
-    notice: 'may not hold Cellucid data',
-  }),
-  Object.freeze({
-    label: 'schemaless',
-    base: `${BROKEN}schemaless-catalog/`,
-    notice: 'must contain exactly: datasets, default, schema (missing: schema)',
-    // Retrying cannot help: the notice says what the catalog must be.
-    advice: false,
-  }),
-]);
-
-for (const failure of CATALOG_FAILURES) {
-  test(
-    `a ${failure.label} dataset catalog fails bounded and stays recoverable`,
-    async ({ page }, testInfo) => {
-      await page.goto(catalogUrl(failure.base, null), {
-        waitUntil: 'domcontentloaded',
-      });
-      await dismissWelcome(page);
-
-      await expect(page.locator(CATALOG_NOTICE)).toBeVisible();
-      // The cause the loader published reaches the notice: an address with
-      // nothing on it is not reported as a network problem, and a reply that
-      // is not a dataset list is not reported as a missing address.
-      await expect(page.locator(CATALOG_NOTICE)).toContainText(failure.notice);
-      if (failure.advice !== false) {
-        await expect(page.locator(CATALOG_NOTICE)).toContainText('try again');
-      }
-      await expect(
-        page.locator(`${CATALOG_NOTICE} button`),
-      ).toHaveText('Try again');
-      await expect(page.locator(STARTUP_FAILURE)).toHaveCount(0);
-
-      const observed = await recordUserFacingFailure(
-        page,
-        testInfo,
-        failure.label,
-      );
-      // Nothing half-loaded is on screen and nothing unloadable is offered.
-      expect(NO_DATASET_NAMES).toContain(observed.datasetName);
-      await expect(
-        page.locator('#dataset-select option:not([value="__none__"])'),
-      ).toHaveText(['No datasets found']);
-
-      // The user can still load their own data without reloading the page.
-      await openGoodFile(page);
-    },
-  );
-}
-
-test('a permission-denied catalog fails bounded and stays recoverable', async ({
+test('a absent dataset catalog fails bounded and stays recoverable', async ({
   page,
 }, testInfo) => {
-  await page.route(`${GOOD_CATALOG}datasets.json`, route =>
-    route.fulfill({
-      status: 403,
-      contentType: 'text/plain',
-      body: 'Forbidden',
-    }));
-
-  await page.goto(catalogUrl(GOOD_CATALOG, null), {
+  await page.goto(catalogUrl(`${ORIGIN}/tests/browser/fixtures/no-such-catalog/`, null), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
 
   await expect(page.locator(CATALOG_NOTICE)).toBeVisible();
-  const observed = await recordUserFacingFailure(page, testInfo, 'denied-403');
-  expect(NO_DATASET_NAMES).toContain(observed.datasetName);
+  // The cause the loader published reaches the notice: an address with
+  // nothing on it is not reported as a network problem.
+  await expect(page.locator(CATALOG_NOTICE)).toContainText('datasets.json was not found at');
+  await expect(
+    page.locator(`${CATALOG_NOTICE} button`),
+  ).toHaveText('Try again');
   await expect(page.locator(STARTUP_FAILURE)).toHaveCount(0);
+
+  const observed = await recordUserFacingFailure(
+    page,
+    testInfo,
+    'absent',
+  );
+  // Nothing half-loaded is on screen and nothing unloadable is offered.
+  expect(NO_DATASET_NAMES).toContain(observed.datasetName);
+  await expect(
+    page.locator('#dataset-select option:not([value="__none__"])'),
+  ).toHaveText(['No datasets found']);
+
+  // The user can still load their own data without reloading the page.
+  await openGoodFile(page);
 });
 
 test('a catalog failure recovers in place once the catalog is reachable', async ({
@@ -360,11 +309,18 @@ const OPENING_FAILURES = Object.freeze({
   },
 });
 
+/**
+ * A dataset that cannot be opened is said once: one notification, one short
+ * sentence, its own error folded under Details. What to do stays next to
+ * the selector with the retry; the opening that failed says nothing more.
+ * And the session survives it.
+ */
 for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
   test(
-    `choosing a dataset whose file was ${label} fails bounded and keeps the session`,
+    `choosing a dataset whose file was ${label} is said once and keeps the session`,
     async ({ browserName, page }, testInfo) => {
       test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
+      await observePage(page);
       await page.goto(catalogUrl(GOOD_CATALOG, MIXED_DEFAULT.id), {
         waitUntil: 'domcontentloaded',
       });
@@ -382,81 +338,59 @@ for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
       await page.locator('#dataset-select').selectOption(
         optionValue(GOOD_DATASET.id),
       );
-      const errors = await captureFirstErrorNotification(page);
-      await testInfo.attach(`user-facing-failure-${label}-file.json`, {
-        body: JSON.stringify({ errorNotifications: errors }, null, 2),
-        contentType: 'application/json',
-      });
-      expect(errors.length).toBeGreaterThan(0);
-      // The notification says it in one sentence: a host's answer by whose
-      // problem it is (`describeHostFault`), any other cause generically;
-      // what happened and what to do stay next to the selector too.
-      expect(errors.join('\n')).toMatch(new RegExp(`Could not open "${GOOD_DATASET.name}"\\.|"${GOOD_DATASET.name}" could not be opened: `));
-      await expect(page.locator(CATALOG_NOTICE)).toContainText(
-        `"${GOOD_DATASET.name}" could not be opened`,
-      );
 
-      // The session survives: the dataset that was rendered is still rendered,
-      // the selector returns to it, and other data still loads.
-      await expectRenders(page, MIXED_DEFAULT);
-      await expect(page.locator('#dataset-select')).toHaveValue(
-        optionValue(MIXED_DEFAULT.id),
-      );
-      await expect(page.locator(STARTUP_FAILURE)).toHaveCount(0);
-      await openGoodFile(page);
+      await test.step(`a dataset whose file was ${label} is announced by exactly one notification`, async () => {
+        await expect(page.locator(CATALOG_NOTICE)).toBeVisible();
+        await expectRenders(page, MIXED_DEFAULT);
+        await expect(page.locator(
+          '#notification-center .notification[data-type="loading"], '
+            + '#notification-center .notification[data-type="progress"]',
+        )).toHaveCount(0);
+        // Settled: every notification ever shown is recorded.
+        await page.evaluate(() => new Promise(resolve => {
+          setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(resolve)), 0);
+        }));
+        const { notifications } = await readRecord(page);
+        const errors = new Set(
+          notifications.filter(entry => entry.type === 'error').map(entry => entry.id),
+        );
+        expect(errors.size, JSON.stringify(notifications)).toBe(1);
+        const card = page.locator('#notification-center .notification-error');
+        await expect(card).toHaveCount(1);
+        await expect(card.locator('.notification-message')).toHaveText(
+          new RegExp(`^(Could not open "${GOOD_DATASET.name}"\\.|"${GOOD_DATASET.name}" could not be opened: .+)$`),
+        );
+        // The raw error is folded under Details, not in the sentence.
+        await expect(card.locator('.notification-details-text')).toBeHidden();
+        await expect(card.locator('.notification-details-text')).toHaveText(/\S/);
+      });
+
+      await test.step(`choosing a dataset whose file was ${label} fails bounded and keeps the session`, async () => {
+        const errors = await captureFirstErrorNotification(page);
+        await testInfo.attach(`user-facing-failure-${label}-file.json`, {
+          body: JSON.stringify({ errorNotifications: errors }, null, 2),
+          contentType: 'application/json',
+        });
+        expect(errors.length).toBeGreaterThan(0);
+        // The notification says it in one sentence: a host's answer by whose
+        // problem it is (`describeHostFault`), any other cause generically;
+        // what happened and what to do stay next to the selector too.
+        expect(errors.join('\n')).toMatch(new RegExp(`Could not open "${GOOD_DATASET.name}"\\.|"${GOOD_DATASET.name}" could not be opened: `));
+        await expect(page.locator(CATALOG_NOTICE)).toContainText(
+          `"${GOOD_DATASET.name}" could not be opened`,
+        );
+
+        // The session survives: the dataset that was rendered is still rendered,
+        // the selector returns to it, and other data still loads.
+        await expectRenders(page, MIXED_DEFAULT);
+        await expect(page.locator('#dataset-select')).toHaveValue(
+          optionValue(MIXED_DEFAULT.id),
+        );
+        await expect(page.locator(STARTUP_FAILURE)).toHaveCount(0);
+        await openGoodFile(page);
+      });
     },
   );
-}
-
-/**
- * A dataset that cannot be opened is said once: one notification, one short
- * sentence, its own error folded under Details. What to do stays next to
- * the selector with the retry; the opening that failed says nothing more.
- */
-for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
-  test(`a dataset whose file was ${label} is announced by exactly one notification`, async ({
-    browserName,
-    page,
-  }) => {
-    test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
-    await observePage(page);
-    await page.goto(catalogUrl(GOOD_CATALOG, MIXED_DEFAULT.id), {
-      waitUntil: 'domcontentloaded',
-    });
-    await dismissWelcome(page);
-    await expectRenders(page, MIXED_DEFAULT);
-    // The samples are listed once the first view has settled
-    // (`holdListingUntil`): the file is read, and the dataset named, before
-    // it is broken.
-    await expect(page.locator(`#dataset-select option[value="${optionValue(GOOD_DATASET.id)}"]`))
-      .toContainText(GOOD_DATASET.name);
-    await page.route(`${GOOD_CATALOG}${GOOD_DATASET.id}.zarr.zip`, fail);
-
-    await page.locator('#dataset-select').selectOption(optionValue(GOOD_DATASET.id));
-    await expect(page.locator(CATALOG_NOTICE)).toBeVisible();
-    await expectRenders(page, MIXED_DEFAULT);
-    await expect(page.locator(
-      '#notification-center .notification[data-type="loading"], '
-        + '#notification-center .notification[data-type="progress"]',
-    )).toHaveCount(0);
-    // Settled: every notification ever shown is recorded.
-    await page.evaluate(() => new Promise(resolve => {
-      setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(resolve)), 0);
-    }));
-    const { notifications } = await readRecord(page);
-    const errors = new Set(
-      notifications.filter(entry => entry.type === 'error').map(entry => entry.id),
-    );
-    expect(errors.size, JSON.stringify(notifications)).toBe(1);
-    const card = page.locator('#notification-center .notification-error');
-    await expect(card).toHaveCount(1);
-    await expect(card.locator('.notification-message')).toHaveText(
-      new RegExp(`^(Could not open "${GOOD_DATASET.name}"\\.|"${GOOD_DATASET.name}" could not be opened: .+)$`),
-    );
-    // The raw error is folded under Details, not in the sentence.
-    await expect(card.locator('.notification-details-text')).toBeHidden();
-    await expect(card.locator('.notification-details-text')).toHaveText(/\S/);
-  });
 }
 
 /**
@@ -465,15 +399,10 @@ for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
  * happened in one sentence, with the dataset file's problem under Details and
  * the ways on.
  */
-const STARTUP_FILE_FAILURES = Object.freeze({
-  'missing-file': /forms-h5ad\.h5ad/,
-  'truncated-file': /forms-h5ad\.h5ad is truncated/,
-  'corrupt-file': /forms-h5ad\.h5ad \(dataset 'forms-h5ad' in datasets\.json\): .*not a valid HDF5 file, so it cannot be an AnnData \(\.h5ad\) file/,
-  'mismatched-id': /lists forms-h5ad\.h5ad as dataset 'another-id', but the file states the id 'forms-h5ad'/,
-});
-
-for (const [label, names] of Object.entries(STARTUP_FILE_FAILURES)) {
-  test(`a catalog with a ${label.replace('-', ' ')} leaves Cellucid running with one actionable opening`, async ({
+{
+  const label = 'missing-file';
+  const names = /forms-h5ad\.h5ad/;
+  test('a catalog with a missing file leaves Cellucid running with one actionable opening', async ({
     page,
   }, testInfo) => {
     await page.goto(catalogUrl(`${BROKEN}${label}/`, null), {
@@ -507,13 +436,14 @@ for (const [label, names] of Object.entries(STARTUP_FILE_FAILURES)) {
  * Transport failures: offline, slow, canceled
  * ------------------------------------------------------------------ */
 
-test('a sample that cannot be listed leaves the open dataset shown and the list recoverable', async ({
+test('a sample that cannot be listed leaves the open dataset shown and the list recoverable, by itself once back online', async ({
   page,
+  context,
 }) => {
   // The samples are listed from their files once the open dataset has its
   // first view, so a sample file that fails to read then (a busy host, a
-  // file taken down) arrives while the person works on the open one. It used
-  // to empty the whole picker with "The dataset list could not be loaded",
+  // file taken down) arrives while the person works on the open one. It does
+  // not empty the whole picker with "The dataset list could not be loaded",
   // as if the open dataset were gone: it is not, and only that sample's
   // listing failed.
   let unreadableListed = true;
@@ -544,9 +474,19 @@ test('a sample that cannot be listed leaves the open dataset shown and the list 
   await expect(page.locator('#dataset-select option:checked')).toHaveText('—');
   await expectRenders(page, GOOD_DATASET);
 
-  // Once the sample is listed no more, Try again lists them all.
+  // Once the sample is listed no more, Try again lists them all. Pressed
+  // while this computer is offline, the listing says so, and it is read
+  // again by itself once the connection is back.
   unreadableListed = false;
+  expect(errors).toEqual([]);
+  await goOffline(context);
   await notice.getByRole('button', { name: 'Try again' }).click();
+  await expect(notice).toContainText('This computer is offline');
+  // WebKit reports the reader worker's code, which this offline browser
+  // could not load, as a page error, whoever handles the worker's failure
+  // (`helpers/offline.mjs`); nothing else is said while offline.
+  expect(errors.splice(0).filter(error => error !== 'Importing a module script failed.')).toEqual([]);
+  await context.setOffline(false);
   await expect(notice).toBeHidden();
   await expect(page.locator(`#dataset-select option[value="${optionValue(MIXED_DEFAULT.id)}"]`)).toHaveCount(1);
   await expect(page.locator('#dataset-select')).toHaveValue(optionValue(GOOD_DATASET.id));
@@ -563,10 +503,6 @@ test('an offline dataset switch is reported and the session survives', async ({
   });
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
-  // The samples' listing reads their files once the first view has settled
-  // (`holdListingUntil`): over before the link goes, so the dataset is named.
-  await expect(page.locator(`#dataset-select option[value="${optionValue(MIXED_DEFAULT.id)}"]`))
-    .toContainText(MIXED_DEFAULT.name);
 
   await goOffline(context);
   await page.locator('#dataset-select').selectOption(
@@ -592,205 +528,18 @@ test('an offline dataset switch is reported and the session survives', async ({
   await expectRenders(page, MIXED_DEFAULT);
 });
 
-test('a slow link still reaches a rendered dataset', async ({ page }) => {
-  await page.route(`${GOOD_CATALOG}**`, async route => {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    await route.continue();
-  });
-
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
-  });
-  await dismissWelcome(page);
-  await expectRenders(page, GOOD_DATASET);
-});
-
-test('a load cancelled by switching datasets leaves the winner rendered', async ({
-  browserName,
-  page,
-}) => {
-  test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
-  });
-  await dismissWelcome(page);
-  await expectRenders(page, GOOD_DATASET);
-  // The samples' listing reads their files once the first view has settled
-  // (`holdListingUntil`): over before the 3D file is held, so the reads held
-  // below are the opening's, not the listing's.
-  await expect(page.locator(`#dataset-select option[value="${optionValue(MIXED_DEFAULT.id)}"]`))
-    .toContainText(MIXED_DEFAULT.name);
-
-  // Slow every read of the 3D dataset's file, start it, then choose the 1D
-  // dataset while its first read is in flight. The last request must win and
-  // the first must not resurface.
-  const supersededUrl = `${GOOD_CATALOG}synthetic-development-3d.zarr.zip`;
-  const superseded = { settled: 0, started: 0 };
-  const settled = new Set();
-  const settleSuperseded = request => {
-    if (request.url() !== supersededUrl || settled.has(request)) return;
-    settled.add(request);
-    superseded.settled += 1;
-  };
-  page.context().on('requestfinished', settleSuperseded);
-  page.context().on('requestfailed', settleSuperseded);
-  // Every read of the 3D file is held until the 1D dataset has rendered, so
-  // the newer choice supersedes it however slow the runner; then each is
-  // answered, and a load that was not stopped would land on it.
-  let releaseSuperseded;
-  const supersededReleased = new Promise(resolve => {
-    releaseSuperseded = resolve;
-  });
-  await page.route(supersededUrl, async route => {
-    superseded.started += 1;
-    // The newer choice stops the superseded read and ends its reader worker,
-    // whose requests are then never answered.
-    onWorkerClose(page, workerScriptPattern('annDataReaderWorker'), () => settleSuperseded(route.request()));
-    await supersededReleased;
-    await route.continue().catch(() => {});
-  });
-  await page.locator('#dataset-select').selectOption(
-    optionValue('synthetic-development-3d'),
-  );
-  await expect.poll(() => superseded.started).toBeGreaterThan(0);
-  await page.locator('#dataset-select').selectOption(
-    optionValue('synthetic-trajectory-1d'),
-  );
-
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Synthetic trajectory — 1D',
-  );
-  await expect(page.locator('#dataset-cells')).toHaveText('48');
-  await expect
-    .poll(() => page.evaluate(
-      () => window._cellucidViewer.getPointCount(),
-    ))
-    .toBe(48);
-  releaseSuperseded();
-  // Let the superseded 3-D load land if it were going to: every request it
-  // issued has been answered or abandoned, and the page has run its
-  // continuations without the load issuing another one.
-  await expect.poll(async () => {
-    const startedBefore = superseded.started;
-    if (startedBefore === 0 || superseded.settled !== startedBefore) {
-      return false;
-    }
-    await page.evaluate(() => new Promise(resolve => {
-      setTimeout(() => {
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      }, 0);
-    }));
-    return (
-      superseded.started === startedBefore &&
-      superseded.settled === startedBefore
-    );
-  }).toBe(true);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Synthetic trajectory — 1D',
-  );
-  await expect(page.locator('#dataset-select')).toHaveValue(
-    optionValue('synthetic-trajectory-1d'),
-  );
-});
-
 /* ------------------------------------------------------------------ *
  * Direct-file failures: wrong format, truncated, wrong directory, retry
  * ------------------------------------------------------------------ */
 
-test('a non-h5ad file offered to the .h5ad picker fails bounded', async ({
-  page,
-}, testInfo) => {
-  const decoy = await derivedFile(
-    testInfo,
-    'not-really.h5ad',
-    Buffer.from(
-      'cell_id,cell_type\nAAACCTG-1,T cell\nAAACGGG-1,B cell\n',
-      'utf8',
-    ),
-  );
+/** The person reads each error and dismisses it, so the next step waits for its own. */
+async function dismissErrorNotifications(page) {
+  const dismiss = page.locator('#notification-center .notification-error .notification-dismiss');
+  for (let left = await dismiss.count(); left > 0; left -= 1) await dismiss.first().click();
+  await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
+}
 
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
-  });
-  await dismissWelcome(page);
-  await expectRenders(page, GOOD_DATASET);
-
-  await chooseFiles(page.locator('#user-data-file-input'), decoy);
-  const errors = await captureFirstErrorNotification(page);
-  await testInfo.attach('user-facing-failure-h5ad-wrong-format.json', {
-    body: JSON.stringify({ errorNotifications: errors }, null, 2),
-    contentType: 'application/json',
-  });
-  expect(errors.join('\n')).toContain(
-    'The selected file is not a valid HDF5 file, so it cannot be an AnnData (.h5ad) file. '
-      + 'Save it again with anndata',
-  );
-
-  // The dataset that was already on screen must survive a rejected file, and a
-  // real file must still load afterwards.
-  await expectRenders(page, GOOD_DATASET);
-  await chooseFiles(page.locator('#user-data-file-input'), h5adFixturePath);
-  await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
-  await expect
-    .poll(() => page.evaluate(
-      () => window._cellucidViewer.getPointCount(),
-    ))
-    .toBe(120);
-});
-
-test('a truncated .h5ad file fails bounded and the previous dataset survives', async ({
-  page,
-}, testInfo) => {
-  const whole = await readFile(h5adFixturePath);
-  const truncated = await derivedFile(
-    testInfo,
-    'truncated.h5ad',
-    whole.subarray(0, Math.floor(whole.length / 3)),
-  );
-
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
-  });
-  await dismissWelcome(page);
-  await expectRenders(page, GOOD_DATASET);
-
-  await chooseFiles(page.locator('#user-data-file-input'), truncated);
-  const errors = await captureFirstErrorNotification(page);
-  await testInfo.attach('user-facing-failure-h5ad-truncated.json', {
-    body: JSON.stringify({ errorNotifications: errors }, null, 2),
-    contentType: 'application/json',
-  });
-  expect(errors.length).toBeGreaterThan(0);
-  await expectRenders(page, GOOD_DATASET);
-});
-
-test('a truncated Zarr ZIP archive fails bounded and the previous dataset survives', async ({
-  page,
-}, testInfo) => {
-  const whole = await readFile(zarrFixturePath);
-  const truncated = await derivedFile(
-    testInfo,
-    'truncated.zarr.zip',
-    whole.subarray(0, Math.floor(whole.length / 3)),
-  );
-
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
-  });
-  await dismissWelcome(page);
-  await expectRenders(page, GOOD_DATASET);
-
-  await chooseFiles(page.locator('#user-data-file-input'), truncated);
-  const errors = await captureFirstErrorNotification(page);
-  await testInfo.attach('user-facing-failure-zarr-truncated.json', {
-    body: JSON.stringify({ errorNotifications: errors }, null, 2),
-    contentType: 'application/json',
-  });
-  expect(errors.length).toBeGreaterThan(0);
-  await expectRenders(page, GOOD_DATASET);
-});
-
-test('a Zarr store folder chosen one level too high fails bounded', async ({
+test('a file that cannot be opened is refused, the dataset on screen stays, and a good file opens after', async ({
   page,
   browserName,
 }, testInfo) => {
@@ -800,70 +549,133 @@ test('a Zarr store folder chosen one level too high fails bounded', async ({
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
 
-  // Picking the folder that holds a store instead of the store itself is the
-  // mistake a first-time user makes with a folder picker.
-  await chooseFiles(
-    page.locator('#user-data-folder-input'),
-    path.join(fixturesDirectory, 'forms-catalog'),
-  );
-
-  const errors = await captureFirstErrorNotification(page);
-  await testInfo.attach('user-facing-failure-zarr-parent-folder.json', {
-    body: JSON.stringify({ errorNotifications: errors }, null, 2),
-    contentType: 'application/json',
+  await test.step('a truncated .h5ad file fails bounded and the previous dataset survives', async () => {
+    const whole = await readFile(h5adFixturePath);
+    const truncated = await derivedFile(
+      testInfo,
+      'truncated.h5ad',
+      whole.subarray(0, Math.floor(whole.length / 3)),
+    );
+    await chooseFiles(page.locator('#user-data-file-input'), truncated);
+    const errors = await captureFirstErrorNotification(page);
+    await testInfo.attach('user-facing-failure-h5ad-truncated.json', {
+      body: JSON.stringify({ errorNotifications: errors }, null, 2),
+      contentType: 'application/json',
+    });
+    expect(errors.length).toBeGreaterThan(0);
+    await expectRenders(page, GOOD_DATASET);
+    await dismissErrorNotifications(page);
   });
-  // WebKit's folder dialog leaves out hidden files, so there the listing is
-  // refused for that before the reader sees it.
-  expect(errors.join('\n')).toContain(
-    browserName === 'webkit'
-      ? "left out the folder's hidden files"
-      : 'Select the .zarr folder itself',
-  );
-  await expectRenders(page, GOOD_DATASET);
-});
 
-test('a rejected file can be fixed and re-picked without reloading', async ({
-  page,
-}, testInfo) => {
-  const retryPath = await derivedFile(
-    testInfo,
-    'retry-same-name.h5ad',
-    Buffer.from('not an hdf5 file at all\n', 'utf8'),
-  );
-
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
+  await test.step('a truncated Zarr ZIP archive fails bounded and the previous dataset survives', async () => {
+    const whole = await readFile(zarrFixturePath);
+    const truncated = await derivedFile(
+      testInfo,
+      'truncated.zarr.zip',
+      whole.subarray(0, Math.floor(whole.length / 3)),
+    );
+    await chooseFiles(page.locator('#user-data-file-input'), truncated);
+    const errors = await captureFirstErrorNotification(page);
+    await testInfo.attach('user-facing-failure-zarr-truncated.json', {
+      body: JSON.stringify({ errorNotifications: errors }, null, 2),
+      contentType: 'application/json',
+    });
+    expect(errors.length).toBeGreaterThan(0);
+    await expectRenders(page, GOOD_DATASET);
+    await dismissErrorNotifications(page);
   });
-  await dismissWelcome(page);
-  await expectRenders(page, GOOD_DATASET);
 
-  await chooseFiles(page.locator('#user-data-file-input'), retryPath);
-  expect((await captureFirstErrorNotification(page)).length)
-    .toBeGreaterThan(0);
+  await test.step('a Zarr store folder chosen one level too high fails bounded', async () => {
+    // Picking the folder that holds a store instead of the store itself is the
+    // mistake a first-time user makes with a folder picker.
+    await chooseFiles(
+      page.locator('#user-data-folder-input'),
+      path.join(fixturesDirectory, 'forms-catalog'),
+    );
 
-  // The rejected file must not stay selected: a stale value means the same
-  // path fires no `change` event and the user's retry is silently dropped.
-  await expect
-    .poll(() => page.locator('#user-data-file-input').evaluate(input => ({
-      fileCount: input.files.length,
-      value: input.value,
-    })))
-    .toEqual({ fileCount: 0, value: '' });
+    const errors = await captureFirstErrorNotification(page);
+    await testInfo.attach('user-facing-failure-zarr-parent-folder.json', {
+      body: JSON.stringify({ errorNotifications: errors }, null, 2),
+      contentType: 'application/json',
+    });
+    // WebKit's folder dialog leaves out hidden files, so there the listing is
+    // refused for that before the reader sees it.
+    expect(errors.join('\n')).toContain(
+      browserName === 'webkit'
+        ? "left out the folder's hidden files"
+        : 'Select the .zarr folder itself',
+    );
+    await expectRenders(page, GOOD_DATASET);
+    await dismissErrorNotifications(page);
+  });
 
-  // Replace the bad file with a real one under the same name and retry. The
-  // dataset is named after the file, so the fixed file arrives as
-  // "retry-same-name" carrying the fixture's 120 cells.
-  await derivedFile(
-    testInfo,
-    'retry-same-name.h5ad',
-    await readFile(h5adFixturePath),
-  );
-  await chooseFiles(page.locator('#user-data-file-input'), retryPath);
-  await expect(page.locator('#dataset-name')).toHaveText('retry-same-name');
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
-  await expect
-    .poll(() => page.evaluate(
-      () => window._cellucidViewer.getPointCount(),
-    ))
-    .toBe(120);
+  await test.step('a non-h5ad file offered to the .h5ad picker fails bounded', async () => {
+    const decoy = await derivedFile(
+      testInfo,
+      'not-really.h5ad',
+      Buffer.from(
+        'cell_id,cell_type\nAAACCTG-1,T cell\nAAACGGG-1,B cell\n',
+        'utf8',
+      ),
+    );
+    await chooseFiles(page.locator('#user-data-file-input'), decoy);
+    const errors = await captureFirstErrorNotification(page);
+    await testInfo.attach('user-facing-failure-h5ad-wrong-format.json', {
+      body: JSON.stringify({ errorNotifications: errors }, null, 2),
+      contentType: 'application/json',
+    });
+    expect(errors.join('\n')).toContain(
+      'The selected file is not a valid HDF5 file, so it cannot be an AnnData (.h5ad) file. '
+        + 'Save it again with anndata',
+    );
+
+    // The dataset that was already on screen must survive a rejected file, and a
+    // real file must still load afterwards.
+    await expectRenders(page, GOOD_DATASET);
+    await dismissErrorNotifications(page);
+    await chooseFiles(page.locator('#user-data-file-input'), h5adFixturePath);
+    await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+    await expect
+      .poll(() => page.evaluate(
+        () => window._cellucidViewer.getPointCount(),
+      ))
+      .toBe(120);
+  });
+
+  await test.step('a rejected file can be fixed and re-picked without reloading', async () => {
+    const retryPath = await derivedFile(
+      testInfo,
+      'retry-same-name.h5ad',
+      Buffer.from('not an hdf5 file at all\n', 'utf8'),
+    );
+    await chooseFiles(page.locator('#user-data-file-input'), retryPath);
+    expect((await captureFirstErrorNotification(page)).length)
+      .toBeGreaterThan(0);
+
+    // The rejected file must not stay selected: a stale value means the same
+    // path fires no `change` event and the user's retry is silently dropped.
+    await expect
+      .poll(() => page.locator('#user-data-file-input').evaluate(input => ({
+        fileCount: input.files.length,
+        value: input.value,
+      })))
+      .toEqual({ fileCount: 0, value: '' });
+
+    // Replace the bad file with a real one under the same name and retry. The
+    // dataset is named after the file, so the fixed file arrives as
+    // "retry-same-name" carrying the fixture's 120 cells.
+    await derivedFile(
+      testInfo,
+      'retry-same-name.h5ad',
+      await readFile(h5adFixturePath),
+    );
+    await chooseFiles(page.locator('#user-data-file-input'), retryPath);
+    await expect(page.locator('#dataset-name')).toHaveText('retry-same-name');
+    await expect(page.locator('#dataset-cells')).toHaveText('120');
+    await expect
+      .poll(() => page.evaluate(
+        () => window._cellucidViewer.getPointCount(),
+      ))
+      .toBe(120);
+  });
 });

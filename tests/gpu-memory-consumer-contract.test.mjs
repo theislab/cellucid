@@ -90,7 +90,7 @@ test('situation reporter distinguishes exact renderer memory from its pre-public
 
   // Before publication the estimate follows what the points renderer stores
   // per cell: 4 bytes per position axis, 4 of RGBA color and 1 of alpha —
-  // 13 B in 2D and 17 B in 3D, as measured; an unknown dimension counts as 3D.
+  // 13 B in 2D and 17 B in 3D; an unknown dimension counts as 3D.
   for (const [dimension, bytesPerPoint] of [[2, 13], [3, 17], [null, 17]]) {
     const estimated = reporter._collectRendererSnapshot(null, {
       dataset: { pointCount: 100, dimension },
@@ -162,14 +162,14 @@ test('situation-report memory findings identify exact and estimated values truth
 
 test('main benchmark panel consumes exact renderer memory and labels only the pre-render fallback as an estimate', async () => {
   const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
+    new URL('../assets/js/app/ui/modules/benchmark/benchmark-controls.js', import.meta.url),
     'utf8',
   );
   const helperStart = mainSource.indexOf(
     'function formatBenchmarkGpuMemory',
   );
   const helperEnd = mainSource.indexOf(
-    '// The base URL of the dataset shown',
+    'export function initBenchmarkControls(',
     helperStart,
   );
   assert.ok(helperStart >= 0 && helperEnd > helperStart);

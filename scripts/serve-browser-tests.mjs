@@ -260,16 +260,15 @@ async function serve(request, response) {
 
 // A request that never reaches the client is one test's problem. A server that
 // stops listening is every later test's problem, and it reports as
-// `ERR_CONNECTION_REFUSED` in specs that have nothing to do with the cause --
-// which is what a whole batch of community-annotation tests failing after the
-// twenty-eighth one looked like. Nothing a client does may end this process.
+// `ERR_CONNECTION_REFUSED` in specs that have nothing to do with the cause.
+// Nothing a client does may end this process.
 //
-// Two things could. `serve` is `async`, so anything it threw after the request
-// was aborted -- writing a head to a socket the client had already reset, which
-// is exactly what the publication-abort specs do on purpose -- became an
-// unhandled rejection, and an unhandled rejection ends a Node process. And the
-// bind-failure handler was registered permanently rather than for the bind, so
-// any later server error called `process.exit(1)` through it.
+// Two things could. `serve` is `async`, so anything it throws after the request
+// is aborted -- writing a head to a socket the client has already reset, which
+// is exactly what the publication-abort specs do on purpose -- would be an
+// unhandled rejection, and an unhandled rejection ends a Node process. And a
+// bind-failure handler registered permanently rather than for the bind would
+// call `process.exit(1)` on any later server error.
 function handle(request, response) {
   const abandon = () => {
     if (!response.destroyed) response.destroy();
@@ -302,7 +301,7 @@ const sampleServer = createServer(handle);
 // Node closes an idle keep-alive connection after five seconds by default. A
 // client that reuses that connection at the same moment gets `ECONNRESET`;
 // browsers retry such a request transparently, but Playwright's `route.fetch`
-// does not, so a spec proxying through it failed at random. Idle connections
+// does not, so a spec proxying through it would fail at random. Idle connections
 // are kept far longer than any spec waits between requests, and the header
 // deadline must exceed the keep-alive one.
 for (const activeServer of [server, sampleServer]) {
@@ -326,8 +325,8 @@ function reportListenFailure(error, role, listenPort, variable) {
   // closed (one still binding is closed when it binds, in listenOnce) and the
   // process ends with status 1 once nothing holds it. Not process.exit():
   // Node can deadlock there, joining a V8 background thread that waits for a
-  // garbage collection only the exiting main thread could run (measured with
-  // the token validator: 7 of 60 failing runs hung).
+  // garbage collection only the exiting main thread could run (measured:
+  // 38_decisions_testing_and_hosted_runners.md).
   bindFailed = true;
   process.exitCode = 1;
   for (const activeServer of [server, sampleServer]) {

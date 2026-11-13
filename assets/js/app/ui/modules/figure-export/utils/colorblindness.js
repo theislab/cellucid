@@ -5,11 +5,10 @@
  * Fernandes (2009, "A Physiologically-based Model for Simulation of Color
  * Vision Deficiency", IEEE TVCG 15(6)), a 3×3 matrix that applies to
  * *linear* RGB: a pixel is decoded from sRGB, transformed, and encoded again.
- * The matrices used before (2026-11-11, R9U-2) were the old "Coblis"
- * approximation applied to the encoded values: they showed vivid cerulean
- * and iris purple, the default palette's second and tenth colors, as plainly
- * different under deuteranopia, where they look the same (ΔE2000 1.0), so a
- * figure that a red–green colorblind reader cannot read passed the preview.
+ * Applying a matrix to the encoded values instead (the old "Coblis"
+ * approximation) shows colors as plainly different that a red–green
+ * colorblind reader cannot tell apart, so a figure they cannot read would
+ * pass the preview (36_decisions_figure_export.md).
  *
  * Preview-only: the exported figure keeps its colors.
  *

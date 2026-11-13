@@ -229,7 +229,7 @@ const PROGRAM_KINDS = ['w1', 'w2', 'w3', 'highlight'];
 export class GpuPermuter {
   /**
    * @param {WebGL2RenderingContext} gl
-   * @param {(refusal: string, allocate: () => void) => void} [allocateGpu] -
+   * @param {(refusal: string, allocate: () => void, options?: {onError?: Function|null}) => void} [allocateGpu] -
    *   Runs one allocation and reports a refusal (the renderer's
    *   `_allocateGpu`, which releases memory kept only for speed and retries).
    * @param {{chunkPoints?: number}} [options] - `chunkPoints`: points a pass
@@ -677,7 +677,7 @@ export class GpuPermuter {
    * page goes on, and the first pass that needs one only reads its status.
    * A program compiled on first use instead holds that pass's task for the
    * whole compile (a 10M tree's adoption, or a highlight of millions of
-   * cells: 90-190 ms the first time a machine compiles them).
+   * cells; measured: 28_decisions_rendering_layers.md).
    *
    * @param {string[]} kinds
    */
@@ -905,9 +905,9 @@ export class GpuPermuter {
   /**
    * Put the source words into an R32UI linear texture, one texel a word. One
    * channel keeps the upload native on every backend (Metal has no
-   * three-channel 32-bit format, so RGB32UI would be converted on the CPU:
-   * 50 ms against 13 ms for 10M 3D points). Words in a GPU buffer are copied
-   * from it on the GPU.
+   * three-channel 32-bit format, so RGB32UI would be converted on the CPU,
+   * several times slower; measured: 28_decisions_rendering_layers.md). Words
+   * in a GPU buffer are copied from it on the GPU.
    * @private
    */
   _uploadSource(source, held = null) {
@@ -961,104 +961,102 @@ export class GpuPermuter {
     }
     return { texture, plan };
   }
-}
 
-/**
- * Draw the words of a GPU buffer into the R32UI linear texture `texture`
- * (`plan`), layer by layer, as `SOURCE_DRAW_VS` describes; every state it
- * changes is put back.
- *
- * @this {GpuPermuter}
- */
-GpuPermuter.prototype._drawSource = function drawSource(texture, plan, { buffer, words, firstWord = 0, wordsPerPoint: pointWords = null }) {
-  const gl = this.gl;
-  // The source's segments in words: one buffer, or a segmented store whose
-  // segments count points.
-  const pointSegments = buffer instanceof PointStore ? buffer.segments : Array.isArray(buffer) ? buffer : null;
-  // `firstWord`: texel 0 takes the buffer's word `firstWord` (a band of a
-  // store, `writeWordsRange`, which names its words a point); the whole
-  // store from its first word otherwise.
-  const wordsPerPoint = pointSegments === null
-    ? 1
-    : pointWords ?? words / pointSegments.reduce((sum, segment) => sum + segment.count, 0);
-  const segments = pointSegments === null
-    ? [{ buffer, first: 0, count: words }]
-    : pointSegments.map(segment => ({
-      buffer: segment.buffer,
-      first: segment.first * wordsPerPoint,
-      count: segment.count * wordsPerPoint,
-    }));
-  const glState = glStateOf(gl);
-  if (this._sourceDraw === null) {
-    const program = this._linkedProgram('source');
-    const vao = gl.createVertexArray();
-    const framebuffer = gl.createFramebuffer();
-    if (!vao || !framebuffer) throw new Error('GPU permute could not allocate its source draw.');
-    this._sourceDraw = {
-      program,
-      vao,
-      framebuffer,
-      shape: gl.getUniformLocation(program, 'u_shape'),
-      size: gl.getUniformLocation(program, 'u_size'),
-      base: gl.getUniformLocation(program, 'u_base'),
+  /**
+   * Draw the words of a GPU buffer into the R32UI linear texture `texture`
+   * (`plan`), layer by layer, as `SOURCE_DRAW_VS` describes; every state it
+   * changes is put back.
+   */
+  _drawSource(texture, plan, { buffer, words, firstWord = 0, wordsPerPoint: pointWords = null }) {
+    const gl = this.gl;
+    // The source's segments in words: one buffer, or a segmented store whose
+    // segments count points.
+    const pointSegments = buffer instanceof PointStore ? buffer.segments : Array.isArray(buffer) ? buffer : null;
+    // `firstWord`: texel 0 takes the buffer's word `firstWord` (a band of a
+    // store, `writeWordsRange`, which names its words a point); the whole
+    // store from its first word otherwise.
+    const wordsPerPoint = pointSegments === null
+      ? 1
+      : pointWords ?? words / pointSegments.reduce((sum, segment) => sum + segment.count, 0);
+    const segments = pointSegments === null
+      ? [{ buffer, first: 0, count: words }]
+      : pointSegments.map(segment => ({
+        buffer: segment.buffer,
+        first: segment.first * wordsPerPoint,
+        count: segment.count * wordsPerPoint,
+      }));
+    const glState = glStateOf(gl);
+    if (this._sourceDraw === null) {
+      const program = this._linkedProgram('source');
+      const vao = gl.createVertexArray();
+      const framebuffer = gl.createFramebuffer();
+      if (!vao || !framebuffer) throw new Error('GPU permute could not allocate its source draw.');
+      this._sourceDraw = {
+        program,
+        vao,
+        framebuffer,
+        shape: gl.getUniformLocation(program, 'u_shape'),
+        size: gl.getUniformLocation(program, 'u_size'),
+        base: gl.getUniformLocation(program, 'u_base'),
+      };
+    }
+    const draw = this._sourceDraw;
+    const saved = {
+      framebuffer: gl.getParameter(gl.FRAMEBUFFER_BINDING),
+      program: gl.getParameter(gl.CURRENT_PROGRAM),
+      vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
+      arrayBuffer: gl.getParameter(gl.ARRAY_BUFFER_BINDING),
+      viewport: glState.viewport,
+      colorMask: glState.colorMask,
+      capabilities: [gl.BLEND, gl.DEPTH_TEST, gl.SCISSOR_TEST, gl.STENCIL_TEST, gl.RASTERIZER_DISCARD]
+        .map(capability => [capability, glState.isEnabled(capability)]),
     };
-  }
-  const draw = this._sourceDraw;
-  const saved = {
-    framebuffer: gl.getParameter(gl.FRAMEBUFFER_BINDING),
-    program: gl.getParameter(gl.CURRENT_PROGRAM),
-    vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
-    arrayBuffer: gl.getParameter(gl.ARRAY_BUFFER_BINDING),
-    viewport: glState.viewport,
-    colorMask: glState.colorMask,
-    capabilities: [gl.BLEND, gl.DEPTH_TEST, gl.SCISSOR_TEST, gl.STENCIL_TEST, gl.RASTERIZER_DISCARD]
-      .map(capability => [capability, glState.isEnabled(capability)]),
-  };
-  try {
-    for (const [capability] of saved.capabilities) gl.disable(capability);
-    gl.colorMask(true, true, true, true);
-    gl.useProgram(draw.program);
-    gl.uniform2i(draw.shape, plan.widthShift, plan.rowsPerLayer);
-    gl.uniform2f(draw.size, plan.width, plan.rowsPerLayer);
-    gl.bindVertexArray(draw.vao);
-    gl.enableVertexAttribArray(0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, draw.framebuffer);
-    gl.viewport(0, 0, plan.width, plan.rowsPerLayer);
-    const perLayer = plan.width * plan.rowsPerLayer;
-    for (let layer = 0; layer < plan.layers; layer++) {
-      const first = layer * perLayer;
-      if (first >= words) break;
-      const end = Math.min(words, first + perLayer);
-      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, texture, 0, layer);
-      // The whole layer is written first: an image only drawn in part is
-      // cleared again by Firefox before the draw ("lazy initialization").
-      gl.clearBufferuiv(gl.COLOR, 0, ZERO_WORDS);
-      // Each segment's words in this layer, its vertex 0 being its first word.
-      forEachSegmentRange(segments, firstWord + first, end - first, (index, localFirst, localCount) => {
-        const segment = segments[index];
-        gl.bindBuffer(gl.ARRAY_BUFFER, segment.buffer);
-        gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
-        gl.uniform1i(draw.base, segment.first - firstWord);
-        drawPointsInSegments(gl, localFirst, localCount);
-      });
+    try {
+      for (const [capability] of saved.capabilities) gl.disable(capability);
+      gl.colorMask(true, true, true, true);
+      gl.useProgram(draw.program);
+      gl.uniform2i(draw.shape, plan.widthShift, plan.rowsPerLayer);
+      gl.uniform2f(draw.size, plan.width, plan.rowsPerLayer);
+      gl.bindVertexArray(draw.vao);
+      gl.enableVertexAttribArray(0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, draw.framebuffer);
+      gl.viewport(0, 0, plan.width, plan.rowsPerLayer);
+      const perLayer = plan.width * plan.rowsPerLayer;
+      for (let layer = 0; layer < plan.layers; layer++) {
+        const first = layer * perLayer;
+        if (first >= words) break;
+        const end = Math.min(words, first + perLayer);
+        gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, texture, 0, layer);
+        // The whole layer is written first: an image only drawn in part is
+        // cleared again by Firefox before the draw ("lazy initialization").
+        gl.clearBufferuiv(gl.COLOR, 0, ZERO_WORDS);
+        // Each segment's words in this layer, its vertex 0 being its first word.
+        forEachSegmentRange(segments, firstWord + first, end - first, (index, localFirst, localCount) => {
+          const segment = segments[index];
+          gl.bindBuffer(gl.ARRAY_BUFFER, segment.buffer);
+          gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
+          gl.uniform1i(draw.base, segment.first - firstWord);
+          drawPointsInSegments(gl, localFirst, localCount);
+        });
+      }
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, null, 0, 0);
+    } finally {
+      // The draw's vertex array lets go of the last source segment it read
+      // (onto the anchor: `releaseVertexAttribute`), so it keeps no store alive.
+      gl.bindVertexArray(draw.vao);
+      releaseVertexAttribute(gl, 0, this._anchor);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, saved.framebuffer);
+      gl.viewport(saved.viewport[0], saved.viewport[1], saved.viewport[2], saved.viewport[3]);
+      gl.colorMask(saved.colorMask[0], saved.colorMask[1], saved.colorMask[2], saved.colorMask[3]);
+      for (const [capability, enabled] of saved.capabilities) {
+        (enabled ? gl.enable : gl.disable).call(gl, capability);
+      }
+      gl.useProgram(saved.program);
+      gl.bindVertexArray(saved.vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, saved.arrayBuffer);
     }
-    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, null, 0, 0);
-  } finally {
-    // The draw's vertex array lets go of the last source segment it read
-    // (onto the anchor: `releaseVertexAttribute`), so it keeps no store alive.
-    gl.bindVertexArray(draw.vao);
-    releaseVertexAttribute(gl, 0, this._anchor);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, saved.framebuffer);
-    gl.viewport(saved.viewport[0], saved.viewport[1], saved.viewport[2], saved.viewport[3]);
-    gl.colorMask(saved.colorMask[0], saved.colorMask[1], saved.colorMask[2], saved.colorMask[3]);
-    for (const [capability, enabled] of saved.capabilities) {
-      (enabled ? gl.enable : gl.disable).call(gl, capability);
-    }
-    gl.useProgram(saved.program);
-    gl.bindVertexArray(saved.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, saved.arrayBuffer);
   }
-};
+}
 
 const ZERO_WORDS = new Uint32Array(4);
 

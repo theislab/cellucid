@@ -6,11 +6,9 @@
  * opens in the share's cell order (a permutation of the file's rows), and
  * its gene index is in segments -- the share's carried, the rest in store
  * order answered in open order (`prefix-column-index.js`
- * `fileOrderedAccess`, a gene's entries mapped and put in order). Measured
- * on a 10M-cell Zarr (Chromium, every cell): differential expression 9.4 s
- * on the first opening, 35.9 s after the round trip; 1M: 1.5 s and 9.0 s,
- * and without a gene read before the round trip the run failed after
- * 3 min 50 s (a read of 8,610 genes asked every gene's column at once).
+ * `fileOrderedAccess`, a gene's entries mapped and put in order); without
+ * these a differential expression after the round trip is several times
+ * slower than on the first opening (measured: 23_decisions_partial_reading.md).
  *
  * - **A cell subset reaching the last segment is read by the run's priced
  *   route** (`getMatrixCellSubset`): the read of each gene's first rows
@@ -21,8 +19,8 @@
  *   it, every gene of the read at once, unpriced.
  * - **Putting a gene's entries in order is linear in its entries**
  *   (`utils/radix-order.js`): a digit has no more values than there are
- *   keys. A fixed 16-bit digit walked 65,536 counts a pass whatever the keys
- *   (6 s of the 1M run's differential expression).
+ *   keys. A fixed 16-bit digit would walk 65,536 counts a pass whatever the
+ *   keys.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -243,8 +241,8 @@ test('raised back to every cell in the share\'s order, the cells past the share\
 
 test('a run\'s reads of the same cells check them once: every later read compares them, never walks them again', async () => {
   // A differential expression of two groups of 10M cells reads ~1.9M cells
-  // some 400 times; checked, bounded by the gene sample, by the rows read and
-  // by a prefix each read, they were 8.5 of the reader's 9 s (Chromium).
+  // some 400 times; checked at every read, they would be most of the reader's
+  // time (measured: 23_decisions_partial_reading.md).
   const { tree, values } = csrTree();
   const { store } = countingStore(tree);
   const root = await openZarr(store, { decodedChunkCacheBytes: 0 });

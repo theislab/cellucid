@@ -22,7 +22,7 @@ import {
   requireSafeInteger,
 } from './exact-contract.js';
 import { selectBarNotice } from './mode-copy.js';
-import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 /** Every tool that owns a step-control block, in toolbelt order. */

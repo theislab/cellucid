@@ -119,93 +119,89 @@ async function showDimension(page, dimension) {
   ).toBe(dimension);
 }
 
-test('the dimension rule keeps re-selecting a mode nobody chose', async ({
+test('the dimension rule keeps re-selecting a mode nobody chose; Reset Camera gives it back; a mode the user picked is remembered for its dimension', async ({
   page,
 }) => {
   await installFixture(page);
   await openFixture(page, 'navigation-ownership-default');
 
-  await expect(page.locator('#view-representation-select option:checked'))
-    .toHaveText(/ · 3D$/);
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
+  await test.step('the dimension rule keeps re-selecting a mode nobody chose', async () => {
+    await expect(page.locator('#view-representation-select option:checked'))
+      .toHaveText(/ · 3D$/);
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
-  // A restore publishing the mode the dimension already implies is not a user
-  // choice, so it must not take navigation away from the dimension rule. This
-  // is exactly what a dataset's starting view does through the `camera` state
-  // domain (`app/state/domains/camera.js`).
-  await page.evaluate(() => {
-    window._cellucidViewer.setNavigationMode('orbit');
+    // A restore publishing the mode the dimension already implies is not a user
+    // choice, so it must not take navigation away from the dimension rule. This
+    // is exactly what a dataset's starting view does through the `camera` state
+    // domain (`app/state/domains/camera.js`).
+    await page.evaluate(() => {
+      window._cellucidViewer.setNavigationMode('orbit');
+    });
+
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+
+    await showDimension(page, 1);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+
+    await showDimension(page, 3);
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
   });
 
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  await test.step('Reset Camera restores the mode this dimension defaults to', async () => {
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 
-  await showDimension(page, 1);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+    await page.selectOption('#navigation-mode', 'orbit');
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
-  await showDimension(page, 3);
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
-});
+    // "Reset Camera" restores initial defaults. The initial default for a 2-D
+    // embedding is Planar, not the Orbit the page happened to start on before any
+    // dataset existed.
+    await page.click('#reset-camera-btn');
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 
-test('a mode the user picked is remembered for the dimension it was picked in', async ({
-  page,
-}) => {
-  await installFixture(page);
-  await openFixture(page, 'navigation-ownership-explicit');
+    // And navigation is back under the dimension rule.
+    await showDimension(page, 3);
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  });
 
-  // Free-fly is never a dimension default, so choosing it in 3D is a choice
-  // for 3D: a 2D or 1D representation pans, and 3D flies again.
-  await page.selectOption('#navigation-mode', 'free');
-  await expect(page.locator('#navigation-mode')).toHaveValue('free');
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-  await showDimension(page, 1);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-  await showDimension(page, 3);
-  await expect(page.locator('#navigation-mode')).toHaveValue('free');
+  await test.step('a mode the user picked is remembered for the dimension it was picked in', async () => {
+    // The step above ends in 2D under the rule: this one starts in 3D.
+    await showDimension(page, 3);
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
-  // Orbit is the 3-D default: choosing it hands 3D back to the rule. In 2D it
-  // is a choice for 2D, which 1D does not inherit and 2D keeps.
-  await page.selectOption('#navigation-mode', 'orbit');
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-  await page.selectOption('#navigation-mode', 'orbit');
-  await showDimension(page, 1);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
+    // Free-fly is never a dimension default, so choosing it in 3D is a choice
+    // for 3D: a 2D or 1D representation pans, and 3D flies again.
+    await page.selectOption('#navigation-mode', 'free');
+    await expect(page.locator('#navigation-mode')).toHaveValue('free');
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+    await showDimension(page, 1);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+    await showDimension(page, 3);
+    await expect(page.locator('#navigation-mode')).toHaveValue('free');
 
-  // Choosing the dimension's own default hands navigation back to the rule.
-  await page.selectOption('#navigation-mode', 'planar');
-  await showDimension(page, 3);
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-});
+    // Orbit is the 3-D default: choosing it hands 3D back to the rule. In 2D it
+    // is a choice for 2D, which 1D does not inherit and 2D keeps.
+    await page.selectOption('#navigation-mode', 'orbit');
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+    await page.selectOption('#navigation-mode', 'orbit');
+    await showDimension(page, 1);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
-test('Reset Camera restores the mode this dimension defaults to', async ({
-  page,
-}) => {
-  await installFixture(page);
-  await openFixture(page, 'navigation-ownership-reset');
-
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-
-  await page.selectOption('#navigation-mode', 'orbit');
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
-
-  // "Reset Camera" restores initial defaults. The initial default for a 2-D
-  // embedding is Planar, not the Orbit the page happened to start on before any
-  // dataset existed.
-  await page.click('#reset-camera-btn');
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-
-  // And navigation is back under the dimension rule.
-  await showDimension(page, 3);
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
-  await showDimension(page, 2);
-  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+    // Choosing the dimension's own default hands navigation back to the rule.
+    await page.selectOption('#navigation-mode', 'planar');
+    await showDimension(page, 3);
+    await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
+    await showDimension(page, 2);
+    await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  });
 });
 
 test('a published starting state reports its field and leaves the dimension rule alone', async ({

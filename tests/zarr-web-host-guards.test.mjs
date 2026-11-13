@@ -261,11 +261,11 @@ test('cancelling one read of a merged range leaves the others waiting for it; th
   assert.equal(aborted, 1, 'the shared request stopped once nobody waited');
 });
 
-test('a served store whose file changed on disk (409 from cellucid serve) is refused with the server\'s sentence, and every later read too (R9S-9)', async () => {
-  // A file written again while `cellucid serve` served it: every chunk was
-  // answered 500 with an HDF5 error, said as the server failing ("try again
-  // later"). The server now answers 409 with what to do; the store says it
-  // as it is and reads nothing more of either version.
+test('a served store whose file changed on disk (409 from cellucid serve) is refused with the server\'s sentence, and every later read too', async () => {
+  // A file written again while `cellucid serve` serves it: the server answers
+  // 409 with what to do, not 500 with an HDF5 error said as the server failing
+  // ("try again later"); the store says it as it is and reads nothing more of
+  // either version.
   const entries = await corpusEntries('anndata/v2.zarr');
   const why = 'atlas.h5ad changed on disk since the server opened it: serve it again (restart cellucid serve, or show the viewer again) to read it as it is now.';
   let changed = false;

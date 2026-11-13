@@ -1,8 +1,8 @@
 /**
  * The AnnData data-mapping candidate catalog, built in the browser from the
  * metadata the opened AnnData store declares (an `.h5ad`, a Zarr store, or
- * any other input format presented as one; design §1.2), and the load-time
- * check every embedding passes before it is plotted (§1.3).
+ * any other input format presented as one), and the load-time
+ * check every embedding passes before it is plotted.
  *
  * The catalog is answered at the `candidates` route under the dataset's base,
  * for a file opened here, from a link, or served by `cellucid serve` or a
@@ -48,7 +48,6 @@ import {
   parseVectorFieldKey,
   slotDimension,
   validateEmbeddingColumns,
-  vectorFieldKeys,
 } from './data-mapping.js';
 import { formatCountOf } from '../utils/format-units.js';
 
@@ -70,10 +69,6 @@ const DECIMAL = '(?:0|[1-9][0-9]*)';
 const EMBEDDING_ROUTE = new RegExp(
   `^obsm/(${DECIMAL})/(${DECIMAL}(?:-${DECIMAL}){0,2})$`
 );
-
-function formatCount(value) {
-  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
 
 function requireArray(value, label) {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array.`);
@@ -160,7 +155,7 @@ function requireElementProbe(probe, label) {
 }
 
 /**
- * Describe every `obsm` entry with the listing-time verdict of §1.3, in the
+ * Describe every `obsm` entry with its listing-time verdict, in the
  * file's key order.
  *
  * @param {ReadonlyArray<ElementProbe>} probes
@@ -293,7 +288,7 @@ function countsOf(probe, label) {
 
 /**
  * A probe's `notLog1p`: null (the values do not refute `uns['log1p']`, or
- * were not probed), or what refutes it (`AnnDataReader` `storedValueFacts`):
+ * were not probed), or what refutes it (`anndata/probe.js` `storedValueFacts`):
  * the largest value read, the matrix's dtype, and the cell total its log1p
  * undone implies (null past float64).
  */

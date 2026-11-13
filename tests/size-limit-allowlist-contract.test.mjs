@@ -16,9 +16,9 @@
  * - MSG: how much of something a message quotes;
  * - UI: a visual or interaction parameter that bounds no data, or a list that
  *   keeps every item reachable another way;
- * - OWNED: a limit still to be removed, naming its owner and the inventory
- *   (cellucid-private/plans/limits-inventory.md). The owner deletes the entry
- *   with the fix. No other class takes a limit made up for convenience.
+ * - OWNED: a limit still to be removed, naming its owner. The owner deletes
+ *   the entry with the fix. No other class takes a limit made up for
+ *   convenience.
  *
  * A cap can also be written inline, as a bare number where a value is bounded,
  * with no name to find. INLINE_ALLOWLIST classifies those the same way, keyed
@@ -92,8 +92,7 @@ const ALLOWLIST = {
   'app/community-annotations/orcid-client.js:ORCID_RESPONSE_MAX_UTF8_BYTES': ['HOST', 'Bounds one ORCID search response for that many suggestions.'],
   'app/community-annotations/wire-contract.js:ANNOTATION_FILE_MAX_UTF8_BYTES': ['PLAT', "GitHub's Contents API returns a file's content as JSON only up to 1 MB."],
   'app/community-annotations/wire-contract.js:ANNOTATION_JSON_MAX_DEPTH': ['PLAT', "The repository validator's JSON reader (Python's json) recurses once per level and stops at the interpreter's recursion limit (1000 by default); both validators refuse deeper JSON with one sentence, and no valid annotation file nests deeper than 7 levels."],
-  'app/main.js:MAX_LOD_VISIBILITY_RETRIES': ['UI', 'Frames to wait for level-of-detail visibility before drawing anyway.'],
-  'app/main.js:MEBIBYTE': ['UI', 'A unit, not a limit.'],
+  'app/ui/modules/connectivity-controls.js:MAX_LOD_VISIBILITY_RETRIES': ['UI', 'Frames to wait for level-of-detail visibility before drawing anyway.'],
   'app/notification-center.js:MAX_TIMER_DELAY_MS': ['PLAT', 'setTimeout delays are signed 32-bit milliseconds.'],
   'data/sources/auth/token-store.js:MAX_TIMER_DELAY_MS': ['PLAT', 'setTimeout delays are signed 32-bit milliseconds.'],
   'app/optional-analytics.js:QUEUE_LIMIT': ['PERF', 'Telemetry queued before the analytics module loads.'],
@@ -102,6 +101,7 @@ const ALLOWLIST = {
   'app/sidebar-metrics.js:SIDEBAR_MAX_WIDTH_PX': ['UI', 'How wide the sidebar may be dragged.'],
   'app/ui/core/antialias-preference.js:AUTOMATIC_ANTIALIAS_CELL_LIMIT': ['PERF', 'Automatic antialiasing turns off above this many cells; the user can force it.'],
   'app/ui/core/antialias-preference.js:AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT': ['PERF', 'Automatic antialiasing turns off above this many flat cells; the user can force it.'],
+  'app/ui/modules/benchmark/benchmark-controls.js:MEBIBYTE': ['UI', 'A unit, not a limit.'],
   'app/ui/modules/benchmark/camera-path.js:PHI_LIMIT': ['UI', 'Keeps the benchmark camera off the poles.'],
   'app/ui/modules/benchmark/generation-contract.js:MAX_SYNTHETIC_COUNT': ['PLAT', 'Synthetic benchmark points: 16 bytes a point reaches 4 GB, the largest ArrayBuffer every engine allocates.'],
   'app/ui/modules/benchmark/matrix-runner.js:GEOMETRY_SETTLE_FRAME_BUDGET': ['UI', 'Frames a benchmark configuration waits for its views\' spatial trees to land and be adopted before a window; a build that never lands is reported.'],
@@ -119,9 +119,8 @@ const ALLOWLIST = {
   'data/categorical-storage-contract.js:MAX_CATEGORICAL_CATEGORIES': ['FORMAT', 'uint32 codes hold 4,294,967,295 categories beside the missing marker.'],
   'data/connectivity-summary-contract.js:UINT32_CELL_CAPACITY': ['FORMAT', 'uint32 edge indices address 2^32 cells.'],
   'data/continuous-payload-diagnosis.js:NON_FINITE_EXAMPLE_LIMIT': ['MSG', 'How many offending values a diagnosis quotes; every value is checked.'],
-  'data/dimension-manager.js:MIB': ['UI', 'A unit, not a limit.'],
   'data/sources/providers/github.js:LFS_POINTER_MAX_BYTES': ['FORMAT', 'The Git LFS specification keeps a pointer file under 1024 bytes; a larger file is content, not a pointer.'],
-  'data/anndata/reader.js:FLOAT_DTYPE_MAX': ['FORMAT', 'The largest finite value of each IEEE float type a matrix is stored in: a cell total its log1p undone implies past it refutes uns[\'log1p\'] (no data held it).'],
+  'data/anndata/probe.js:FLOAT_DTYPE_MAX': ['FORMAT', 'The largest finite value of each IEEE float type a matrix is stored in: a cell total its log1p undone implies past it refutes uns[\'log1p\'] (no data held it).'],
   'data/anndata/values.js:SLAB_BYTES': ['PERF', 'Decoded bytes per row slab of a long read; a larger array is read in several slabs.'],
   'data/anndata/prefix-column-index.js:SLAB_ENTRIES': ['PERF', 'Entries of one slab of a gene index\'s work: the least a first index segment covers; any matrix is indexed, in as many segments as it takes.'],
   'data/viewer-protocol.js:VIEWER_COMMAND_ERROR_REASON_LIMIT': ['MSG', 'How much of a failed command\'s reason the viewer reports to the host.'],
@@ -170,7 +169,7 @@ const ALLOWLIST = {
   'rendering/overlays/velocity/velocity-overlay.js:DEFAULT_VELOCITY_PARTICLE_CAPACITY': ['UI', 'Animated velocity particles drawn, not data.'],
   'rendering/overlays/velocity/velocity-overlay.js:SPAWN_BUILD_MAX_ITEMS_PER_SLICE': ['PERF', 'Items built per slice between yields.'],
   'rendering/overlays/velocity/velocity-overlay.js:SPAWN_BUILD_TIME_BUDGET_MS': ['PERF', 'Time per slice between yields.'],
-  'rendering/point-sprite.js:POINT_SPRITE_MAX_PX': ['UI', 'The largest sprite a cell near the camera is drawn at, in device pixels (owner 2026-11-11, F97: 160); the GPU\'s own ALIASED_POINT_SIZE_RANGE bounds it where smaller. One constant for the shaders, picking and the figure export.'],
+  'rendering/point-sprite.js:POINT_SPRITE_MAX_PX': ['UI', 'The largest sprite a cell near the camera is drawn at, in device pixels (160); the GPU\'s own ALIASED_POINT_SIZE_RANGE bounds it where smaller. One constant for the shaders, picking and the figure export.'],
   'rendering/point-size-scale.js:MAXIMUM_AUTOMATIC_POINT_SIZE': ['UI', 'The largest size automatic point sizing picks.'],
   'rendering/point-size-scale.js:MAXIMUM_POINT_SIZE': ['UI', 'The largest point size.'],
   'rendering/point-size-scale.js:POINT_SIZE_SLIDER_MAXIMUM': ['UI', 'The point size slider range.'],
@@ -255,7 +254,7 @@ const INLINE_ALLOWLIST = {
   'app/community-annotations/scope-lock.js:max: 36': ['FORMAT', 'A UUID is 36 characters.'],
   'app/history/model.js:maxItems: 2': ['FORMAT', 'A pair has two items.'],
   'app/jobs/cancellable-job.js:Math.min 100': ['FORMAT', PERCENT],
-  'app/main.js:clamp 1000': ['UI', "The connectivity slider's lowest edge count (1% of the edges, held between 100 and 1,000); its top is every edge."],
+  'app/ui/modules/connectivity-controls.js:clamp 1000': ['UI', "The connectivity slider's lowest edge count (1% of the edges, held between 100 and 1,000); its top is every edge."],
   'app/read-progress-notifications.js:Math.min 100': ['FORMAT', PERCENT],
   'app/session/bundle/writer.js:maximum: 0xffff_ffff': ['FORMAT', 'A session bundle frame length is a little-endian u32.'],
   'app/session/session-context.js:maximum: 3': ['FORMAT', 'A view is drawn in one to three dimensions.'],

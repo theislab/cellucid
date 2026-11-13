@@ -1,6 +1,5 @@
 /**
- * Every label of gene values names the values they are in (F152, plan
- * `expression-values-plan.md` §2): with Data mapping › Expression values on,
+ * Every label of gene values names the values they are in: with Data mapping › Expression values on,
  * a gene's values are "Ins1 · log1p(norm.)" wherever they are shown, plotted
  * or exported — the legend, the figure legend, the cell card, a gene's range
  * filter and range highlight, Detailed (axes, summary, CSV), Correlation

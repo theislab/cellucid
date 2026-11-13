@@ -8,8 +8,7 @@ const PREPARED_DATASET_URL =
   + '&dataset=current-ui&acceptance=highlight-selection-feedback-ci';
 
 const MODE_DESCRIPTION = '#highlight-mode-description';
-// The active tool's gesture, or what it needs first: the Selection (i)'s first line.
-const TOOL_HINT = '#highlight-tool-hint';
+const OFF_VIEW_NOTICE = 'That gesture ended outside the view';
 
 function observeProductErrors(page) {
   const errors = [];
@@ -49,20 +48,6 @@ async function colorByCellType(page) {
   ).toBe('category');
 }
 
-/** Screen point the viewer's own picker resolves to no cell at all. */
-async function findEmptyPoint(page) {
-  const point = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    for (let y = 40; y < 980; y += 5) {
-      for (let x = 340; x < 1430; x += 5) {
-        if (viewer.pickCellAtScreen(x, y) < 0) return { x, y };
-      }
-    }
-    return null;
-  });
-  expect(point).not.toBeNull();
-  return point;
-}
 
 /** Screen point that the viewer's own picker resolves to a cell. */
 async function findCellPoints(page, limit) {
@@ -136,430 +121,190 @@ const unifiedState = page => page.evaluate(
 );
 
 test(
-  'Escape abandons an in-progress selection in every tool that offers Cancel',
+  'a selection walked through every tool: Escape, the step controls by keyboard, an empty lasso, a drag let go on the sidebar',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
     await colorByCellType(page);
     const points = await findCellPoints(page, 4);
 
-    // Annotation
-    await armSelection(page, 'annotation', () => altClick(page, points[0]));
-    expect((await unifiedState(page)).inProgress).toBe(true);
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: false,
-      stepCount: 0,
-      candidateCount: 0,
+    await test.step('Escape abandons an in-progress selection in every tool that offers Cancel', async () => {
+      // Annotation
+      await armSelection(page, 'annotation', () => altClick(page, points[0]));
+      expect((await unifiedState(page)).inProgress).toBe(true);
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+      expect(await unifiedState(page)).toMatchObject({
+        inProgress: false,
+        stepCount: 0,
+        candidateCount: 0,
+      });
+
+      // Lasso
+      await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
+      await armSelection(page, 'lasso', () => altDraw(page, [
+        [400, 200], [1300, 200], [1300, 900], [400, 900], [400, 200],
+      ]));
+      expect((await unifiedState(page)).inProgress).toBe(true);
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+      expect((await unifiedState(page)).inProgress).toBe(false);
+
+      // Proximity
+      await page.locator('.highlight-mode-btn[data-mode="proximity"]').click();
+      await armSelection(page, 'proximity', () => altDrag(
+        page,
+        { x: points[1].x, y: points[1].y },
+        { x: points[1].x + 140, y: points[1].y + 80 },
+      ));
+      expect((await unifiedState(page)).inProgress).toBe(true);
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
+      expect((await unifiedState(page)).inProgress).toBe(false);
     });
 
-    // Lasso
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
-    await armSelection(page, 'lasso', () => altDraw(page, [
-      [400, 200], [1300, 200], [1300, 900], [400, 900], [400, 200],
-    ]));
-    expect((await unifiedState(page)).inProgress).toBe(true);
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
-    expect((await unifiedState(page)).inProgress).toBe(false);
+    await test.step('the step controls are reachable by keyboard and never strand focus', async () => {
+      await page.locator('.highlight-mode-btn[data-mode="annotation"]').click();
+      await armSelection(page, 'annotation', () => altClick(page, points[0]));
 
-    // Proximity
-    await page.locator('.highlight-mode-btn[data-mode="proximity"]').click();
-    await armSelection(page, 'proximity', () => altDrag(
-      page,
-      { x: points[1].x, y: points[1].y },
-      { x: points[1].x + 140, y: points[1].y + 80 },
-    ));
-    expect((await unifiedState(page)).inProgress).toBe(true);
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
-    expect((await unifiedState(page)).inProgress).toBe(false);
+      // Glyph buttons carry no readable text, so their names come from aria-label.
+      await expect(page.locator('#annotation-undo-btn')).toHaveAttribute(
+        'aria-label',
+        'Undo last selection step',
+      );
+      await expect(page.locator('#annotation-redo-btn')).toHaveAttribute(
+        'aria-label',
+        'Redo last selection step',
+      );
+      await expect(page.locator('#annotation-cancel-btn')).toHaveAttribute(
+        'aria-keyshortcuts',
+        'Escape',
+      );
+      await expect(page.locator('#annotation-cancel-btn')).toHaveAttribute(
+        'title',
+        /\(Esc\)/,
+      );
 
-    expect(productErrors).toEqual([]);
-  },
-);
+      const focusedMode = () => page.evaluate(() => {
+        const active = document.activeElement;
+        if (active === null) return null;
+        return {
+          mode: active.dataset === undefined ? null : active.dataset.mode ?? null,
+          pressed: active.getAttribute('aria-pressed'),
+          tag: active.tagName,
+        };
+      });
 
-test(
-  'Escape with no selection in progress stays available to the rest of the app',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
+      await page.locator('#annotation-cancel-btn').focus();
+      await page.keyboard.press('Enter');
+      await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+      expect(await focusedMode()).toEqual({
+        mode: 'annotation',
+        pressed: 'true',
+        tag: 'BUTTON',
+      });
 
-    // The info popover owns Escape; an idle selection tool must not eat it.
-    await page.locator('#active-filter-scope-btn').click();
-    await expect(page.locator('#active-filter-scope-tooltip')).toBeVisible();
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#active-filter-scope-tooltip')).toBeHidden();
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'the annotation panel names the field it needs and follows the one chosen',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-
-    // The fixture opens colored by its cell types (`first-coloring.js`);
-    // with no coloring field Alt+click is inert.
-    await expect(page.locator('#categorical-field option:checked')).toHaveText('cell_type');
-    await page.locator('#categorical-field').selectOption({ label: 'None' });
-    await expect(page.locator('#categorical-field')).toHaveValue('-1');
-    await expect(page.locator('#continuous-field')).toHaveValue('-1');
-    await expect(page.locator(TOOL_HINT)).toContainText(
-      'Color by a field first',
-    );
-    await expect(page.locator(TOOL_HINT)).not.toContainText(
-      'Alt+click a cell to select',
-    );
-
-    const points = await findCellPoints(page, 1);
-    await altClick(page, points[0]);
-    await expect(page.locator(TOOL_HINT)).toContainText(
-      'Color by a field first',
-    );
-
-    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-    await expect(page.locator(TOOL_HINT)).toContainText(
-      'Alt+click a cell to select',
-    );
-    await expect(page.locator(TOOL_HINT)).not.toContainText(
-      'Color by a field first',
-    );
-
-    await page.locator('#categorical-field').selectOption({ label: 'None' });
-    await expect(page.locator(TOOL_HINT)).toContainText(
-      'Color by a field first',
-    );
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'repeating a gesture that selects the same cells costs one step and one undo',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-    await colorByCellType(page);
-    const points = await findCellPoints(page, 1);
-
-    await armSelection(page, 'annotation', () => altClick(page, points[0]));
-    for (let click = 0; click < 5; click++) {
-      await altClick(page, points[0]);
-      await expect(page.locator('#annotation-step-controls')).toBeVisible();
-    }
-
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText('Step 1:');
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      'That gesture did not change the selection.',
-    );
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: true,
-      stepCount: 1,
-      candidateCount: 40,
+      await armSelection(page, 'annotation', () => altClick(page, points[1]));
+      await page.locator('#annotation-confirm-btn').focus();
+      await page.keyboard.press('Enter');
+      await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+      await expect(page.locator('#highlight-count')).toContainText(
+        'cells highlighted',
+      );
+      expect(await focusedMode()).toEqual({
+        mode: 'annotation',
+        pressed: 'true',
+        tag: 'BUTTON',
+      });
     });
 
-    // One undo, and the tool is back where it started.
-    await expect(page.locator('#annotation-undo-btn')).toBeEnabled();
-    await page.locator('#annotation-undo-btn').click();
-    await expect(page.locator('#annotation-undo-btn')).toBeDisabled();
-    expect((await unifiedState(page)).inProgress).toBe(false);
+    await test.step('a lasso that encloses no cells lands as the step the user drew', async () => {
+      await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
 
-    expect(productErrors).toEqual([]);
-  },
-);
+      await armSelection(page, 'lasso', () => altDraw(page, [
+        [400, 200], [1300, 200], [1300, 900], [400, 900], [400, 200],
+      ]));
+      expect((await unifiedState(page)).candidateCount).toBeGreaterThan(0);
 
-test(
-  'redrawing the same lasso does not advance the step counter',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-    await colorByCellType(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
-
-    const polygon = [
-      [400, 200], [1300, 200], [1300, 900], [400, 900], [400, 200],
-    ];
-    await armSelection(page, 'lasso', () => altDraw(page, polygon));
-    const first = await unifiedState(page);
-    expect(first.stepCount).toBe(1);
-
-    await altDraw(page, polygon);
-    await altDraw(page, polygon);
-
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      'That gesture did not change the selection.',
-    );
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: true,
-      stepCount: 1,
-      candidateCount: first.candidateCount,
-    });
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'the step controls are reachable by keyboard and never strand focus',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-    await colorByCellType(page);
-    const points = await findCellPoints(page, 2);
-
-    await armSelection(page, 'annotation', () => altClick(page, points[0]));
-
-    // Glyph buttons carry no readable text, so their names come from aria-label.
-    await expect(page.locator('#annotation-undo-btn')).toHaveAttribute(
-      'aria-label',
-      'Undo last selection step',
-    );
-    await expect(page.locator('#annotation-redo-btn')).toHaveAttribute(
-      'aria-label',
-      'Redo last selection step',
-    );
-    await expect(page.locator('#annotation-cancel-btn')).toHaveAttribute(
-      'aria-keyshortcuts',
-      'Escape',
-    );
-    await expect(page.locator('#annotation-cancel-btn')).toHaveAttribute(
-      'title',
-      /\(Esc\)/,
-    );
-
-    const focusedMode = () => page.evaluate(() => {
-      const active = document.activeElement;
-      if (active === null) return null;
-      return {
-        mode: active.dataset === undefined ? null : active.dataset.mode ?? null,
-        pressed: active.getAttribute('aria-pressed'),
-        tag: active.tagName,
-      };
-    });
-
-    await page.locator('#annotation-cancel-btn').focus();
-    await page.keyboard.press('Enter');
-    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
-    expect(await focusedMode()).toEqual({
-      mode: 'annotation',
-      pressed: 'true',
-      tag: 'BUTTON',
-    });
-
-    await armSelection(page, 'annotation', () => altClick(page, points[1]));
-    await page.locator('#annotation-confirm-btn').focus();
-    await page.keyboard.press('Enter');
-    await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
-    await expect(page.locator('#highlight-count')).toContainText(
-      'cells highlighted',
-    );
-    expect(await focusedMode()).toEqual({
-      mode: 'annotation',
-      pressed: 'true',
-      tag: 'BUTTON',
-    });
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'every mode button keeps the aria-pressed contract across mode switches',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-
-    const pressedState = () => page.evaluate(
-      () => [...document.querySelectorAll('.highlight-mode-btn')].map(button => [
-        button.dataset.mode,
-        button.getAttribute('aria-pressed'),
-      ]),
-    );
-
-    for (const mode of ['knn', 'proximity', 'lasso', 'annotation']) {
-      await page.locator(`.highlight-mode-btn[data-mode="${mode}"]`).click();
-      await expect.poll(() => pressedState()).toEqual([
-        ['annotation', mode === 'annotation' ? 'true' : 'false'],
-        ['knn', mode === 'knn' ? 'true' : 'false'],
-        ['proximity', mode === 'proximity' ? 'true' : 'false'],
-        ['lasso', mode === 'lasso' ? 'true' : 'false'],
-      ]);
-    }
-
-    // Space activates a focused mode button, and the contract holds for it too.
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').focus();
-    await page.keyboard.press('Space');
-    await expect.poll(() => pressedState()).toEqual([
-      ['annotation', 'false'],
-      ['knn', 'false'],
-      ['proximity', 'false'],
-      ['lasso', 'true'],
-    ]);
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-// ---------------------------------------------------------------------------
-// A gesture the renderer consumed and could not turn into a step
-// ---------------------------------------------------------------------------
-
-const MISSED_CELL_NOTICE = 'That click did not land on a cell';
-const OFF_VIEW_NOTICE = 'That gesture ended outside the view';
-
-test(
-  'an Alt+click that lands on no cell says so instead of doing nothing at all',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-    await colorByCellType(page);
-    const cell = (await findCellPoints(page, 1))[0];
-    const empty = await findEmptyPoint(page);
-
-    // Points draw around a pixel wide, so this is the everyday gesture: the
-    // user aims at a group and lands beside it.
-    await altClick(page, empty);
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      MISSED_CELL_NOTICE,
-    );
-    await expect(page.locator(TOOL_HINT)).toContainText(
-      'Alt+click a cell to select',
-    );
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: false,
-      stepCount: 0,
-      candidateCount: 0,
-    });
-
-    // Repeating it must not stack a second line onto the panel.
-    const afterOneMiss = await page.locator(MODE_DESCRIPTION).innerHTML();
-    await altClick(page, empty);
-    await altClick(page, empty);
-    expect(await page.locator(MODE_DESCRIPTION).innerHTML()).toBe(afterOneMiss);
-
-    // A miss in the middle of a selection leaves that selection standing, and
-    // says so over the top of it.
-    await armSelection(page, 'annotation', () => altClick(page, cell));
-    const armed = await unifiedState(page);
-    expect(armed.candidateCount).toBeGreaterThan(0);
-
-    await altClick(page, empty);
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      MISSED_CELL_NOTICE,
-    );
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText('Step 1:');
-    await expect(page.locator('#annotation-step-controls')).toBeVisible();
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: true,
-      stepCount: armed.stepCount,
-      candidateCount: armed.candidateCount,
-    });
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'a lasso that encloses no cells lands as the step the user drew',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-    await colorByCellType(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
-
-    await armSelection(page, 'lasso', () => altDraw(page, [
-      [400, 200], [1300, 200], [1300, 900], [400, 900], [400, 200],
-    ]));
-    expect((await unifiedState(page)).candidateCount).toBeGreaterThan(0);
-
-    // A rectangle the picker resolves to nothing anywhere inside it.
-    const emptyBox = await page.evaluate(() => {
-      const viewer = window._cellucidViewer;
-      for (let top = 60; top < 860; top += 20) {
-        for (let left = 360; left < 1300; left += 20) {
-          let clean = true;
-          for (let y = top; y <= top + 120 && clean; y += 4) {
-            for (let x = left; x <= left + 120; x += 4) {
-              if (viewer.pickCellAtScreen(x, y) >= 0) {
-                clean = false;
-                break;
+      // A rectangle the picker resolves to nothing anywhere inside it.
+      const emptyBox = await page.evaluate(() => {
+        const viewer = window._cellucidViewer;
+        for (let top = 60; top < 860; top += 20) {
+          for (let left = 360; left < 1300; left += 20) {
+            let clean = true;
+            for (let y = top; y <= top + 120 && clean; y += 4) {
+              for (let x = left; x <= left + 120; x += 4) {
+                if (viewer.pickCellAtScreen(x, y) >= 0) {
+                  clean = false;
+                  break;
+                }
               }
             }
+            if (clean) return { left, top };
           }
-          if (clean) return { left, top };
         }
+        return null;
+      });
+      expect(emptyBox).not.toBeNull();
+
+      await altDraw(page, [
+        [emptyBox.left + 10, emptyBox.top + 10],
+        [emptyBox.left + 110, emptyBox.top + 10],
+        [emptyBox.left + 110, emptyBox.top + 110],
+        [emptyBox.left + 10, emptyBox.top + 110],
+        [emptyBox.left + 10, emptyBox.top + 10],
+      ]);
+
+      // Intersecting down to zero is an outcome the user drew on purpose, so it
+      // is a step, it is reported, and one Undo takes it back.
+      await expect(page.locator(MODE_DESCRIPTION)).toContainText('Step 2:');
+      await expect(page.locator(MODE_DESCRIPTION)).toContainText('0 cells');
+      expect(await unifiedState(page)).toMatchObject({
+        inProgress: true,
+        stepCount: 2,
+        candidateCount: 0,
+      });
+      await expect(page.locator('#lasso-confirm-btn')).toBeDisabled();
+      await expect(page.locator('#lasso-undo-btn')).toBeEnabled();
+
+      await page.locator('#lasso-undo-btn').click();
+      expect((await unifiedState(page)).candidateCount).toBeGreaterThan(0);
+
+      // Cancel, so the next step starts with nothing in progress.
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+    });
+
+    await test.step('a drag that lets go on the sidebar is retired, not committed', async () => {
+      const modeButton = page.locator('.highlight-mode-btn[data-mode="knn"]');
+      await modeButton.scrollIntoViewIfNeeded();
+      const box = await modeButton.boundingBox();
+      expect(box).not.toBeNull();
+
+      // Draw across the plot, wander onto the sidebar, and release over a
+      // control. The polygon behind the sidebar covers cells the user cannot
+      // even see, so committing it would select something never drawn.
+      await page.mouse.move(500, 300);
+      await page.keyboard.down('Alt');
+      await page.mouse.down();
+      for (const [x, y] of [[1000, 300], [1000, 700], [600, 700]]) {
+        await page.mouse.move(x, y, { steps: 8 });
       }
-      return null;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
+        steps: 10,
+      });
+      await page.mouse.up();
+      await page.keyboard.up('Alt');
+
+      await expect(page.locator(MODE_DESCRIPTION)).toContainText(OFF_VIEW_NOTICE);
+      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+      expect(await unifiedState(page)).toMatchObject({
+        inProgress: false,
+        stepCount: 0,
+        candidateCount: 0,
+      });
+
+      expect(productErrors).toEqual([]);
     });
-    expect(emptyBox).not.toBeNull();
-
-    await altDraw(page, [
-      [emptyBox.left + 10, emptyBox.top + 10],
-      [emptyBox.left + 110, emptyBox.top + 10],
-      [emptyBox.left + 110, emptyBox.top + 110],
-      [emptyBox.left + 10, emptyBox.top + 110],
-      [emptyBox.left + 10, emptyBox.top + 10],
-    ]);
-
-    // Intersecting down to zero is an outcome the user drew on purpose, so it
-    // is a step, it is reported, and one Undo takes it back.
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText('Step 2:');
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText('0 cells');
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: true,
-      stepCount: 2,
-      candidateCount: 0,
-    });
-    await expect(page.locator('#lasso-confirm-btn')).toBeDisabled();
-    await expect(page.locator('#lasso-undo-btn')).toBeEnabled();
-
-    await page.locator('#lasso-undo-btn').click();
-    expect((await unifiedState(page)).candidateCount).toBeGreaterThan(0);
-
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'a drag that lets go on the sidebar is retired, not committed',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openPreparedDataset(page);
-    await colorByCellType(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
-
-    const modeButton = page.locator('.highlight-mode-btn[data-mode="knn"]');
-    await modeButton.scrollIntoViewIfNeeded();
-    const box = await modeButton.boundingBox();
-    expect(box).not.toBeNull();
-
-    // Draw across the plot, wander onto the sidebar, and release over a
-    // control. The polygon behind the sidebar covers cells the user cannot
-    // even see, so committing it would select something never drawn.
-    await page.mouse.move(500, 300);
-    await page.keyboard.down('Alt');
-    await page.mouse.down();
-    for (const [x, y] of [[1000, 300], [1000, 700], [600, 700]]) {
-      await page.mouse.move(x, y, { steps: 8 });
-    }
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
-      steps: 10,
-    });
-    await page.mouse.up();
-    await page.keyboard.up('Alt');
-
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(OFF_VIEW_NOTICE);
-    await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
-    expect(await unifiedState(page)).toMatchObject({
-      inProgress: false,
-      stepCount: 0,
-      candidateCount: 0,
-    });
-
-    expect(productErrors).toEqual([]);
   },
 );

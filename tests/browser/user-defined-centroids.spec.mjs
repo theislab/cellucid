@@ -4,17 +4,17 @@
  *
  * Positions are normalized in place as each layout loads, so no raw
  * coordinates are resident once the app is running. User-defined centroids
- * were computed only from raw coordinates: a new field had no centroids (no
- * labels), and switching the view's dimension while it was active threw "Raw
- * 2D positions are unavailable for centroid computation". This spec drives the
- * real application on a dataset with 1D, 2D and 3D layouts, and checks every
- * label against means of the normalized coordinates computed here,
- * independently of the application.
+ * are computed from the normalized coordinates: from raw ones, a new field
+ * would have no centroids (no labels), and switching the view's dimension
+ * while it was active would throw "Raw 2D positions are unavailable for
+ * centroid computation". This spec drives the real application on a dataset
+ * with 1D, 2D and 3D layouts, and checks every label against means of the
+ * normalized coordinates computed here, independently of the application.
  *
  * The session is restored into a fresh page, where the field is new: the
- * restore's UI settlement used to sync the field selectors before rebuilding
- * them, so restoring a session whose active field was user-defined failed with
- * "Active categorical field is absent from its rendered selector".
+ * restore's UI settlement rebuilds the field selectors before it syncs them;
+ * synced first, they would fail a session whose active field is user-defined
+ * with "Active categorical field is absent from its rendered selector".
  */
 
 import { readFile } from 'node:fs/promises';
@@ -111,7 +111,7 @@ function expectClose(actual, expected, label) {
 }
 
 // The dataset has no genes on purpose: saving a session on a dataset without
-// genes used to fail for want of a var inventory.
+// genes must not fail for want of a var inventory.
 async function installFixture(page) {
   await serveSyntheticCatalog(page, ROOT, {
     id: DATASET_ID,
@@ -349,7 +349,7 @@ test('a categorical from a selection keeps exact labels across dimensions and se
       `${dimension}D labels land exactly where they were before saving`,
     ).toEqual(drawnBefore[dimension]);
   }
-  // Each layout a view switched to computed its centroids from the restored
+  // Each layout a view switches to computes its centroids from the restored
   // codes, landing on exactly what the field held before saving.
   expect(await readStoredCentroids(page)).toEqual(storedBefore);
   expect(errors, 'saving and restoring raise no error').toEqual([]);

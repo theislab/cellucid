@@ -41,7 +41,7 @@
  */
 
 import { getReadActivityLog } from './read-activity-log.js';
-import { textWithPublicLinks } from './sources/link-credentials.js';
+import { textWithPublicLinks } from './sources/link-text.js';
 import { getTransferLog } from './transfer-log.js';
 import { formatBytes, formatDuration, formatRemaining } from '../utils/format-units.js';
 import { createDeadline } from '../utils/deadline.js';
@@ -312,8 +312,8 @@ export class OpeningProgress {
    * file refused before it could open, the dataset's sample view not
    * applied). The next opening replaces the dataset or the attempt it was
    * about, so the notice would then describe something no longer on screen
-   * (R9U-13: "Sample view unavailable" of one sample stayed beside the next
-   * sample's own, and a refused file's card outlived two datasets).
+   * (a "Sample view unavailable" of one sample would stay beside the next
+   * sample's own, and a refused file's card would outlive two datasets).
    * `takeEarlierNotices` hands them to the view that withdraws them.
    *
    * @param {string} id
@@ -562,10 +562,9 @@ export class OpeningProgress {
     let percent = null;
     let left = null;
     // The rate is of the time the reads ran: a wait on the person (an `.rda`
-    // asking which object to open) moves no byte, and counted in, it made the
-    // rate shown beside the question fall for as long as the person thought
-    // (F76: "7.3 MB/s" in one capture, another figure in the next). While the
-    // person is asked, no rate is shown.
+    // asking which object to open) moves no byte, and counted in, it makes the
+    // rate shown beside the question fall for as long as the person thought.
+    // While the person is asked, no rate is shown.
     const since = opening.firstByteAt === null
       ? 0
       : now - opening.firstByteAt - opening.personWaitMs

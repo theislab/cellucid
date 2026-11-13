@@ -19,12 +19,12 @@ import { HISTORY_PAGE_STEPS as DEFAULT_PAGE_STEPS } from '../actions/definitions
 const idName = record => ({ id: record.id, name: record.name });
 
 /** Who acted, as reads give it (snake_case keys as every result). */
-export function byResult(by) {
+function byResult(by) {
   return { origin: by.origin, agent: by.agent, model: by.model, host: by.host, person: by.person, turn: by.turn };
 }
 
 /** A note, as reads give it. */
-export function noteResult(note) {
+function noteResult(note) {
   return { id: note.id, text: note.text, by: byResult(note.by), at: note.at, edited_at: note.editedAt, from_reply: note.fromReply };
 }
 
@@ -32,10 +32,9 @@ export function noteResult(note) {
  * `history.summary`: trackers, branches (fork step, tip, own steps, flags),
  * groups, bookmarks, turns, the recording switch, the pending branch, stale
  * results and Recently deleted, without the steps; the notes on the tracker,
- * each branch, group and turn in full (a turn's first is its summary). Only
- * counts once: a colleague's agent opening a shared session read "notes: 1"
- * on each branch and no read gave their text, so it said the donor check the
- * notes reported "is not recorded" (live-7 L25-9).
+ * each branch, group and turn in full (a turn's first is its summary), not
+ * only counted: an agent told "notes: 1" with no way to read the text could
+ * report as not recorded what the note says was done.
  */
 export function historySummary(tracker, { trackers, active, pending, stale }) {
   const own = new Map([...tracker.branches.keys()].map(id => [id, 0]));

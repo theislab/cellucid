@@ -54,7 +54,7 @@ function requireById(ownerDocument, id) {
  * @param {{rest: string|null, name: string}} choice
  * @returns {{field: {source: 'obs', key: string}, groups: Array<{label: string, categories: string[]}>, rest: string|null, name: string}|null}
  */
-export function groupParamsOf(fieldKey, rows, { rest, name }) {
+function groupParamsOf(fieldKey, rows, { rest, name }) {
   const groups = new Map();
   for (const { category, group } of rows) {
     const label = group.trim();
@@ -78,7 +78,7 @@ export function groupParamsOf(fieldKey, rows, { rest, name }) {
  * @param {number} categories - The field's categories
  * @returns {string}
  */
-export function groupStatusOf(params, categories) {
+function groupStatusOf(params, categories) {
   if (params === null) return 'Type a group for the categories it holds.';
   const grouped = params.groups.reduce((sum, group) => sum + group.categories.length, 0);
   const others = categories - grouped;

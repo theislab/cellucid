@@ -97,9 +97,9 @@
 }
 
 /* Quiet: an action inside a nested area (a list item's details, a row).
-   Controls get quieter the deeper they sit (found 2026-11-11: a history
-   step's details carried full pills and a filled "Show", louder than the
-   panel around them). One line always: a quiet action never wraps. */
+   Controls get quieter the deeper they sit, so a history step's details do
+   not carry full pills or a filled "Show", louder than the panel around
+   them. One line always: a quiet action never wraps. */
 .btn.btn-quiet {
   min-height: max(var(--control-compact-height), var(--control-target-min));
   padding: var(--control-button-compact-padding-y) var(--space-1-5);

@@ -22,8 +22,8 @@
  * leaves out every chunk holding only the fill value); a bucket the reader
  * may not read serves nothing, and its 403 refuses the store. Every request goes past the browser's HTTP cache (`cache:
  * 'no-store'`): WebKit never finished reading the bodies of chunks it served
- * from its cache to the reader worker (measured: a page reloaded with a warm
- * cache waited for them forever, every time), and nothing then mixes chunks
+ * from its cache to the reader worker (a page reloaded with a warm
+ * cache waits for them forever), and nothing then mixes chunks
  * cached from an earlier version of a store with its current metadata. A
  * request the host says is busy or failing (408, 429, 5xx), whose connection
  * fails (a 503 sent without CORS headers arrives as exactly that) or that

@@ -2,15 +2,13 @@
  * Every way a gene is chosen colors by it or says why not
  * (`app/utils/gene-lookup.js`, `ui/modules/field-selector-gene-expression.js`).
  *
- * Found on the live site: opening the Suo sample from a link, typing
- * `AC058791.1` in Gene expression and pressing Enter did nothing -- no
- * colors, no message. The sample opens progressively (a first view, then
- * more cells in steps); the choice took the dataset generation when Enter
- * was pressed, its load waited for the step under way (as it must), the step
- * advanced the generation, and the choice took its own gene for one of a
- * replaced dataset and dropped it as a cancellation, which says nothing.
- * A choice is now work on the open cells: it starts on the cells after a
- * change under way, and no change commits under it.
+ * A choice is work on the open cells: it starts on the cells after a change
+ * under way, and no change commits under it. Otherwise a choice made while a
+ * progressive opening advances (a first view, then more cells in steps) takes
+ * the dataset generation when Enter is pressed, its load waits for the step
+ * under way (as it must), the step advances the generation, and the choice
+ * takes its own gene for one of a replaced dataset and drops it as a
+ * cancellation, which says nothing: no colors, no message.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -219,8 +217,8 @@ test('Enter chooses what the box says, typed, pasted or set, and says when it na
 });
 
 test('leaving the box, by Escape or elsewhere, names the gene shown, never a name that chose nothing', async t => {
-  // Found 2026-11-10 on Suo: CD19 shown, "CD3E" typed (not among its genes) and
-  // Enter, then Escape: the box kept saying CD3E while the cells showed CD19.
+  // On Suo: CD19 shown, "CD3E" typed (not among its genes) and
+  // Enter, then Escape: the box must not keep saying CD3E while the cells show CD19.
   recordNotifications(t);
   const { loads, onLoad } = heldLoads();
   const { dom } = mountGeneSelector(exportedGenes('CD3E', 'CD19'), { onLoad });
@@ -292,10 +290,10 @@ test('a gene chosen while the open cells change is shown on the cells after the 
 });
 
 test('a gene chosen is named and holds the field menus through every refresh until its choice ends', async t => {
-  // Found in CI (the obs menus' twin, `h5ad-ui-smoke.spec.mjs`): a refresh
-  // of the selector while a choice was under way (the gene list read after
-  // the first view, an annotation change) put back what was shown and
-  // erased the choice. The choice under way is what a refresh names.
+  // The obs menus' twin (`h5ad-ui-smoke.spec.mjs`): a refresh
+  // of the selector while a choice is under way (the gene list read after
+  // the first view, an annotation change) must not put back what was shown and
+  // erase the choice. The choice under way is what a refresh names.
   recordNotifications(t);
   const { loads, onLoad } = heldLoads();
   const owner = createFieldInteractionOwner();
@@ -425,7 +423,7 @@ test('a gene list replaced before or while the gene is read: the choice follows 
   replaceGeneList(api, state, fields, ['AC058791.1', 'MS4A1', 'CD3E'], (field, position) => position);
   // The selector is refreshed for the new list (the app does on
   // `var-axis:changed`): the search keeps naming the gene being chosen, not
-  // the one shown (it used to empty).
+  // the one shown.
   api.syncFromState();
   assert.equal(dom.geneSearch.value, 'MS4A1');
   api.clearLocalSelectionUI();
@@ -498,8 +496,8 @@ test('the analysis gene picker takes the gene typed on Enter, not None, and says
   };
   typeAndEnter('ac058791.1');
   typeAndEnter('ENSG00000141510.17');
-  // With a gene chosen, typing another and Enter takes it (it used to clear
-  // the choice: None stayed active).
+  // With a gene chosen, typing another and Enter takes it (it does not clear
+  // the choice: None would stay active).
   typeAndEnter('cd3');
   assert.deepEqual(chosen, ['AC058791.1', 'ENSG00000141510', 'CD3E']);
   typeAndEnter('NOTAGENE1');

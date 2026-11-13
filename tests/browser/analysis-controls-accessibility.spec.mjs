@@ -2,27 +2,27 @@
  * Every control in the Analysis panel must be operable and announced — in the
  * sidebar and in a copied floating window alike.
  *
- * These assertions come from defects found by driving the running app:
+ * What each assertion pins, and what breaks without it:
  *
- * - The accordion headers' `aria-controls` pointed at ids the UI manager had
- *   already overwritten, so the relationship resolved to nothing.
- * - The page chips ("Page 1", "Rest of Page 1") were `<div>`s with a click
- *   listener: choosing which pages an analysis runs over was impossible without
- *   a mouse and announced no role, name or selected state.
- * - The collapsible settings sections were `<div>`s with a click listener
- *   too, hiding every control inside them from keyboard users.
- * - Selects built by the shared form helpers had no accessible name at all.
- * - The multi-select popup is appended to `<body>`, so sequential focus never
- *   reached it and Escape left focus stranded. It is a non-modal popover its
- *   button opens (`popovertarget`): next in the focus order, no Tab trap, no
- *   `aria-modal` (F146).
- * - Copying an analysis mode into a floating window produced duplicate element
- *   ids, so the copy's label toggled the sidebar's checkbox.
- * - The lazily built analysis controls joined the session UI-control inventory,
- *   which made a session unrestorable unless the same analysis panel happened
- *   to be open.
- * - Rebuilding the form when an accordion reopened discarded every choice made
- *   in it.
+ * - The accordion headers' `aria-controls` point at ids that exist (the UI
+ *   manager rewrites ids, so a stale one resolves to nothing).
+ * - The page chips ("Page 1", "Rest of Page 1") are buttons with a role, a
+ *   name and a selected state: choosing which pages an analysis runs over
+ *   needs no mouse.
+ * - The collapsible settings sections are native disclosures: a `<div>` with
+ *   a click listener hides every control inside it from keyboard users.
+ * - Selects built by the shared form helpers have an accessible name.
+ * - The multi-select popup is appended to `<body>`, so it is a non-modal
+ *   popover its button opens (`popovertarget`): next in the focus order, no
+ *   Tab trap, no `aria-modal`; otherwise sequential focus never reaches it
+ *   and Escape leaves focus stranded.
+ * - Copying an analysis mode into a floating window makes no duplicate
+ *   element ids: the copy's label toggles the copy's checkbox.
+ * - The lazily built analysis controls stay out of the session UI-control
+ *   inventory: a session is restorable whether or not the same analysis
+ *   panel happens to be open.
+ * - Rebuilding the form when an accordion reopens keeps every choice made in
+ *   it.
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -64,9 +64,10 @@ async function openDataset(page) {
 
 const panelFor = mode => `.analysis-mode-content[data-mode="${mode}"]`;
 
+/** Opens the analysis `mode`, unless it is the one open already. */
 async function openMode(page, mode) {
   const header = page.locator(`#analysis-header-${mode}`);
-  await header.click();
+  if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
   await expect(header).toHaveAttribute('aria-expanded', 'true');
   const panel = page.locator(panelFor(mode));
   await expect(panel).toBeVisible();
@@ -121,331 +122,308 @@ function readControlNames(page, selector) {
   }, selector);
 }
 
-test('every analysis accordion header controls a region that exists', async ({
-  page
-}) => {
+// One opening. The control inventory is read before any panel has been opened; the step that
+// changes the marker genes form and the one that copies a window come last.
+test('the analysis panels by keyboard and by name: headers, every control, page chips, disclosures, the multi-select popup, kept settings, a copied window', async ({ page, browserName }) => {
   const productErrors = observeProductErrors(page);
   await openDataset(page);
 
-  // Headers are native disclosure buttons with no control nested inside
-  // them, and the accordion does not claim a tablist it does not implement.
-  expect(await page.evaluate(() => ({
-    tablists: document.querySelectorAll('.analysis-mode-list[role="tablist"]').length,
-    headers: [...document.querySelectorAll('.analysis-mode-list .disclosure-header')]
-      .filter(header => header.id.startsWith('analysis-header-'))
-      .map(header => ({
-        tag: header.tagName,
-        nested: header.querySelectorAll('button, input, select, textarea, [tabindex]').length,
-        copySibling: header.parentElement
-          .querySelector(':scope > .analysis-mode-copy-btn') !== null,
-      })),
-  }))).toEqual({
-    tablists: 0,
-    headers: MODES.map(() => ({ tag: 'BUTTON', nested: 0, copySibling: true })),
-  });
-
-  const relationships = await page.evaluate(() =>
-    [...document.querySelectorAll('.analysis-mode-list .disclosure-header')]
-      .filter(header => header.id.startsWith('analysis-header-'))
-      .map(header => ({
-        header: header.id,
-        controls: header.getAttribute('aria-controls'),
-        resolves:
-          document.getElementById(header.getAttribute('aria-controls') ?? '') !== null
-      }))
-  );
-  expect(relationships).toHaveLength(MODES.length);
-  for (const relationship of relationships) {
-    expect(relationship.controls, relationship.header).toBe(
-      `analysis-panel-${relationship.header.replace('analysis-header-', '')}`
-    );
-    expect(relationship.resolves, relationship.header).toBe(true);
-  }
-  expect(productErrors).toEqual([]);
-});
-
-test('every control in every analysis panel has an accessible name', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-
-  for (const mode of MODES) {
-    const header = await openMode(page, mode);
-    const controls = await readControlNames(page, panelFor(mode));
-    expect(controls.length, `${mode} exposes at least one control`)
-      .toBeGreaterThan(0);
-    expect(
-      controls.filter(control => !control.named).map(c => c.description),
-      `unnamed controls in ${mode}`
-    ).toEqual([]);
-    await header.click();
-  }
-  expect(productErrors).toEqual([]);
-});
-
-test('page chips are operable and announced without a mouse', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'detailed');
-
-  const chips = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`);
-  await expect(chips).toHaveCount(2);
-
-  // The empty page cannot be selected and says so.
-  const empty = chips.first();
-  await expect(empty).toHaveRole('button');
-  await expect(empty).toHaveAttribute('aria-disabled', 'true');
-  await expect(empty).toHaveAttribute('tabindex', '-1');
-  await expect(empty).toHaveAccessibleName(/no cells, cannot be selected/);
-
-  // The populated page is a toggle button carrying its cell count.
-  const populated = chips.nth(1);
-  await expect(populated).toHaveRole('button');
-  await expect(populated).toHaveAttribute('tabindex', '0');
-  await expect(populated).toHaveAccessibleName(/120 cells/);
-  await expect(populated).toHaveAttribute('aria-pressed', 'true');
-
-  await populated.focus();
-  await page.keyboard.press('Enter');
-  const afterEnter = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`).nth(1);
-  await expect(afterEnter).toHaveAttribute('aria-pressed', 'false');
-  // Toggling updates the chips in place; focus stays on the same chip.
-  await expect(afterEnter).toBeFocused();
-
-  await page.keyboard.press(' ');
-  const afterSpace = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`).nth(1);
-  await expect(afterSpace).toHaveAttribute('aria-pressed', 'true');
-  await expect(afterSpace).toBeFocused();
-
-  // The color picker is a separate, individually named control, and no
-  // interactive control is nested inside the chip's toggle button.
-  await expect(
-    page.locator(`${panelFor('detailed')} .color-swatch-input`)
-  ).toHaveAccessibleName(/^Highlight color for /);
-  expect(await page.evaluate(selector => (
-    [...document.querySelectorAll(`${selector} .analysis-page-tabs .chip`)].map(chip => ({
-      tag: chip.tagName,
-      nested: chip.querySelectorAll('button, input, select, textarea, [tabindex]').length,
-    }))
-  ), panelFor('detailed'))).toEqual([
-    { tag: 'BUTTON', nested: 0 },
-    { tag: 'BUTTON', nested: 0 },
-  ]);
-
-  expect(productErrors).toEqual([]);
-});
-
-test('collapsible settings sections open from the keyboard', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'genesPanel');
-
-  // "More options", then each group of options inside it.
-  const panel = panelFor('genesPanel');
-  const toggleFromKeyboard = async header => {
-    await expect(header).toHaveRole('button');
-    await expect(header).toHaveAttribute('aria-expanded', 'false');
-    const regionId = await header.getAttribute('aria-controls');
-    expect(regionId).toBeTruthy();
-    const region = page.locator(`[id="${regionId}"]`);
-    await expect(region).toBeHidden();
-    await header.focus();
-    await page.keyboard.press('Enter');
-    await expect(header).toHaveAttribute('aria-expanded', 'true');
-    await expect(region).toBeVisible();
-    await page.keyboard.press(' ');
-    await expect(header).toHaveAttribute('aria-expanded', 'false');
-    await expect(region).toBeHidden();
-  };
-  const more = page.locator(`${panel} .analysis-more-options > .disclosure-header`);
-  await expect(more).toHaveCount(1);
-  await toggleFromKeyboard(more);
-  await more.click();
-  const groups = page.locator(
-    `${panel} .analysis-options-group > .disclosure-header-row > .disclosure-header`
-  );
-  await expect(groups).toHaveCount(4);
-  for (let index = 0; index < 4; index++) await toggleFromKeyboard(groups.nth(index));
-  await more.click();
-
-  // The Quick Insights page-selection disclosure follows the same contract.
-  await page.locator('#analysis-header-genesPanel').click();
-  await openMode(page, 'simple');
-  const insights = page.locator(
-    `${panelFor('simple')} .insights-page-selector-section > .disclosure-header`
-  );
-  await expect(insights).toHaveRole('button');
-  await expect(insights).toHaveAttribute('aria-expanded', 'false');
-  await expect(insights).toHaveAccessibleName(/^Page selection/);
-  await insights.focus();
-  await page.keyboard.press('Enter');
-  await expect(insights).toHaveAttribute('aria-expanded', 'true');
-
-  expect(productErrors).toEqual([]);
-});
-
-test('the multi-select popup takes focus, is next in the Tab order, and hands it back', async ({
-  page,
-  browserName,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'simple');
-
-  const trigger = page.getByRole('button', { name: 'Choose composition fields' });
-  await expect(trigger).toHaveAttribute('aria-expanded', 'false');
-  await trigger.focus();
-  await page.keyboard.press('Enter');
-  await expect(trigger).toHaveAttribute('aria-expanded', 'true');
-
-  const panel = page.locator('.multi-select-dropdown-panel:popover-open');
-  await expect(panel).toBeVisible();
-  await expect(panel).not.toHaveAttribute('aria-modal', /.*/);
-  await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
-
-  // Tab walks on through the popup's own controls (a non-modal popup: no
-  // trap, the page stays usable).
-  await page.keyboard.press(tabKey(browserName));
-  await expect
-    .poll(() => page.evaluate(
-      () => document.activeElement?.closest('.multi-select-dropdown-panel') !== null
-    ))
-    .toBe(true);
-  await page.keyboard.press(tabKey(browserName, { shift: true }));
-  await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
-
-  await page.keyboard.press('Escape');
-  await expect(trigger).toHaveAttribute('aria-expanded', 'false');
-  await expect(trigger).toBeFocused();
-
-  expect(productErrors).toEqual([]);
-});
-
-test('a copied analysis window owns its own controls', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'genesPanel');
-
-  await page
-    .locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
-    .click();
-  const floating = page.locator('#floating-panels-root .analysis-window-panel');
-  await expect(floating).toHaveCount(1);
-  await expect(floating.locator('select[name="groupBy"]')).toBeVisible();
-
-  const duplicateIds = await page.evaluate(() => {
-    const ids = [...document.querySelectorAll('[id]')].map(element => element.id);
-    return [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))];
-  });
-  expect(duplicateIds).toEqual([]);
-
-  // Clicking the copy's label must operate the copy's control, not the
-  // sidebar's.
-  const focused = await page.evaluate(() => {
-    const sidebarSelect = document.querySelector('#sidebar').querySelector('select[name="groupBy"]');
-    const floatingSelect = document.querySelector('#floating-panels-root').querySelector('select[name="groupBy"]');
-    const floatingLabel = document
-      .querySelector('#floating-panels-root')
-      .querySelector(`label[for="${CSS.escape(floatingSelect.id)}"]`);
-    floatingLabel.click();
-    return {
-      floating: document.activeElement === floatingSelect,
-      sidebar: document.activeElement === sidebarSelect,
-    };
-  });
-  expect(focused).toEqual({ floating: true, sidebar: false });
-
-  const controls = await readControlNames(
-    page,
-    '#floating-panels-root .analysis-window-panel'
-  );
-  expect(
-    controls.filter(control => !control.named).map(control => control.description),
-    'unnamed controls in the copied window'
-  ).toEqual([]);
-
-  expect(productErrors).toEqual([]);
-});
-
-test('analysis panels never change the session UI-control inventory', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-
-  const captureInventory = () => page.evaluate(async () => {
-    const { createUiControlSerializer } = await import(
-      '/assets/js/app/state-serializer/ui-controls.js'
-    );
-    return createUiControlSerializer({
-      sidebar: document.getElementById('sidebar')
-    }).collectUIControls();
-  });
-
-  const beforeControls = await captureInventory();
-  for (const mode of MODES) {
-    await openMode(page, mode);
-  }
-  const afterControls = await captureInventory();
-  expect(Object.keys(afterControls).sort()).toEqual(
-    Object.keys(beforeControls).sort()
-  );
-
-  // A session captured with the analysis panels closed still restores while
-  // they are open.
-  const validation = await page.evaluate(async payload => {
-    const { createUiControlSerializer } = await import(
-      '/assets/js/app/state-serializer/ui-controls.js'
-    );
-    try {
-      createUiControlSerializer({
+  await test.step('analysis panels never change the session UI-control inventory', async () => {
+    const captureInventory = () => page.evaluate(async () => {
+      const { createUiControlSerializer } = await import(
+        '/assets/js/app/state-serializer/ui-controls.js'
+      );
+      return createUiControlSerializer({
         sidebar: document.getElementById('sidebar')
-      }).validateUIControls(payload);
-      return { ok: true, error: null };
-    } catch (error) {
-      return { ok: false, error: `${error.name}: ${error.message}` };
+      }).collectUIControls();
+    });
+
+    const beforeControls = await captureInventory();
+    for (const mode of MODES) {
+      await openMode(page, mode);
     }
-  }, beforeControls);
-  expect(validation).toEqual({ ok: true, error: null });
+    const afterControls = await captureInventory();
+    expect(Object.keys(afterControls).sort()).toEqual(
+      Object.keys(beforeControls).sort()
+    );
 
-  expect(productErrors).toEqual([]);
-});
+    // A session captured with the analysis panels closed still restores while
+    // they are open.
+    const validation = await page.evaluate(async payload => {
+      const { createUiControlSerializer } = await import(
+        '/assets/js/app/state-serializer/ui-controls.js'
+      );
+      try {
+        createUiControlSerializer({
+          sidebar: document.getElementById('sidebar')
+        }).validateUIControls(payload);
+        return { ok: true, error: null };
+      } catch (error) {
+        return { ok: false, error: `${error.name}: ${error.message}` };
+      }
+    }, beforeControls);
+    expect(validation).toEqual({ ok: true, error: null });
 
-test('analysis settings survive collapsing and reopening the panel', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await openMode(page, 'genesPanel');
+    expect(productErrors).toEqual([]);
+  });
 
-  const form = panelFor('genesPanel');
-  await page.locator(`${form} .analysis-more-options > .disclosure-header`).click();
-  await page.locator(form).getByRole('button', { name: 'Test', exact: true }).click();
-  await page.locator(form).getByRole('combobox', { name: 'Method' }).selectOption('ttest');
-  await page.locator(form).getByRole('button', { name: 'Bonferroni' }).click();
+  await test.step('every analysis accordion header controls a region that exists', async () => {
+    // Headers are native disclosure buttons with no control nested inside
+    // them, and the accordion does not claim a tablist it does not implement.
+    expect(await page.evaluate(() => ({
+      tablists: document.querySelectorAll('.analysis-mode-list[role="tablist"]').length,
+      headers: [...document.querySelectorAll('.analysis-mode-list .disclosure-header')]
+        .filter(header => header.id.startsWith('analysis-header-'))
+        .map(header => ({
+          tag: header.tagName,
+          nested: header.querySelectorAll('button, input, select, textarea, [tabindex]').length,
+          copySibling: header.parentElement
+            .querySelector(':scope > .analysis-mode-copy-btn') !== null,
+        })),
+    }))).toEqual({
+      tablists: 0,
+      headers: MODES.map(() => ({ tag: 'BUTTON', nested: 0, copySibling: true })),
+    });
 
-  const expectCarried = async () => {
-    await expect(page.locator(form).getByRole('combobox', { name: 'Method' })).toHaveValue('ttest');
-    await expect(page.locator(form).getByRole('button', { name: 'Bonferroni' })).toHaveAttribute('aria-pressed', 'true');
-    // The Wilcoxon p-value choice applies to Wilcoxon only.
-    await expect(page.locator(form).getByRole('combobox', { name: 'Wilcoxon p-values' })).toHaveCount(0);
-    // The open disclosures are carried with the choices.
-    await expect(page.locator(`${form} .analysis-more-options > .disclosure-header`)).toHaveAttribute('aria-expanded', 'true');
-  };
-  await expectCarried();
+    const relationships = await page.evaluate(() =>
+      [...document.querySelectorAll('.analysis-mode-list .disclosure-header')]
+        .filter(header => header.id.startsWith('analysis-header-'))
+        .map(header => ({
+          header: header.id,
+          controls: header.getAttribute('aria-controls'),
+          resolves:
+            document.getElementById(header.getAttribute('aria-controls') ?? '') !== null
+        }))
+    );
+    expect(relationships).toHaveLength(MODES.length);
+    for (const relationship of relationships) {
+      expect(relationship.controls, relationship.header).toBe(
+        `analysis-panel-${relationship.header.replace('analysis-header-', '')}`
+      );
+      expect(relationship.resolves, relationship.header).toBe(true);
+    }
+    expect(productErrors).toEqual([]);
+  });
 
-  await page.locator('#analysis-header-genesPanel').click();
-  await openMode(page, 'genesPanel');
-  await expectCarried();
+  await test.step('every control in every analysis panel has an accessible name', async () => {
+    for (const mode of MODES) {
+      const header = await openMode(page, mode);
+      const controls = await readControlNames(page, panelFor(mode));
+      expect(controls.length, `${mode} exposes at least one control`)
+        .toBeGreaterThan(0);
+      expect(
+        controls.filter(control => !control.named).map(c => c.description),
+        `unnamed controls in ${mode}`
+      ).toEqual([]);
+      await header.click();
+    }
+    expect(productErrors).toEqual([]);
+  });
 
-  await page.locator('#analysis-header-correlation').click();
-  await page.locator('#analysis-header-genesPanel').click();
-  await expect(page.locator(`#analysis-header-genesPanel`)).toHaveAttribute(
-    'aria-expanded',
-    'true'
-  );
-  await expectCarried();
+  await test.step('page chips are operable and announced without a mouse', async () => {
+    await openMode(page, 'detailed');
 
-  expect(productErrors).toEqual([]);
+    const chips = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`);
+    await expect(chips).toHaveCount(2);
+
+    // The empty page cannot be selected and says so.
+    const empty = chips.first();
+    await expect(empty).toHaveRole('button');
+    await expect(empty).toHaveAttribute('aria-disabled', 'true');
+    await expect(empty).toHaveAttribute('tabindex', '-1');
+    await expect(empty).toHaveAccessibleName(/no cells, cannot be selected/);
+
+    // The populated page is a toggle button carrying its cell count.
+    const populated = chips.nth(1);
+    await expect(populated).toHaveRole('button');
+    await expect(populated).toHaveAttribute('tabindex', '0');
+    await expect(populated).toHaveAccessibleName(/120 cells/);
+    await expect(populated).toHaveAttribute('aria-pressed', 'true');
+
+    await populated.focus();
+    await page.keyboard.press('Enter');
+    const afterEnter = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`).nth(1);
+    await expect(afterEnter).toHaveAttribute('aria-pressed', 'false');
+    // Toggling updates the chips in place; focus stays on the same chip.
+    await expect(afterEnter).toBeFocused();
+
+    await page.keyboard.press(' ');
+    const afterSpace = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`).nth(1);
+    await expect(afterSpace).toHaveAttribute('aria-pressed', 'true');
+    await expect(afterSpace).toBeFocused();
+
+    // The color picker is a separate, individually named control, and no
+    // interactive control is nested inside the chip's toggle button.
+    await expect(
+      page.locator(`${panelFor('detailed')} .color-swatch-input`)
+    ).toHaveAccessibleName(/^Highlight color for /);
+    expect(await page.evaluate(selector => (
+      [...document.querySelectorAll(`${selector} .analysis-page-tabs .chip`)].map(chip => ({
+        tag: chip.tagName,
+        nested: chip.querySelectorAll('button, input, select, textarea, [tabindex]').length,
+      }))
+    ), panelFor('detailed'))).toEqual([
+      { tag: 'BUTTON', nested: 0 },
+      { tag: 'BUTTON', nested: 0 },
+    ]);
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('collapsible settings sections open from the keyboard', async () => {
+    await openMode(page, 'genesPanel');
+
+    // "More options", then each group of options inside it.
+    const panel = panelFor('genesPanel');
+    const toggleFromKeyboard = async header => {
+      await expect(header).toHaveRole('button');
+      await expect(header).toHaveAttribute('aria-expanded', 'false');
+      const regionId = await header.getAttribute('aria-controls');
+      expect(regionId).toBeTruthy();
+      const region = page.locator(`[id="${regionId}"]`);
+      await expect(region).toBeHidden();
+      await header.focus();
+      await page.keyboard.press('Enter');
+      await expect(header).toHaveAttribute('aria-expanded', 'true');
+      await expect(region).toBeVisible();
+      await page.keyboard.press(' ');
+      await expect(header).toHaveAttribute('aria-expanded', 'false');
+      await expect(region).toBeHidden();
+    };
+    const more = page.locator(`${panel} .analysis-more-options > .disclosure-header`);
+    await expect(more).toHaveCount(1);
+    await toggleFromKeyboard(more);
+    await more.click();
+    const groups = page.locator(
+      `${panel} .analysis-options-group > .disclosure-header-row > .disclosure-header`
+    );
+    await expect(groups).toHaveCount(4);
+    for (let index = 0; index < 4; index++) await toggleFromKeyboard(groups.nth(index));
+    await more.click();
+
+    // The Quick Insights page-selection disclosure follows the same contract.
+    await page.locator('#analysis-header-genesPanel').click();
+    await openMode(page, 'simple');
+    const insights = page.locator(
+      `${panelFor('simple')} .insights-page-selector-section > .disclosure-header`
+    );
+    await expect(insights).toHaveRole('button');
+    await expect(insights).toHaveAttribute('aria-expanded', 'false');
+    await expect(insights).toHaveAccessibleName(/^Page selection/);
+    await insights.focus();
+    await page.keyboard.press('Enter');
+    await expect(insights).toHaveAttribute('aria-expanded', 'true');
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('the multi-select popup takes focus, is next in the Tab order, and hands it back', async () => {
+    await openMode(page, 'simple');
+
+    const trigger = page.getByRole('button', { name: 'Choose composition fields' });
+    await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    await trigger.focus();
+    await page.keyboard.press('Enter');
+    await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+
+    const panel = page.locator('.multi-select-dropdown-panel:popover-open');
+    await expect(panel).toBeVisible();
+    await expect(panel).not.toHaveAttribute('aria-modal', /.*/);
+    await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
+
+    // Tab walks on through the popup's own controls (a non-modal popup: no
+    // trap, the page stays usable).
+    await page.keyboard.press(tabKey(browserName));
+    await expect
+      .poll(() => page.evaluate(
+        () => document.activeElement?.closest('.multi-select-dropdown-panel') !== null
+      ))
+      .toBe(true);
+    await page.keyboard.press(tabKey(browserName, { shift: true }));
+    await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
+
+    await page.keyboard.press('Escape');
+    await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    await expect(trigger).toBeFocused();
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('analysis settings survive collapsing and reopening the panel', async () => {
+    await openMode(page, 'genesPanel');
+
+    const form = panelFor('genesPanel');
+    await page.locator(`${form} .analysis-more-options > .disclosure-header`).click();
+    await page.locator(form).getByRole('button', { name: 'Test', exact: true }).click();
+    await page.locator(form).getByRole('combobox', { name: 'Method' }).selectOption('ttest');
+    await page.locator(form).getByRole('button', { name: 'Bonferroni' }).click();
+
+    const expectCarried = async () => {
+      await expect(page.locator(form).getByRole('combobox', { name: 'Method' })).toHaveValue('ttest');
+      await expect(page.locator(form).getByRole('button', { name: 'Bonferroni' })).toHaveAttribute('aria-pressed', 'true');
+      // The Wilcoxon p-value choice applies to Wilcoxon only.
+      await expect(page.locator(form).getByRole('combobox', { name: 'Wilcoxon p-values' })).toHaveCount(0);
+      // The open disclosures are carried with the choices.
+      await expect(page.locator(`${form} .analysis-more-options > .disclosure-header`)).toHaveAttribute('aria-expanded', 'true');
+    };
+    await expectCarried();
+
+    await page.locator('#analysis-header-genesPanel').click();
+    await openMode(page, 'genesPanel');
+    await expectCarried();
+
+    await page.locator('#analysis-header-correlation').click();
+    await page.locator('#analysis-header-genesPanel').click();
+    await expect(page.locator(`#analysis-header-genesPanel`)).toHaveAttribute(
+      'aria-expanded',
+      'true'
+    );
+    await expectCarried();
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('a copied analysis window owns its own controls', async () => {
+    await openMode(page, 'genesPanel');
+
+    await page
+      .locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
+      .click();
+    const floating = page.locator('#floating-panels-root .analysis-window-panel');
+    await expect(floating).toHaveCount(1);
+    await expect(floating.locator('select[name="groupBy"]')).toBeVisible();
+
+    const duplicateIds = await page.evaluate(() => {
+      const ids = [...document.querySelectorAll('[id]')].map(element => element.id);
+      return [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))];
+    });
+    expect(duplicateIds).toEqual([]);
+
+    // Clicking the copy's label must operate the copy's control, not the
+    // sidebar's.
+    const focused = await page.evaluate(() => {
+      const sidebarSelect = document.querySelector('#sidebar').querySelector('select[name="groupBy"]');
+      const floatingSelect = document.querySelector('#floating-panels-root').querySelector('select[name="groupBy"]');
+      const floatingLabel = document
+        .querySelector('#floating-panels-root')
+        .querySelector(`label[for="${CSS.escape(floatingSelect.id)}"]`);
+      floatingLabel.click();
+      return {
+        floating: document.activeElement === floatingSelect,
+        sidebar: document.activeElement === sidebarSelect,
+      };
+    });
+    expect(focused).toEqual({ floating: true, sidebar: false });
+
+    const controls = await readControlNames(
+      page,
+      '#floating-panels-root .analysis-window-panel'
+    );
+    expect(
+      controls.filter(control => !control.named).map(control => control.description),
+      'unnamed controls in the copied window'
+    ).toEqual([]);
+
+    expect(productErrors).toEqual([]);
+  });
 });

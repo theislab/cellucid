@@ -3,7 +3,7 @@
  * tool it made up), never run as HTML: not in the chat, its tool rows or the
  * history, and not in the chat exported as Markdown (raw HTML escaped, a
  * script link left as text), which a renderer that does not sanitise may
- * show. From the agents bug hunt of 2026-11-04.
+ * show.
  */
 import { readFile } from 'node:fs/promises';
 

@@ -1,11 +1,11 @@
 /**
- * Stored outlier quantiles are accepted for a category of any size (audit
- * NS-4). The rule writes a cell's quantile as `fround(fround(r) / fround(n))`
+ * Stored outlier quantiles are accepted for a category of any size.
+ * The rule writes a cell's quantile as `fround(fround(r) / fround(n))`
  * (`rankShare`); above 2^24 placed cells float32 no longer tells neighboring
  * ranks apart, so a quantile names a range of ranks, and recovering one rank
- * from it (`round(q · n)`) refused quantiles the rule wrote correctly — from
- * about 17M cells in one category every opening read and ranked the whole
- * latent space instead. The check is by ranges: the cells holding each
+ * from it (`round(q · n)`) would refuse quantiles the rule wrote correctly —
+ * from about 17M cells in one category every opening would read and rank the
+ * whole latent space instead. The check is by ranges: the cells holding each
  * distinct quantile end at a count that must give it.
  */
 import assert from 'node:assert/strict';

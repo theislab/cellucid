@@ -15,13 +15,19 @@
  * - focus returns to the opener even when a mouse click never focused it
  *   (WebKit does not focus a clicked link or button), or to what a function
  *   names at close time when the opener is gone;
+ * - Tab that comes back from the browser's own controls lands on the dialog's
+ *   first control: a selection left in the page behind is moved to the
+ *   dialog's start (`startSelectionIn`), where Firefox starts Tab;
  * - keys pressed inside the dialog stay in it: the page's own keys (the camera,
  *   the shortcuts, Escape leaving a selection or a tour) never act behind an
  *   open dialog. Listeners in the capture phase still see them first, which is
  *   how a tip or popover shown inside the dialog takes its own Escape;
  * - `close()` settles at once (focus back, `onClose`), where the native `close`
  *   event comes a task later; a close by Escape or the backdrop settles on that
- *   event;
+ *   event, or when the dialog is opened again before it. A close while `open()` runs (a focus listener reacting to the
+ *   dialog's first focus) settles before `open()` returns, and `dialog.open`
+ *   is then false: what an opener records after `open()` it records only when
+ *   the dialog is still open;
  * - a dialog under the topmost is made inert itself (`inert`), as the stacking
  *   promises, and given back when it is the topmost again: Linux's WebKit let
  *   focus into a dialog under a confirmation;
@@ -36,6 +42,8 @@
  *
  * @module ui/components/app-dialog
  */
+
+import { holdPlace } from '../../utils/dom-utils.js';
 
 /** Open modal dialogs, the topmost last. */
 const openModals = [];
@@ -56,9 +64,9 @@ function topModal() {
 
 /**
  * A dialog under the topmost is inert, set here and not only left to the
- * browser: Linux's WebKit (Playwright's WPE build, as GNOME Web) still let a
- * control of a dialog under a confirmation take focus (CI run 43106620008,
- * `community-annotation-cap-voting.spec.mjs`), where the stacking a modal
+ * browser: Linux's WebKit (Playwright's WPE build, as GNOME Web) still lets a
+ * control of a dialog under a confirmation take focus
+ * (`community-annotation-cap-voting.spec.mjs`), where the stacking a modal
  * dialog promises makes everything outside the topmost unreachable. The
  * attribute is taken off when the dialog is the topmost again.
  */
@@ -78,26 +86,11 @@ function coverModalsBelowTop() {
 }
 
 /**
- * Put `element` back where `home` says it lived: before the sibling it stood
- * before. That sibling may itself be kept above dialogs and not home yet (two
- * followers side by side: the notification center and the agents' dock); the
- * place is then before the sibling *it* goes back before, and so on, so every
- * follower ends where it was whatever the order they go home in. Before, the
- * first of two neighbors to go home found its sibling away and was put at
- * the end of its parent: the two had swapped places, and with them which of
- * the two is drawn over the other (found 2026-11-12, Firefox,
- * `community-annotation-cap-voting.spec.mjs`).
+ * Back where it lives without a dialog (`holdPlace`); to the end of its
+ * parent when that place is gone.
  */
 function goHome(element, home) {
-  const { parent } = home;
-  if (parent === null) return;
-  let anchor = home.next;
-  while (anchor !== null && anchor.parentNode !== parent) {
-    const away = followers.get(anchor)?.home ?? null;
-    anchor = away !== null && away.parent === parent ? away.next : null;
-  }
-  if (anchor !== null) parent.insertBefore(element, anchor);
-  else parent.append(element);
+  if (!home.goBack()) home.parent?.append(element);
 }
 
 function placeFollowers() {
@@ -105,12 +98,11 @@ function placeFollowers() {
   const top = topModal();
   for (const [element, state] of followers) {
     if (top !== null) {
-      state.home ??= { parent: element.parentNode, next: element.nextSibling };
+      state.home ??= { parent: element.parentNode, goBack: holdPlace(element) };
       if (element.parentNode !== top) top.append(element);
       continue;
     }
     if (state.home === null) continue;
-    // Its home is known to the others until it is back in it (`goHome`).
     goHome(element, state.home);
     state.home = null;
   }
@@ -143,6 +135,23 @@ export function keepAboveModals(element) {
     followers.delete(element);
     return true;
   };
+}
+
+/**
+ * Put the document's selection at the start of `dialog` when it lies in the
+ * page the dialog makes inert. With nothing focused (Tab went past the
+ * dialog's last control to the browser's own controls and came back), Firefox
+ * starts Tab from the selection, and a script's focus does not move it: a
+ * caret left where a highlight page was renamed sent every lap of Tab from the
+ * licence text past the browser and back to the text, never to Close. From
+ * the dialog's start, Tab comes back to its first control, as in the other
+ * engines (which start from what was focused last).
+ */
+function startSelectionIn(dialog) {
+  const selection = dialog.ownerDocument.getSelection();
+  if (selection === null || selection.rangeCount === 0) return;
+  if (selection.anchorNode !== null && dialog.contains(selection.anchorNode)) return;
+  selection.collapse(dialog, 0);
 }
 
 /** A control focus can go back to: still in the page, enabled, not the body. */
@@ -196,9 +205,9 @@ export function wireAppDialog(dialog, { onClose = null, dismissible = true } = {
     // `close` event): focus that moved on meanwhile (a row the person, or a
     // key, focused right after Escape) stays where it went. Focus is taken
     // back only from the dialog, the body (focus lost with the dialog), or
-    // where the browser put it back itself (what was focused at open). F260:
-    // under load, F2's rename dialog closed by Escape took focus back from the
-    // step row focused next, and Delete then acted on the branch row.
+    // where the browser put it back itself (what was focused at open). A
+    // dialog closed by Escape that took focus back from the row focused next
+    // would send a Delete to the wrong row.
     const active = dialog.ownerDocument.activeElement;
     const movedOn = active !== null && active !== dialog.ownerDocument.body && !dialog.contains(active) && active !== before;
     const target = typeof returnTo === 'function' ? returnTo() : returnTo;
@@ -244,12 +253,29 @@ export function wireAppDialog(dialog, { onClose = null, dismissible = true } = {
      */
     open(opener = null, { focus = null } = {}) {
       if (dialog.open) return;
+      // Closed by Escape or the backdrop, its native close event still to
+      // come: that opening ends now, with its focus and its `onClose`, so
+      // each opening settles once and the dialog is listed once.
+      settle();
       const before = dialog.ownerDocument.activeElement;
-      const returnTo = opener ?? before;
-      dialog.showModal();
-      session = { returnTo, before };
+      const opening = { returnTo: opener ?? before, before };
+      // `showModal()` focuses the dialog's first control before it returns,
+      // and a focus listener may close the dialog there: that close settles
+      // at once like any other, so the opening is known before the call;
+      // otherwise only the native close event would settle it, which
+      // Chromium dispatches with the next animation frame.
+      session = opening;
       openModals.push(dialog);
+      try {
+        dialog.showModal();
+      } catch (error) {
+        session = null;
+        openModals.splice(openModals.indexOf(dialog), 1);
+        throw error;
+      }
+      if (session !== opening) return;
       placeFollowers();
+      startSelectionIn(dialog);
       if (focus !== null) focus.focus({ preventScroll: true });
     },
     close,

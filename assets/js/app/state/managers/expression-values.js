@@ -58,7 +58,7 @@ import { PLACES, placePath } from '../../ui/place-names.js';
 const SHOWN = Symbol('expression transform shown by a gene loader');
 
 /**
- * The cells' totals pass as a progress line says it while it runs (F167):
+ * The cells' totals pass as a progress line says it while it runs:
  * a load that finds it (a session file, a saved state, a replay) names it
  * on its own line, with its Cancel (`session-serializer.js`).
  */
@@ -125,6 +125,7 @@ function shownRows(rows, factors, log1p) {
 export class DataStateExpressionMethods {
   /**
    * The expression transform asked (the `expression` state domain).
+   * @this {import('../core/data-state.js').DataState}
    * @returns {import('../../../data/expression-transform.js').ExpressionTransform}
    */
   getExpressionTransform() {
@@ -134,6 +135,7 @@ export class DataStateExpressionMethods {
   /**
    * The transform the mapped matrix's values are shown in now: what is
    * asked, when the matrix takes it, else the values as stored.
+   * @this {import('../core/data-state.js').DataState}
    */
   getShownExpressionTransform() {
     return shownTransformOf(this.varFieldLoader);
@@ -145,6 +147,7 @@ export class DataStateExpressionMethods {
    * values are `log1p` already (Data mapping › Genes › Values), or one that
    * does not hold counts.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object|null} [mapping]
    * @returns {{offered: boolean, reason: string|null}}
    */
@@ -165,6 +168,7 @@ export class DataStateExpressionMethods {
    * The transform the matrix `mapping` maps is shown in: `asked` (the one
    * asked now by default) when the matrix takes it.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object|null} mapping
    * @param {import('../../../data/expression-transform.js').ExpressionTransform} [asked]
    */
@@ -176,13 +180,18 @@ export class DataStateExpressionMethods {
    * The obs field the file names as the mapped matrix's cells' totals
    * (`uns['cellucid']['totalCounts']`, for the mapped modality), or null.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {{field: string, over: 'all genes'|'source panel'|'stored genes'}|null}
    */
   storedCellTotals() {
     return this._storedTotalsOf(baseVarLoader(this.varFieldLoader), this.dataMapping?.modality ?? null);
   }
 
-  /** The obs field a matrix's own loader names as its cells' totals for `modality`, or null. @private */
+  /**
+   * The obs field a matrix's own loader names as its cells' totals for `modality`, or null.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _storedTotalsOf(base, modality) {
     const records = base?.storedTotals?.() ?? null;
     if (records === null) return null;
@@ -194,6 +203,7 @@ export class DataStateExpressionMethods {
    * are read (the section's source line, `dataset.summary`): the obs field
    * the file names, else one named like a total, else every gene summed.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {{field: string|null, over: 'all genes'|'source panel'|'stored genes'|null, genes: number}}
    */
   cellTotalsPlan() {
@@ -202,7 +212,11 @@ export class DataStateExpressionMethods {
     return this._cellTotalsPlanOf(baseVarLoader(loader), this._shownLineage(), this.dataMapping?.modality ?? null);
   }
 
-  /** `cellTotalsPlan` of a matrix: its own loader, its lineage, its modality. @private */
+  /**
+   * `cellTotalsPlan` of a matrix: its own loader, its lineage, its modality.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _cellTotalsPlanOf(base, lineage, modality) {
     const sizes = keptLibrarySizes(lineage);
     if (sizes !== null) return { field: sizes.field, over: sizes.over, genes: sizes.genes };
@@ -219,6 +233,7 @@ export class DataStateExpressionMethods {
    * (`valuesRecord`): the transform and where the cells' totals came from;
    * null for the values as stored.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {{normalize: boolean, log1p: boolean, totals: string|null}|null}
    */
   shownValuesRecord() {
@@ -228,7 +243,11 @@ export class DataStateExpressionMethods {
     return valuesRecord(shown, sizes ?? { source: 'the cells\' totals (not read yet)' });
   }
 
-  /** The continuous obs fields by the key the file gives them, to their position. @private */
+  /**
+   * The continuous obs fields by the key the file gives them, to their position.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _continuousObsKeys() {
     const keys = new Map();
     (this.obsData?.fields ?? []).forEach((field, index) => {
@@ -240,6 +259,7 @@ export class DataStateExpressionMethods {
   /**
    * A lineage of cells' totals: the gene list (descriptors) of a matrix and
    * its name, the holder `data/library-sizes.js` keeps the totals with.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _cellTotalsLineage(genes, mapping) {
@@ -255,6 +275,7 @@ export class DataStateExpressionMethods {
    * dataset open: one per matrix (its modality and name), so the totals of
    * a matrix mapped again, or shown as stored and then normalized, are read
    * once. `genes`: its gene list's descriptors, for a lineage made now.
+   * @this {import('../core/data-state.js').DataState}
    */
   matrixLineage(mapping, genes) {
     this._cellTotalLineages ??= new Map();
@@ -270,6 +291,7 @@ export class DataStateExpressionMethods {
   /**
    * Drop every matrix's cells' totals: another dataset published, or the
    * open cells put in another order (totals by position no longer apply).
+   * @this {import('../core/data-state.js').DataState}
    */
   resetCellTotals() {
     this._cellTotalLineages = new Map();
@@ -278,6 +300,7 @@ export class DataStateExpressionMethods {
   /**
    * The cells' totals of a lineage read through `base`, for open cells
    * `[0, readTo)` (`data/library-sizes.js` `cellLibrarySizes`).
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _lineageLibrarySizes(base, lineage, { readTo, signal = null, owner = null }) {
@@ -304,7 +327,11 @@ export class DataStateExpressionMethods {
     });
   }
 
-  /** The open cells genes of the mapped matrix are read for: `[0, readTo)` (of `open` cells, the open ones by default). @private */
+  /**
+   * The open cells genes of the mapped matrix are read for: `[0, readTo)` (of `open` cells, the open ones by default).
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _geneReadTo(open = this.pointCount) {
     return Math.min(open, this.getGeneSample?.()?.cells ?? open);
   }
@@ -315,6 +342,7 @@ export class DataStateExpressionMethods {
    * normalizing its genes divides by. Kept with the matrix's lineage, so
    * the shown values and every run share one pass.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{readTo?: number, signal?: AbortSignal|null, owner?: string|null}} [options]
    * @returns {Promise<import('../../../data/library-sizes.js').LibrarySizes>}
    */
@@ -328,6 +356,7 @@ export class DataStateExpressionMethods {
    * The lineage of the mapped matrix: the shown loader's, else the matrix's
    * own (values shown as stored: a run normalizing its genes, or turning
    * normalization on later, shares its pass).
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _shownLineage() {
@@ -340,6 +369,7 @@ export class DataStateExpressionMethods {
    * totals it shares (a resized loader's is its predecessor's); a new one of
    * `genes` (the gene list's descriptors) when null.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Function|null} base
    * @param {import('../../../data/expression-transform.js').ExpressionTransform} transform
    * @param {{lineage: Object}} options - The cells' totals it shares (`matrixLineage`)
@@ -415,6 +445,7 @@ export class DataStateExpressionMethods {
   /**
    * The gene loader of the current one put back over new totals (the open
    * cells put in another order: totals by position no longer apply).
+   * @this {import('../core/data-state.js').DataState}
    */
   renewShownVarLoader() {
     const parts = shownLoaderParts(this.varFieldLoader);
@@ -435,6 +466,7 @@ export class DataStateExpressionMethods {
    * open yet, priced the same way, the open cells grown). A share of cells is
    * priced as that share of the pass.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{base: Function, lineage: Object, readTo?: number, added?: number}} matrix
    * @returns {Promise<{ms: number|null, bytes: number|null, genes: number, cells: number, what: string}|null>}
    */
@@ -477,6 +509,7 @@ export class DataStateExpressionMethods {
    * (`cellTotalsCostOf` of the mapped matrix): null when it reads nothing
    * more (no normalization, an obs column of totals, totals already kept).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{normalize: boolean, log1p: boolean}} next
    * @returns {Promise<{ms: number|null, bytes: number|null, genes: number, cells: number, what: string}|null>}
    */
@@ -494,6 +527,7 @@ export class DataStateExpressionMethods {
    * same one now taking the transform). Reads the other matrix's gene list
    * to price it (`mappingVarLoaderOf`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} mapping
    * @returns {Promise<{ms: number|null, bytes: number|null, genes: number, cells: number, what: string}|null>}
    */
@@ -515,6 +549,7 @@ export class DataStateExpressionMethods {
    * read (`signal` stops it). Every change that needs totals not kept yet
    * reads them here.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{base: Function, lineage: Object, readTo?: number, signal?: AbortSignal|null,
    *   heavy?: ((estimate: Object) => Promise<void>)|null}} change
    * @returns {Promise<import('../../../data/library-sizes.js').LibrarySizes>}
@@ -535,6 +570,7 @@ export class DataStateExpressionMethods {
    * place, for the cells added); null when the values shown are not
    * normalized or their totals come from an obs column.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{readTo?: number, reread?: number|null}} [options]
    */
   async shownCellTotalsCost({ readTo = this._geneReadTo(), reread = null } = {}) {
@@ -554,6 +590,7 @@ export class DataStateExpressionMethods {
    * reads, asked for by its `heavy`, so no later read sums the matrix.
    * Nothing when the values shown are not normalized.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{readTo?: number, signal?: AbortSignal|null, heavy?: ((estimate: Object) => Promise<void>)|null}} [options]
    */
   async prepareCellTotals({ readTo = this._geneReadTo(), signal = null, heavy = null } = {}) {
@@ -574,6 +611,7 @@ export class DataStateExpressionMethods {
    * `requireOffered`, which refuses. `heavy`: asks for the totals' pass as
    * heavy work (`cellTotalsForChange`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{normalize: boolean, log1p: boolean}} next
    * @param {{signal?: AbortSignal|null, requireOffered?: boolean, heavy?: ((estimate: Object) => Promise<void>)|null}} [options]
    * @returns {Promise<{changed: boolean, shown: Object, dropped: string[]}>}

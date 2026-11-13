@@ -169,7 +169,7 @@ export const downloadTrackingMethods = {
   },
 
   /**
-   * Name the work a load does now that is not reading bytes (F167: the
+   * Name the work a load does now that is not reading bytes (the
    * cells' totals it sums once read): "<name>: <doing>", without a
    * percentage, its Cancel kept. The next byte count or its end replaces it.
    * @param {string} id - Tracker ID

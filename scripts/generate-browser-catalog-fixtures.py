@@ -15,7 +15,7 @@
 - ``tests/browser/fixtures/uint32-categories.h5ad``: the current-ui dataset
   with 70,000 ``cell_type`` categories.
 - ``tests/browser/fixtures/integer-identifiers.h5ad``: the current-ui
-  dataset with ``donor_id``, unsigned 64-bit identifiers past 2^53 (F116).
+  dataset with ``donor_id``, unsigned 64-bit identifiers past 2^53.
 - ``tests/browser/fixtures/replay-other.h5ad``: the current-ui cells as
   another sample, for a history recorded on current-ui replayed on it: some
   names the same, some not.
@@ -372,10 +372,10 @@ def uint32_categories() -> anndata.AnnData:
 def integer_identifiers() -> anndata.AnnData:
     """The current-ui dataset with `donor_id`: unsigned 64-bit integers, four
     of its five values past 2^53 (2^60 + 11, 2^60 + 22, 2^62 + 33, 2^63 + 44,
-    and 7), which the viewer reads as their exact decimal text (F116); and
+    and 7), which the viewer reads as their exact decimal text; and
     `n_counts`, 64-bit integers within 2^53, which stay numbers; and `tissue`,
     a categorical with an empty and a blank category (shown `(empty)` and
-    `(blank)`, R9D-8)."""
+    `(blank)`)."""
     adata = current_ui()
     donors = np.array([2**60 + 11, 2**60 + 22, 2**62 + 33, 2**63 + 44, 7], dtype=np.uint64)
     adata.obs["donor_id"] = donors[np.arange(adata.n_obs) % donors.size]

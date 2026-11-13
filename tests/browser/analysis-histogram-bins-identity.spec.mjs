@@ -2,8 +2,8 @@
  * A histogram hands Plotly a few values per bin with summed weights instead of
  * every value (assets/js/app/analysis/plots/plotly-histogram-bins.js). This
  * spec draws each fixture twice in the real engine — once through the
- * application's histogram definition, once as the raw-value trace it used to
- * build — under every normalization, cumulative mode and bar mode, and
+ * application's histogram definition, once as the raw-value trace (every value
+ * handed to Plotly) — under every normalization, cumulative mode and bar mode, and
  * requires the same calcdata (bar positions, heights and hover bin ranges,
  * compared with `Object.is`), the same bar geometry, the same autorange and
  * the same hover text.
@@ -61,7 +61,7 @@ test('representative histogram samples draw exactly the raw-value histogram', as
         ];
         const fresh = definition.buildTraces(pageData, options, null);
         sampled += fresh.filter(trace => trace.histfunc === 'sum').length;
-        // The raw-value trace this module built before the bins were sampled.
+        // The raw-value trace: every value handed to Plotly.
         const raw = fresh.map((trace, index) => {
           const copy = { ...trace };
           delete copy.y;

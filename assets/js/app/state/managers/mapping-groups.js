@@ -23,7 +23,8 @@
  * reason for the rest of the dataset's session, and the transaction rolls
  * back.
  *
- * Owners outside DataState (the connectivity owner in `main.js`) register
+ * Owners outside DataState (the connectivity owner, which
+ * `app/dataset/publication.js` registers) register
  * through `setMappingRuntime`.
  *
  * @module state/managers/mapping-groups
@@ -31,7 +32,6 @@
 
 import {
   ANNDATA_KIND,
-  DIMENSION_SLOTS,
   EMBEDDING_KEY_PREFIX,
   canonicalEmbeddingId,
   defaultExpression,
@@ -195,6 +195,7 @@ export class DataStateMappingGroupMethods {
    * Register the owners a mapping transaction publishes through, or remove
    * them with null.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{
    *   getBaseUrl: () => string,
    *   getConnectivityGraph: () => {summary: Object|null, url: string|null, edges: number|null},
@@ -216,6 +217,7 @@ export class DataStateMappingGroupMethods {
    * The neighbor graph in use: null for none, else its edge count (null
    * while a graph read straight from a file is not counted yet).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {{edges: number|null}|null}
    */
   getConnectivityGraphFact() {
@@ -225,7 +227,8 @@ export class DataStateMappingGroupMethods {
 
   /**
    * Forget every choice refused this session: a new dataset was published.
-   * @private
+   * The state's own, called by the mapping methods; not for callers.
+   * @this {import('../core/data-state.js').DataState}
    */
   _resetMappingGroups() {
     this._unusableMappingChoices = new Map();
@@ -234,6 +237,7 @@ export class DataStateMappingGroupMethods {
   /**
    * Whether the open dataset can change one group.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} group
    * @returns {boolean}
    */
@@ -248,6 +252,7 @@ export class DataStateMappingGroupMethods {
   /**
    * Why one choice of one group cannot be used this session, or null.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} group
    * @param {string} key
    * @returns {string|null}
@@ -258,7 +263,7 @@ export class DataStateMappingGroupMethods {
 
   /**
    * Record that one choice failed its load-time check.
-   * @private
+   * @this {import('../core/data-state.js').DataState}
    */
   _markMappingChoiceUnusable(group, key, reason) {
     if (!(this._unusableMappingChoices instanceof Map)) {
@@ -277,6 +282,7 @@ export class DataStateMappingGroupMethods {
    * whether it can be used and why not. Null for a group the open dataset
    * cannot change.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} group
    * @returns {Array<{value: string|null, label: string, usable: boolean, reason: string|null}>|null}
    */
@@ -360,6 +366,7 @@ export class DataStateMappingGroupMethods {
    * The gene-name choices of one expression source: the var index, then
    * every column of that axis's var (`raw.var` for `raw`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string|null} expression
    * @returns {Array<{value: string, label: string, usable: boolean, reason: string|null}>}
    */
@@ -385,6 +392,7 @@ export class DataStateMappingGroupMethods {
    * every boolean column of that axis's var (`raw.var` for `raw`),
    * `highly_variable` first (`highlyVariableCandidates`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string|null} expression
    * @returns {Array<{value: string|null, label: string, usable: boolean, reason: string|null}>}
    */
@@ -408,6 +416,7 @@ export class DataStateMappingGroupMethods {
    * stored, or log1p of a base, with the base the file's `uns['log1p']`
    * records and any the mapping names offered too.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Array<{value: string, label: string, usable: boolean, reason: null}>}
    */
   getLog1pChoices() {
@@ -430,6 +439,7 @@ export class DataStateMappingGroupMethods {
    * its vector fields. Embeddings bound in the mapping in use are listed too,
    * so unbinding one does not hide it.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} mapping - The mapping whose embeddings are listed (the
    *   one being edited).
    * @returns {Array<{embeddingKey: string, label: string, options: Array<{binding: Object, label: string, usable: boolean, reason: string|null, suggested: boolean}>}>|null}
@@ -483,6 +493,7 @@ export class DataStateMappingGroupMethods {
    * fingerprint's `varCount` is compared against before that mapping is
    * restored. Metadata only.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} mapping - A canonical mapping of the open dataset's kind.
    * @returns {number}
    */
@@ -511,6 +522,7 @@ export class DataStateMappingGroupMethods {
    * shown's own context only: `highly_variable` of `X` is not a column of
    * `raw.var`.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} group
    * @param {unknown} value
    * @param {Object|null} [mapping]
@@ -577,6 +589,7 @@ export class DataStateMappingGroupMethods {
 
   /**
    * Why a list of vector bindings cannot be used, as a clause, or null.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _describeVectorBindingsRefusal(bindings) {
@@ -597,6 +610,7 @@ export class DataStateMappingGroupMethods {
    * applied to the open dataset, or return null when they can. Nothing is
    * loaded.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} current - The current canonical mapping.
    * @param {Object} next - A canonical mapping of the same kind.
    * @returns {string|null}
@@ -640,6 +654,7 @@ export class DataStateMappingGroupMethods {
    * path. Nothing is installed in field state; the handle is of this
    * dataset generation only (`readMatrixSparseColumn`, `readMatrixCellSubset`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} expression - `X`, `raw` or `layer:<key>`
    * @returns {Promise<{expression: string, generation: number, fields: ReadonlyArray<{key: string, kind: string, path: string}>, loader: Function}>}
    */
@@ -684,6 +699,7 @@ export class DataStateMappingGroupMethods {
    * what the genes stage installs, and what pricing the change reads
    * (`expression-values.js` `mappingTotalsCost`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} mapping - With an expression matrix
    * @returns {Promise<{geneList: Object, varFieldLoader: Function}>}
    */
@@ -708,6 +724,7 @@ export class DataStateMappingGroupMethods {
    * Whether `group` is read now in another context than the mapping shown's:
    * the expression groups within a pending modality, and gene names and the
    * highly variable genes on the axis of a pending expression matrix.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _expressionContextDiffers(group) {
@@ -723,6 +740,7 @@ export class DataStateMappingGroupMethods {
   /**
    * Run `read` with gene-name choices taken from the axis of `expression`
    * (null: no matrix), of `modality` (a multimodal dataset's) when given.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _withPendingExpression(expression, read, modality = undefined) {
@@ -742,6 +760,7 @@ export class DataStateMappingGroupMethods {
    * modality not applied yet lists that modality's matrices and columns.
    * Null reads the mapping's.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @template T
    * @param {string|null} modality
    * @param {() => T} read
@@ -763,6 +782,7 @@ export class DataStateMappingGroupMethods {
    * index for names, its recorded log1p, and its highly variable column
    * (each as a dataset opening with that modality would).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} modality
    * @returns {{expression: string|null, geneNames: string, log1p: Object, highlyVariable: string|null}}
    */
@@ -804,6 +824,7 @@ export class DataStateMappingGroupMethods {
    * A modality or matrix the dataset does not have is left as named, for the
    * mapping's refusal to name it.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} base - The mapping changed (the one shown, with what is staged)
    * @param {Object} changes - The groups named, by the mapping's keys
    * @returns {Object} The whole next mapping
@@ -848,6 +869,7 @@ export class DataStateMappingGroupMethods {
    * dtype, or whole non-negative first values, as its menu says
    * "· counts"); false with none, or when not probed.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object|null} mapping
    * @returns {boolean}
    */
@@ -856,12 +878,20 @@ export class DataStateMappingGroupMethods {
     return this.withMappingModality(mapping.modality ?? null, () => expressionHoldsCounts(this._expressionScope(), mapping.expression));
   }
 
-  /** The modality expression choices are read from now: the pending one, else the mapping's. @private */
+  /**
+   * The modality expression choices are read from now: the pending one, else the mapping's.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _modalityInUse() {
     return this._pendingModality ?? this.dataMapping?.modality ?? null;
   }
 
-  /** The expression side choices are read from now: the dataset's, or its modality's. @private */
+  /**
+   * The expression side choices are read from now: the dataset's, or its modality's.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
+   */
   _expressionScope() {
     const candidates = this.getMappingCandidates();
     return modalityScope(candidates, this._modalityInUse())?.scope ?? candidates;
@@ -871,6 +901,7 @@ export class DataStateMappingGroupMethods {
    * Load and check everything the changed groups of `next` need, without
    * changing what is shown, and return the steps that publish them.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} current
    * @param {Object} next
    * @param {{requireCurrent: () => void, heavy?: ((estimate: Object) => Promise<void>)|null, signal?: AbortSignal|null}} owner - `requireCurrent`
@@ -937,7 +968,7 @@ export class DataStateMappingGroupMethods {
 
   /**
    * The runtime registered for the open dataset.
-   * @private
+   * @this {import('../core/data-state.js').DataState}
    */
   _requireMappingRuntime() {
     if (this._mappingRuntime === null || this._mappingRuntime === undefined) {

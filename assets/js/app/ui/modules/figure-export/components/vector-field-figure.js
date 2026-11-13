@@ -25,7 +25,7 @@
  * (`planLegend` `vectorKey`, `utils/layout.js`); only a figure without a
  * legend draws it inside the plot's bottom-right corner (the top corners
  * hold the selection badge and the orientation indicator), where on a small
- * plot it covered the cells (found 2026-11-11, F271 check).
+ * plot it would cover the cells.
  *
  * Pure: the caller hands the arrays (`figure-export-engine.js`), and the
  * builders draw one plan (`planVectorFieldFigure`), so PNG and SVG agree.
@@ -230,7 +230,7 @@ export function formatSpeed(value) {
 }
 
 /** The key's lines: the field and how it is drawn, then the speed range. */
-export function vectorFieldKeyText(plan) {
+function vectorFieldKeyText(plan) {
   return [
     `${plan.label}: mean arrows of nearby cells`,
     `speed 0 – ${formatSpeed(plan.speedMax)}`,
@@ -301,9 +301,7 @@ function wrapWords(text, room, size, measure) {
  * size (a figure set in points, `utils/figure-size.js`), so on a plot
  * narrower than the key's one line (a single-column figure: a plot of 35 mm)
  * the field's line wraps at its words to the plot's width instead of running
- * out of the plot and off the figure (found 2026-11-11, F271 check:
- * "velocity: mean arrows of nearby cells" cut at a single column's left
- * edge).
+ * out of the plot and off the figure.
  *
  * @returns {{lines: string[], labelLines: number, size: number, pad: number, rampWidth: number, x: number, y: number, width: number, height: number}}
  *   `lines`: the field's lines (the first beside the swatch arrow), then the speed line

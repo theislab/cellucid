@@ -1,5 +1,5 @@
 /**
- * History v2 §6 test 1, seeds 701 to 1400 of 2100 (`history-tree-properties.mjs`
+ * The history's tree properties, seeds 701 to 1400 of 2100 (`history-tree-properties.mjs`
  * holds the generator and the invariants; the shards run in parallel).
  * `HISTORY_SEEDS=n` runs seeds 1 to n here instead, for a deeper local run.
  */

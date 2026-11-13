@@ -1,7 +1,7 @@
 /**
  * Exact feedback contract for the four highlight selection tools.
  *
- * Every test here pins one thing the tools used to do silently: abandon a
+ * Every test here pins one thing the tools say rather than do silently: abandon a
  * gesture with no explanation, record a step that changed nothing, invite a
  * click the app cannot serve, or leave Escape unbound while a Cancel button
  * sits beside it.
@@ -9,7 +9,6 @@
 
 import { CellSet } from '../assets/js/app/utils/cell-set.js';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { initAnnotationSelection }
@@ -45,7 +44,7 @@ import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
 import { withHighlightPage } from './helpers/highlight-state-pages.mjs';
 
 // Cell 4 carries the uint8 missing code, so a gesture that lands on it resolves
-// to no cells at all — the exact case that used to `return` without a word.
+// to no cells at all — the case that must not `return` without a word.
 const CATEGORY_CODES = Uint8Array.from([0, 0, 1, 1, 255, 2]);
 const CATEGORY_FIELD = Object.freeze({
   key: 'kind',
@@ -767,27 +766,6 @@ test('repeating an abandoned gesture repaints the same panel, not a second '
   assert.equal(tool.modeDescription.innerHTML, afterOne);
 });
 
-test('the miss notice offers only a remedy hit testing actually responds to',
-  async () => {
-    const pickingSource = await readFile(
-      new URL('../assets/js/rendering/picking.js', import.meta.url),
-      'utf8'
-    );
-
-    // A click hits the drawn dot, sized by the same Point size and perspective
-    // attenuation the shader uses, so both remedies the notice offers are ones
-    // the picking code actually reads.
-    assert.match(pickingSource, /pointSize/);
-    assert.match(pickingSource, /sizeAttenuation/);
-    assert.match(SELECTION_NOTICE.noCellUnderPointer, /\bZoom in\b/);
-    assert.match(SELECTION_NOTICE.noCellUnderPointer, /\bPoint size\b/);
-
-    // Zoom also selects a finer LOD level, and picking rejects every cell the
-    // active level has not admitted.
-    assert.match(pickingSource, /lodAdmissionLevels\[cellIndex\] > lodLevel/);
-  }
-);
-
 test('the tools reject an abandonment reason they have no wording for', () => {
   assert.throws(
     () => abandonedGestureNotice('whatever'),
@@ -1142,6 +1120,22 @@ test('Escape defers to a handler that already claimed it', () => {
 
     assert.deepEqual(owner.cancels, [], `${label} must not cancel a selection`);
     assert.equal(event.prevented, false, `${label} must not be consumed`);
+  }
+});
+
+test('every mode button keeps the aria-pressed contract across mode switches', () => {
+  const owner = buildModeUi();
+  const pressedState = () => owner.buttons.map(button => [
+    button.dataset.mode,
+    button.getAttribute('aria-pressed')
+  ]);
+  const onlyPressed = mode => ['annotation', 'knn', 'proximity', 'lasso']
+    .map(name => [name, name === mode ? 'true' : 'false']);
+  assert.deepEqual(pressedState(), onlyPressed('annotation'));
+
+  for (const mode of ['knn', 'proximity', 'lasso', 'annotation', 'lasso', 'lasso']) {
+    owner.buttons.find(button => button.dataset.mode === mode).click();
+    assert.deepEqual(pressedState(), onlyPressed(mode), `after choosing ${mode}`);
   }
 });
 

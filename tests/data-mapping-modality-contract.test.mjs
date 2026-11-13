@@ -5,7 +5,7 @@
  * expression side, its mapping names the modality, and the gene routes of
  * another modality (`var/mod-{j}:X/index`) read that modality's genes, NaN
  * where it measured no cell. A file of one feature space has no modality
- * anywhere (D7: no existing session, preset or fixture changes).
+ * anywhere (no existing session, preset or fixture changes).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

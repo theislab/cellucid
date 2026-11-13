@@ -1,16 +1,16 @@
 /**
  * An action still running when another dataset opens ends with the history
- * that began recording it (bug hunt R9W-3). Opening another dataset retires
+ * that began recording it. Opening another dataset retires
  * the shown dataset's history (`dataset-history.js` `retire`: destroyed) and
  * the new dataset's history takes the dispatcher's recorder. The running
  * action's token belongs to the retired one: it is never put back through,
  * nor recorded in, the new dataset's history.
  *
- * Before the fix the dispatcher told whichever recorder was current: a
- * markers run on Garcia stopped by opening Pancreas ended with "The history
- * has no value c7be2ab0cc2b" (Pancreas's history trying to put back
- * Garcia's values), and a change that finished after the switch was merged
- * into the new history's view of the state.
+ * Told to whichever recorder is current instead, a markers run on Garcia
+ * stopped by opening Pancreas would end with "The history has no value ..."
+ * (Pancreas's history trying to put back Garcia's values), and a change that
+ * finished after the switch would be merged into the new history's view of
+ * the state.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';

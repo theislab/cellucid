@@ -8,8 +8,8 @@
  * region's dashed endpoint (`s3-<region>.amazonaws.com`, which the Regions
  * older than 2019 keep), and virtual-hosted on the global endpoint
  * (`<bucket>.s3.amazonaws.com`). Each answers with the same bytes, the same
- * `ETag` and the same CORS headers (measured on the CELLxGENE Census bucket
- * in us-west-2: seven hosts, one `ETag`, `Access-Control-Allow-Origin: *`
+ * `ETag` and the same CORS headers (the CELLxGENE Census bucket in us-west-2
+ * answers at seven hosts with one `ETag` and `Access-Control-Allow-Origin: *`
  * from each; the global endpoint path-style answers 301, so it is not one).
  * A Region without a dashed endpoint does not resolve it: that mirror fails
  * twice and is dropped (`mirrors.js`), its requests asked of the file's own

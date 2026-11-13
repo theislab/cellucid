@@ -13,9 +13,8 @@
  * Any other first byte is refused. A set is always stored on its own, never
  * relative to another set (the Python and R readers decode these three).
  *
- * Measured on Suo (562k cells, 22 highlight groups of 5–170k cells): the
- * per-set choice among 0–2 stores 188 KB where sorted-delta alone stored
- * 197 KB (both gzipped).
+ * The per-set choice among 0–2 stores less than sorted-delta alone, gzipped
+ * (measured: 33_decisions_actions_domains_and_history.md).
  *
  * @module session/codecs/cell-set
  */

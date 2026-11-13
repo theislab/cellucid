@@ -73,7 +73,8 @@
  */
 
 import { attachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
-import { announceIfUpdated } from '../../app-code.js';
+import { failedLoad } from '../../app-code.js';
+import { isCancellation } from '../../../utils/abort.js';
 import { versionedAssetUrl } from '../../asset-url.js';
 import { applyThemeToAllPlots, getPlotTheme, invalidatePlotThemeCache } from '../shared/plot-theme.js';
 
@@ -87,7 +88,6 @@ if (typeof window !== 'undefined') {
 
 let plotlyLoadPromise = null;
 let plotlyLoaded = false;
-let nativeHintsHidden = false;
 
 // WebGL2 verification state
 let _webgl2Verified = false;
@@ -172,7 +172,6 @@ export function loadPlotly() {
     // Plotly was loaded outside this lazy loader.
     hidePlotlyNativeHints();
     attachPlotlyHints();
-    nativeHintsHidden = true;
     return Promise.resolve(window.Plotly);
   }
 
@@ -195,15 +194,16 @@ export function loadPlotly() {
       // still get the same notification UX as plots created through our wrappers.
       hidePlotlyNativeHints();
       attachPlotlyHints();
-      nativeHintsHidden = true;
       resolve(window.Plotly);
     };
 
     script.onerror = (err) => {
       plotlyLoadPromise = null;
-      void announceIfUpdated();
-      console.error('[PlotlyLoader] Failed to load Plotly.js:', err);
-      reject(new Error('Failed to load Plotly.js library'));
+      // A load the page's leaving cut off ends as a `page-left` cancellation, unsaid.
+      void failedLoad(new Error('Failed to load Plotly.js library', { cause: err })).then(reason => {
+        if (!isCancellation(reason)) console.error('[PlotlyLoader] Failed to load Plotly.js:', err);
+        reject(reason);
+      });
     };
 
     document.head.appendChild(script);

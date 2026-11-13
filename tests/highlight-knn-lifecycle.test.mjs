@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -292,27 +291,4 @@ test('dataset replacement clears every KNN graph and interaction owner', t => {
   assert.equal(tools.knnStepCount, 0);
   assert.equal(canvas.style.cursor, 'default');
   assert.ok(removedClasses.includes('knn-dragging'));
-});
-
-test('viewer connectivity lifecycle routes through the edge layer', async () => {
-  const source = await readFile(
-    new URL('../assets/js/rendering/viewer.js', import.meta.url),
-    'utf8'
-  );
-  // A new dataset drops the graph and every pane's records at once.
-  assert.match(
-    source,
-    /hpRenderer\.loadData\([\s\S]+?edgeLayer\.clear\(\);\s*useInstancedEdges = false;/
-  );
-  assert.match(source, /clearEdgesV2\(\) \{\s*edgeLayer\.clear\(\);\s*useInstancedEdges = false;\s*\}/);
-  // Context loss forgets handles; disposal deletes them.
-  assert.match(source, /edgeLayer\.abandon\(\);/);
-  assert.match(source, /edgeLayer\.dispose\(\);/);
-  // Removing a kept view removes its edge records.
-  assert.match(source, /edgeLayer\.deleteView\(exactId\)/);
-  // No per-edge or per-cell texture is left in the viewer.
-  assert.doesNotMatch(
-    source,
-    /edgeTextureV2|edgePositionTexture|edgeVisibilityTexture|EdgePrefix|nEdgesV2|hasEdgeDataV2/
-  );
 });

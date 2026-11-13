@@ -17,7 +17,7 @@
  * - **Load** verifies the file against the open dataset before anything is
  *   applied (its identity, data mapping and cell order,
  *   `verifySessionFingerprint`; the fields it uses), then adds its trackers
- *   beside the person's own (`history.importTrackers`, History v2 Q2): the
+ *   beside the person's own (`history.importTrackers`): the
  *   file's active head is shown as soon as the eager chunks are read, the
  *   rest is read while it is shown, and a failure anywhere puts back what was
  *   shown before. A file of steps only opens as a replay plan
@@ -96,7 +96,7 @@ import { formatCountOf } from '../../utils/format-units.js';
 export function describeLoadFailure(error) {
   const unchanged = 'so it was not opened; the history shown is unchanged.';
   const other = error !== null && typeof error === 'object' ? WRITTEN_BY.get(error) : undefined;
-  // A history another version wrote that this one cannot read is said as that, never as damaged or a problem inside (F155).
+  // A history another version wrote that this one cannot read is said as that, never as damaged or a problem inside.
   if (other !== undefined && (isDamagedFile(error) || isInternalFailure(error) || modelFailure(error))) {
     return { message: `${otherVersionWords(other)}, which this version cannot read, ${unchanged}`, details: failureDetailsText(error) };
   }
@@ -129,7 +129,7 @@ function otherVersionWords({ when, version }) {
 
 /**
  * What a load could not restore (`history.load` / `importTrackers`
- * `unrestored`, F155), one sentence per part, each saying what that part is
+ * `unrestored`), one sentence per part, each saying what that part is
  * and what became of it, and the words of each failure for Details. A part
  * of a history another version wrote (`other`) that this version refused is
  * said as saved by that version, which this one cannot read; any other
@@ -137,7 +137,7 @@ function otherVersionWords({ when, version }) {
  * browser it came from is kept as it was (the history goes on as a new one
  * beside it).
  *
- * A part of the state this version does not have (`unknown-domain`, F164)
+ * A part of the state this version does not have (`unknown-domain`)
  * is said once for all such parts: their changes are left out of every
  * step. `subject`: what was restored ("Session", "Starting view").
  *
@@ -234,7 +234,7 @@ export class SessionSerializer {
    *   state: import('../state/core/data-state.js').DataState,
    *   dataSourceManager: object|null,
    *   getHistory: () => (ReturnType<typeof import('../history/history.js').createHistory>|null),
-   *   dispatcher: {idle: () => Promise<void>},
+   *   dispatcher: {whenApplied: () => Promise<void>},
    *   onLoaded: () => void,
    *   catalog?: object,
    *   version?: () => string,
@@ -244,8 +244,8 @@ export class SessionSerializer {
    *   camera path saved with Autoplay on starts, `cinematic-camera` `startAutoplay`);
    *   `catalog`: the action catalog files are stamped with (the page's);
    *   `version`: the Cellucid version that writes (the page's `<meta name="cellucid-version">`);
-   *   `chrome`: the page chrome sessions carry outside the history (the pressed selection tool,
-   *   CEL-0249): taken at a save, put back once a load shows its head
+   *   `chrome`: the page chrome sessions carry outside the history (the pressed selection tool):
+   *   taken at a save, put back once a load shows its head
    */
   constructor(options) {
     const keys = ['state', 'dataSourceManager', 'getHistory', 'dispatcher', 'onLoaded'];
@@ -253,7 +253,7 @@ export class SessionSerializer {
     if (options.state === null || typeof options.state !== 'object') throw new TypeError('SessionSerializer needs the DataState.');
     if (typeof options.getHistory !== 'function') throw new TypeError('SessionSerializer needs getHistory().');
     if (typeof options.onLoaded !== 'function') throw new TypeError('SessionSerializer needs onLoaded().');
-    requireMethod(options.dispatcher, 'idle', 'SessionSerializer dispatcher');
+    requireMethod(options.dispatcher, 'whenApplied', 'SessionSerializer dispatcher');
     this._state = options.state;
     this._dataSourceManager = options.dataSourceManager;
     this._getHistory = options.getHistory;
@@ -300,7 +300,7 @@ export class SessionSerializer {
   /**
    * One operation on the session at a time; a failure does not stop the
    * next. `signal`: stopped while it waits for its turn, it never runs and
-   * its caller hears so at once (as the history's `exclusive`, L20-2); once
+   * its caller hears so at once (as the history's `exclusive`); once
    * running, the operation watches the signal itself.
    */
   _exclusive(operation, { signal = null } = {}) {
@@ -406,14 +406,14 @@ export class SessionSerializer {
    *
    * `signal` (the `history.share` dispatch's, an agent's Stop): the waits
    * before the file is written (its turn, the actions still running) end at
-   * once when it is stopped; they change nothing (L20-2).
+   * once when it is stopped; they change nothing.
    *
    * @param {{choice?: object, signal?: AbortSignal|null}} [options]
    * @returns {Promise<{blob: Blob, shared: object}>}
    */
   writeShare({ choice = SAVE_DEFAULTS, signal = null } = {}) {
     return this._exclusive(() => this._withSettlement(this._captureSettlement, async () => {
-      await awaitWithSignal(this._dispatcher.idle(), signal);
+      await awaitWithSignal(this._dispatcher.whenApplied(), signal);
       const history = this._requireHistory();
       // What is shown is what is saved: a paused period's changes and a change made outside an action become steps.
       await history.settlePaused({ origin: 'session' });
@@ -687,7 +687,7 @@ export class SessionSerializer {
     });
     this._progress = loaded => line.progress(loaded);
     // Heavy work the load finds once its file is read (the cells' totals a normalized restore or a
-    // replayed step sums, F167): an agent's load asks first (`heavy`); every load names it on its
+    // replayed step sums): an agent's load asks first (`heavy`); every load names it on its
     // own progress line, with its Cancel, in the words the work gives (`estimate.doing`).
     const loadHeavy = async estimate => {
       if (heavy !== null) await heavy(estimate);
@@ -711,7 +711,7 @@ export class SessionSerializer {
       if (history === null) throw new Error('No dataset is open. Open the dataset the session was saved on, then load the session again.');
       const missing = describeMissingFields(this._state, source.header);
       if (missing !== null) throw new RangeError(missing);
-      // The page chrome it carries (its selection tool, CEL-0249): checked against this page
+      // The page chrome it carries (its selection tool): checked against this page
       // before anything is replaced, put back once the head is shown, what this page lacks said.
       const chrome = source.chrome === undefined || this._chrome === null ? null : this._chrome.plan(source.chrome);
       if (!startingView && source.content === 'steps') {
@@ -734,14 +734,14 @@ export class SessionSerializer {
         assertPublishedDefaultRoot(root);
         const values = Object.fromEntries(Object.entries(root.after).map(([id, hash]) => [id, eager.values.get(hash)]));
         const { leftOut } = await history.showValues(values, keepShownControls, { heavy: loadHeavy });
-        // The starting view's page chrome (its selection tool, CEL-0249).
+        // The starting view's page chrome (its selection tool).
         chrome?.apply();
         applied = true;
         throwIfAborted(controller.signal);
         await refreshUi({ phase: 'commit' });
         line.dismiss();
         if (leftOut.length > 0) {
-          // A part another version of Cellucid has and this one does not is left out, the rest shown (F164).
+          // A part another version of Cellucid has and this one does not is left out, the rest shown.
           const partial = describeUnrestored(leftOut.map(domain => ({ part: 'unknown-domain', domain })), {
             other: await this._writtenBy(source.stamps?.app).catch(() => null), subject: 'Starting view',
           });
@@ -771,7 +771,7 @@ export class SessionSerializer {
       chrome?.apply();
       // One notice says how the load ended, and, when it added trackers beside the person's, which, with
       // Undo: a progress notice keeps the action it was made with (its Cancel), so it gives way to that one.
-      // A load that could not restore every part names each part it could not, with its words under Details (F155).
+      // A load that could not restore every part names each part it could not, with its words under Details.
       const undo = loaded === null ? null : this._undoLoadOf(loaded.trackers);
       const partial = unrestored.length === 0 ? null : describeUnrestored(unrestored, {
         other: await this._writtenBy(source.stamps?.app), savedState: importFile === null,
@@ -829,12 +829,12 @@ export class SessionSerializer {
 }
 
 /**
- * The line a load shows while it runs (round 9 close, RCA-7). A session file
+ * The line a load shows while it runs. A session file
  * or a saved state of this browser: a loading line with its Cancel (its bytes
  * as they are read, and their speed once measured: `download-tracking.js`). A
  * starting view: none. It is a part of its dataset's opening, whose card says
- * what is happening; a line of its own read "Loading Starting view 0 B/s" at
- * every sample's start, a transfer that was none (its file is in the page).
+ * what is happening; a line of its own would read "Loading Starting view 0 B/s" at
+ * every sample's start, a transfer that is none (its file is in the page).
  * Its failure is said by its caller ("the sample view could not be applied").
  */
 function restoreLine(notifications, { label, totalBytes, startingView, onCancel }) {

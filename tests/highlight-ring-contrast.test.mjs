@@ -1,14 +1,14 @@
 /**
- * F162 (2026-11-11): a highlight reads against any coloring.
+ * A highlight reads against any coloring.
  *
- * Garcia colored by LVL1, its 10,993 germ cells highlighted, looked exactly as
- * before: a highlighted cell was a dot and a ring both in the highlight's cyan
- * (the flat ring 0.75 of it, the torus lit cyan), and the germ cells are sky
- * blue (#4CAFEE), so among them a larger cyan point changed nothing. Colored
- * by a gene, the same highlight showed. The ring cannot know the colors of the
- * cells around it, so the rule is a pair that reads against every color: the
- * dot in `HIGHLIGHT_COLOR` inside a ring of `highlightRingColorFor` it (black
- * around the light cyan), on screen and in every figure format.
+ * A highlighted cell is a dot and a ring; with both in the highlight's cyan
+ * (the flat ring 0.75 of it, the torus lit cyan), a larger cyan point changes
+ * nothing among cells of a close color (Garcia's germ cells, sky blue #4CAFEE,
+ * when colored by LVL1), though the same highlight shows when colored by a
+ * gene. The ring cannot know the colors of the cells around it, so the rule is
+ * a pair that reads against every color: the dot in `HIGHLIGHT_COLOR` inside a
+ * ring of `highlightRingColorFor` it (black around the light cyan), on screen
+ * and in every figure format.
  */
 
 import assert from 'node:assert/strict';
@@ -191,7 +191,7 @@ test('a vector figure draws a highlighted cell as the screen does: the dot insid
   }
 
   // Fog thins the dot and the ring, in every quality, as HP_FS_HIGHLIGHT's
-  // v_fogOpacity does (the vector rings were drawn unfogged).
+  // v_fogOpacity does (the vector rings are fogged too).
   const fogged = { ...renderState, shaderQuality: 'full', fogDensity: 1 };
   const markup = await writeSvgPointMarkup({
     strategy: 'full-vector',

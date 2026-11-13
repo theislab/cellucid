@@ -66,11 +66,11 @@ test('an intercepted file chooser, a file set: input and change, no cancel', asy
 test('one file input, its value cleared and clicked again, opens a chooser at every click', async ({ page }) => {
   // An emptied input makes Firefox look up its last upload folder before it
   // creates the picker. Each `waitForEvent` turns interception off once its
-  // event comes; when that reached Playwright's Firefox first, Firefox's own
-  // picker was created, never closed, and the input's next click opened none
-  // (`playwright.config.mjs`, `widget.disable_file_pickers`). Measured on
-  // macOS, headless, without that preference: 2 of 30 picks (3 in each of 10
-  // pages), never a page's first; the pick after one had no chooser.
+  // event comes; when that reaches Playwright's Firefox first, Firefox's own
+  // picker is created, never closed, and the input's next click opens none
+  // (`playwright.config.mjs`, `widget.disable_file_pickers`). Without that
+  // preference a pick is now and then lost, never a page's first, and the pick
+  // after a lost one has no chooser (measured: 38_decisions_testing_and_hosted_runners.md).
   await page.route('**/file-chooser-reused.html', route => route.fulfill({ contentType: 'text/html', body: REUSED_PAGE }));
   await page.goto('/file-chooser-reused.html');
   const names = Array.from({ length: 20 }, (_, index) => `pick-${index}.txt`);

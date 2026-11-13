@@ -1,8 +1,8 @@
 /**
  * What a page has said in notifications, whatever became of them. A notice
  * dismisses itself after seconds of real time, and on a slow runner a spec may
- * come to read it later than that (a replay's line, read after its report on
- * hosted macOS Firefox): a spec about what was said reads this record.
+ * come to read it later than that (a replay's line, read after its report): a
+ * spec about what was said reads this record.
  * Installed before the page opens.
  */
 export async function recordNotifications(page) {

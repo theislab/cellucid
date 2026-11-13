@@ -4,8 +4,11 @@
   "type": "module",
   "scripts": {
     "serve": "node scripts/serve-browser-tests.mjs --published-catalog",
+    "check": "node scripts/check-types.mjs",
     "test": "node scripts/run-web-tests.mjs",
+    "test:core": "node scripts/run-web-tests.mjs --core",
     "test:browser": "playwright test",
+    "test:browser:smoke": "node scripts/run-browser-smoke.mjs",
     "test:browser:bounded": "node scripts/run-browser-shard-bounded.mjs",
     "test:browser:repeat": "node scripts/run-browser-specs-repeat.mjs",
     "test:live-agents": "CELLUCID_LIVE_AGENTS=1 playwright test tests/browser/live-agents --project=chromium --workers=1",
@@ -23,6 +26,7 @@
   "devDependencies": {
     "@playwright/test": "1.65.0",
     "esbuild": "0.28.2",
-    "h5wasm": "0.10.3"
+    "h5wasm": "0.10.3",
+    "typescript": "5.9.3"
   }
 }

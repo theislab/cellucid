@@ -1,7 +1,6 @@
 /**
- * @fileoverview Where the history's memory goes (History v2 §3.5, §3.15.4
- * "Warnings, not walls"). The history keeps every value of the person's
- * work in memory, never evicted; the memory model counts its typed arrays
+ * @fileoverview Where the history's memory goes. The history keeps every value
+ * of the person's work in memory, never evicted; the memory model counts its typed arrays
  * as part of what is drawn (`data/memory-budget.js`, part `history`). Once
  * the history passes what the budget leaves for it (what is drawn, the
  * history included, is more than the app may use), the status line shows

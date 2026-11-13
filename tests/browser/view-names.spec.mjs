@@ -1,5 +1,5 @@
 /**
- * Named views (bug hunt F130): a view can be given a name, in its row of
+ * Named views: a view can be given a name, in its row of
  * Compare views (double-click, or F2) and by `view.rename`, and the name is
  * shown wherever the view is: its row, its pane's title chip, the history's
  * step, a figure's panel title and provenance, the views read; it is one

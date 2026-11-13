@@ -22,7 +22,7 @@
  *     six connections to one host, so six requests are answered at once and
  *     the rest wait in the browser's queue, first come first served. Ranges
  *     of every form are served, suffix ranges (`bytes=-N`) included.
- *   - `h2`: GitHub (Pages, raw, media), as measured: one HTTP/2 connection
+ *   - `h2`: GitHub (Pages, raw, media): one HTTP/2 connection
  *     whose `SETTINGS_MAX_CONCURRENT_STREAMS` is 100 (`--streams`), so 100
  *     requests are answered at once and the rest wait in the browser's
  *     queue; every CORS preflight is refused, so a range that is not a plain

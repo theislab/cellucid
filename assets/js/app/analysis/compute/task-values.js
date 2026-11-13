@@ -22,6 +22,18 @@
 import { isRawValues, transformBlock, transformColumn } from '../../../data/expression-transform.js';
 import { OperationType } from './operations.js';
 
+/**
+ * The values a run computes from (`DataLayer.runValues`): the expression
+ * transform, the cells' totals when it normalizes (null otherwise), its
+ * `key` (`transformKey`) and what a result keeps of them (`record`, null for
+ * the values as stored). Defined here, beside the threads' use of them, so
+ * the analysis worker's modules name no module of the page.
+ *
+ * @typedef {Readonly<{transform: import('../../../data/expression-transform.js').ExpressionTransform,
+ *   sizes: import('../../../data/library-sizes.js').LibrarySizes|null, key: string,
+ *   record: {normalize: boolean, log1p: boolean, totals: string|null}|null}>} RunValues
+ */
+
 /** @type {Map<string, Float32Array>} */
 const heldScales = new Map();
 
@@ -86,7 +98,7 @@ export function transformedTask(payload) {
  * What a delivered task of a run names of its values (`transform`), or null
  * for a run on the values as stored.
  *
- * @param {import('../data/data-layer.js').RunValues|null} values
+ * @param {RunValues|null} values
  * @param {string|null} scaleId - The run's held factors (`withCellScale`)
  * @returns {{scale: string|null, log1p: boolean}|null}
  */
@@ -135,7 +147,7 @@ export async function withCellScale(computeManager, { scale, backend, signal = n
  * (`cells`) those of a cell subset by position; null when it does not
  * normalize.
  *
- * @param {import('../data/data-layer.js').RunValues|null} values
+ * @param {RunValues|null} values
  * @param {ArrayLike<number>|null} [cells]
  * @returns {Float32Array|null}
  */

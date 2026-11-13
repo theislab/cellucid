@@ -7,8 +7,8 @@
  * waits for that lock forever; it has already suspended the JIT worklist,
  * so every later collection in the tab, the page's own included, waits
  * behind it. A dataset whose structure inflates a compressed chunk on the
- * reader thread (`formats/io/inflate.js`) hung on opening that way, and its
- * page then hung its teardown.
+ * reader thread (`formats/io/inflate.js`) would hang on opening that way, and
+ * its page would then hang its teardown.
  *
  * A reader that has been read to its end or canceled holds nothing anyone
  * else needs: it is dropped. The community-annotation Cloudflare Worker

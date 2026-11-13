@@ -2,16 +2,12 @@
  * One implementation of hex colors (`assets/js/utils/hex-color.js`).
  *
  * A color is read from or written as `#rrggbb` text in sessions, exports,
- * color inputs, Scanpy's `uns['<key>_colors']` and plot colors. Round 8 found
- * the parse and the format written out in a dozen places (the legend's
- * `rgbToHex`/`hexToRgb01`, figure export's `color-utils.js`, the analysis
- * `color-utils.js`, `state/domains/colors.js` and `field-overlays.js`
- * `hexOfBytes`/`channelsOfHex`/`hexOfChannels`, `field-actions.js`
- * `hexToRgb01`/`rgb01ToHex`, `cell-exports.js` `hexColor`,
- * `palettes.js` `hexColorToRgb01`, the dataset read's `hex2`, the connectivity
- * color input, the dot plot and Plot theme parsers, and eleven copies of the
- * `#rrggbb` pattern, and the analysis plots' `PlotFactory.hexToRgba`), each with its own strictness. This contract keeps the
- * helpers exact and the source free of new copies.
+ * color inputs, Scanpy's `uns['<key>_colors']` and plot colors. The parse and
+ * the format are written once: a copy of either in another module (the legend,
+ * figure export, the analysis plots, state domains, cell exports, palettes,
+ * the dataset read, the connectivity color input, the dot plot and Plot theme
+ * parsers, or a `#rrggbb` pattern) would carry its own strictness. This
+ * contract keeps the helpers exact and the source free of new copies.
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';

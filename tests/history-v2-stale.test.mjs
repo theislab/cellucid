@@ -1,5 +1,5 @@
 /**
- * History v2 §3.4: staleness follows the result inputs (`reads`) of every
+ * Staleness follows the result inputs (`reads`) of every
  * action, not only analyses, kept views and fields made from pages. A cell
  * set computed from the filters is stale once the filters change, naming the
  * step that changed them; a step whose name only resolves in a domain
@@ -72,7 +72,7 @@ test('a step whose name resolves in a domain is not stale when it changes, and r
 });
 
 test('a step that captures its input (a camera path keyframe) is never stale when that input changes, and still records it', async () => {
-  // Owner, 2026-11-10 (F57): building a path (save, move the camera, save) marked keyframes stale.
+  // Building a path (save, move the camera, save) marks no keyframe stale.
   const { history, step, stale } = await page();
   await step('filter.set', { v: 2 });
   const saved = await step('snapshot.save');

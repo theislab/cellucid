@@ -1,15 +1,12 @@
 /**
- * Cancellation and honest failure, one invariant per finding of the
- * 2026-10-28 audit (cellucid-private/plans/audit-2026-10-28/
- * cancellation-and-errors.md): a cancellation is never a failure and keeps
- * its kind everywhere (CE-03, CE-11); a worker that cannot answer is retired
- * and one that can is not failed for a stray error (CE-04); slowness is
- * never turned into failure by a clock (CE-05); an older browser is told so
- * before startup (CE-06); a long export can be stopped (CE-07); shared work
- * names no waiter's reason (CE-08); a failure is said once (CE-09); a
- * sign-in nobody waits for goes (CE-13); background discards are observed
- * (CE-14). The grep guard over every module is
- * `cancellation-guard-contract.test.mjs`.
+ * Cancellation and honest failure, one invariant per section: a cancellation
+ * is never a failure and keeps its kind everywhere (one identity, one wire
+ * format); a worker that cannot answer is retired and one that can is not
+ * failed for a stray error; slowness is never turned into failure by a clock;
+ * an older browser is told so before startup; a long export can be stopped;
+ * shared work names no waiter's reason; a failure is said once; a sign-in
+ * nobody waits for goes; background discards are observed. The grep guard
+ * over every module is `cancellation-guard-contract.test.mjs`.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -28,7 +25,8 @@ import {
 } from '../assets/js/utils/abort.js';
 import { fromWire, toWire } from '../assets/js/utils/error-wire.js';
 import { isReported, markReported, settleQuietly } from '../assets/js/utils/errors.js';
-import { explainedFailure, isExplainedFailure, DataSourceErrorCode } from '../assets/js/data/data-source.js';
+import { describeHostFault, explainedFailure, isExplainedFailure, DataSourceErrorCode } from '../assets/js/data/data-source.js';
+import { isSettledDataSourceFailure } from '../assets/js/app/ui/modules/dataset-connections.js';
 import {
   AnnDataReaderClient,
   prewarmAnnDataReaderWorker,
@@ -47,7 +45,7 @@ import { probeRemoteServer } from '../assets/js/data/remote-source.js';
 
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
-// --- CE-03: one identity for a cancellation ----------------------------------
+// --- one identity for a cancellation ----------------------------------
 
 test('a cancellation has a kind, is made once, and is told apart by name alone', () => {
   assert.deepEqual([...CANCEL_KINDS], ['user', 'superseded', 'closed', 'released', 'page-left']);
@@ -72,7 +70,7 @@ test('a cancellation has a kind, is made once, and is told apart by name alone',
   assert.equal(isTransientCancellation(cancelled('superseded', 'Newer.')), false);
 });
 
-// --- CE-08: shared work ------------------------------------------------------
+// --- shared work ------------------------------------------------------
 
 test('shared work stops only when every waiter left, and its own abort names no waiter\'s reason', async () => {
   let workSignal = null;
@@ -103,7 +101,7 @@ test('waiting on one signal from many places keeps one listener on it', async ()
   assert.ok(outcomes.every(outcome => cancellationKind(outcome.reason) === 'user'));
 });
 
-// --- CE-11: one wire format --------------------------------------------------
+// --- one wire format --------------------------------------------------
 
 test('an error crosses a thread with its class, kind, code, details, mark and cause', () => {
   const cancellation = fromWire(structuredClone(toWire(cancelled('released', 'Memory was given back.'))));
@@ -121,7 +119,7 @@ test('an error crosses a thread with its class, kind, code, details, mark and ca
   assert.equal(Object.hasOwn(toWire(cancelled('user', 'x')), 'code'), false);
 });
 
-// --- CE-04 / CE-10: the reader worker's lifecycle ------------------------------
+// --- the reader worker's lifecycle ------------------------------
 
 /** A worker double: records what it is sent; the test answers for it. */
 class FakeWorker extends EventTarget {
@@ -183,6 +181,20 @@ test('a reader worker whose script never loaded is retired: its calls fail sayin
   assert.deepEqual(await second, { ok: true });
 });
 
+test('offline, a reader worker whose script never loaded fails its calls as this computer offline, which may pass', async t => {
+  const made = workers(t);
+  const navigatorOwn = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: false } });
+  t.after(() => Object.defineProperty(globalThis, 'navigator', navigatorOwn));
+  const client = new AnnDataReaderClient();
+  const first = client._call('getDatasetMetadata');
+  made[0].onerror(new Event('error'));
+  const error = await first.then(() => assert.fail('the call is answered'), failure => failure);
+  assert.equal(describeHostFault(error)?.kind, 'offline');
+  assert.equal(isSettledDataSourceFailure(error), false, 'Try again, once connected, may cure it');
+  assert.equal(made[0].terminated, true);
+});
+
 test('a stray error of a live reader worker fails none of the reads waiting on it', async t => {
   const made = workers(t);
   const client = new AnnDataReaderClient();
@@ -232,7 +244,7 @@ test('a reopen that failed is not kept: the next call reopens again', async t =>
   assert.deepEqual(await second, ['a']);
 });
 
-// --- CE-05: no clock turns slowness into failure -------------------------------
+// --- no clock turns slowness into failure -------------------------------
 
 test('a server probe has no deadline: a busy server that answers late is a server', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -251,7 +263,7 @@ test('a server probe has no deadline: a busy server that answers late is a serve
   await assert.rejects(probeRemoteServer('http://127.0.0.1:8765', {}), TypeError, 'a probe runs under its opening');
 });
 
-// --- CE-06: the browser floor, checked before startup ---------------------------
+// --- the browser floor, checked before startup ---------------------------
 
 test('a browser without AbortSignal.any is told it is too old before anything starts', () => {
   assert.deepEqual(missingBrowserFeatures(globalThis), []);
@@ -269,7 +281,7 @@ test('a browser without AbortSignal.any is told it is too old before anything st
   assert.match(screen.sentence, /Safari 17\.4/);
 });
 
-// --- CE-07: a figure export can be stopped ---------------------------------------
+// --- a figure export can be stopped ---------------------------------------
 
 test('a stopped figure export skips every request of its session still queued', async () => {
   const handle = createFigureExportWorkerHandler();
@@ -284,7 +296,7 @@ test('a stopped figure export skips every request of its session still queued', 
   assert.equal(isCancellation(fromWire(reopened.reply.error)), false);
 });
 
-// --- CE-09: a failure is said once -------------------------------------------------
+// --- a failure is said once -------------------------------------------------
 
 test('a failure one surface showed is marked, and only what is marked', () => {
   assert.equal(isReported(new Error('unshown')), false);
@@ -293,7 +305,7 @@ test('a failure one surface showed is marked, and only what is marked', () => {
   assert.equal(isReported(shown), true);
 });
 
-// --- CE-13: a sign-in step nobody waits for goes -----------------------------------
+// --- a sign-in step nobody waits for goes -----------------------------------
 
 test('a sign-in step whose every waiter left during an attempt goes when the attempt fails', async () => {
   const steps = new SignInSteps();
@@ -323,7 +335,7 @@ test('a sign-in step whose every waiter left during an attempt goes when the att
   assert.equal(attemptSignal.aborted, true, 'and what its attempt listens on ends');
 });
 
-// --- CE-14: background work is observed ---------------------------------------------
+// --- background work is observed ---------------------------------------------
 
 test('a background discard that fails is logged with what was being done and stops nothing after it', async t => {
   const warned = t.mock.method(console, 'warn', () => {});

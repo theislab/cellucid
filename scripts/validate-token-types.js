@@ -147,8 +147,7 @@ function collectTypeTokenNames() {
 // A failure sets process.exitCode and returns rather than calling
 // process.exit(): Node can deadlock in process.exit(), joining a V8 background
 // compile thread that waits for a garbage collection only the exiting main
-// thread could run (7 of 60 failing runs hung on Node 26.11; none of 120 with
-// exitCode), and the contract suite waited on such a run for over an hour.
+// thread could run (measured: 38_decisions_testing_and_hosted_runners.md).
 function main() {
   const defined = collectDefinedTokenNames();
   if (defined.size === 0) {

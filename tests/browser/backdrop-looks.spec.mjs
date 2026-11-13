@@ -184,47 +184,75 @@ async function cornerSpread(page) {
   return max - min;
 }
 
-for (const look of BACKDROP_LOOK_IDS) {
-  test(`the ${look} look draws in 3-D and 2-D panes and the scene goes quiet`, async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openFixture(page);
-    await installLookProbe(page);
-    for (const dimension of [3, 2]) {
-      await setDimension(page, 'live', dimension);
-      await showLook(page, look);
-      if (dimension === 3) {
-        // Which level the sky reached and how the GPU measured: a CI cell on
-        // a software rasterizer stops early, and the log says where.
-        console.log(`[backdrop-looks] ${look}: ${await page.evaluate(() => {
-          const d = window._cellucidViewer.getBackdropLookDiagnostics();
-          const family = Object.entries(d.families).find(([, f]) => f.ready)?.[1] ?? null;
-          return JSON.stringify(family === null ? null : {
-            family: family.family, cubeSize: family.cubeSize, readyMs: Math.round(family.readyMs),
-            wallMs: Math.round(family.wallMs), texelRateMs: family.texelRateMs,
-            levels: (family.levels ?? []).map(l => ({ size: l.size, bands: l.bands, gpuMs: Math.round(l.gpuMs), wallMs: Math.round(l.wallMs) })),
-          });
-        })}`);
+// One opening: the looks are shown one after another, each in a 3-D and a
+// 2-D pane, then the camera goes under the Atelier floor.
+test('every look draws in 3-D and 2-D panes and the scene goes quiet; below the Atelier floor the look still draws', async ({ page }) => {
+  test.setTimeout((BACKDROP_LOOK_IDS.length + 1) * 90_000);
+  const productErrors = observeProductErrors(page);
+  await openFixture(page);
+  await installLookProbe(page);
+  for (const look of BACKDROP_LOOK_IDS) {
+    await test.step(`the ${look} look draws in 3-D and 2-D panes and the scene goes quiet`, async () => {
+      for (const dimension of [3, 2]) {
+        await setDimension(page, 'live', dimension);
+        await showLook(page, look);
+        if (dimension === 3) {
+          // Which level the sky reached and how the GPU measured: a CI cell on
+          // a software rasterizer stops early, and the log says where.
+          console.log(`[backdrop-looks] ${look}: ${await page.evaluate(() => {
+            const d = window._cellucidViewer.getBackdropLookDiagnostics();
+            const family = Object.entries(d.families).find(([, f]) => f.ready)?.[1] ?? null;
+            return JSON.stringify(family === null ? null : {
+              family: family.family, cubeSize: family.cubeSize, readyMs: Math.round(family.readyMs),
+              wallMs: Math.round(family.wallMs), texelRateMs: family.texelRateMs,
+              levels: (family.levels ?? []).map(l => ({ size: l.size, bands: l.bands, gpuMs: Math.round(l.gpuMs), wallMs: Math.round(l.wallMs) })),
+            });
+          })}`);
+        }
+        const frame = await lookFrame(page);
+        expect(frame.nonFinite, `${look} ${dimension}-D: non-finite uniforms`).toEqual([]);
+        expect(frame.glError, `${look} ${dimension}-D: WebGL error`).toBe(0);
+        expect(frame.draws, `${look} ${dimension}-D: look passes drawn`).toBeGreaterThanOrEqual(1);
+        await expect.poll(() => sceneQuietness(page)).toBe('quiet');
+        expect(await cornerSpread(page), `${look} ${dimension}-D: the corner shows the look`)
+          .toBeGreaterThan(0);
       }
-      const frame = await lookFrame(page);
-      expect(frame.nonFinite, `${look} ${dimension}-D: non-finite uniforms`).toEqual([]);
-      expect(frame.glError, `${look} ${dimension}-D: WebGL error`).toBe(0);
-      expect(frame.draws, `${look} ${dimension}-D: look passes drawn`).toBeGreaterThanOrEqual(1);
-      await expect.poll(() => sceneQuietness(page)).toBe('quiet');
-      expect(await cornerSpread(page), `${look} ${dimension}-D: the corner shows the look`)
-        .toBeGreaterThan(0);
-    }
-    // The page behind the canvas is exactly the color the canvas clears to.
-    const [r, g, b] = BACKDROP_LOOKS[look].surface;
-    await expect.poll(() => page.evaluate(
-      () => getComputedStyle(document.body).backgroundColor,
-    )).toBe(`rgb(${r}, ${g}, ${b})`);
-    expect(await page.evaluate(() => Array.from(
-      window._cellucidViewer.getPresentedViewState('live').renderState.bgColor,
-      channel => Math.round(channel * 255),
-    ))).toEqual([r, g, b]);
+      // The page behind the canvas is exactly the color the canvas clears to.
+      const [r, g, b] = BACKDROP_LOOKS[look].surface;
+      await expect.poll(() => page.evaluate(
+        () => getComputedStyle(document.body).backgroundColor,
+      )).toBe(`rgb(${r}, ${g}, ${b})`);
+      expect(await page.evaluate(() => Array.from(
+        window._cellucidViewer.getPresentedViewState('live').renderState.bgColor,
+        channel => Math.round(channel * 255),
+      ))).toEqual([r, g, b]);
+      expect(productErrors).toEqual([]);
+    });
+  }
+
+  await test.step('below the Atelier floor the look still draws', async () => {
+    await setDimension(page, 'live', 3);
+    await showLook(page, 'atelier');
+    await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const camera = viewer.getCameraState();
+      camera.navigationMode = 'orbit';
+      // Well below the equator: the camera looks up from under the floor.
+      camera.orbit.phi = 2.5;
+      viewer.setCameraState(camera);
+    });
+    const eyeBelowFloor = await page.evaluate(() => {
+      const state = window._cellucidViewer.getPresentedViewState('live').renderState;
+      return state.cameraPosition[1] < state.backdrop.floorY;
+    });
+    expect(eyeBelowFloor).toBe(true);
+    const frame = await lookFrame(page);
+    expect(frame.glError).toBe(0);
+    expect(frame.draws).toBeGreaterThanOrEqual(1);
+    expect(await cornerSpread(page)).toBeGreaterThan(0);
     expect(productErrors).toEqual([]);
   });
-}
+});
 
 test('every pane of a grid draws the look, and the grid goes quiet', async ({ page }) => {
   const productErrors = observeProductErrors(page);
@@ -250,32 +278,6 @@ test('every pane of a grid draws the look, and the grid goes quiet', async ({ pa
     () => window._cellucidViewer.getBackdropLookDiagnostics().jobsQueued,
   )).toBe(0);
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
-  expect(productErrors).toEqual([]);
-});
-
-test('below the Atelier floor the look still draws', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openFixture(page);
-  await installLookProbe(page);
-  await setDimension(page, 'live', 3);
-  await showLook(page, 'atelier');
-  await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const camera = viewer.getCameraState();
-    camera.navigationMode = 'orbit';
-    // Well below the equator: the camera looks up from under the floor.
-    camera.orbit.phi = 2.5;
-    viewer.setCameraState(camera);
-  });
-  const eyeBelowFloor = await page.evaluate(() => {
-    const state = window._cellucidViewer.getPresentedViewState('live').renderState;
-    return state.cameraPosition[1] < state.backdrop.floorY;
-  });
-  expect(eyeBelowFloor).toBe(true);
-  const frame = await lookFrame(page);
-  expect(frame.glError).toBe(0);
-  expect(frame.draws).toBeGreaterThanOrEqual(1);
-  expect(await cornerSpread(page)).toBeGreaterThan(0);
   expect(productErrors).toEqual([]);
 });
 
@@ -390,10 +392,9 @@ function plotAreaColors({ width, height, channels, pixels }) {
 /**
  * The share of the same lattice darker than 192 (mean of R, G and B): on a
  * white paper the paper and its grid are lighter, the shaded spheres of the
- * point pass are not. Measured over this fixture's figure: 0.16 (WebKit) and
- * 0.12 (Chromium). The PNG Linux WebKit wrote while the composed figure
- * reached the encoder as an ImageBitmap held no point and measured 0, while
- * its blurred grid passed a count of more than five colors (it had 28).
+ * point pass are not. A PNG with no point measures 0 here, while its blurred
+ * grid can still pass a count of more than five colors, so the colors alone
+ * do not show the points (measured: 28_decisions_rendering_layers.md).
  */
 function plotAreaShadedShare({ width, height, channels, pixels }) {
   let samples = 0;

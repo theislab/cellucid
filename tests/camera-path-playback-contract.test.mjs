@@ -184,7 +184,7 @@ test('Play resumes from the position an idle path was scrubbed to', () => {
     );
 
     // A stop that leaves the camera where it is keeps the position the
-    // transport shows (R9R-7); the bar's Stop (back to the first keyframe)
+    // transport shows; the bar's Stop (back to the first keyframe)
     // clears it, so the next Play starts at the top.
     controller.stop({ resetCamera: false });
     assert.ok(controller.getProgress() > 0.4, 'a stop in place keeps the position');

@@ -1,13 +1,13 @@
 /**
- * Pseudobulk differential expression (analysis overhaul Phase 2): each
+ * Pseudobulk differential expression: each
  * sample's cells of a group form one unit, a gene's unit value (a matrix
  * that is not counts) is its mean over those cells (per-unit sums from the
  * dot plot's one-pass kernel), and the fit is limma's (`~ group`; one gene:
  * too few to moderate, so its own residual variance). References are R
  * limma 3.68.5 `lmFit` + `eBayes(trend = TRUE)` on the same per-sample means
  * (NA for a sample short of measured cells). A sample with fewer of a
- * side's cells than the minimum per sample is left out of that side (audit
- * F-8), and counted. The counts path and moderation over many genes:
+ * side's cells than the minimum per sample is left out of that side, and
+ * counted. The counts path and moderation over many genes:
  * `analysis-pseudobulk-limma.test.mjs`.
  */
 import assert from 'node:assert/strict';

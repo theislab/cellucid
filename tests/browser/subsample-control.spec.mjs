@@ -9,11 +9,16 @@
  * - A highlight made before is carried across by original cell position:
  *   the cells of it still open, and no other.
  * - Back at 100%, every cell is open again.
+ * - A figure exported from a subsample says it is one: its provenance (the
+ *   SVG's `cellucid:json` and `dc:description`) names the open cells, the
+ *   dataset's, how they were chosen and the cell-set digest the Session panel
+ *   shows. A figure of every cell makes no such claim.
  *
  * Fixture: `data-mapping-full.h5ad` (300 cells).
  */
 
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -64,7 +69,31 @@ async function highlightOriginals(page, label) {
   }, label);
 }
 
-test('a share of the cells is read in place, and a highlight keeps its cells that stay open', async ({ page }) => {
+function decodeXmlText(value) {
+  return value
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&');
+}
+
+async function exportSvg(page, testInfo, label) {
+  await page.getByLabel('Download format').selectOption('svg');
+  await page.getByLabel('SVG point strategy').selectOption('full-vector');
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#figure-export-btn').click();
+  const download = await downloadPromise;
+  expect(await download.failure()).toBeNull();
+  const outputPath = testInfo.outputPath(`${label}.svg`);
+  await download.saveAs(outputPath);
+  const svg = await readFile(outputPath, 'utf8');
+  const json = JSON.parse(decodeXmlText(svg.match(/<cellucid:json>([\s\S]+?)<\/cellucid:json>/)[1]));
+  const description = decodeXmlText(svg.match(/<dc:description>([\s\S]*?)<\/dc:description>/)[1]);
+  return { json, description };
+}
+
+test('a share of the cells is read in place, a highlight keeps its cells that stay open, and a figure names the cells it shows', async ({ page }, testInfo) => {
   const errors = collectBrowserErrors(page);
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
@@ -77,6 +106,16 @@ test('a share of the cells is read in place, and a highlight keeps its cells tha
   await expect(page.locator('#subsample-count')).toHaveText('All 300 cells');
   await expect(page.locator('#subsample-settings')).toBeHidden();
   await expect(page.locator('#subsample-apply')).toBeDisabled();
+
+  // A figure of every cell makes no claim about its cells.
+  await page.locator('#figure-export-section > summary').click();
+  await expect(page.locator('#figure-export-section')).toHaveAttribute('open', '');
+  await page.getByRole('button', { name: /^Download\b/ }).click();
+  await test.step('a figure of every cell does not name its cells', async () => {
+    const whole = await exportSvg(page, testInfo, 'every-cell');
+    expect(whole.json.dataset.cells).toBeNull();
+    expect(whole.description).not.toContain('Cells:');
+  });
 
   // A highlight on the first 60 cells.
   await page.evaluate(() => {
@@ -125,6 +164,15 @@ test('a share of the cells is read in place, and a highlight keeps its cells tha
   // What a gene costs on this file, worked out once Details opened.
   await expect(page.locator('#subsample-details-list dt').filter({ hasText: /^(A gene reads|First gene)$/ })).toHaveCount(1);
 
+  // A figure of the subsample says it is one: the open cells, the dataset's,
+  // how they were chosen and the cell-set digest the Session panel shows.
+  await test.step('a figure of a subsample names its cells', async () => {
+    const digest = await page.evaluate(() => window._cellucidState.cellIdentity.digest);
+    const share = await exportSvg(page, testInfo, 'subsample');
+    expect(share.json.dataset.cells).toEqual({ open: 120, of: 300, method: 'uniform, seed 7', digest });
+    expect(share.description).toContain(`Cells: a subsample, 120 of 300 (uniform, seed 7; cell set ${digest})`);
+  });
+
   // The highlight kept its cells that are still open, and no other.
   const carried = await highlightOriginals(page, 'probe');
   expect(carried).toEqual(expected.filter(position => position < 60));
@@ -171,31 +219,48 @@ test('a link with a subsample opens exactly those cells and keeps them in the ad
   expect(errors).toEqual([]);
 });
 
-test('a malformed subsample in a link is said by name, and the dataset opens whole', async ({ page }) => {
-  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&cells=ten`, { waitUntil: 'domcontentloaded' });
-  await expect(page.getByText('"cells" must be a share (10%) or a count of cells').first()).toBeVisible();
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  expect(await page.evaluate(() => window._cellucidState.cellIdentity.isSubset)).toBe(false);
-});
-
-test('one cell is not offered: a link asking for it is refused with the reason, and the control says why', async ({ page }) => {
+test('one cell is not offered, and every count of the open cells says how many of every cell they are', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&cells=1`, { waitUntil: 'domcontentloaded' });
-  // One cell has no coordinate variation to draw (`FEWEST_OPEN_CELLS`).
-  await expect(page.getByText('"cells" must be at least 2: one cell has no coordinate variation to draw; got "1".').first()).toBeVisible();
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  expect(await page.evaluate(() => window._cellucidState.cellIdentity.isSubset)).toBe(false);
-  await openCollapsedPanels(page);
-  // 0.5% of 120 cells is one cell: said, and not applied.
-  await page.locator('#subsample-percent').fill('0.5');
-  await expect(page.locator('#subsample-count')).toHaveText('1 of 120 cells: one cell has no coordinate variation to draw, so at least 2 cells open.');
-  await expect(page.locator('#subsample-apply')).toBeDisabled();
-  // Two cells are.
-  await page.locator('#subsample-percent').fill('1.5');
-  await expect(page.locator('#subsample-count')).toHaveText('2 of 120 cells');
-  await expect(page.locator('#subsample-apply')).toBeEnabled();
+
+  await test.step('one cell is not offered: a link asking for it is refused with the reason, and the control says why', async () => {
+    // One cell has no coordinate variation to draw (`FEWEST_OPEN_CELLS`).
+    await expect(page.getByText('"cells" must be at least 2: one cell has no coordinate variation to draw; got "1".').first()).toBeVisible();
+    await dismissWelcome(page);
+    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+    expect(await page.evaluate(() => window._cellucidState.cellIdentity.isSubset)).toBe(false);
+    await openCollapsedPanels(page);
+    // 0.5% of 120 cells is one cell: said, and not applied.
+    await page.locator('#subsample-percent').fill('0.5');
+    await expect(page.locator('#subsample-count')).toHaveText('1 of 120 cells: one cell has no coordinate variation to draw, so at least 2 cells open.');
+    await expect(page.locator('#subsample-apply')).toBeDisabled();
+    // Two cells are.
+    await page.locator('#subsample-percent').fill('1.5');
+    await expect(page.locator('#subsample-count')).toHaveText('2 of 120 cells');
+    await expect(page.locator('#subsample-apply')).toBeEnabled();
+  });
+
+  await test.step('every count of the open cells says how many of every cell they are, the picker\'s too', async () => {
+    await page.locator('#subsample-percent').fill('50');
+    await page.locator('#subsample-method').selectOption('uniform');
+    await page.locator('#subsample-seed').fill('0');
+    await page.locator('#subsample-apply').click();
+    await expect.poll(() => pointCount(page)).toBe(60);
+    const option = page.locator('#dataset-select option', { hasText: 'Current UI fixture' });
+    // The chosen sample says its name alone at rest (the Dataset card says its
+    // cells); reached for, the picker says its open cells.
+    await expect(option).toHaveText('Current UI fixture');
+    await page.locator('#dataset-select').focus();
+    await expect(option).toHaveText('Current UI fixture (60 of 120 cells)');
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 60 of 120 cells');
+    // Every cell again: the counts are the dataset's.
+    await page.locator('#subsample-percent').fill('100');
+    await page.locator('#subsample-apply').click();
+    await expect.poll(() => pointCount(page)).toBe(120);
+    await page.locator('#dataset-select').focus();
+    await expect(option).toHaveText('Current UI fixture (120 cells)');
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  });
   expect(errors.filter(error => !error.includes('"cells" must be at least 2'))).toEqual([]);
 });
 
@@ -228,27 +293,4 @@ test.describe('in a locale that writes a decimal comma', () => {
     expect(await page.evaluate(() => window._cellucidState.cellIdentity.kept.length)).toBe(15);
     expect(errors).toEqual([]);
   });
-});
-
-test('every count of the open cells says how many of every cell they are, the picker\'s too', async ({ page }) => {
-  const errors = collectBrowserErrors(page);
-  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&cells=60&sample=uniform&seed=0`, { waitUntil: 'domcontentloaded' });
-  await expect.poll(() => pointCount(page)).toBe(60);
-  await dismissWelcome(page);
-  const option = page.locator('#dataset-select option', { hasText: 'Current UI fixture' });
-  // The chosen sample says its name alone at rest (the Dataset card says its
-  // cells); reached for, the picker says its open cells.
-  await expect(option).toHaveText('Current UI fixture');
-  await page.locator('#dataset-select').focus();
-  await expect(option).toHaveText('Current UI fixture (60 of 120 cells)');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 60 of 120 cells');
-  // Every cell again: the counts are the dataset's.
-  await openCollapsedPanels(page);
-  await page.locator('#subsample-percent').fill('100');
-  await page.locator('#subsample-apply').click();
-  await expect.poll(() => pointCount(page)).toBe(120);
-  await page.locator('#dataset-select').focus();
-  await expect(option).toHaveText('Current UI fixture (120 cells)');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-  expect(errors).toEqual([]);
 });

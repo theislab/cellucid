@@ -52,50 +52,49 @@ async function open(browser, reducedMotion) {
   return { context, page };
 }
 
-test('without the preference a flick glides on, and asking for reduced motion stops it at once', async ({ browser }) => {
+// One opening: the page starts without the preference, is asked for reduced
+// motion in the middle of a glide, and stays under it for the second step.
+test('a flick glides until reduced motion is asked for; under it nothing glides and a zoom arrives at once', async ({ browser }) => {
   test.setTimeout(180_000);
   const { context, page } = await open(browser, 'no-preference');
   try {
-    await flick(page);
-    await frames(page, 1);
-    const released = await camera(page);
-    await frames(page, 4);
-    expect(await camera(page), 'the camera glides after the release').not.toBe(released);
-    await page.emulateMedia({ reducedMotion: 'reduce' });
-    await frames(page, 2);
-    const stopped = await camera(page);
-    await frames(page, 6);
-    expect(await camera(page), 'stopped when the setting changed').toBe(stopped);
-  } finally {
-    await closeContextWithApplicationRetirement(context);
-  }
-});
-
-test('under reduced motion a flick stops at the release and a zoom arrives at once', async ({ browser }) => {
-  test.setTimeout(180_000);
-  const { context, page } = await open(browser, 'reduce');
-  try {
-    await flick(page);
-    await frames(page, 1);
-    const released = await camera(page);
-    await frames(page, 8);
-    expect(await camera(page), 'no glide after the release').toBe(released);
-    expect(
-      await page.evaluate(() => window._cellucidViewer.getFrameScheduleState().animationCause) ?? 'nothing',
-      'no inertia animates after the release (null: nothing animates)',
-    ).not.toMatch(/inertia/);
-
-    // A zoom asked for (its target radius moved): there on the next frame.
-    await page.evaluate(() => {
-      const viewer = window._cellucidViewer;
-      const state = viewer.getCameraState();
-      state.orbit.targetRadius = state.orbit.radius * 1.5;
-      viewer.setCameraState(state);
+    await test.step('without the preference a flick glides on, and asking for reduced motion stops it at once', async () => {
+      await flick(page);
+      await frames(page, 1);
+      const released = await camera(page);
+      await frames(page, 4);
+      expect(await camera(page), 'the camera glides after the release').not.toBe(released);
+      await page.emulateMedia({ reducedMotion: 'reduce' });
+      await frames(page, 2);
+      const stopped = await camera(page);
+      await frames(page, 6);
+      expect(await camera(page), 'stopped when the setting changed').toBe(stopped);
     });
-    await frames(page, 2);
-    const orbit = await page.evaluate(() => window._cellucidViewer.getCameraState().orbit);
-    expect(orbit.radius).toBe(orbit.targetRadius);
-    await expect.poll(() => sceneQuietness(page), { timeout: 60_000 }).toBe('quiet');
+
+    await test.step('under reduced motion a flick stops at the release and a zoom arrives at once', async () => {
+      await expect.poll(() => sceneQuietness(page), { timeout: 60_000 }).toBe('quiet');
+      await flick(page);
+      await frames(page, 1);
+      const released = await camera(page);
+      await frames(page, 8);
+      expect(await camera(page), 'no glide after the release').toBe(released);
+      expect(
+        await page.evaluate(() => window._cellucidViewer.getFrameScheduleState().animationCause) ?? 'nothing',
+        'no inertia animates after the release (null: nothing animates)',
+      ).not.toMatch(/inertia/);
+
+      // A zoom asked for (its target radius moved): there on the next frame.
+      await page.evaluate(() => {
+        const viewer = window._cellucidViewer;
+        const state = viewer.getCameraState();
+        state.orbit.targetRadius = state.orbit.radius * 1.5;
+        viewer.setCameraState(state);
+      });
+      await frames(page, 2);
+      const orbit = await page.evaluate(() => window._cellucidViewer.getCameraState().orbit);
+      expect(orbit.radius).toBe(orbit.targetRadius);
+      await expect.poll(() => sceneQuietness(page), { timeout: 60_000 }).toBe('quiet');
+    });
   } finally {
     await closeContextWithApplicationRetirement(context);
   }

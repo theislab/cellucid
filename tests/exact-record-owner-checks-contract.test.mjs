@@ -6,9 +6,9 @@
  * `requireObjectKeys`, `requireExactObjectKeys`), for an owner the app built
  * (a `DataState`, a viewer, a manager), whose prototype is its class.
  *
- * Checking an owner as a plain record refuses every real one: the category
- * builder did so with the `DataState` and the app no longer started, while
- * every node test passed with plain stub states. This contract keeps owner
+ * Checking an owner as a plain record refuses every real one: a category
+ * builder that did so with the `DataState` would keep the app from starting,
+ * while every node test passed with plain stub states. This contract keeps owner
  * values out of the plain checks by their names, and holds the real state
  * class to the owner checks.
  */

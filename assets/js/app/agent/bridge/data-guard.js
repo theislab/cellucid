@@ -28,8 +28,8 @@
  * (`figure.export`, `cells.export`, `field.export`, `analysis.export`, `history.report`,
  * `history.share`) writes its file to the person's computer through the
  * browser; what the agent is told is its name, its size and counts
- * (`OUTSIDE_RESULTS`), so it runs with the switch on (owner decision
- * 2026-11-04: the switch keeps cell-level values out of tool results).
+ * (`OUTSIDE_RESULTS`), so it runs with the switch on (the switch keeps
+ * cell-level values out of tool results, not files the person receives).
  * The report given as text holds what `history.get` holds, never a picture.
  *
  * **Groups an agent shaped** by naming cells (`../data-scope.js`

@@ -1,8 +1,7 @@
 /**
  * Work on the dataset shown that this browser is not keeping is never lost
- * without a question (bug hunt R9W-2: with Autosave off, opening another
- * dataset dropped every step without a word; a reload or a closed tab did
- * the same).
+ * without a question (with Autosave off, opening another dataset, a reload
+ * or a closed tab would drop every step without a word).
  *
  * - `DatasetHistories.unkept()` says what would be lost: steps made since the
  *   last save while the autosave is not keeping them (off, no storage, no
@@ -190,9 +189,10 @@ test('every path that replaces the dataset passes the one guard; the page asks b
   const main = source('app/main.js');
   // Every opening (sample, My datasets, file, link, server, catalog, session of another dataset,
   // dataset.open) is a reload in place; None clears; the benchmark replaces it too.
-  assert.match(main, /if \(!isStartupLoad && loadMethod !== DATA_LOAD_METHODS\.SUBSAMPLE\) \{\s*step\('Asking before the dataset shown is replaced'\);\s*await confirmDatasetReplacement\(reloadTransaction, \{ to: datasetName \}\);/);
-  assert.match(main, /async function clearActiveDatasetInPlace\(reloadTransaction\) \{\s*requireDatasetChangeTransaction\(reloadTransaction\);\s*reloadTransaction\.assertCurrent\(\);\s*await confirmDatasetReplacement\(reloadTransaction, \{ closing: true \}\);/);
-  assert.match(main, /const syntheticTransaction = datasetReloadCoordinator\.begin\(\);\s*try \{\s*try \{\s*await confirmDatasetReplacement\(syntheticTransaction, \{\}\);/);
+  const changes = source('app/dataset/reload.js');
+  assert.match(changes, /if \(!isStartupLoad && loadMethod !== DATA_LOAD_METHODS\.SUBSAMPLE\) \{\s*step\('Asking before the dataset shown is replaced'\);\s*await confirmDatasetReplacement\(reloadTransaction, \{ to: datasetName \}\);/);
+  assert.match(changes, /async function clearActiveDatasetInPlace\(reloadTransaction\) \{\s*requireDatasetChangeTransaction\(reloadTransaction\);\s*reloadTransaction\.assertCurrent\(\);\s*await confirmDatasetReplacement\(reloadTransaction, \{ closing: true \}\);/);
+  assert.match(source('app/ui/modules/benchmark/benchmark-controls.js'), /const syntheticTransaction = datasetReloadCoordinator\.begin\(\);\s*try \{\s*try \{\s*await confirmDatasetReplacement\(syntheticTransaction, \{\}\);/);
   assert.match(main, /window\.addEventListener\('beforeunload', warnBeforeLeavingUnkeptWork\);/);
   assert.match(main, /window\.removeEventListener\('beforeunload', warnBeforeLeavingUnkeptWork\);/);
   const open = source('app/ui/modules/dataset-open-action.js');

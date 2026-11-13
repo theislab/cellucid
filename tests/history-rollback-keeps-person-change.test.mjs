@@ -1,10 +1,11 @@
 /**
  * A stopped action's rollback puts back only what the action itself changed,
- * never the person's own act made meanwhile (switching lane R9W-5): a Marker
+ * never the person's own act made meanwhile: a Marker
  * genes run in a floating window, the window's × pressed while it ran; the ×
- * closed the window (an observed change of `analysis`), the closing stopped
- * the run, and the run's rollback put the whole `analysis` domain back — the
- * window opened again and no "Closed" step was kept. A person's act is its
+ * closes the window (an observed change of `analysis`), the closing stops
+ * the run, and the run's rollback must not put the whole `analysis` domain
+ * back — the window would open again and no "Closed" step be kept. A person's
+ * act is its
  * own step and stands through the rollback; work the action set off (a
  * change observed without `person`) is still the action's and goes with it.
  */

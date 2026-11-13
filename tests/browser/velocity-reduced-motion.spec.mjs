@@ -1,5 +1,5 @@
 /**
- * F103: under `prefers-reduced-motion: reduce` the velocity overlay draws a
+ * Under `prefers-reduced-motion: reduce` the velocity overlay draws a
  * still picture of the flow (`stillFlowTrace`, velocity-overlay.js) and the
  * viewer requests no further frame once it is drawn; the picture is the same
  * every time it is traced (a camera moved away and back, the flow resumed and

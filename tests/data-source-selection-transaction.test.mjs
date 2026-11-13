@@ -290,10 +290,10 @@ test('stale and failed staged commits preserve the exact prior selection', async
     assert.equal(alpha.deactivations.length, 0);
   });
 
-  await t.test('the shown dataset growing in place does not supersede a newer stage (R9V-2)', async () => {
+  await t.test('the shown dataset growing in place does not supersede a newer stage', async () => {
     // Suo grows in the background while a link opens: each growth step adopts
-    // the resized metadata, which once made the link fail "superseded before
-    // publication" and left Suo on screen.
+    // the resized metadata, which must not make the link fail "superseded before
+    // publication" and leave Suo on screen.
     const manager = new DataSourceManager();
     manager.registerSource('alpha', source('alpha'));
     manager.registerSource('link', source('link'));
@@ -438,10 +438,6 @@ test('unpublished manager commit can roll back after runtime publication failure
 test(
   'the data source manager exposes exactly the members its consumers reach',
   async () => {
-    const managerSource = await readFile(
-      new URL('../assets/js/data/data-source-manager.js', import.meta.url),
-      'utf8',
-    );
     const manager = new DataSourceManager();
 
     // Figure export reaches `getStateSnapshot` through a method-name list, so
@@ -457,8 +453,8 @@ test(
     assert.match(exportSource, /'getStateSnapshot',/);
     assert.equal(typeof manager.getStateSnapshot, 'function');
 
-    // Session restore from a URL was never wired to the interface and is
-    // gone, and with it the only caller of the manager's `fetch`.
+    // Session restore from a URL is no part of the interface, so the manager's
+    // `fetch` has no caller.
     assert.equal(
       manager.fetch,
       undefined,
@@ -473,7 +469,6 @@ test(
         undefined,
         `${removed} has no consumer; re-adding it re-creates dead surface`,
       );
-      assert.equal(managerSource.includes(removed), false);
     }
   },
 );

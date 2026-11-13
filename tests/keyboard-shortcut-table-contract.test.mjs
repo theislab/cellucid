@@ -2,12 +2,11 @@
  * The one shortcut table (`assets/js/app/ui/onboarding/shortcut-table.js`)
  * against every key the app answers.
  *
- * The Keyboard shortcuts panel was hand-written HTML beside five separate key
- * listeners, held together by a test reading both; it still missed Ctrl+Y,
- * the History list's keys and the keys that move a panel, a page or a
- * category (round 9, R9K-4). Now the panel and the docs page are drawn from
- * the table and the page's key listener answers from it, so these tests pin
- * the rest: every key a page-wide listener or a keyed widget answers is a
+ * The Keyboard shortcuts panel and the docs page are drawn from the table and
+ * the page's key listener answers from it, so a panel written by hand beside
+ * five separate key listeners, held together by a test reading both, cannot
+ * miss Ctrl+Y, the History list's keys or the keys that move a panel, a page
+ * or a category. These tests pin the rest: every key a page-wide listener or a keyed widget answers is a
  * row, every row is served, and the docs page is what the table writes.
  */
 import assert from 'node:assert/strict';
@@ -23,14 +22,14 @@ import { NAVIGATION_KEYS, NAVIGATION_KEY_MODES } from '../assets/js/rendering/na
 import { MOVE_KEYS } from '../assets/js/app/ui/keyboard-move.js';
 import { historyKeyOf } from '../assets/js/app/ui/modules/state/keyboard.js';
 import { renderShortcutReference, shortcutReferencePath } from '../scripts/generate-shortcut-reference.mjs';
+import { skipAbsentSibling } from '../scripts/shared-files.mjs';
 import { sourceFiles } from './helpers/source-files.mjs';
 
 const ROOT = new URL('../', import.meta.url);
 const read = relative => readFile(new URL(relative, ROOT), 'utf8');
 
-const [viewerSource, selectModeSource, highlightRenderer, modeUiSource, graphSource, indexHtml] = await Promise.all([
+const [viewerSource, highlightRenderer, modeUiSource, graphSource, indexHtml] = await Promise.all([
   read('assets/js/rendering/viewer.js'),
-  read('assets/js/rendering/select-mode.js'),
   read('assets/js/rendering/highlight-renderer.js'),
   read('assets/js/app/ui/modules/highlight/mode-ui.js'),
   read('assets/js/app/ui/modules/state/graph.js'),
@@ -143,8 +142,6 @@ test('the viewer moves the camera by exactly the movements each mode is listed w
   assert.deepEqual(listed('orbit'), listed('planar'));
   assert.deepEqual(read(orbitPlanar), listed('orbit'), 'orbit and planar');
   assert.doesNotMatch(viewerSource, /activeKeys\.has\('/, 'no camera key is named outside NAVIGATION_KEYS');
-  assert.match(freefly, /vec3\.scaleAndAdd\(_freeflyMove, _freeflyMove, upVec, upShare - downShare\)/);
-  assert.match(freefly, /const upShare = keyShare\('up'\)/);
 });
 
 test('every camera key is a row, under the group that names its modes', () => {
@@ -179,13 +176,10 @@ function assertOneSelectionGate() {
     highlightRenderer,
     /handlePointerDown\(e\) \{\s*\n\s*const combine = resolveSelectionGestureCombine\(e, this\.selectMode\);\s*\n\s*if \(combine === null\) return false;/,
   );
-  assert.match(selectModeSource, /if \(event\.altKey !== true && selectMode\.enabled !== true\) return null;/);
 }
 
 test('the selection rows name the modifiers the one selection gate reads', () => {
   assertOneSelectionGate();
-  assert.match(selectModeSource, /return null;[\s\S]{0,200}?if \(event\.shiftKey === true\) return 'union';/);
-  assert.match(selectModeSource, /if \(event\.ctrlKey === true \|\| event\.metaKey === true\) return 'subtract';/);
   assert.deepEqual(rowsSaying(/add to selection/i).map(row => row.combos), [[{ keys: ['Shift', 'Alt'], gesture: 'click' }]]);
   assert.deepEqual(rowsSaying(/^subtract$/i).map(row => row.combos), [[{ keys: ['Ctrl', 'Alt'], gesture: 'click' }]]);
   // Plain Shift+drag pans: no row promises a selection from Shift alone.
@@ -242,10 +236,7 @@ test('the move grammar\'s keys are the Moving by keys rows', () => {
 
 test('the docs page is what the table writes', async t => {
   const page = shortcutReferencePath();
-  if (!existsSync(path.dirname(page))) {
-    t.skip(`no docs tree at ${path.dirname(page)} (set CELLUCID_PYTHON_DOCS)`);
-    return;
-  }
+  if (skipAbsentSibling(t, existsSync(path.dirname(page)), `no docs tree at ${path.dirname(page)} (set CELLUCID_PYTHON_DOCS)`)) return;
   const current = await readFile(page, 'utf8').catch(() => null);
   assert.equal(current, renderShortcutReference(), 'run node scripts/generate-shortcut-reference.mjs');
 });

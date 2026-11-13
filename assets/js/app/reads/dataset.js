@@ -127,7 +127,7 @@ export function createDatasetReads({ state, viewer, dataSourceManager }) {
     const obs = (state.obsData?.fields ?? []).filter(field => field && field._isDeleted !== true);
     const sample = state.getGeneSample?.() ?? null;
     // Every embedding the data mapping offers, on or off, by the obsm key and columns that
-    // mapping_set and view_embedding_set take: an agent given the labels only guessed keys (L21-6).
+    // mapping_set and view_embedding_set take: an agent given the labels only would guess keys.
     const embeddings = (state.getRepresentationChoices?.() ?? []).map(choice => ({
       name: choice.name,
       dimension: choice.dimension ?? null,
@@ -157,14 +157,14 @@ export function createDatasetReads({ state, viewer, dataSourceManager }) {
         count: state.getVarAxisGeneCount?.() ?? 0,
         // The modalities of a MuData, as Data mapping › Modality lists them: an
         // agent that could not see them said "I have no tool that lists the
-        // modalities" of a CITE-seq file (L18-9).
+        // modalities" of a CITE-seq file.
         ...modalitiesOf(),
         read_for: sample === null ? null : { cells: sample.cells, of: sample.of },
         values: expressionValues(),
       },
       embeddings,
       // Per-cell vectors the vector field overlay draws (RNA velocity, drift): an agent
-      // told of no such field said a scVelo sample had no velocity.
+      // told of no such field would say a scVelo sample has no velocity.
       vector_fields: (state.getAvailableVectorFields?.() ?? []).map(field => field.label),
       fields: {
         categorical: obs.filter(field => field.kind === FieldKind.CATEGORY).length,
@@ -218,7 +218,7 @@ export function createDatasetReads({ state, viewer, dataSourceManager }) {
    * Genes matching `query`, ranked as the search box ranks them; or, for
    * `names`, which of them are genes (exact, any case), in the order asked:
    * an agent checking a marker panel against a dataset of a few thousand
-   * genes made one search per gene (28 calls in one turn).
+   * genes asks once with `names`, not once per gene.
    */
   function searchGenes({ query, names, limit }) {
     requireCells();

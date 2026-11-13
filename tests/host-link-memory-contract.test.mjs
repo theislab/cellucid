@@ -79,8 +79,8 @@ test('a source on this machine (a loopback host, a local file) is priced as this
   assert.equal(seed('http://127.0.0.1:8765').thisMachine, true);
   assert.equal(seed('https://s3.us-west-2.amazonaws.com').thisMachine, false);
   assert.equal(seed(EMBEDDED_HOST_ORIGIN).thisMachine, false, 'a kernel may run across the internet (Colab, a JupyterHub)');
-  // A 10M-cell store on a loopback host (Chromium): its opening's 0.9 MB of
-  // metadata reads measured 45 MB/s, none of them keeping the link full.
+  // An opening on a loopback host: its 0.9 MB of metadata reads at 45 MB/s,
+  // none of them keeping the link full (measured: 23_decisions_partial_reading.md).
   const opening = { measured: true, latencyMs: 3.35, loadedLatencyMs: 4.85, warmLatencyMs: 2.65, bytesPerMs: 45_003, bandwidthMeasured: false, deliveredBytes: 901_120, busyMs: 33.1, mergeGapBytes: 25_126, roundTripBytes: 150_761 };
   const local = pricingLink(opening, seed('http://127.0.0.1:8765'));
   assert.equal(local.bytesPerMs, LOCAL_POLICY.bytesPerMs, 'a disk\'s rate, as a local file\'s link is priced');
@@ -91,14 +91,14 @@ test('a source on this machine (a loopback host, a local file) is priced as this
   assert.equal(local.mergeGapBytes, opening.mergeGapBytes, 'what the meter derives stays its own');
   // Measured with a delivery that kept the link full: still a disk. On this
   // machine such a delivery is slowed by the machine's own load (another
-  // browser starting, a run ending beside it), not by a network: a 10M-cell
-  // store's opening right after another run measured a fraction of the
-  // link, and its first gene was read for a sample (5 of about 40 runs).
+  // browser starting, a run ending beside it), not by a network: an opening
+  // right after another run measures a fraction of the link, and its first
+  // gene would be read for a sample (measured: 23_decisions_partial_reading.md).
   const full = pricingLink({ ...opening, bandwidthMeasured: true }, seed('http://127.0.0.1:8765'));
   assert.equal(full.bytesPerMs, LOCAL_POLICY.bytesPerMs);
   assert.equal(full.thisMachine, true);
   // Requests that waited on the busy machine (a round trip under load of
-  // 863 ms measured where 1.5-7 ms is usual; a time a request under load):
+  // 863 ms; a time a request under load):
   // priced at the shortest round trip, no time a request beyond it.
   const waited = pricingLink({ ...opening, bytesPerMs: 2e6, loadedLatencyMs: 863, requestCostMs: 40, loadedRequestMs: 40 }, seed('http://127.0.0.1:8765'));
   assert.equal(waited.bytesPerMs, 2e6, 'a rate past a disk\'s as measured');
@@ -133,7 +133,7 @@ test('a source on this machine (a loopback host, a local file) is priced as this
 });
 
 test('a revisit prices its first reads at the round trip under load a visit measured, on this path, never below its own', async () => {
-  // S3: 230 ms idle, a small request 0.35-0.5 s with 42 in flight. A
+  // S3: 230 ms idle, a small request 0.35-0.5 s with 42 in flight (measured: 22_decisions_link_model_and_request_planning.md). A
   // revisit's opening makes a few requests that barely load the link: its
   // gene sample, Genes read for and an export are priced at the round
   // trip under load the last visit measured (`link.js` `loadedLatencyMs`).
@@ -164,7 +164,7 @@ test('a revisit prices its first reads at the round trip under load a visit meas
 
 test('a visit is kept at the rate its reads sustained, never at its fastest moment', () => {
   const storage = memoryStorage();
-  // HLCA: its fastest delivery was 6.2 MB/s, its reads sustained 1.6 MB/s.
+  // A record's fastest delivery is 6.2 MB/s while its reads sustain 1.6 MB/s (measured: 22_decisions_link_model_and_request_planning.md).
   rememberHostLink('https://census.test', { latencyMs: 232, bytesPerMs: 6232, deliveredBytes: 98e6, busyMs: 61_250 }, storage);
   assert.equal(rememberedHostLink('https://census.test', storage).bytesPerMs, 98e6 / 61_250);
   // A measurement that says nothing of its busy time is not kept.

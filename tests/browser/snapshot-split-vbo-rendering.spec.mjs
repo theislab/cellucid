@@ -15,8 +15,9 @@ if (
 // The pixel, ownership and GL-state contract needs one paired sample of each
 // draw path; the timing is diagnostic. A benchmark takes more samples when
 // asked (CELLUCID_SNAPSHOT_GPU_BENCH_SAMPLES=7: seven wall-clock and seven
-// GPU-timer samples of 32 draws per path). Run by default, the old seven and
-// five took about 85 of the spec's 120 s under a software rasterizer.
+// GPU-timer samples of 32 draws per path); a default run takes fewer, as more
+// take most of the spec's time under a software rasterizer
+// (measured: 38_decisions_testing_and_hosted_runners.md).
 const configuredSamples = Number.parseInt(
   process.env.CELLUCID_SNAPSHOT_GPU_BENCH_SAMPLES ?? '1',
   10,
@@ -331,7 +332,7 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
       render(configureSplitRgbaR8, first.vao.vaos[0], true),
     );
 
-    // Preserve the original 32-draw timing sample while keeping each
+    // Time a sample of 32 draws, keeping each
     // synchronous submission batch below browser/driver watchdog windows.
     // Frame-service time is excluded from the diagnostic, so the result still
     // measures draw work rather than the cooperative scheduling boundary.

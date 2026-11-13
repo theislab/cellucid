@@ -68,7 +68,7 @@ import { float16Bits } from '../../../formats/zarr/writer.js';
 import { itemSizeOf, recordDtype, zarrV2Dtype } from '../../../formats/zarr/format-v2.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
 import { throwIfAborted } from '../../../utils/abort.js';
-import { readUnsCellucid } from '../reader.js';
+import { readUnsCellucid } from '../uns.js';
 import { requireCopyChanges, requireNormalisedDistinct } from './changes.js';
 import { folderKey, portableElementName } from './names.js';
 import { formatCountOf } from '../../../utils/format-units.js';
@@ -384,6 +384,12 @@ async function copyNode(node, path, relative, context, anndata) {
  * A dataframe: its index first, then its columns in their order, each
  * change written in place of the column it names (or renames, `from`) or
  * after the others.
+ *
+ * @param {*} frame
+ * @param {string} path
+ * @param {*} context
+ * @param {{role: string, changes: *, relative: string, anndata: *, skipColumn?: (name: string) => boolean}} options -
+ *   `skipColumn`: whether a column of that name is left out of the copy
  */
 async function copyFrame(frame, path, context, { role, changes, relative, anndata, skipColumn = () => false }) {
   const { writer } = context;
@@ -597,7 +603,7 @@ function copySteps(shape, chunks, itemBytes, context, from = 0) {
   const [rows, columns] = shape;
   const [bandRows, chunkColumns] = chunks;
   // A band of every column at once when the budget holds it (a dense
-  // matrix's bands are sized so, `bandRowsOf`): each band of the source is read once.
+  // matrix's bands are sized so, `chunkShapeOf` in `layout.js`): each band of the source is read once.
   const groupColumns = bandRows * columns * itemBytes <= context.budgetBytes
     ? columns
     : chunkColumns * Math.max(1, Math.floor(context.budgetBytes / (bandRows * chunkColumns * itemBytes)));

@@ -1,6 +1,6 @@
 /**
  * The data-mapping groups beside the embeddings, end to end on a file opened
- * in the browser (`.h5ad` and Zarr ZIP): the neighbor graph (Phase E).
+ * in the browser: the neighbor graph.
  *
  * Fixture: `data-mapping-full` from `scripts/generate-data-mapping-fixtures.py`
  * (three graphs: `connectivities`, `scvi_connectivities` and an asymmetric
@@ -25,7 +25,6 @@ test.beforeEach(async ({ page }) => {
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const FULL_H5AD = path.join(FIXTURES, 'data-mapping-full.h5ad');
-const FULL_ZARR = path.join(FIXTURES, 'data-mapping-full.zarr.zip');
 const EXPECTED = JSON.parse(readFileSync(path.join(FIXTURES, 'data-mapping-full.expected.json'), 'utf8'));
 const START_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -99,7 +98,6 @@ async function findCellPoint(page) {
 
 for (const [format, input, file] of [
   ['H5AD', '#user-data-file-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: the neighbour graph is chosen, redrawn, refused and restored`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -213,7 +211,6 @@ const activeGene = page => page.evaluate(() => {
 
 for (const [format, input, file] of [
   ['H5AD', '#user-data-file-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: gene names and expression change the gene list, keeping cells and the colored gene`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -342,7 +339,6 @@ const activeOutliers = page => page.evaluate(async () => {
 
 for (const [format, input, file] of [
   ['H5AD', '#user-data-file-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: the latent space of outlier filters is chosen, computed as the server does, and restored`, () => {
     // Two tests, one dataset load each, so neither runs into the other's

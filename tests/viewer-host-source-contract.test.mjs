@@ -168,34 +168,6 @@ async function nextTask() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-function createDeterministicTimeoutClock() {
-  let nextId = 1;
-  const pending = new Map();
-  return Object.freeze({
-    schedule(callback, delay) {
-      assert.equal(typeof callback, 'function');
-      assert.equal(Number.isFinite(delay) && delay >= 0, true);
-      const id = nextId;
-      nextId += 1;
-      pending.set(id, callback);
-      return id;
-    },
-    cancel(id) {
-      pending.delete(id);
-    },
-    get pendingCount() {
-      return pending.size;
-    },
-    runNext() {
-      const entry = pending.entries().next();
-      assert.equal(entry.done, false, 'Expected one scheduled timeout.');
-      const [id, callback] = entry.value;
-      pending.delete(id);
-      callback();
-    },
-  });
-}
-
 async function waitFor(condition, label) {
   for (let attempt = 0; attempt < 50; attempt++) {
     if (condition()) return;
@@ -671,7 +643,7 @@ test('Viewer host pointer freeze fences queued and future lifecycle work', async
 
 test('Viewer host pointer hooks use per-view pick records without changing wire payloads', () => {
   const mainSource = readFileSync(
-    new URL('../assets/js/app/main.js', import.meta.url),
+    new URL('../assets/js/app/viewer-host/host-view.js', import.meta.url),
     'utf8',
   );
   assert.match(
@@ -714,7 +686,7 @@ test('Viewer host pointer hooks use per-view pick records without changing wire 
     'const freezeViewerHostView = () => {',
   );
   const freezeEnd = mainSource.indexOf(
-    '\n      };',
+    '\n  };',
     freezeStart,
   );
   const freezeSource = mainSource.slice(freezeStart, freezeEnd);
@@ -730,7 +702,7 @@ test('Viewer host pointer hooks use per-view pick records without changing wire 
 
   // The channel's end freezes the view before it tells the person, once.
   const endStart = mainSource.indexOf('const endViewerHostView = end => {', freezeEnd);
-  const endSource = mainSource.slice(endStart, mainSource.indexOf('\n      };', endStart));
+  const endSource = mainSource.slice(endStart, mainSource.indexOf('\n  };', endStart));
   assert.ok(endStart > 0);
   assert.ok(endSource.indexOf('freezeViewerHostView();') < endSource.indexOf('notifications['));
   assert.ok(endSource.indexOf('if (viewerHostEndSaid) return;') < endSource.indexOf('notifications['));
@@ -739,7 +711,7 @@ test('Viewer host pointer hooks use per-view pick records without changing wire 
   // The end is said on the frozen picture, which covers the notifications.
   assert.ok(endSource.indexOf("caption.id = 'cellucid-viewer-host-freeze-caption';") > endSource.indexOf('freezeViewerHostView();'));
   // A host's own stop (`freeze`, then a normal close) is said as a stop
-  // (R9S-7: it froze the page in silence).
+  // (not a page frozen in silence).
   assert.match(
     mainSource,
     /if \(message\.type === 'freeze'\) \{\s*endViewerHostView\(\{ kind: 'stopped', message: viewerStoppedMessage\(viewerHostSource\.getHostRuntime\(\)\) \}\);/,
@@ -775,8 +747,8 @@ test('Viewer host command failure names the command and its host for the person 
       'correct the call in the program serving this viewer and run it again.',
   });
   assert.throws(() => describeViewerHostCommandFailure(null, new Error('boom'), null, 'perl'), /runtime is one of/);
-  // A reason ending its own sentence is not ended twice (R9S-6: the field
-  // refusal read '… "sample".. The viewer is unchanged').
+  // A reason ending its own sentence is not ended twice (not '… "sample"..
+  // The viewer is unchanged').
   assert.equal(
     describeViewerHostCommandFailure('action', new Error('There is no field "x"; the fields are "a" and "b".'), 'color.by', 'jupyter').message,
     `The notebook's "color.by" action did not run: There is no field "x"; the fields are "a" and "b". ${FIX}`,
@@ -1318,7 +1290,7 @@ test('a host that does not take action results is answered with nothing', async 
   source.disconnect();
 });
 
-test('a disconnect lets go of what ran when the channel reopened, as of what ran at its end (RCD-3)', async () => {
+test('a disconnect lets go of what ran when the channel reopened, as of what ran at its end', async () => {
   const { source } = await connectedSource();
   const before = [];
   source.onChannelReopen(() => before.push('reopened'));
@@ -1447,7 +1419,6 @@ test('selection encoding builds no per-cell hash set and copies nothing on littl
     return text.slice(start, text.indexOf('\n}\n', start));
   };
   for (const body of [
-    bodyOf(protocol, 'export function encodeViewerCells('),
     bodyOf(protocol, 'export function decodeViewerBinaryCommand('),
     bodyOf(cellSet, 'export function requireCellList('),
     bodyOf(notification, 'function requireDelivery('),
@@ -1486,22 +1457,32 @@ test('the viewer sends only event types the protocol declares, each as a literal
 });
 
 test('main wires the channel: session bundles on it, commands accepted after every handler', () => {
-  const mainSource = readFileSync(new URL('../assets/js/app/main.js', import.meta.url), 'utf8');
+  const read = file => readFileSync(new URL(`../assets/js/app/${file}`, import.meta.url), 'utf8');
+  const mainSource = read('main.js');
+  const channelSource = read('viewer-host/host-channel.js');
+  const viewSource = read('viewer-host/host-view.js');
   assert.match(mainSource, /viewerHostConfig = getViewerHostConfig\(\);/);
   assert.match(mainSource, /createViewerHostBridgeDataSource\(viewerHostConfig\)/);
-  assert.match(mainSource, /viewerHostSource\.sendSessionBundle\(message\.requestId, bundle\)/);
-  assert.match(mainSource, /viewerHostSource\.onChannelEnd\(/);
+  assert.match(channelSource, /viewerHostSource\.sendSessionBundle\(message\.requestId, bundle\)/);
+  assert.match(viewSource, /viewerHostSource\.onChannelEnd\(/);
   // The host's actions are the page's actions, dispatched as the host's.
-  assert.match(mainSource, /viewerHostSource\.onAction\(viewerHostCommandHandlers\.handleAction\)/);
+  assert.match(channelSource, /viewerHostSource\.onAction\(viewerHostCommandHandlers\.handleAction\)/);
   // An agent app's calls through the host run as a local connection's (`agent-calls.js`).
-  assert.match(mainSource, /createAgentCalls\(\{[^}]*kind: 'local'/s);
-  assert.ok(mainSource.indexOf('viewerHostSource.acceptCommands();') > mainSource.indexOf('viewerHostSource.onAgent('));
-  const accept = mainSource.indexOf('viewerHostSource.acceptCommands();');
-  assert.ok(accept > mainSource.indexOf('viewerHostSource.onAction('));
-  assert.ok(accept > mainSource.indexOf('viewerHostSource.sendSessionBundle('));
+  assert.match(channelSource, /createAgentCalls\(\{[^}]*kind: 'local'/s);
+  assert.ok(channelSource.indexOf('viewerHostSource.acceptCommands();') > channelSource.indexOf('viewerHostSource.onAgent('));
+  const accept = channelSource.indexOf('viewerHostSource.acceptCommands();');
+  assert.ok(accept > channelSource.indexOf('viewerHostSource.onAction('));
+  // The session bundles are answered from before the interface is built; the
+  // commands are accepted last, once the interface and every handler exist.
+  const bundles = mainSource.indexOf('installViewerHostSessionBundles(');
+  const channel = mainSource.indexOf('installViewerHostChannel(');
+  assert.ok(bundles > 0 && mainSource.indexOf('ui = initUI({') > bundles);
+  assert.ok(channel > mainSource.indexOf('ui = initUI({'));
   // No polling: the host closing the channel is how the viewer learns it stopped.
-  assert.doesNotMatch(mainSource, /HealthMonitor|checkHealth\(/);
-  assert.doesNotMatch(mainSource, /postMessage|_cellucid\/(?:events|selection|session_bundle)/);
+  for (const source of [mainSource, channelSource, viewSource]) {
+    assert.doesNotMatch(source, /HealthMonitor|checkHealth\(/);
+    assert.doesNotMatch(source, /postMessage|_cellucid\/(?:events|selection|session_bundle)/);
+  }
 });
 
 test('a dropped channel reopens at once and sends what waited, in order, with the newest hover', async t => {

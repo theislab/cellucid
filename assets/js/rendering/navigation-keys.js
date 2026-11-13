@@ -12,10 +12,8 @@
  * accelerates the camera for the time it was held: a frame credits each key
  * with the share of that frame it was down (`share`), so a press and release
  * between two frames still moves the camera, and a key held through part of a
- * slow frame moves it for that part only. Sampling only "is it down now" at
- * frame time lost a tap shorter than a frame and credited a held key with the
- * whole frame it was seen in, so equal presses moved the camera by different
- * amounts on a slow frame (round 9, R9K-3).
+ * slow frame moves it for that part only. A tap shorter than a frame is never
+ * lost, and equal presses move the camera by equal amounts on a slow frame.
  *
  * @module rendering/navigation-keys
  */

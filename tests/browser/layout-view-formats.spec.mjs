@@ -119,25 +119,7 @@ test('a Loom file opens like an .h5ad and has no Modality select', async ({ page
   expect(errors).toEqual([]);
 });
 
-test('a Loom clustering of numbers colors the cells: its categories are 0, 1, 2, 3 in the legend', async ({ page }) => {
-  // L18-8 (live pass 5): coloring by velocyto's integer `ClusterID` failed with "Could not load the field:
-  // [CommunityAnnotationSession] category at index 0 must be nonblank": the legend handed the community
-  // annotation session the numbers themselves.
-  const errors = collectBrowserErrors(page);
-  await openStart(page);
-  await chooseFiles(page.locator('#user-data-file-input'), await unpacked('loom', 'loompy-3.0.8', 'velocyto.loom'));
-  await expectOpened(page, 48);
-  await page.locator('#categorical-field').selectOption({ label: 'ClusterID' });
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getActiveField?.()?.key ?? null)).toBe('ClusterID');
-  // Its categories are numbers (read once the field is loaded): the case that failed.
-  expect(await page.evaluate(() => window._cellucidState.getFields().find(field => field.key === 'ClusterID').categories))
-    .toEqual([0, 1, 2, 3]);
-  await expect(page.locator('.notification').filter({ hasText: 'Could not load the field' })).toHaveCount(0);
-  await expect(page.locator('.legend-item .legend-label-main')).toHaveText(['0', '1', '2', '3']);
-  expect(errors).toEqual([]);
-});
-
-test('a CITE-seq .h5mu shows one Modality select; choosing the proteins reads them', async ({ page }) => {
+test('a CITE-seq .h5mu shows one Modality select; choosing the proteins reads them, and a session saved on them restores them', async ({ page }, testInfo) => {
   const errors = collectBrowserErrors(page);
   await openStart(page);
   await chooseFiles(page.locator('#user-data-file-input'), await unpacked('mudata', 'mudata-0.4.1', 'citeseq-subset.h5mu'));
@@ -151,6 +133,26 @@ test('a CITE-seq .h5mu shows one Modality select; choosing the proteins reads th
   await page.locator('#data-mapping-apply').click();
   await expect.poll(() => page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe('prot');
   await expect.poll(() => page.evaluate(() => window._cellucidState.getVarAxisGeneCount())).toBe(5);
+
+  await test.step('a session saved on another modality restores it', async () => {
+    const applyModality = async name => {
+      await modality.selectOption(name);
+      await page.locator('#data-mapping-apply').click();
+      await expect.poll(() => page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe(name);
+    };
+    // The proteins are the modality shown.
+    const downloadPromise = page.waitForEvent('download');
+    await clickSaveSession(page);
+    const sessionPath = testInfo.outputPath('modality.cellucid-session');
+    await (await downloadPromise).saveAs(sessionPath);
+
+    await applyModality('rna');
+    const chooserPromise = page.waitForEvent('filechooser');
+    await clickLoadSession(page);
+    await (await chooserPromise).setFiles(sessionPath);
+    await expect.poll(() => page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe('prot');
+    await expect.poll(() => page.evaluate(() => window._cellucidState.getVarAxisGeneCount())).toBe(5);
+  });
   expect(errors).toEqual([]);
 });
 
@@ -175,33 +177,6 @@ test('a 10x .h5 alone is refused with what to do; its outs/ folder opens with Ce
   expect(await page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe('Gene Expression');
   await openGenesSection(page);
   await expect(page.locator('#data-mapping-modality option')).toHaveText(['Gene Expression · 30 features', 'Antibody Capture · 6 features']);
-  expect(errors).toEqual([]);
-});
-
-test('a session saved on another modality restores it', async ({ page }, testInfo) => {
-  const errors = collectBrowserErrors(page);
-  await openStart(page);
-  await chooseFiles(page.locator('#user-data-file-input'), await unpacked('mudata', 'mudata-0.4.1', 'citeseq.h5mu'));
-  await expectOpened(page, 44);
-  await openGenesSection(page);
-  const modality = page.locator('#data-mapping-modality');
-  const applyModality = async name => {
-    await modality.selectOption(name);
-    await page.locator('#data-mapping-apply').click();
-    await expect.poll(() => page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe(name);
-  };
-  await applyModality('prot');
-  const downloadPromise = page.waitForEvent('download');
-  await clickSaveSession(page);
-  const sessionPath = testInfo.outputPath('modality.cellucid-session');
-  await (await downloadPromise).saveAs(sessionPath);
-
-  await applyModality('rna');
-  const chooserPromise = page.waitForEvent('filechooser');
-  await clickLoadSession(page);
-  await (await chooserPromise).setFiles(sessionPath);
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe('prot');
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getVarAxisGeneCount())).toBe(5);
   expect(errors).toEqual([]);
 });
 

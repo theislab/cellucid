@@ -1,9 +1,8 @@
 /**
  * A gene read that fails reaches the caller as itself. `readGeneColumns`
  * stops the other reads when one fails; that stop is the failure's own
- * cleanup, and once it was reported as "invalidated by an analysis request
- * ownership change" -- every failed signature read said so, whatever the
- * cause (analysis overhaul §0.1).
+ * cleanup and is never reported as "invalidated by an analysis request
+ * ownership change", whatever the cause.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

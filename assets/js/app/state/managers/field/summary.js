@@ -35,8 +35,8 @@ import { cellSampleFilterOf } from '../category-cell-sample.js';
  * range (obs field or gene) and outlier filter, whatever is colored (as the
  * visibility pass applies them).
  *
- * The count loops used to walk every field for every cell and re-derive each
- * filter's state there — at 5,000,000 cells that was most of a categorical
+ * The count loops do not walk every field for every cell and re-derive each
+ * filter's state there: on a large dataset that is most of a categorical
  * field switch. A category filter that hides nothing and a continuous filter
  * spanning its whole range can never hide a cell, so they are left out.
  *
@@ -435,6 +435,7 @@ export class FieldSummaryMethods {
   /**
    * Get the active field for a specific view (without switching to it).
    * Returns null if viewId is invalid or has no active field.
+   * @this {import('../../core/data-state.js').DataState}
    */
   getFieldForView(viewId) {
     const key = String(viewId || 'live');
@@ -459,6 +460,7 @@ export class FieldSummaryMethods {
    * figure-export provenance records them. Active and stored views go through
    * the same structured definition; a disabled filter hides nothing, so it is
    * not a restriction and is left out.
+   * @this {import('../../core/data-state.js').DataState}
    */
   getFilterSummaryForView(viewId) {
     const key = String(viewId || 'live');
@@ -472,6 +474,7 @@ export class FieldSummaryMethods {
     return lines.length > 0 ? lines : ['No filters active'];
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   updateFilteredCount() {
     if (!this.pointCount) {
       this.filteredCount = { shown: 0, total: 0 };
@@ -501,10 +504,12 @@ export class FieldSummaryMethods {
     this.filteredCount = { shown, total };
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getFilteredCount() {
     return this.filteredCount || { shown: this.pointCount, total: this.pointCount };
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   computeCategoryCountsForField(field) {
     if (!field || field.kind !== 'category') return null;
     const categories = field.categories || [];
@@ -599,6 +604,7 @@ export class FieldSummaryMethods {
     return counts;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   _computeCountsForContinuous(field, source, { ignoreSelfFilter = false } = {}) {
     if (!field || field.kind !== 'continuous') return null;
     const n = this.pointCount || 0;
@@ -667,6 +673,7 @@ export class FieldSummaryMethods {
     return { ...counts };
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getFilterCellCounts(filter) {
     if (!filter) return null;
     if (filter.type === 'category') {
@@ -697,6 +704,7 @@ export class FieldSummaryMethods {
     return null;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   _applyCategoryCountsToCentroids(field, counts) {
     if (!field || field.kind !== 'category') return false;
     const centroids = this._getCentroidsForActiveLayout(field);

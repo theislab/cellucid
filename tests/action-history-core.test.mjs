@@ -227,7 +227,7 @@ test('a merge is shared by its author: a turn parts an agent\'s or a notebook\'s
   // Each notebook cell is a turn of its own: one step each.
   for (const at of [4, 5]) await dispatcher.dispatch('camera.set', { at }, { origin: 'host', host: 'python', turn: `cell-${at}` });
   assert.equal(history.active.steps.size, 4);
-  // A host naming a language the history cannot record is refused before its handler runs (F165).
+  // A host naming a language the history cannot record is refused before its handler runs.
   await assert.rejects(dispatcher.dispatch('camera.set', { at: 6 }, { origin: 'host', host: 'julia', turn: 'cell-6' }),
     /^TypeError: A host action names its language: one of python, r$/);
   await assert.rejects(dispatcher.dispatch('camera.set', { at: 6 }, { origin: 'host', turn: 'cell-6' }),
@@ -674,6 +674,77 @@ test('idle resolves once no action, history operation or observed change is unde
   assert.deepEqual(order.slice(0, -1).sort(), ['action', 'observed', 'undo']);
   // Nothing under way: it resolves at once.
   await history.idle();
+
+  // A control's change asked while a history operation runs waits at the
+  // gate, and is under way from the moment it is asked: the dispatcher's own
+  // idle waits for it.
+  const gatedOrder = [];
+  const before = dispatcher.dispatch('color.set', { color: 'green', slow: true });
+  const move = history.undo();
+  const gated = dispatcher.dispatch('camera.set', { at: 5 }).then(() => gatedOrder.push('gated'));
+  await dispatcher.idle().then(() => gatedOrder.push('idle'));
+  assert.deepEqual(gatedOrder, ['gated', 'idle'], 'idle waits for a change held at the gate');
+  assert.equal(page.state.camera, 5);
+  await Promise.all([before, move, gated]);
+
+  // One waiting for the person's go-ahead waits for a person, not for work:
+  // idle, asked before the question is (while the start is judged), resolves
+  // once the person is asked, before they answer (in a later turn of the
+  // page), and waits for the change once given.
+  dispatcher.setConfirmer(({ asking }) => new Promise(resolve => { asking(); setImmediate(() => resolve(true)); }));
+  const asked = dispatcher.dispatch('file.write', {}, { origin: 'agent', agent: 'Claude' });
+  await dispatcher.idle();
+  assert.equal(page.state.settings.wrote, undefined, 'idle resolved while the person was asked');
+  await new Promise(resolve => setImmediate(resolve));
+  await dispatcher.idle();
+  assert.equal(page.state.settings.wrote, true);
+  await asked;
+});
+
+test('idle does not wait for a question an implementation asks, nor one a dispatch it runs asks through it', async () => {
+  const definition = (type, extra = {}) => defineAction({
+    type, title: type, summary: 'A change.', group: 'Test',
+    params: { type: 'object', additionalProperties: false, properties: {} },
+    touches: ['settings'], reads: [], effect: 'state', describe: () => type, code: () => `${type}()`, ...extra,
+  });
+  const dispatcher = createActionDispatcher({ catalog: createActionCatalog([
+    definition('download.large', { confirm: 'large-download', confirmAt: 'handler' }),
+    // A move of the history, which replays steps as internal dispatches.
+    definition('outer.replay', { effect: 'history', touches: [] }),
+    definition('inner.step'),
+  ]) });
+  const done = [];
+  dispatcher.provide('download.large', async (params, { confirm }) => { await confirm('It downloads 2 GB.'); done.push('download'); });
+  dispatcher.provide('inner.step', async (params, { heavy }) => {
+    await heavy({ ms: 60_000, bytes: null, what: 'It reads every gene.' });
+    done.push('inner');
+  });
+  dispatcher.provide('outer.replay', (params, { heavy, signal }) =>
+    dispatcher.dispatch('inner.step', {}, { origin: 'replay', internal: true, heavy, signal }));
+  const questions = [];
+  // Every change of an agent's passes the confirmer at its start: allowed
+  // there, asked only from the implementation, and answered in a later turn
+  // of the page.
+  dispatcher.setConfirmer(({ stage, detail, asking }) => stage === 'start' || new Promise(resolve => {
+    questions.push(detail);
+    asking();
+    setImmediate(() => resolve(true));
+  }));
+  const agent = { origin: 'agent', agent: 'Claude' };
+
+  for (const type of ['download.large', 'outer.replay']) {
+    const dispatched = dispatcher.dispatch(type, {}, agent);
+    // Asked at once, while the start is judged: the question comes later, from the implementation.
+    await dispatcher.idle();
+    assert.equal(questions.length, 1, `${type}: idle resolved once its implementation asked the person`);
+    assert.deepEqual(done, [], `${type}: idle resolved before the person answered`);
+    await new Promise(resolve => setImmediate(resolve));
+    await dispatcher.idle();
+    assert.equal(done.length, 1, `${type}: idle waits for the work the answer let go on`);
+    await dispatched;
+    done.length = 0;
+    questions.length = 0;
+  }
 });
 
 test('a change observed with the work it set off is recorded once that work settles, as one step holding both; idle waits for it', async () => {

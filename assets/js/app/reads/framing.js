@@ -130,7 +130,7 @@ export function createFramingReads({ state, viewer }) {
    * A first pose framing a group (module overview), from its spread on
    * either side of its mean across and up the frame (the root mean square
    * of the cells' distances from the mean on that side), so a lopsided group
-   * starts near its middle. `refinePoses` then corrects it in perspective.
+   * starts near its middle. The perspective passes of `framing` then correct it.
    */
   function initialPose(group, sides, axes, mode, frame, fill) {
     const { center, cov } = centerAndCovariance(group);

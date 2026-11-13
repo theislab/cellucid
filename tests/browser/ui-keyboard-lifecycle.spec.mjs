@@ -51,246 +51,358 @@ async function yieldPageTask(page) {
   await outlastPageTimers(page, 0);
 }
 
-test('highlight pages provide complete roving-tab keyboard workflows', async ({
-  page
+test('the welcome, the highlight page tabs, the analysis dialog and the licence work from the keyboard', async ({
+  page,
+  browserName
 }) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
 
-  const tablist = page.getByRole('tablist', { name: 'Highlight pages' });
-  await expect(tablist).toHaveAttribute('aria-orientation', 'horizontal');
-  let tabs = tablist.getByRole('tab');
-  await expect(tabs).toHaveCount(1);
-  await expect(tabs.first()).toHaveAttribute('aria-selected', 'true');
-  await expect(tabs.first()).toHaveAttribute('tabindex', '0');
+  await test.step('welcome modal owns focus, contains Tab, and returns it on close', async () => {
 
-  await page.getByRole('button', { name: 'Add highlight page' }).click();
-  tabs = tablist.getByRole('tab');
-  await expect(tabs).toHaveCount(2);
-  await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
-  await expect(tabs.nth(1)).toBeFocused();
-  await expect(tabs.nth(0)).toHaveAttribute('tabindex', '-1');
+    const modal = page.locator('#welcome-modal');
+    const startButton = page.locator('#welcome-start-btn');
+    const learnMore = modal.getByRole('link', { name: /Learn more/ });
 
-  await page.keyboard.press('ArrowLeft');
-  await expect(tabs.nth(0)).toHaveAttribute('aria-selected', 'true');
-  await expect(tabs.nth(0)).toBeFocused();
-  await expect(tabs.nth(0)).toHaveAttribute('tabindex', '0');
-  await expect(tabs.nth(1)).toHaveAttribute('tabindex', '-1');
+    // A modal <dialog>: focus enters it and the page behind is inert. It lands
+    // on the dialog itself, so no choice opens looking pre-selected.
+    await expectWelcomeShown(page);
+    expect(await modal.evaluate(dialog => dialog.matches(':modal'))).toBe(true);
+    await expect(modal).toBeFocused();
+    await expect(startButton).not.toBeFocused();
 
-  await page.keyboard.press('Enter');
-  const renameInput = page.getByRole('textbox', { name: 'Rename Page 1' });
-  await expect(renameInput).toBeFocused();
-  await renameInput.fill('Activated cells');
-  await page.keyboard.press('Enter');
-  tabs = tablist.getByRole('tab');
-  await expect(tabs.nth(0)).toHaveAccessibleName(
-    /Activated cells, 0 highlighted cells/
-  );
-  await expect(tabs.nth(0)).toBeFocused();
+    const forward = await tabWalk(page, browserName, '#welcome-modal', 6);
+    expectContained(forward, 'Tab');
+    expect(forward[0]).toEqual({ at: 'welcome-start-btn', inside: true });
+    expect(forward.some(stop => stop.inside && stop.at === 'welcome-start-btn')).toBe(true);
+    expect(forward.some(stop => stop.inside && stop.at.includes('Learn more'))).toBe(true);
+    await learnMore.focus();
+    const backward = await tabWalk(page, browserName, '#welcome-modal', 6, { shift: true });
+    expectContained(backward, 'Shift+Tab');
+    expect(backward[0]).toEqual({ at: 'welcome-start-btn', inside: true });
 
-  const combineButton = page.getByRole('button', {
-    name: 'Combine Activated cells with another page'
-  });
-  await combineButton.click();
-  let combineMenu = page.getByRole('menu', {
-    name: 'Combine Activated cells'
-  });
-  await expect(combineButton).toHaveAttribute('aria-haspopup', 'menu');
-  await expect(combineButton).toHaveAttribute('aria-expanded', 'true');
-  await expect(combineMenu).toBeVisible();
-  const menuItems = combineMenu.getByRole('menuitem');
-  await expect(menuItems.first()).toBeFocused();
-  await page.keyboard.press('ArrowDown');
-  await expect(menuItems.nth(1)).toBeFocused();
-  await page.keyboard.press('Home');
-  await expect(menuItems.first()).toBeFocused();
-  await page.keyboard.press('Escape');
-  await expect(combineMenu).toHaveCount(0);
-  await expect(combineButton).toBeFocused();
-  await expect(combineButton).toHaveAttribute('aria-expanded', 'false');
+    await page.keyboard.press('Escape');
+    await expect(modal).toBeHidden();
+    await expect(page.locator('#dataset-name')).toHaveText(
+      'Current UI fixture'
+    );
 
-  await combineButton.click();
-  combineMenu = page.getByRole('menu', {
-    name: 'Combine Activated cells'
-  });
-  await combineMenu.getByRole('menuitem', {
-    name: /Union with Page 2/
-  }).click();
-  tabs = tablist.getByRole('tab');
-  await expect(tabs).toHaveCount(3);
-  const combinedTab = tabs.filter({
-    has: page.getByText('Activated cells ∪ Page 2', { exact: true })
-  });
-  await expect(combinedTab).toHaveAttribute('aria-selected', 'true');
-  await expect(combinedTab).toBeFocused();
-
-  await page.keyboard.press('Delete');
-  tabs = tablist.getByRole('tab');
-  await expect(tabs).toHaveCount(2);
-  await expect(tabs.nth(0)).toHaveAttribute('aria-selected', 'true');
-  await expect(tabs.nth(0)).toBeFocused();
-  await expect(tabs.nth(0)).toHaveAttribute('tabindex', '0');
-
-  expect(productErrors).toEqual([]);
-});
-
-test('analysis modal owns focus and releases every active pointer interaction on Escape', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
-
-  const results = await page.evaluate(async () => {
-    const {
-      createAnalysisModal,
-      openModal
-    } = await import('/assets/js/app/analysis/ui/components/modal.js');
-    const readInlineUserSelect = () => ({
-      standard: document.body.style.getPropertyValue('user-select'),
-      webkit: document.body.style.getPropertyValue('-webkit-user-select')
-    });
-    const readEffectiveInlineUserSelect = () => {
-      const values = readInlineUserSelect();
-      return values.standard || values.webkit;
-    };
-    const scenarios = [
-      {
-        expectedCursor: 'ew-resize',
-        selector: '.analysis-modal-edge-resize-e'
-      },
-      {
-        expectedCursor: 'col-resize',
-        selector: '.analysis-modal-resizer-vertical'
-      },
-      {
-        expectedCursor: 'move',
-        selector: '.analysis-modal-header'
+    // Reopened from a real invoker, closing must hand focus back to it.
+    await openCollapsedPanels(page);
+    const resetCamera = page.locator('#reset-camera-btn');
+    await resetCamera.focus();
+    await page.evaluate(async () => {
+      const { showWelcomeModal } = await import(
+        '/assets/js/app/ui/onboarding/welcome-modal.js'
+      );
+      if (showWelcomeModal() !== true) {
+        throw new Error('Welcome modal did not reopen');
       }
-    ];
-    const outcomes = [];
+    });
+    await expect(modal).toBeVisible();
+    await expect(modal).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(modal).toBeHidden();
+    await expect(resetCamera).toBeFocused();
 
-    for (let index = 0; index < scenarios.length; index++) {
-      const scenario = scenarios[index];
-      const trigger = document.createElement('button');
-      trigger.type = 'button';
-      trigger.textContent = `Modal trigger ${index + 1}`;
-      document.body.appendChild(trigger);
-      trigger.focus();
-      const previousCursor = document.body.style.cursor;
-      const previousUserSelect = readInlineUserSelect();
-      const modal = createAnalysisModal();
-      openModal(modal);
-      const closeButton = modal.querySelector('.analysis-modal-close');
-      // A modal `<dialog>` (R9E-18): the browser makes the page inert and
-      // holds Tab; nothing says `aria-modal` by hand.
-      const initial = {
-        closeFocused: document.activeElement === closeButton,
-        labelled:
-          modal.getAttribute('aria-labelledby') === modal._title.id,
-        modal: modal.matches(':modal'),
-        ariaModal: modal.getAttribute('aria-modal'),
-        tag: modal.tagName
-      };
-      const tabStayedInside = document.body.matches(':has(dialog:modal)');
-
-      const target = modal.querySelector(scenario.selector);
-      let capturedPointer = null;
-      let releasedPointer = null;
-      Object.defineProperties(target, {
-        hasPointerCapture: {
-          configurable: true,
-          value(pointerId) {
-            return capturedPointer === pointerId;
-          }
-        },
-        releasePointerCapture: {
-          configurable: true,
-          value(pointerId) {
-            releasedPointer = pointerId;
-            capturedPointer = null;
-          }
-        },
-        setPointerCapture: {
-          configurable: true,
-          value(pointerId) {
-            capturedPointer = pointerId;
-          }
+    // Start exploring closes it like Escape: from the keyboard (Enter, then
+    // Space) focus returns to the invoker, and nothing else is opened or
+    // focused; the Sample dataset dropdown is never activated for the user.
+    const sessionOpen = await page.locator('#session-section').evaluate(section => section.open);
+    for (const key of ['Enter', 'Space']) {
+      await page.evaluate(async () => {
+        const { showWelcomeModal } = await import(
+          '/assets/js/app/ui/onboarding/welcome-modal.js'
+        );
+        if (showWelcomeModal() !== true) {
+          throw new Error('Welcome modal did not reopen');
         }
       });
-      target.dispatchEvent(new PointerEvent('pointerdown', {
-        bubbles: true,
-        cancelable: true,
-        clientX: 400,
-        clientY: 240,
-        pointerId: 31
-      }));
-      const during = {
-        cursor: document.body.style.cursor,
-        userSelect: readEffectiveInlineUserSelect()
-      };
-
-      // Escape is the browser's: it closes the dialog (`cancel`, then
-      // `close`), as `close()` does; the view's close follows.
-      // The `close` event is a queued task of its own, ordered with no other
-      // task source: wait for it, never a timer (a zero timer can run first).
-      const closed = new Promise(resolve => modal.addEventListener('close', resolve, { once: true }));
-      modal.close();
-      await closed;
-      if (modal._closePromise === null) {
-        throw new Error('Escape did not publish the modal close owner.');
-      }
-      await modal._closePromise;
-      outcomes.push({
-        captureReleased:
-          capturedPointer === null && releasedPointer === 31,
-        classesCleared:
-          !target.classList.contains('resizing'),
-        detached: !modal.isConnected,
-        during,
-        expectedCursor: scenario.expectedCursor,
-        focusRestored: document.activeElement === trigger,
-        initial,
-        previousUserSelect,
-        restoredCursor: document.body.style.cursor === previousCursor,
-        restoredUserSelect: readInlineUserSelect(),
-        tabStayedInside
-      });
-      trigger.remove();
+      await expect(modal).toBeFocused();
+      await startButton.focus();
+      await page.keyboard.press(key);
+      await expect(modal).toBeHidden();
+      await expect(resetCamera).toBeFocused();
+      await expect(page.locator('#dataset-select')).not.toBeFocused();
+      expect(await page.locator('#session-section').evaluate(section => section.open)).toBe(sessionOpen);
     }
-    return outcomes;
-  });
 
-  for (const result of results) {
-    expect(result.initial).toEqual({
-      closeFocused: true,
-      labelled: true,
-      modal: true,
-      ariaModal: null,
-      tag: 'DIALOG'
+    expect(productErrors).toEqual([]);
+  });
+  await test.step('highlight pages provide complete roving-tab keyboard workflows', async () => {
+    await expect(page.locator('#dataset-name')).toHaveText(
+      'Current UI fixture'
+    );
+
+    const tablist = page.getByRole('tablist', { name: 'Highlight pages' });
+    await expect(tablist).toHaveAttribute('aria-orientation', 'horizontal');
+    let tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(1);
+    await expect(tabs.first()).toHaveAttribute('aria-selected', 'true');
+    await expect(tabs.first()).toHaveAttribute('tabindex', '0');
+
+    await page.getByRole('button', { name: 'Add highlight page' }).click();
+    tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
+    await expect(tabs.nth(1)).toBeFocused();
+    await expect(tabs.nth(0)).toHaveAttribute('tabindex', '-1');
+
+    await page.keyboard.press('ArrowLeft');
+    await expect(tabs.nth(0)).toHaveAttribute('aria-selected', 'true');
+    await expect(tabs.nth(0)).toBeFocused();
+    await expect(tabs.nth(0)).toHaveAttribute('tabindex', '0');
+    await expect(tabs.nth(1)).toHaveAttribute('tabindex', '-1');
+
+    await page.keyboard.press('Enter');
+    const renameInput = page.getByRole('textbox', { name: 'Rename Page 1' });
+    await expect(renameInput).toBeFocused();
+    await renameInput.fill('Activated cells');
+    await page.keyboard.press('Enter');
+    tabs = tablist.getByRole('tab');
+    await expect(tabs.nth(0)).toHaveAccessibleName(
+      /Activated cells, 0 highlighted cells/
+    );
+    await expect(tabs.nth(0)).toBeFocused();
+
+    const combineButton = page.getByRole('button', {
+      name: 'Combine Activated cells with another page'
     });
-    expect(result.tabStayedInside).toBe(true);
-    expect(result.during).toEqual({
-      cursor: result.expectedCursor,
-      userSelect: 'none'
+    await combineButton.click();
+    let combineMenu = page.getByRole('menu', {
+      name: 'Combine Activated cells'
     });
-    expect(result.captureReleased).toBe(true);
-    expect(result.classesCleared).toBe(true);
-    expect(result.detached).toBe(true);
-    expect(result.focusRestored).toBe(true);
-    expect(result.restoredCursor).toBe(true);
-    expect(result.restoredUserSelect).toEqual(result.previousUserSelect);
-  }
-  expect(productErrors).toEqual([]);
+    await expect(combineButton).toHaveAttribute('aria-haspopup', 'menu');
+    await expect(combineButton).toHaveAttribute('aria-expanded', 'true');
+    await expect(combineMenu).toBeVisible();
+    const menuItems = combineMenu.getByRole('menuitem');
+    await expect(menuItems.first()).toBeFocused();
+    await page.keyboard.press('ArrowDown');
+    await expect(menuItems.nth(1)).toBeFocused();
+    await page.keyboard.press('Home');
+    await expect(menuItems.first()).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(combineMenu).toHaveCount(0);
+    await expect(combineButton).toBeFocused();
+    await expect(combineButton).toHaveAttribute('aria-expanded', 'false');
+
+    await combineButton.click();
+    combineMenu = page.getByRole('menu', {
+      name: 'Combine Activated cells'
+    });
+    await combineMenu.getByRole('menuitem', {
+      name: /Union with Page 2/
+    }).click();
+    tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(3);
+    const combinedTab = tabs.filter({
+      has: page.getByText('Activated cells ∪ Page 2', { exact: true })
+    });
+    await expect(combinedTab).toHaveAttribute('aria-selected', 'true');
+    await expect(combinedTab).toBeFocused();
+
+    await page.keyboard.press('Delete');
+    tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(0)).toHaveAttribute('aria-selected', 'true');
+    await expect(tabs.nth(0)).toBeFocused();
+    await expect(tabs.nth(0)).toHaveAttribute('tabindex', '0');
+
+    expect(productErrors).toEqual([]);
+  });
+  await test.step('analysis modal owns focus and releases every active pointer interaction on Escape', async () => {
+    await expect(page.locator('#dataset-name')).toHaveText(
+      'Current UI fixture'
+    );
+
+    const results = await page.evaluate(async () => {
+      const {
+        createAnalysisModal,
+        openModal
+      } = await import('/assets/js/app/analysis/ui/components/modal.js');
+      const readInlineUserSelect = () => ({
+        standard: document.body.style.getPropertyValue('user-select'),
+        webkit: document.body.style.getPropertyValue('-webkit-user-select')
+      });
+      const readEffectiveInlineUserSelect = () => {
+        const values = readInlineUserSelect();
+        return values.standard || values.webkit;
+      };
+      const scenarios = [
+        {
+          expectedCursor: 'ew-resize',
+          selector: '.analysis-modal-edge-resize-e'
+        },
+        {
+          expectedCursor: 'col-resize',
+          selector: '.analysis-modal-resizer-vertical'
+        },
+        {
+          expectedCursor: 'move',
+          selector: '.analysis-modal-header'
+        }
+      ];
+      const outcomes = [];
+
+      for (let index = 0; index < scenarios.length; index++) {
+        const scenario = scenarios[index];
+        const trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.textContent = `Modal trigger ${index + 1}`;
+        document.body.appendChild(trigger);
+        trigger.focus();
+        const previousCursor = document.body.style.cursor;
+        const previousUserSelect = readInlineUserSelect();
+        const modal = createAnalysisModal();
+        openModal(modal);
+        const closeButton = modal.querySelector('.analysis-modal-close');
+        // A modal `<dialog>`: the browser makes the page inert and
+        // holds Tab; nothing says `aria-modal` by hand.
+        const initial = {
+          closeFocused: document.activeElement === closeButton,
+          labelled:
+            modal.getAttribute('aria-labelledby') === modal._title.id,
+          modal: modal.matches(':modal'),
+          ariaModal: modal.getAttribute('aria-modal'),
+          tag: modal.tagName
+        };
+        const tabStayedInside = document.body.matches(':has(dialog:modal)');
+
+        const target = modal.querySelector(scenario.selector);
+        let capturedPointer = null;
+        let releasedPointer = null;
+        Object.defineProperties(target, {
+          hasPointerCapture: {
+            configurable: true,
+            value(pointerId) {
+              return capturedPointer === pointerId;
+            }
+          },
+          releasePointerCapture: {
+            configurable: true,
+            value(pointerId) {
+              releasedPointer = pointerId;
+              capturedPointer = null;
+            }
+          },
+          setPointerCapture: {
+            configurable: true,
+            value(pointerId) {
+              capturedPointer = pointerId;
+            }
+          }
+        });
+        target.dispatchEvent(new PointerEvent('pointerdown', {
+          bubbles: true,
+          cancelable: true,
+          clientX: 400,
+          clientY: 240,
+          pointerId: 31
+        }));
+        const during = {
+          cursor: document.body.style.cursor,
+          userSelect: readEffectiveInlineUserSelect()
+        };
+
+        // Escape is the browser's: it closes the dialog (`cancel`, then
+        // `close`), as `close()` does; the view's close follows.
+        // The `close` event is a queued task of its own, ordered with no other
+        // task source: wait for it, never a timer (a zero timer can run first).
+        const closed = new Promise(resolve => modal.addEventListener('close', resolve, { once: true }));
+        modal.close();
+        await closed;
+        if (modal._closePromise === null) {
+          throw new Error('Escape did not publish the modal close owner.');
+        }
+        await modal._closePromise;
+        outcomes.push({
+          captureReleased:
+            capturedPointer === null && releasedPointer === 31,
+          classesCleared:
+            !target.classList.contains('resizing'),
+          detached: !modal.isConnected,
+          during,
+          expectedCursor: scenario.expectedCursor,
+          focusRestored: document.activeElement === trigger,
+          initial,
+          previousUserSelect,
+          restoredCursor: document.body.style.cursor === previousCursor,
+          restoredUserSelect: readInlineUserSelect(),
+          tabStayedInside
+        });
+        trigger.remove();
+      }
+      return outcomes;
+    });
+
+    for (const result of results) {
+      expect(result.initial).toEqual({
+        closeFocused: true,
+        labelled: true,
+        modal: true,
+        ariaModal: null,
+        tag: 'DIALOG'
+      });
+      expect(result.tabStayedInside).toBe(true);
+      expect(result.during).toEqual({
+        cursor: result.expectedCursor,
+        userSelect: 'none'
+      });
+      expect(result.captureReleased).toBe(true);
+      expect(result.classesCleared).toBe(true);
+      expect(result.detached).toBe(true);
+      expect(result.focusRestored).toBe(true);
+      expect(result.restoredCursor).toBe(true);
+      expect(result.restoredUserSelect).toEqual(result.previousUserSelect);
+    }
+    expect(productErrors).toEqual([]);
+  });
+  // After the walks above: the highlight page renamed there leaves the document's
+  // caret in the page behind the dialog, where Firefox starts Tab that comes back
+  // from the browser's own controls (`app-dialog.js` `startSelectionIn`).
+  await test.step('licence modal owns focus, contains Tab, and returns it to its link', async () => {
+    const link = page.locator('#license-link');
+    const modal = page.locator('#license-modal');
+    const closeButton = page.locator('#license-close-btn');
+    const body = modal.locator('.license-body');
+
+    // The license text scrolls, so it is a declared tab stop in every engine.
+    await expect(body).toHaveAttribute('tabindex', '0');
+
+    await link.click();
+    await expect(modal).toBeVisible();
+    expect(await modal.evaluate(dialog => dialog.matches(':modal'))).toBe(true);
+    await expect(closeButton).toBeFocused();
+
+    const forward = await tabWalk(page, browserName, '#license-modal', 4);
+    expectContained(forward, 'Tab');
+    // The text (no id: named by its words) after Close, and Close again.
+    const isText = stop => stop.inside && stop.at.startsWith('Copyright');
+    expect(isText(forward[0])).toBe(true);
+    expect(forward.some(stop => stop.inside && stop.at === 'license-close-btn'), JSON.stringify(forward.map(stop => stop.at.slice(0, 20)))).toBe(true);
+    const backward = await tabWalk(page, browserName, '#license-modal', 4, { shift: true });
+    expectContained(backward, 'Shift+Tab');
+
+    await closeButton.click();
+    await expect(modal).toBeHidden();
+    await expect(link).toBeFocused();
+
+    await link.press('Enter');
+    await expect(modal).toBeVisible();
+    await expect(closeButton).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(modal).toBeHidden();
+    await expect(link).toBeFocused();
+
+    // The backdrop: a press and a release outside the card.
+    await link.press('Enter');
+    await expect(modal).toBeVisible();
+    await page.mouse.click(4, 4);
+    await expect(modal).toBeHidden();
+    await expect(link).toBeFocused();
+
+    expect(productErrors).toEqual([]);
+  });
 });
 
 test('community profile modal owns focus, requests, timers, and global listeners', async ({
@@ -1021,7 +1133,7 @@ test('ORCID retry, blur, and Escape settlements stay with the focused combobox',
   expect(productErrors).toEqual([]);
 });
 
-test('community profile modal cannot outlive its controls owner', async ({
+test('a community panel built beside the page: its profile dialog, a pending launch, a reentrant publication and the voting dialog end with their owner', async ({
   page
 }) => {
   const productErrors = observeProductErrors(page);
@@ -1036,198 +1148,100 @@ test('community profile modal cannot outlive its controls owner', async ({
     'Current UI fixture'
   );
 
-  const result = await page.evaluate(async () => {
-    const { initCommunityAnnotationControls } = await import(
-      '/assets/js/app/ui/modules/community-annotation-controls.js'
-    );
-    const datasetListeners = new Set();
-    const container = document.createElement('div');
-    container.id = 'annotation-destroy-audit';
-    document.body.appendChild(container);
+  await test.step('community profile modal cannot outlive its controls owner', async () => {
+    const result = await page.evaluate(async () => {
+      const { initCommunityAnnotationControls } = await import(
+        '/assets/js/app/ui/modules/community-annotation-controls.js'
+      );
+      const datasetListeners = new Set();
+      const container = document.createElement('div');
+      container.id = 'annotation-destroy-audit';
+      document.body.appendChild(container);
 
-    const controls = initCommunityAnnotationControls({
-      state: {
-        getFields() {
-          return [];
+      const controls = initCommunityAnnotationControls({
+        state: {
+          getFields() {
+            return [];
+          },
         },
-      },
-      dom: { container },
-      dataSourceManager: {
-        getCurrentIdentityId() {
-          return 'current-ui';
+        dom: { container },
+        dataSourceManager: {
+          getCurrentIdentityId() {
+            return 'current-ui';
+          },
+          onDatasetChange(listener) {
+            datasetListeners.add(listener);
+          },
+          offDatasetChange(listener) {
+            datasetListeners.delete(listener);
+          },
         },
-        onDatasetChange(listener) {
-          datasetListeners.add(listener);
+        infoPopovers: {
+          closeWithin() {},
+          configurePair() {},
         },
-        offDatasetChange(listener) {
-          datasetListeners.delete(listener);
-        },
-      },
-      infoPopovers: {
-        closeWithin() {},
-        configurePair() {},
-      },
-    });
+      });
 
-    const edit = [...container.querySelectorAll('button')].find(
-      button => button.textContent === 'Edit'
-    );
-    if (!(edit instanceof HTMLButtonElement) || edit.disabled) {
-      throw new Error('Synthetic annotation profile Edit button unavailable');
-    }
-    edit.click();
+      const edit = [...container.querySelectorAll('button')].find(
+        button => button.textContent === 'Edit'
+      );
+      if (!(edit instanceof HTMLButtonElement) || edit.disabled) {
+        throw new Error('Synthetic annotation profile Edit button unavailable');
+      }
+      edit.click();
 
-    // The click's handler opens the dialog after work of its own: a task at
-    // a time until it has, however many that takes.
-    while (!document.querySelector('.community-annotation-dialog:not(.community-annotation-details-dialog)')) {
-      await new Promise(resolve => setTimeout(resolve, 0));
-    }
-    const overlay = document.querySelector(
-      '.community-annotation-dialog:not(.community-annotation-details-dialog)'
-    );
-    if (!(overlay instanceof HTMLElement)) {
-      throw new Error('Synthetic annotation profile modal did not open');
-    }
-
-    const markupBeforeDestroy = container.innerHTML;
-    const mutations = [];
-    const observer = new MutationObserver(records => mutations.push(...records));
-    observer.observe(container, { childList: true, subtree: true });
-
-    controls.destroy();
-    const survivedDestroy = overlay.isConnected;
-
-    // Let the in-progress edit task observe closure and settle.
-    overlay.remove();
-    await new Promise(resolve => setTimeout(resolve, 0));
-    await new Promise(resolve => setTimeout(resolve, 0));
-    observer.disconnect();
-
-    const outcome = {
-      focusRetiredWithOwner: container.contains(document.activeElement),
-      listenersRemaining: datasetListeners.size,
-      markupStable: container.innerHTML === markupBeforeDestroy,
-      postDestroyMutations: mutations.length,
-      survivedDestroy,
-    };
-    container.remove();
-    return outcome;
-  });
-
-  expect(result).toEqual({
-    focusRetiredWithOwner: false,
-    listenersRemaining: 0,
-    markupStable: true,
-    postDestroyMutations: 0,
-    survivedDestroy: false,
-  });
-  expect(productErrors).toEqual([]);
-});
-
-test('pending community profile launch cannot cross controls teardown', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.addInitScript(() => {
-    window._simulate_repo_connected = true;
-    window._author_mode = true;
-  });
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
-
-  const result = await page.evaluate(async () => {
-    const { initCommunityAnnotationControls } = await import(
-      '/assets/js/app/ui/modules/community-annotation-controls.js'
-    );
-    const datasetListeners = new Set();
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const controls = initCommunityAnnotationControls({
-      state: {
-        getFields() {
-          return [];
-        },
-      },
-      dom: { container },
-      dataSourceManager: {
-        getCurrentIdentityId() {
-          return 'current-ui';
-        },
-        onDatasetChange(listener) {
-          datasetListeners.add(listener);
-        },
-        offDatasetChange(listener) {
-          datasetListeners.delete(listener);
-        },
-      },
-      infoPopovers: {
-        closeWithin() {},
-        configurePair() {},
-      },
-    });
-    const edit = [...container.querySelectorAll('button')].find(
-      button => button.textContent === 'Edit'
-    );
-    if (!(edit instanceof HTMLButtonElement) || edit.disabled) {
-      throw new Error('Synthetic annotation profile Edit button unavailable');
-    }
-
-    edit.click();
-    controls.destroy();
-    const markupAfterDestroy = container.innerHTML;
-    const mutations = [];
-    const observer = new MutationObserver(records => mutations.push(...records));
-    observer.observe(container, { childList: true, subtree: true });
-    await new Promise(resolve => setTimeout(resolve, 0));
-    await new Promise(resolve => setTimeout(resolve, 0));
-    observer.disconnect();
-
-    const outcome = {
-      listenersRemaining: datasetListeners.size,
-      modalCount: document.querySelectorAll(
+      // The click's handler opens the dialog after work of its own: a task at
+      // a time until it has, however many that takes.
+      while (!document.querySelector('.community-annotation-dialog:not(.community-annotation-details-dialog)')) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      const overlay = document.querySelector(
         '.community-annotation-dialog:not(.community-annotation-details-dialog)'
-      ).length,
-      postDestroyMutations: mutations.length,
-      stableMarkup: container.innerHTML === markupAfterDestroy,
-    };
-    container.remove();
-    return outcome;
-  });
+      );
+      if (!(overlay instanceof HTMLElement)) {
+        throw new Error('Synthetic annotation profile modal did not open');
+      }
 
-  expect(result).toEqual({
-    listenersRemaining: 0,
-    modalCount: 0,
-    postDestroyMutations: 0,
-    stableMarkup: true,
-  });
-  expect(productErrors).toEqual([]);
-});
+      const markupBeforeDestroy = container.innerHTML;
+      const mutations = [];
+      const observer = new MutationObserver(records => mutations.push(...records));
+      observer.observe(container, { childList: true, subtree: true });
 
-test('community profile publication survives reentrant focus lifecycle changes', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.addInitScript(() => {
-    window._simulate_repo_connected = true;
-    window._author_mode = true;
-  });
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
+      controls.destroy();
+      const survivedDestroy = overlay.isConnected;
 
-  const result = await page.evaluate(async () => {
-    const { initCommunityAnnotationControls } = await import(
-      '/assets/js/app/ui/modules/community-annotation-controls.js'
-    );
-    const createControls = () => {
-      const listeners = new Set();
+      // Let the in-progress edit task observe closure and settle.
+      overlay.remove();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      observer.disconnect();
+
+      const outcome = {
+        focusRetiredWithOwner: container.contains(document.activeElement),
+        listenersRemaining: datasetListeners.size,
+        markupStable: container.innerHTML === markupBeforeDestroy,
+        postDestroyMutations: mutations.length,
+        survivedDestroy,
+      };
+      container.remove();
+      return outcome;
+    });
+
+    expect(result).toEqual({
+      focusRetiredWithOwner: false,
+      listenersRemaining: 0,
+      markupStable: true,
+      postDestroyMutations: 0,
+      survivedDestroy: false,
+    });
+    expect(productErrors).toEqual([]);
+  });
+  await test.step('pending community profile launch cannot cross controls teardown', async () => {
+    const result = await page.evaluate(async () => {
+      const { initCommunityAnnotationControls } = await import(
+        '/assets/js/app/ui/modules/community-annotation-controls.js'
+      );
+      const datasetListeners = new Set();
       const container = document.createElement('div');
       document.body.appendChild(container);
       const controls = initCommunityAnnotationControls({
@@ -1242,10 +1256,10 @@ test('community profile publication survives reentrant focus lifecycle changes',
             return 'current-ui';
           },
           onDatasetChange(listener) {
-            listeners.add(listener);
+            datasetListeners.add(listener);
           },
           offDatasetChange(listener) {
-            listeners.delete(listener);
+            datasetListeners.delete(listener);
           },
         },
         infoPopovers: {
@@ -1253,88 +1267,260 @@ test('community profile publication survives reentrant focus lifecycle changes',
           configurePair() {},
         },
       });
-      return { container, controls, listeners };
-    };
-    const findEdit = container => {
       const edit = [...container.querySelectorAll('button')].find(
         button => button.textContent === 'Edit'
       );
       if (!(edit instanceof HTMLButtonElement) || edit.disabled) {
         throw new Error('Synthetic annotation profile Edit button unavailable');
       }
-      return edit;
-    };
-    const nextTurns = async () => {
+
+      edit.click();
+      controls.destroy();
+      const markupAfterDestroy = container.innerHTML;
+      const mutations = [];
+      const observer = new MutationObserver(records => mutations.push(...records));
+      observer.observe(container, { childList: true, subtree: true });
       await new Promise(resolve => setTimeout(resolve, 0));
       await new Promise(resolve => setTimeout(resolve, 0));
-    };
+      observer.disconnect();
 
-    const autoCloseOwner = createControls();
-    const closeOnFocus = event => {
-      if (
-        event.target instanceof HTMLButtonElement &&
-        event.target.classList.contains('community-annotation-modal-close')
-      ) {
-        event.target.click();
-      }
-    };
-    window.addEventListener('focusin', closeOnFocus);
-    findEdit(autoCloseOwner.container).click();
-    await nextTurns();
-    window.removeEventListener('focusin', closeOnFocus);
-    const autoClosed = !document.querySelector(
-      '.community-annotation-dialog:not(.community-annotation-details-dialog)'
-    );
+      const outcome = {
+        listenersRemaining: datasetListeners.size,
+        modalCount: document.querySelectorAll(
+          '.community-annotation-dialog:not(.community-annotation-details-dialog)'
+        ).length,
+        postDestroyMutations: mutations.length,
+        stableMarkup: container.innerHTML === markupAfterDestroy,
+      };
+      container.remove();
+      return outcome;
+    });
 
-    findEdit(autoCloseOwner.container).click();
-    await nextTurns();
-    const reopened = document.querySelector(
-      '.community-annotation-dialog:not(.community-annotation-details-dialog)'
-    ) instanceof HTMLElement;
-    autoCloseOwner.controls.destroy();
-    const autoCloseListenersRemaining = autoCloseOwner.listeners.size;
-    autoCloseOwner.container.remove();
+    expect(result).toEqual({
+      listenersRemaining: 0,
+      modalCount: 0,
+      postDestroyMutations: 0,
+      stableMarkup: true,
+    });
+    expect(productErrors).toEqual([]);
+  });
+  await test.step('community profile publication survives reentrant focus lifecycle changes', async () => {
+    const result = await page.evaluate(async () => {
+      const { initCommunityAnnotationControls } = await import(
+        '/assets/js/app/ui/modules/community-annotation-controls.js'
+      );
+      const createControls = () => {
+        const listeners = new Set();
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+        const controls = initCommunityAnnotationControls({
+          state: {
+            getFields() {
+              return [];
+            },
+          },
+          dom: { container },
+          dataSourceManager: {
+            getCurrentIdentityId() {
+              return 'current-ui';
+            },
+            onDatasetChange(listener) {
+              listeners.add(listener);
+            },
+            offDatasetChange(listener) {
+              listeners.delete(listener);
+            },
+          },
+          infoPopovers: {
+            closeWithin() {},
+            configurePair() {},
+          },
+        });
+        return { container, controls, listeners };
+      };
+      const findEdit = container => {
+        const edit = [...container.querySelectorAll('button')].find(
+          button => button.textContent === 'Edit'
+        );
+        if (!(edit instanceof HTMLButtonElement) || edit.disabled) {
+          throw new Error('Synthetic annotation profile Edit button unavailable');
+        }
+        return edit;
+      };
+      const nextTurns = async () => {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await new Promise(resolve => setTimeout(resolve, 0));
+      };
 
-    const destroyOwner = createControls();
-    let markupAfterReentrantDestroy = null;
-    const destroyOnFocus = event => {
-      if (
-        event.target instanceof HTMLButtonElement &&
-        event.target.classList.contains('community-annotation-modal-close')
-      ) {
-        destroyOwner.controls.destroy();
-        markupAfterReentrantDestroy = destroyOwner.container.innerHTML;
-      }
-    };
-    window.addEventListener('focusin', destroyOnFocus);
-    findEdit(destroyOwner.container).click();
-    await nextTurns();
-    window.removeEventListener('focusin', destroyOnFocus);
-
-    const outcome = {
-      autoCloseListenersRemaining,
-      autoClosed,
-      destroyListenersRemaining: destroyOwner.listeners.size,
-      destroyedMarkupStable:
-        destroyOwner.container.innerHTML === markupAfterReentrantDestroy,
-      modalCount: document.querySelectorAll(
+      const autoCloseOwner = createControls();
+      // The dialog's first focus presses its Close while the dialog opens;
+      // the press settles the dialog before it returns, its Close gone from
+      // the page with it.
+      let settledAtPress = null;
+      const closeOnFocus = event => {
+        if (
+          event.target instanceof HTMLButtonElement &&
+          event.target.classList.contains('community-annotation-modal-close')
+        ) {
+          event.target.click();
+          settledAtPress ??= !event.target.isConnected;
+        }
+      };
+      window.addEventListener('focusin', closeOnFocus);
+      findEdit(autoCloseOwner.container).click();
+      await nextTurns();
+      window.removeEventListener('focusin', closeOnFocus);
+      const autoClosed = settledAtPress === true && !document.querySelector(
         '.community-annotation-dialog:not(.community-annotation-details-dialog)'
-      ).length,
-      reopened,
-    };
-    destroyOwner.container.remove();
-    return outcome;
-  });
+      );
 
-  expect(result).toEqual({
-    autoCloseListenersRemaining: 0,
-    autoClosed: true,
-    destroyListenersRemaining: 0,
-    destroyedMarkupStable: true,
-    modalCount: 0,
-    reopened: true,
+      findEdit(autoCloseOwner.container).click();
+      await nextTurns();
+      const reopened = document.querySelector(
+        '.community-annotation-dialog:not(.community-annotation-details-dialog)'
+      ) instanceof HTMLElement;
+      autoCloseOwner.controls.destroy();
+      const autoCloseListenersRemaining = autoCloseOwner.listeners.size;
+      autoCloseOwner.container.remove();
+
+      const destroyOwner = createControls();
+      let markupAfterReentrantDestroy = null;
+      const destroyOnFocus = event => {
+        if (
+          event.target instanceof HTMLButtonElement &&
+          event.target.classList.contains('community-annotation-modal-close')
+        ) {
+          destroyOwner.controls.destroy();
+          markupAfterReentrantDestroy = destroyOwner.container.innerHTML;
+        }
+      };
+      window.addEventListener('focusin', destroyOnFocus);
+      findEdit(destroyOwner.container).click();
+      await nextTurns();
+      window.removeEventListener('focusin', destroyOnFocus);
+
+      const outcome = {
+        autoCloseListenersRemaining,
+        autoClosed,
+        destroyListenersRemaining: destroyOwner.listeners.size,
+        destroyedMarkupStable:
+          destroyOwner.container.innerHTML === markupAfterReentrantDestroy,
+        modalCount: document.querySelectorAll(
+          '.community-annotation-dialog:not(.community-annotation-details-dialog)'
+        ).length,
+        reopened,
+      };
+      destroyOwner.container.remove();
+      return outcome;
+    });
+
+    expect(result).toEqual({
+      autoCloseListenersRemaining: 0,
+      autoClosed: true,
+      destroyListenersRemaining: 0,
+      destroyedMarkupStable: true,
+      modalCount: 0,
+      reopened: true,
+    });
+    expect(productErrors).toEqual([]);
   });
-  expect(productErrors).toEqual([]);
+  await test.step('community voting closes and aborts its pending field load at an exact context boundary', async () => {
+    const result = await page.evaluate(async () => {
+      const { getCommunityAnnotationSession } = await import(
+        '/assets/js/app/community-annotations/session.js'
+      );
+      const { openCommunityAnnotationVotingModal } = await import(
+        '/assets/js/app/ui/modules/community-annotation-voting-modal.js'
+      );
+      const session = getCommunityAnnotationSession();
+      const openingContext = {
+        datasetId: session.getDatasetId(),
+        repoRef: session.getRepoRef(),
+        userId: session.getCacheUserId()
+      };
+      const originalSetFieldCategories = session.setFieldCategories;
+      let categoryWrites = 0;
+      let capturedSignal = null;
+      let loadAbortEvents = 0;
+      let resolveLoadAbort;
+      const loadAborted = new Promise(resolve => {
+        resolveLoadAbort = resolve;
+      });
+      session.setFieldCategories = function countCategoryWrite(...args) {
+        categoryWrites += 1;
+        return originalSetFieldCategories.apply(this, args);
+      };
+
+      let outcome;
+      try {
+        const field = {
+          _isDeleted: false,
+          categories: ['T cell', 'B cell'],
+          key: 'cell_type',
+          kind: 'category',
+          loaded: false
+        };
+        const state = {
+          ensureFieldLoaded(_fieldIndex, options) {
+            capturedSignal = options.signal;
+            return new Promise((_resolve, reject) => {
+              options.signal.addEventListener('abort', () => {
+                loadAbortEvents += 1;
+                const error = new Error('Synthetic voting field load retired');
+                error.name = 'AbortError';
+                reject(error);
+                resolveLoadAbort();
+              }, { once: true });
+            });
+          },
+          getFields() {
+            return [field];
+          }
+        };
+        const modal = openCommunityAnnotationVotingModal({
+          defaultCatIdx: 0,
+          defaultFieldKey: 'cell_type',
+          state
+        });
+        if (modal === null) {
+          throw new Error('Synthetic connected voting context did not open');
+        }
+        if (capturedSignal === null) {
+          throw new Error('Voting field load did not receive its context signal');
+        }
+
+        session.setCacheContext({
+          datasetId: 'voting-context-boundary',
+          repoRef: null,
+          userId: null
+        });
+        await loadAborted;
+        await Promise.resolve();
+        await Promise.resolve();
+
+        outcome = {
+          categoryWrites,
+          contextAfterRetirement: session.getDatasetId(),
+          loadAbortEvents,
+          modalConnected: modal.overlay.isConnected,
+          signalAborted: capturedSignal.aborted
+        };
+      } finally {
+        session.setFieldCategories = originalSetFieldCategories;
+        session.setCacheContext(openingContext);
+      }
+      return outcome;
+    });
+
+    expect(result).toEqual({
+      categoryWrites: 0,
+      contextAfterRetirement: 'voting-context-boundary',
+      loadAbortEvents: 1,
+      modalConnected: false,
+      signalAborted: true
+    });
+    expect(productErrors).toEqual([]);
+  });
 });
 
 test('community profile Save surfaces teardown failure after exact cleanup', async ({
@@ -1413,127 +1599,10 @@ test('community profile Save surfaces teardown failure after exact cleanup', asy
   )).toHaveLength(1);
 });
 
-test('community voting closes and aborts its pending field load at an exact context boundary', async ({
+test('the signed-in community panel names its legend, its settings and its GitHub sync dialog', async ({
   page
 }) => {
   const productErrors = observeProductErrors(page);
-  await page.addInitScript(() => {
-    window._simulate_repo_connected = true;
-  });
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
-
-  const result = await page.evaluate(async () => {
-    const { getCommunityAnnotationSession } = await import(
-      '/assets/js/app/community-annotations/session.js'
-    );
-    const { openCommunityAnnotationVotingModal } = await import(
-      '/assets/js/app/ui/modules/community-annotation-voting-modal.js'
-    );
-    const session = getCommunityAnnotationSession();
-    const openingContext = {
-      datasetId: session.getDatasetId(),
-      repoRef: session.getRepoRef(),
-      userId: session.getCacheUserId()
-    };
-    const originalSetFieldCategories = session.setFieldCategories;
-    let categoryWrites = 0;
-    let capturedSignal = null;
-    let loadAbortEvents = 0;
-    let resolveLoadAbort;
-    const loadAborted = new Promise(resolve => {
-      resolveLoadAbort = resolve;
-    });
-    session.setFieldCategories = function countCategoryWrite(...args) {
-      categoryWrites += 1;
-      return originalSetFieldCategories.apply(this, args);
-    };
-
-    let outcome;
-    try {
-      const field = {
-        _isDeleted: false,
-        categories: ['T cell', 'B cell'],
-        key: 'cell_type',
-        kind: 'category',
-        loaded: false
-      };
-      const state = {
-        ensureFieldLoaded(_fieldIndex, options) {
-          capturedSignal = options.signal;
-          return new Promise((_resolve, reject) => {
-            options.signal.addEventListener('abort', () => {
-              loadAbortEvents += 1;
-              const error = new Error('Synthetic voting field load retired');
-              error.name = 'AbortError';
-              reject(error);
-              resolveLoadAbort();
-            }, { once: true });
-          });
-        },
-        getFields() {
-          return [field];
-        }
-      };
-      const modal = openCommunityAnnotationVotingModal({
-        defaultCatIdx: 0,
-        defaultFieldKey: 'cell_type',
-        state
-      });
-      if (modal === null) {
-        throw new Error('Synthetic connected voting context did not open');
-      }
-      if (capturedSignal === null) {
-        throw new Error('Voting field load did not receive its context signal');
-      }
-
-      session.setCacheContext({
-        datasetId: 'voting-context-boundary',
-        repoRef: null,
-        userId: null
-      });
-      await loadAborted;
-      await Promise.resolve();
-      await Promise.resolve();
-
-      outcome = {
-        categoryWrites,
-        contextAfterRetirement: session.getDatasetId(),
-        loadAbortEvents,
-        modalConnected: modal.overlay.isConnected,
-        signalAborted: capturedSignal.aborted
-      };
-    } finally {
-      session.setFieldCategories = originalSetFieldCategories;
-      session.setCacheContext(openingContext);
-    }
-    return outcome;
-  });
-
-  expect(result).toEqual({
-    categoryWrites: 0,
-    contextAfterRetirement: 'voting-context-boundary',
-    loadAbortEvents: 1,
-    modalConnected: false,
-    signalAborted: true
-  });
-  expect(productErrors).toEqual([]);
-});
-
-test('community annotation legend and settings expose complete keyboard identities', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  const readGlErrorAfterFrames = () => page.evaluate(async () => {
-    await new Promise(resolve => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    });
-    return window._cellucidViewer.getGLContext().getError();
-  });
   await page.addInitScript(() => {
     window._simulate_repo_connected = true;
     window._author_mode = true;
@@ -1545,396 +1614,258 @@ test('community annotation legend and settings expose complete keyboard identiti
     'Current UI fixture'
   );
 
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('.legend-item')).toHaveCount(3);
-  expect(await readGlErrorAfterFrames()).toBe(0);
-
-  let alphaRow = page.locator('.legend-item', {
-    has: page.locator('.legend-label-main', { hasText: /^alpha$/ })
-  });
-  await expect(alphaRow.locator('.legend-checkbox')).toHaveAccessibleName(
-    'Show category alpha'
-  );
-  await expect(alphaRow.locator('.legend-color-input')).toHaveAccessibleName(
-    'Color for category alpha'
-  );
-
-  const section = page.locator('#community-annotation-section');
-  await section.evaluate(element => {
-    if (!(element instanceof HTMLDetailsElement)) {
-      throw new TypeError('Community annotation section must be details');
-    }
-    element.open = true;
-  });
-  const manage = section.locator('.disclosure').filter({
-    has: page.locator('.disclosure-title', { hasText: /^Annotated columns$/i })
-  });
-  await manage
-    .getByRole('button', { name: /^annotated columns/i })
-    .click();
-  const fieldSelect = manage.locator('.control-block > select.obs-select').first();
-  await expect(fieldSelect).toHaveAccessibleName('Categorical obs');
-  await fieldSelect.selectOption({ label: 'cell_type' });
-  await manage.getByRole('button', { name: 'Add', exact: true }).click();
-  expect(await readGlErrorAfterFrames()).toBe(0);
-
-  const annotationSettings = manage.locator(
-    '.community-annotation-annotatable-settings'
-  );
-  await expect(annotationSettings).toBeVisible();
-  await expect(annotationSettings).toHaveAttribute('role', 'group');
-  await expect(
-    annotationSettings.locator('input[type="range"]')
-  ).toHaveAccessibleName('Threshold');
-  await expect(
-    annotationSettings.locator('input[type="number"]')
-  ).toHaveAccessibleName('Min annotators');
-
-  const derived = section.locator('.disclosure').filter({
-    has: page.locator('.disclosure-title', { hasText: /^Consensus column$/i })
-  });
-  await derived
-    .getByRole('button', { name: /^consensus column/i })
-    .click();
-  await expect(
-    derived.locator('.control-block > select.obs-select').first()
-  ).toHaveAccessibleName('Annotatable column');
-  await expect(
-    derived.locator('input[type="text"]')
-  ).toHaveAccessibleName('New column key');
-  await expect(
-    derived.locator('.community-annotation-settings input[type="range"]')
-  ).toHaveAccessibleName('Consensus threshold');
-  await expect(
-    derived.locator('.community-annotation-settings input[type="number"]')
-  ).toHaveAccessibleName('Min annotators');
-
-  alphaRow = page.locator('.legend-item', {
-    has: page.locator('.legend-label-main', { hasText: /^alpha$/ })
-  });
-  await expect(alphaRow).toHaveClass(/legend-item-annotating/);
-  const voteTrigger = alphaRow.getByRole('button', {
-    name: 'Vote on category alpha'
-  });
-  await expect(voteTrigger).toHaveAttribute('tabindex', '0');
-
-  const highlightButton = alphaRow.getByRole('button', {
-    name: 'Highlight category alpha'
-  });
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
-  await highlightButton.click();
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
-  expect(await readGlErrorAfterFrames()).toBe(0);
-  await page.evaluate(() => {
-    window._cellucidState.clearActivePageHighlights();
-  });
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
-  expect(await readGlErrorAfterFrames()).toBe(0);
-  await highlightButton.click();
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
-  expect(await readGlErrorAfterFrames()).toBe(0);
-
-  await page.evaluate(async () => {
-    const state = window._cellucidState;
-    const fields = state.getFields();
-    const scoreIndex = fields.findIndex(field => field?.key === 'score');
-    if (scoreIndex < 0) {
-      throw new Error('Prepared fixture score field is unavailable');
-    }
-    const score = await state.ensureFieldLoaded(scoreIndex, { silent: true });
-    if (!(score?.values instanceof Float32Array)) {
-      throw new TypeError('Prepared fixture score values must be Float32');
-    }
-    state.applyContinuousFilter(
-      scoreIndex,
-      score.values[1],
-      score.values[1]
-    );
-  });
-  await expect(page.locator('#filter-count')).toHaveText(
-    'Showing 1 of 120 cells'
-  );
-  await expect(alphaRow).toHaveClass(/legend-item-disabled/);
-  await expect(alphaRow.locator('.legend-vote-trigger')).toHaveCount(0);
-  await expect(alphaRow.locator('.legend-label')).toHaveAttribute(
-    'title',
-    /Voting unavailable/
-  );
-  await expect(alphaRow.locator('.legend-checkbox')).toBeDisabled();
-  await expect(alphaRow.locator('.legend-color-input')).toBeDisabled();
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
-  await expect(highlightButton).toBeEnabled();
-  await highlightButton.click();
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
-  await expect(highlightButton).toBeDisabled();
-  expect(
-    await highlightButton.evaluate(
-      button => getComputedStyle(button).cursor
-    )
-  ).toBe('not-allowed');
-
-  await page.evaluate(() => {
-    const state = window._cellucidState;
-    const scoreIndex = state
-      .getFields()
-      .findIndex(field => field?.key === 'score');
-    if (scoreIndex < 0) {
-      throw new Error('Prepared fixture score field is unavailable');
-    }
-    state.resetContinuousFilter(scoreIndex);
-  });
-  await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 cells'
-  );
-  await expect(alphaRow).not.toHaveClass(/legend-item-disabled/);
-  await expect(
-    alphaRow.getByRole('button', { name: 'Vote on category alpha' })
-  ).toBeEnabled();
-  await expect(alphaRow.locator('.legend-label')).toHaveAttribute(
-    'title',
-    /Voting mode enabled/
-  );
-  await expect(highlightButton).toBeEnabled();
-  await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
-
-  await voteTrigger.focus();
-  const openingVoteHandle = await voteTrigger.elementHandle();
-  if (openingVoteHandle === null) {
-    throw new Error('Community annotation vote trigger handle is unavailable');
-  }
-  await voteTrigger.press('Enter');
-  let dialog = page.getByRole('dialog', { name: 'Community voting' });
-  await expect(dialog).toBeVisible();
-  await expect(
-    dialog.getByText('cell_type • alpha', { exact: true })
-  ).toBeVisible();
-  await expect(
-    dialog.getByRole('button', { name: 'Close' })
-  ).toBeFocused();
-
-  await page.evaluate(async () => {
-    const { getCommunityAnnotationSession } = await import(
-      '/assets/js/app/community-annotations/session.js'
-    );
-    getCommunityAnnotationSession().setAnnotatableConsensusSettings(
-      'cell_type',
-      { minAnnotators: 2, threshold: 0.5 }
-    );
-  });
-  expect(await openingVoteHandle.evaluate(element => element.isConnected)).toBe(
-    false
-  );
-  await page.keyboard.press('Escape');
-  await expect(dialog).toHaveCount(0);
-  alphaRow = page.locator('.legend-item', {
-    has: page.locator('.legend-label-main', { hasText: /^alpha$/ })
-  });
-  const currentVoteTrigger = alphaRow.getByRole('button', {
-    name: 'Vote on category alpha'
-  });
-  await expect(currentVoteTrigger).toBeFocused();
-
-  await currentVoteTrigger.press('Space');
-  dialog = page.getByRole('dialog', { name: 'Community voting' });
-  await expect(dialog).toBeVisible();
-  await expect(
-    dialog.getByText('cell_type • alpha', { exact: true })
-  ).toBeVisible();
-  await dialog.getByRole('button', { name: 'Close' }).click();
-  await expect(dialog).toHaveCount(0);
-  await expect(currentVoteTrigger).toBeFocused();
-
-  await section
-    .locator('.community-annotation-identity-actions')
-    .getByRole('button', { name: 'Edit', exact: true })
-    .click();
-  const profileDialog = page.getByRole('dialog', { name: 'Your identity' });
-  await expect(profileDialog).toBeVisible();
-  await expect(
-    profileDialog.getByRole('combobox', { name: 'Name', exact: true })
-  ).toBeVisible();
-  await expect(
-    profileDialog.getByRole('textbox', {
-      name: 'Affiliation / role',
-      exact: true
-    })
-  ).toBeVisible();
-  await expect(
-    profileDialog.getByRole('textbox', { name: 'LinkedIn', exact: true })
-  ).toBeVisible();
-  await expect(
-    profileDialog.getByRole('combobox', { name: 'ORCID', exact: true })
-  ).toBeVisible();
-  await profileDialog.getByRole('button', { name: 'Close' }).click();
-
-  expect(productErrors).toEqual([]);
-});
-
-test('community annotation GitHub sync controls expose exact accessible identities', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.addInitScript(() => {
-    window._simulate_repo_connected = true;
-  });
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
-
-  const section = page.locator('#community-annotation-section');
-  await section.evaluate(element => {
-    if (!(element instanceof HTMLDetailsElement)) {
-      throw new TypeError('Community annotation section must be details');
-    }
-    element.open = true;
-  });
-  await section.getByRole('button', { name: 'GitHub sync…' }).click();
-
-  const dialog = page.getByRole('dialog', { name: 'GitHub sync' });
-  await expect(dialog).toBeVisible();
-  await expect(
-    dialog.locator('input[placeholder="Filter repositories…"]')
-  ).toHaveAttribute('aria-label', 'Filter repositories');
-  await expect(
-    dialog.locator('.community-annotation-auto-pull-select')
-  ).toHaveAttribute('aria-label', 'Auto pull interval');
-  await dialog.getByRole('button', { name: 'Close' }).click();
-  await expect(dialog).toHaveCount(0);
-
-  expect(productErrors).toEqual([]);
-});
-
-test('welcome modal owns focus, contains Tab, and returns it on close', async ({
-  page,
-  browserName
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-
-  const modal = page.locator('#welcome-modal');
-  const startButton = page.locator('#welcome-start-btn');
-  const learnMore = modal.getByRole('link', { name: /Learn more/ });
-
-  // A modal <dialog>: focus enters it and the page behind is inert. It lands
-  // on the dialog itself, so no choice opens looking pre-selected.
-  await expectWelcomeShown(page);
-  expect(await modal.evaluate(dialog => dialog.matches(':modal'))).toBe(true);
-  await expect(modal).toBeFocused();
-  await expect(startButton).not.toBeFocused();
-
-  const forward = await tabWalk(page, browserName, '#welcome-modal', 6);
-  expectContained(forward, 'Tab');
-  expect(forward[0]).toEqual({ at: 'welcome-start-btn', inside: true });
-  expect(forward.some(stop => stop.inside && stop.at === 'welcome-start-btn')).toBe(true);
-  expect(forward.some(stop => stop.inside && stop.at.includes('Learn more'))).toBe(true);
-  await learnMore.focus();
-  const backward = await tabWalk(page, browserName, '#welcome-modal', 6, { shift: true });
-  expectContained(backward, 'Shift+Tab');
-  expect(backward[0]).toEqual({ at: 'welcome-start-btn', inside: true });
-
-  await page.keyboard.press('Escape');
-  await expect(modal).toBeHidden();
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
-
-  // Reopened from a real invoker, closing must hand focus back to it.
-  await openCollapsedPanels(page);
-  const resetCamera = page.locator('#reset-camera-btn');
-  await resetCamera.focus();
-  await page.evaluate(async () => {
-    const { showWelcomeModal } = await import(
-      '/assets/js/app/ui/onboarding/welcome-modal.js'
-    );
-    if (showWelcomeModal() !== true) {
-      throw new Error('Welcome modal did not reopen');
-    }
-  });
-  await expect(modal).toBeVisible();
-  await expect(modal).toBeFocused();
-  await page.keyboard.press('Escape');
-  await expect(modal).toBeHidden();
-  await expect(resetCamera).toBeFocused();
-
-  // Start exploring closes it like Escape: from the keyboard (Enter, then
-  // Space) focus returns to the invoker, and nothing else is opened or
-  // focused; the Sample dataset dropdown is never activated for the user.
-  const sessionOpen = await page.locator('#session-section').evaluate(section => section.open);
-  for (const key of ['Enter', 'Space']) {
-    await page.evaluate(async () => {
-      const { showWelcomeModal } = await import(
-        '/assets/js/app/ui/onboarding/welcome-modal.js'
-      );
-      if (showWelcomeModal() !== true) {
-        throw new Error('Welcome modal did not reopen');
-      }
+  await test.step('community annotation legend and settings expose complete keyboard identities', async () => {
+    const readGlErrorAfterFrames = () => page.evaluate(async () => {
+      await new Promise(resolve => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+      return window._cellucidViewer.getGLContext().getError();
     });
-    await expect(modal).toBeFocused();
-    await startButton.focus();
-    await page.keyboard.press(key);
-    await expect(modal).toBeHidden();
-    await expect(resetCamera).toBeFocused();
-    await expect(page.locator('#dataset-select')).not.toBeFocused();
-    expect(await page.locator('#session-section').evaluate(section => section.open)).toBe(sessionOpen);
-  }
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await expect(page.locator('.legend-item')).toHaveCount(3);
+    expect(await readGlErrorAfterFrames()).toBe(0);
 
-  expect(productErrors).toEqual([]);
-});
+    let alphaRow = page.locator('.legend-item', {
+      has: page.locator('.legend-label-main', { hasText: /^alpha$/ })
+    });
+    await expect(alphaRow.locator('.legend-checkbox')).toHaveAccessibleName(
+      'Show category alpha'
+    );
+    await expect(alphaRow.locator('.legend-color-input')).toHaveAccessibleName(
+      'Color for category alpha'
+    );
 
-test('licence modal owns focus, contains Tab, and returns it to its link', async ({
-  page,
-  browserName
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
+    const section = page.locator('#community-annotation-section');
+    await section.evaluate(element => {
+      if (!(element instanceof HTMLDetailsElement)) {
+        throw new TypeError('Community annotation section must be details');
+      }
+      element.open = true;
+    });
+    const manage = section.locator('.disclosure').filter({
+      has: page.locator('.disclosure-title', { hasText: /^Annotated columns$/i })
+    });
+    await manage
+      .getByRole('button', { name: /^annotated columns/i })
+      .click();
+    const fieldSelect = manage.locator('.control-block > select.obs-select').first();
+    await expect(fieldSelect).toHaveAccessibleName('Categorical obs');
+    await fieldSelect.selectOption({ label: 'cell_type' });
+    await manage.getByRole('button', { name: 'Add', exact: true }).click();
+    expect(await readGlErrorAfterFrames()).toBe(0);
 
-  const link = page.locator('#license-link');
-  const modal = page.locator('#license-modal');
-  const closeButton = page.locator('#license-close-btn');
-  const body = modal.locator('.license-body');
+    const annotationSettings = manage.locator(
+      '.community-annotation-annotatable-settings'
+    );
+    await expect(annotationSettings).toBeVisible();
+    await expect(annotationSettings).toHaveAttribute('role', 'group');
+    await expect(
+      annotationSettings.locator('input[type="range"]')
+    ).toHaveAccessibleName('Threshold');
+    await expect(
+      annotationSettings.locator('input[type="number"]')
+    ).toHaveAccessibleName('Min annotators');
 
-  // The license text scrolls, so it is a declared tab stop in every engine.
-  await expect(body).toHaveAttribute('tabindex', '0');
+    const derived = section.locator('.disclosure').filter({
+      has: page.locator('.disclosure-title', { hasText: /^Consensus column$/i })
+    });
+    await derived
+      .getByRole('button', { name: /^consensus column/i })
+      .click();
+    await expect(
+      derived.locator('.control-block > select.obs-select').first()
+    ).toHaveAccessibleName('Annotatable column');
+    await expect(
+      derived.locator('input[type="text"]')
+    ).toHaveAccessibleName('New column key');
+    await expect(
+      derived.locator('.community-annotation-settings input[type="range"]')
+    ).toHaveAccessibleName('Consensus threshold');
+    await expect(
+      derived.locator('.community-annotation-settings input[type="number"]')
+    ).toHaveAccessibleName('Min annotators');
 
-  await link.click();
-  await expect(modal).toBeVisible();
-  expect(await modal.evaluate(dialog => dialog.matches(':modal'))).toBe(true);
-  await expect(closeButton).toBeFocused();
+    alphaRow = page.locator('.legend-item', {
+      has: page.locator('.legend-label-main', { hasText: /^alpha$/ })
+    });
+    await expect(alphaRow).toHaveClass(/legend-item-annotating/);
+    const voteTrigger = alphaRow.getByRole('button', {
+      name: 'Vote on category alpha'
+    });
+    await expect(voteTrigger).toHaveAttribute('tabindex', '0');
 
-  const forward = await tabWalk(page, browserName, '#license-modal', 4);
-  expectContained(forward, 'Tab');
-  // The text (no id: named by its words) after Close, and Close again.
-  const isText = stop => stop.inside && stop.at.startsWith('Copyright');
-  expect(isText(forward[0])).toBe(true);
-  expect(forward.some(stop => stop.inside && stop.at === 'license-close-btn')).toBe(true);
-  const backward = await tabWalk(page, browserName, '#license-modal', 4, { shift: true });
-  expectContained(backward, 'Shift+Tab');
+    const highlightButton = alphaRow.getByRole('button', {
+      name: 'Highlight category alpha'
+    });
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
+    await highlightButton.click();
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
+    expect(await readGlErrorAfterFrames()).toBe(0);
+    await page.evaluate(() => {
+      window._cellucidState.clearActivePageHighlights();
+    });
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
+    expect(await readGlErrorAfterFrames()).toBe(0);
+    await highlightButton.click();
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
+    expect(await readGlErrorAfterFrames()).toBe(0);
 
-  await closeButton.click();
-  await expect(modal).toBeHidden();
-  await expect(link).toBeFocused();
+    await page.evaluate(async () => {
+      const state = window._cellucidState;
+      const fields = state.getFields();
+      const scoreIndex = fields.findIndex(field => field?.key === 'score');
+      if (scoreIndex < 0) {
+        throw new Error('Prepared fixture score field is unavailable');
+      }
+      const score = await state.ensureFieldLoaded(scoreIndex, { silent: true });
+      if (!(score?.values instanceof Float32Array)) {
+        throw new TypeError('Prepared fixture score values must be Float32');
+      }
+      state.applyContinuousFilter(
+        scoreIndex,
+        score.values[1],
+        score.values[1]
+      );
+    });
+    await expect(page.locator('#filter-count')).toHaveText(
+      'Showing 1 of 120 cells'
+    );
+    await expect(alphaRow).toHaveClass(/legend-item-disabled/);
+    await expect(alphaRow.locator('.legend-vote-trigger')).toHaveCount(0);
+    await expect(alphaRow.locator('.legend-label')).toHaveAttribute(
+      'title',
+      /Voting unavailable/
+    );
+    await expect(alphaRow.locator('.legend-checkbox')).toBeDisabled();
+    await expect(alphaRow.locator('.legend-color-input')).toBeDisabled();
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
+    await expect(highlightButton).toBeEnabled();
+    await highlightButton.click();
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
+    await expect(highlightButton).toBeDisabled();
+    expect(
+      await highlightButton.evaluate(
+        button => getComputedStyle(button).cursor
+      )
+    ).toBe('not-allowed');
 
-  await link.press('Enter');
-  await expect(modal).toBeVisible();
-  await expect(closeButton).toBeFocused();
-  await page.keyboard.press('Escape');
-  await expect(modal).toBeHidden();
-  await expect(link).toBeFocused();
+    await page.evaluate(() => {
+      const state = window._cellucidState;
+      const scoreIndex = state
+        .getFields()
+        .findIndex(field => field?.key === 'score');
+      if (scoreIndex < 0) {
+        throw new Error('Prepared fixture score field is unavailable');
+      }
+      state.resetContinuousFilter(scoreIndex);
+    });
+    await expect(page.locator('#filter-count')).toHaveText(
+      'Showing all 120 cells'
+    );
+    await expect(alphaRow).not.toHaveClass(/legend-item-disabled/);
+    await expect(
+      alphaRow.getByRole('button', { name: 'Vote on category alpha' })
+    ).toBeEnabled();
+    await expect(alphaRow.locator('.legend-label')).toHaveAttribute(
+      'title',
+      /Voting mode enabled/
+    );
+    await expect(highlightButton).toBeEnabled();
+    await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
 
-  // The backdrop: a press and a release outside the card.
-  await link.press('Enter');
-  await expect(modal).toBeVisible();
-  await page.mouse.click(4, 4);
-  await expect(modal).toBeHidden();
-  await expect(link).toBeFocused();
+    await voteTrigger.focus();
+    const openingVoteHandle = await voteTrigger.elementHandle();
+    if (openingVoteHandle === null) {
+      throw new Error('Community annotation vote trigger handle is unavailable');
+    }
+    await voteTrigger.press('Enter');
+    let dialog = page.getByRole('dialog', { name: 'Community voting' });
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByText('cell_type • alpha', { exact: true })
+    ).toBeVisible();
+    await expect(
+      dialog.getByRole('button', { name: 'Close' })
+    ).toBeFocused();
 
-  expect(productErrors).toEqual([]);
+    await page.evaluate(async () => {
+      const { getCommunityAnnotationSession } = await import(
+        '/assets/js/app/community-annotations/session.js'
+      );
+      getCommunityAnnotationSession().setAnnotatableConsensusSettings(
+        'cell_type',
+        { minAnnotators: 2, threshold: 0.5 }
+      );
+    });
+    expect(await openingVoteHandle.evaluate(element => element.isConnected)).toBe(
+      false
+    );
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    alphaRow = page.locator('.legend-item', {
+      has: page.locator('.legend-label-main', { hasText: /^alpha$/ })
+    });
+    const currentVoteTrigger = alphaRow.getByRole('button', {
+      name: 'Vote on category alpha'
+    });
+    await expect(currentVoteTrigger).toBeFocused();
+
+    await currentVoteTrigger.press('Space');
+    dialog = page.getByRole('dialog', { name: 'Community voting' });
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByText('cell_type • alpha', { exact: true })
+    ).toBeVisible();
+    await dialog.getByRole('button', { name: 'Close' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(currentVoteTrigger).toBeFocused();
+
+    await section
+      .locator('.community-annotation-identity-actions')
+      .getByRole('button', { name: 'Edit', exact: true })
+      .click();
+    const profileDialog = page.getByRole('dialog', { name: 'Your identity' });
+    await expect(profileDialog).toBeVisible();
+    await expect(
+      profileDialog.getByRole('combobox', { name: 'Name', exact: true })
+    ).toBeVisible();
+    await expect(
+      profileDialog.getByRole('textbox', {
+        name: 'Affiliation / role',
+        exact: true
+      })
+    ).toBeVisible();
+    await expect(
+      profileDialog.getByRole('textbox', { name: 'LinkedIn', exact: true })
+    ).toBeVisible();
+    await expect(
+      profileDialog.getByRole('combobox', { name: 'ORCID', exact: true })
+    ).toBeVisible();
+    await profileDialog.getByRole('button', { name: 'Close' }).click();
+
+    expect(productErrors).toEqual([]);
+  });
+  await test.step('community annotation GitHub sync controls expose exact accessible identities', async () => {
+    const section = page.locator('#community-annotation-section');
+    await section.evaluate(element => {
+      if (!(element instanceof HTMLDetailsElement)) {
+        throw new TypeError('Community annotation section must be details');
+      }
+      element.open = true;
+    });
+    await section.getByRole('button', { name: 'GitHub sync…' }).click();
+
+    const dialog = page.getByRole('dialog', { name: 'GitHub sync' });
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.locator('input[placeholder="Filter repositories…"]')
+    ).toHaveAttribute('aria-label', 'Filter repositories');
+    await expect(
+      dialog.locator('.community-annotation-auto-pull-select')
+    ).toHaveAttribute('aria-label', 'Auto pull interval');
+    await dialog.getByRole('button', { name: 'Close' }).click();
+    await expect(dialog).toHaveCount(0);
+
+    expect(productErrors).toEqual([]);
+  });
 });

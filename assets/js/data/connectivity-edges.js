@@ -110,7 +110,7 @@ const FAINTEST_STRENGTH = 2 ** -126;
  *
  * @param {Object|null} conn - A reader's `getConnectivities(key)` result
  * @param {number} nCells
- * @returns {ConnectivityEdges|null}
+ * @returns {Promise<ConnectivityEdges|null>}
  */
 export async function connectivityEdgesOf(conn, nCells) {
   if (conn === null) return null;
@@ -203,9 +203,9 @@ export async function connectivityEdgesFromLines(lines, nCells, { run = work => 
  * the built strengths let go, then the partners, so at most three of the
  * four are held (12 bytes an edge, and 4 a cell twice:
  * `connectivityEdgeBytes` `relabelCells`). Each walk a typed loop of its
- * own (`placeRelabelled`): a closure an edge, and a count after the last
- * line, made a 50% share's edges of a 10M-cell graph cost more than every
- * cell's.
+ * own (`placeRelabelled`): a closure an edge, or a count after the last
+ * line, would make a large share's edges cost more than every cell's
+ * (measured: 24_decisions_graph_edges_at_scale.md).
  *
  * @param {{edges: ConnectivityEdges & {cellOffsets: Uint32Array}|null}} held
  * @param {Uint32Array} positions
@@ -362,8 +362,8 @@ function sortEdges(partners, strengths, first, end) {
  * cell `cells[i]`'s at `neighbors[offsets[i] .. offsets[i + 1]]`, `cells`
  * distinct): the same neighbors (no self, no stored zero, open cells only),
  * ascending. Two passes over every edge, one bit a cell beside: what a large
- * k-NN frontier costs when the page holds the edges anyway (a frontier of
- * 65,536 cells of a 10M-cell file took 1.7 s from the file). Yields between
+ * k-NN frontier costs when the page holds the edges anyway (measured:
+ * 24_decisions_graph_edges_at_scale.md). Yields between
  * steps of `CONNECTIVITY_STEP_ENTRIES` edges; `signal` stops it.
  *
  * @param {ConnectivityEdges} edges
@@ -493,9 +493,10 @@ function ascends(indices, from, to) {
  * axis, a line of fewer than 2^21 entries), the rest by comparison. Lines
  * a file stores unsorted need it; a subsample's induced lines arrive with
  * each column its rank among the open rows in stored order
- * (`graph-lines.js` `inducedGraphLines`), so they stay ascending (when they
- * were renumbered to open positions, nearly every line arrived unsorted, and
- * an array and a comparator a line took 1.5 s of a 2.5M-cell share's 20 s).
+ * (`graph-lines.js` `inducedGraphLines`), so they stay ascending (renumbered
+ * to open positions, nearly every line would arrive unsorted, and an array
+ * and a comparator a line costs much of a large share's time; measured:
+ * 24_decisions_graph_edges_at_scale.md).
  */
 function lineSorter() {
   let lineIndices = new Float64Array(64);
@@ -605,8 +606,8 @@ export function connectivityEdgeBytes({ nCells, nnz, float32, relabelCells = nul
  * and is left out as a stored zero is; symmetry is unaffected, a diagonal
  * entry being its own transpose.
  *
- * Graphs too large to keep the forward adjacency in memory (100M cells,
- * scale-50m-100m.md L-12 part 2, decided, not built) keep this exact count
+ * Graphs too large to keep the forward adjacency in memory (100M cells; not
+ * built) keep this exact count
  * check and compare pairs and weights by a well-mixed keyed 128-bit hash of
  * (source, target, weight bits) summed order-independently in both directions
  * (a false pass has probability 2^-128).

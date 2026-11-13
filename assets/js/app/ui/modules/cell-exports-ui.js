@@ -143,7 +143,7 @@ export function initCellExportsUi({ state, dom, getAnnDataSource, notifications,
   // A button follows the field its select names, not whether the select is
   // enabled: the field selector disables both selects while the chosen
   // field loads and enables them after, with no event, so a button tied to
-  // that stayed disabled after every choice. An export of a field still
+  // that would stay disabled after every choice. An export of a field still
   // loading waits for it (`fieldCsv`).
   const refreshFields = () => {
     dom.categoricalExportButton.disabled = selectedIndex(dom.categoricalSelect) < 0;

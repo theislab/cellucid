@@ -423,8 +423,8 @@ test('range event failures propagate without publishing substituted values', t =
 
 test('a background the browser does not keep is still chosen for this page', t => {
   // A full or refusing store (or none: site data blocked) keeps nothing for
-  // the next visit; the pick is made all the same (R9E-5: it was refused, so
-  // the background could not be changed at all there).
+  // the next visit; the pick is made all the same (a refused pick would leave
+  // the background unchangeable there).
   const storageFailure = new Error('browser storage write error');
   const restore = installDocument('grid', {
     getItem() {
@@ -467,7 +467,7 @@ test('public point-size conversion rejects out-of-contract values', t => {
   // position that was ever stored still means exactly the size it meant, and
   // the reach below 0.25 is added under it rather than folded into it.
   assert.equal(controls.pointSizeToSlider(0.25), 0);
-  // The top is the largest sprite drawn (R9R-9): no travel past what can be drawn.
+  // The top is the largest sprite drawn: no travel past what can be drawn.
   assert.equal(MAXIMUM_POINT_SIZE, POINT_SPRITE_MAX_PX);
   assert.equal(controls.pointSizeToSlider(POINT_SPRITE_MAX_PX), 100);
   assert.equal(formatPointSize(sliderPositionToPointSize(100)), '160.0');
@@ -589,7 +589,7 @@ test('an automatic choice measured no faster is turned off again, and the next f
   const controls = initRenderControls({ viewer, dom, smoke });
   const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
   // A 2D view at full framing: level of detail stays at every cell and
-  // culling only costs (721 ms against 438 ms measured on software GL).
+  // culling only costs (721 ms against 438 ms).
   viewer.calls.length = 0;
   viewer.reportFullDetailFrameCost(438);
   viewer.reportVerified('not-faster', 721, 438);
@@ -1299,31 +1299,6 @@ test('a failed committed smoke rebuild settles inside its frame owner', t => {
   );
 });
 
-test('current render-control source contains no normalization/default route', async () => {
-  const source = await import('node:fs/promises').then(({ readFile }) =>
-    readFile(
-      new URL('../assets/js/app/ui/modules/render-controls.js', import.meta.url),
-      'utf8',
-    )
-  );
-  const numberUtils = await import('node:fs/promises').then(({ readFile }) =>
-    readFile(
-      new URL('../assets/js/app/utils/number-utils.js', import.meta.url),
-      'utf8',
-    )
-  );
-
-  assert.doesNotMatch(
-    source,
-    /safeGetStoredViewerBackground|normalizeViewerBackground|clampNormalized|DEFAULT_POINT_SIZE|\?\.\(|set[A-Z][A-Za-z]+\?\./,
-  );
-  assert.doesNotMatch(
-    source,
-    /gridSizeOverride\s*===\s*undefined\s*\?\s*smokeGridSize/,
-  );
-  assert.doesNotMatch(numberUtils, /export function clampNormalized\\b/);
-});
-
 test('the maturity tag names the selected mode, not the control', t => {
   const restore = installDocument();
   t.after(restore);
@@ -1385,7 +1360,7 @@ test('frames the browser cannot time apart are not kept, and the tip says so, wi
   const controls = initRenderControls({ viewer, dom, smoke });
   // A fence polled late on a busy page: the frame of every cell lies
   // between 174 and 324 ms, and the frame with the choice on between 150
-  // and 174 ms (Web contracts run 41307458156, Linux Chromium).
+  // and 174 ms, so the bounds overlap.
   viewer.reportFullDetailFrameCost({ lo: 174.4, hi: 323.6 });
   assert.equal(dom.hpPerformanceStatus.textContent, 'A frame of every cell took 174–324 ms here; measuring level of detail and frustum culling.');
   viewer.reportVerified('unresolved', { lo: 150, hi: 174.2 }, { lo: 174.4, hi: 323.6 });

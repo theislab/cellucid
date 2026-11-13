@@ -252,10 +252,15 @@ test('failure reporting cannot erase the published UI lifecycle failure', async 
 });
 
 test('main awaits every published dataset UI settlement owner', async () => {
-  const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
-    'utf8'
-  );
+  // Every module that publishes a runtime, the one that declares the
+  // settlement helper first: the publication, a dataset change, the start-up, the benchmark.
+  const sources = await Promise.all([
+    'app/dataset/publication.js',
+    'app/dataset/reload.js',
+    'app/main.js',
+    'app/ui/modules/benchmark/benchmark-controls.js',
+  ].map(file => readFile(new URL(`../assets/js/${file}`, import.meta.url), 'utf8')));
+  const mainSource = sources.join('\n');
   const settlementCalls = [
     ...mainSource.matchAll(/\bsettlePublishedDatasetUi\s*\(\{/g)
   ];

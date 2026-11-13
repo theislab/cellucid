@@ -9,8 +9,7 @@
  *
  * A sprite is `mix(u_pointSize, u_pointSize · pointScale / eyeDepth, a)`
  * pixels (a: the perspective size scaling), clamped to
- * `[POINT_SPRITE_MIN_PX, cap]`. `POINT_SPRITE_MAX_PX` (160 px; 128 until
- * 2026-11-11, raised by the owner, F97) bounds the sprite of a cell near the
+ * `[POINT_SPRITE_MIN_PX, cap]`. `POINT_SPRITE_MAX_PX` (160 px) bounds the sprite of a cell near the
  * camera. It is the only fixed number; the GPU's own largest point
  * (`ALIASED_POINT_SIZE_RANGE`) bounds it from above wherever that is smaller
  * (`pointSpriteCap`), never more: asking for a larger point than the driver
@@ -20,12 +19,9 @@
  * same share of the figure as of the screen.
  *
  * Nothing else depends on the camera's distance: a cell near the camera is
- * drawn whole and opaque, and picked, like any other. A near fade toward the
- * orbit target (an ordered-dither opacity from 0.5 to 0.2 of the focus
- * distance, F97) was shipped and removed the same day on the owner's
- * decision (2026-11-11: near cells must not fade); the browser spec
+ * drawn whole and opaque, and picked, like any other (the browser spec
  * `point-near-camera-solid.spec.mjs` fails if any distance-based fade or
- * shrink returns.
+ * shrink returns; 28_decisions_rendering_layers.md).
  */
 
 /** The smallest sprite drawn, in the pixels drawn into. */

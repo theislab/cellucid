@@ -19,7 +19,7 @@ import { opfsOnDisk, createLocks } from './helpers/opfs-on-disk.mjs';
 import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
 import { httpByteSource } from '../assets/js/formats/io/byte-source.js';
 import { confirmFileVersion, flushKeptParts, keptPartsOf, withKeptParts } from '../assets/js/formats/io/kept-parts.js';
-import { parseKeptJournal } from '../assets/js/data/anndata/transcode/space.js';
+import { parseKeptJournal } from '../assets/js/data/anndata/transcode/kept-journal.js';
 import { ResponseClock } from '../assets/js/formats/io/link.js';
 import { until } from './helpers/until.mjs';
 

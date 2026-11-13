@@ -1,6 +1,6 @@
 # `app/history/exports/`: a history in words
 
-**Owns:** the pure text a history is shared as, made from History v2 records
+**Owns:** the pure text a history is shared as, made from the history's records
 (`app/history/model.js`): how a step is said (`step-text.js`: who acted, the
 parts of the state it changed, its parameters as facts, what a squashed step
 stands for, the path an export covers and its runs of grouped steps), the

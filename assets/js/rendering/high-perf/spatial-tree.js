@@ -289,7 +289,8 @@ export function requirePrebuiltSpatialTree(tree, pointCount) {
 /**
  * The tree as a few typed arrays, for the worker's reply: a structured clone
  * of the node objects costs about a microsecond a node on the receiving
- * thread (38,568 nodes of a 10M-point octree: 35 ms in one task), while the
+ * thread (tens of thousands of nodes for 10M points; measured:
+ * 28_decisions_rendering_layers.md), while the
  * arrays are transferred, not copied. `decodeSpatialTree` rebuilds the same
  * tree. Call it after the draw order numbered the tree (`leafStart`,
  * `leafEnd`, `drawUnit`) and after its leaves' ids were packed into one

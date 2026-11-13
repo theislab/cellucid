@@ -15,9 +15,9 @@
  * **Easing is how the path starts and ends**: from rest (`ease-in`), to rest
  * (`ease-out`), both (`ease-in-out`), or moving at once and to the last
  * frame (`linear`). It never stretches one transition at another's expense.
- * (Until 0.9.8 it warped the whole timeline, so a 5 s transition in the
- * middle of an eased path played in 2.6 s and the first one took twice its
- * time, and the bar's marks were not where the keyframes were.)
+ * (Warping the whole timeline would play a transition in the middle of an
+ * eased path faster than its time and the first one slower, and the bar's
+ * marks would not be where the keyframes are.)
  *
  * **The Catmull-Rom spline is the cinematic one**: a cubic through every
  * keyframe whose velocity is continuous across keyframes, with tangents
@@ -475,8 +475,8 @@ export function resolvePathTiming(keyframes, autoPaceSpeed) {
  * each keyframe and announces every mutation, and the playback controller stops
  * on that announcement, so the path cannot change under a running loop. Proving
  * the schema again on each frame therefore costs work proportional to the path
- * length without being able to reach a different answer — a 100-keyframe path
- * re-derived 1,200 key arrays per frame. The plan moves that proof to the one
+ * length without being able to reach a different answer (a 100-keyframe path
+ * would re-derive 1,200 key arrays per frame). The plan moves that proof to the one
  * place where the input can actually differ.
  *
  * @param {import('./keyframe-store.js').Keyframe[]} keyframes

@@ -1,5 +1,5 @@
 /**
- * History v2 §3.15.1: paused. "Discard and go" discards the paused changes
+ * Paused. "Discard and go" discards the paused changes
  * for good (leaving the tracker and coming back never brings them back);
  * resuming a paused tracker not in use (a reload kept its draft) keeps its
  * draft as one squashed step against its own head.

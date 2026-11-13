@@ -115,7 +115,7 @@ export function unsupportedFilters(filters) {
  * on some platforms stored it with its 16-bit halves byte-swapped; the
  * library accepts both, and so does this.
  */
-export function verifyFletcher32(input, label) {
+function verifyFletcher32(input, label) {
   if (input.length < 4) throw new Hdf5FormatError(`${label} is too short to hold its Fletcher-32 checksum.`);
   const data = input.subarray(0, input.length - 4);
   const end = input.length - 4;

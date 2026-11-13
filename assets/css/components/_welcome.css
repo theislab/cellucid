@@ -255,7 +255,7 @@
   font-size: var(--type-compact);
   font-weight: var(--font-weight-medium);
   /* The quieter text token, not a faded one: secondary text at 60% fell to
-     2.87:1 on the light card (lens-a11y LF-7). */
+     2.87:1 on the light card. */
   color: var(--color-text-tertiary);
   margin-bottom: var(--space-1);
 }

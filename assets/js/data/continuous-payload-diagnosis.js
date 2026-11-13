@@ -11,13 +11,13 @@
  *
  * Refusing is the easy half. The hard half is saying *why* in a way the person
  * looking at the screen can act on, and that is what this module exists for.
- * The failure it describes used to surface as
+ * A bare check would report the failure as
  *
  *     Continuous field value 4118237 must be finite or NaN.
  *
  * which names a flat index into an array the reader never showed anyone, does
  * not name the field, does not say whether the offender was an infinity or how
- * many there were, and does not say what to do. What replaces it names the
+ * many there were, and does not say what to do. This module's message names the
  * field, counts each kind of offending value, gives the first few cell indices,
  * and says which one line of Python or R fixes it.
  *
@@ -265,10 +265,10 @@ export function explainContinuousPayloadFailure({ subject, error }) {
     return `${noun} "${owner.name}" could not be loaded.\n${message}`;
   }
   const classified = TRANSPORT_FAILURES[status] ?? null;
-  const detail = typeof error.serverDetail === 'string'
-    && error.serverDetail.length > 0
-    ? error.serverDetail
-    : null;
+  // The host's own words, kept with the status by the read that failed
+  // (`formats/io/byte-source.js`, `details.words`).
+  const said = error.details?.words;
+  const detail = typeof said === 'string' && said.length > 0 ? said : null;
   const lines = [
     `${noun} "${owner.name}" could not be loaded: the server answered `
     + `${status}.`,

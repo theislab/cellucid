@@ -688,9 +688,9 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         }),
       ];
 
-      // Build the previous split-RGBA/baked-alpha layout against the same
+      // Build the baked-alpha split-RGBA reference layout against the same
       // pooled position owner. It is diagnostic-only, but its exact pixels
-      // prove the new RGB+R8 publication preserves the old visual contract.
+      // prove the RGB+R8 publication preserves the reference's visual contract.
       // The pooled store holds its points in its tree's draw order, so the
       // baked colors are laid out in that order too.
       const drawOrder = renderer.getViewDrawOrder('snapshot-r8');
@@ -819,7 +819,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         legacyPixels,
       );
 
-      // Preserve the original 32-draw timing sample while keeping each
+      // Time a sample of 32 draws, keeping each
       // synchronous submission batch below browser/driver watchdog windows.
       // Excluding frame-service time keeps the diagnostic about draw work.
       const drawsPerBatch = 8;

@@ -1,9 +1,9 @@
 /**
- * History v2 §3.3.9: restoring from Recently deleted. An exact restore is
+ * Restoring from Recently deleted. An exact restore is
  * tried on the records, checked whole and kept only when valid (else the
  * entry is restored as new); a step added below one since and a move since
  * leave it exact. Undoing a rename whose old name was taken since is
- * refused with the name to use instead (§5 #51). A restore as new applies
+ * refused with the name to use instead. A restore as new applies
  * every removed step again (a squash's run in full, from its before-patch),
  * hangs a sub-branch on its restored parent, says the branch it made and
  * the report, and is itself journaled, so it can be undone.

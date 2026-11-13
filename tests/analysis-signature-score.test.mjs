@@ -157,7 +157,7 @@ test('signature scoring without a caller ownership predicate reads its columns',
 test('a signature whose pages have no cell genes are read for says so plainly, and scores a page that has some', async () => {
   const { DataLayer } = await import('../assets/js/app/analysis/data/data-layer.js');
   const { MultiVariableAnalysis } = await import('../assets/js/app/analysis/stats/multi-variable-analysis.js');
-  // Genes are read for the first 2 of 6 open cells (HLCA core: 1,678 of 584,944).
+  // Genes are read for the first 2 of 6 open cells (a gene sample of a large atlas).
   const pages = [
     { id: 'far', name: 'Far', highlightedGroups: [{ id: 'g1', type: 'lasso', label: 'g1', enabled: true, cellIndices: [3, 4, 5], cellCount: 3 }] },
     { id: 'near', name: 'Near', highlightedGroups: [{ id: 'g2', type: 'lasso', label: 'g2', enabled: true, cellIndices: [1, 4], cellCount: 2 }] },

@@ -135,8 +135,8 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     // This is a module-publication contract, not a smoke throughput test. Use
     // every real minimum-cost control: grid size bounds density construction,
     // while ray steps and offscreen resolution bound the full-screen work that
-    // otherwise monopolizes a software/native Firefox main thread. The old
-    // test changed only grid size, which does not reduce fragment count.
+    // otherwise monopolizes a software/native Firefox main thread. Grid size
+    // alone does not reduce fragment count.
     await page.evaluate(controlIds => {
       for (const id of controlIds) {
         const input = document.getElementById(id);
@@ -159,9 +159,10 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     await page.locator('#benchmark-section > summary').click();
     await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
     // Visible live statistics are the production readiness boundary. The
-    // configuration-matrix harness has a separate reachability suite and must
-    // not hold this UI or synthetic generation hostage while its larger graph
-    // is parsed. Its request still starts exactly once from the same activation.
+    // configuration-matrix harness must not hold this UI or synthetic
+    // generation hostage while its larger graph is parsed: its publication is
+    // awaited last. Its request still starts exactly once from the same
+    // activation.
     await expect(page.locator('#benchmark-stats')).toBeVisible();
     await expect(page.locator('#bench-points')).toHaveText('120');
     await expect.poll(async () => ({
@@ -175,6 +176,11 @@ test.describe.serial('GLB benchmark runtime publication', () => {
       performanceTrackerModuleRequests: 1,
       supportModuleRequests: 0,
     });
+    // The harness module that activation asked for is published on the page
+    // once it has loaded.
+    await expect
+      .poll(() => page.evaluate(() => typeof window._cellucidBenchmarkHarness))
+      .toBe('object');
   });
 
   test('GLB benchmark publishes one complete state generation', PROCESS_INTENSIVE, async ({}, testInfo) => {
@@ -213,12 +219,12 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     // frame (`stats.samples > 1`), so a number here proves frames were measured
     // and published — which is what a publication contract owes.
     //
-    // It used to require that number to be greater than zero, which is an
-    // assertion about how fast the host renders, not about publication: the
+    // The number is not required to be greater than zero: that is an
+    // assertion about how fast the host renders, not about publication. The
     // reading is frames per second, so any host slower than one frame per second
-    // publishes a truthful `0` and fails. A hosted macOS Firefox runner, where
+    // publishes a truthful `0`. A hosted macOS Firefox runner, where
     // the VM has no GPU and the fragment stage runs on the CPU at 1440x1000, is
-    // slower than that often enough to fail two runs in three.
+    // that slow.
     await expect.poll(async () => {
       const text = await page.locator('#bench-fps').textContent();
       const value = Number.parseFloat(text);
@@ -268,6 +274,21 @@ test.describe.serial('GLB benchmark runtime publication', () => {
       ),
       fullPage: true
     });
+    expect(browserErrors).toEqual([]);
+  });
+
+  test('a dataset opened after a synthetic run is the one the panel describes', PROCESS_INTENSIVE, async () => {
+    if (page === null || browserErrors === null) {
+      throw new Error('GLB benchmark runtime owner was not initialized.');
+    }
+
+    await expect(page.locator('#bench-points')).toHaveText('1K');
+    await page.locator('#dataset-select').selectOption('__none__');
+    await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount)).toBe(0);
+    await expect(page.locator('#bench-points')).toHaveText('0');
+    await page.locator('#dataset-select').selectOption('dataset:local-demo:current-ui');
+    await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+    await expect(page.locator('#bench-points')).toHaveText('120');
     expect(browserErrors).toEqual([]);
   });
 });

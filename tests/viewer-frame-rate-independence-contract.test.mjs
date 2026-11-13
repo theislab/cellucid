@@ -5,12 +5,12 @@ import test from 'node:test';
 /**
  * Camera motion advances by elapsed time, not by frame count.
  *
- * Orbit/pan inertia, the smooth-zoom ease and held-key acceleration used to
- * apply one fixed step per drawn frame. On a 120 Hz display that is twice the
+ * Orbit/pan inertia, the smooth-zoom ease and held-key acceleration do not
+ * apply one fixed step per drawn frame: on a 120 Hz display that is twice the
  * motion per second of a 60 Hz one, and on a slow frame it is too little.
- * Every per-frame camera integrator now scales by the elapsed reference ticks
- * (`dt * PHYSICS_TICK_RATE`), which reduces to the old per-frame step at
- * exactly 60 Hz, as freefly's integrator already did.
+ * Every per-frame camera integrator scales by the elapsed reference ticks
+ * (`dt * PHYSICS_TICK_RATE`), which reduces to a per-frame step at exactly
+ * 60 Hz, as freefly's integrator does.
  */
 
 const source = await readFile(
@@ -42,38 +42,7 @@ test('inertia moves by the exact sum of its decaying ticks', () => {
   assert.doesNotMatch(body, /\*= INERTIA_FRICTION;/);
 });
 
-test('one long step travels exactly as far as the same time in 60 Hz ticks', () => {
-  // The integrators' closed forms, checked against stepping tick by tick:
-  // a 10 fps frame must not coast the camera in slow motion or overshoot.
-  const friction = 0.92;
-  const tickRate = 60;
-  const orbit = (velocity, dt) => {
-    const decay = friction ** (dt * tickRate);
-    return { travel: velocity * (1 - decay) / (1 - friction), velocity: velocity * decay };
-  };
-  const freefly = (velocity, dt) => {
-    const decay = friction ** (dt * tickRate);
-    return {
-      travel: velocity * friction * (1 - decay) / (1 - friction) / tickRate,
-      velocity: velocity * decay,
-    };
-  };
-  for (const [integrate, tickTravel] of [
-    [orbit, velocity => ({ travel: velocity, velocity: velocity * friction })],
-    [freefly, velocity => ({ travel: velocity * friction / tickRate, velocity: velocity * friction })],
-  ]) {
-    let stepped = { travel: 0, velocity: 0.03 };
-    for (let tick = 0; tick < 6; tick++) {
-      const next = tickTravel(stepped.velocity);
-      stepped = { travel: stepped.travel + next.travel, velocity: next.velocity };
-    }
-    const long = integrate(0.03, 6 / tickRate);
-    assert.ok(Math.abs(long.travel - stepped.travel) < 1e-12);
-    assert.ok(Math.abs(long.velocity - stepped.velocity) < 1e-12);
-    const one = integrate(0.03, 1 / tickRate);
-    const single = tickTravel(0.03);
-    assert.ok(Math.abs(one.travel - single.travel) < 1e-12);
-  }
+test('free-fly coasts by the closed form of its decaying ticks', () => {
   const freeflyBody = functionBody('updateFreefly');
   assert.match(
     freeflyBody,

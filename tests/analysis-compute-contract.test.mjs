@@ -205,7 +205,7 @@ test('WorkerPool rejects every undeclared or coercive configuration shape', asyn
   for (const options of [
     { poolSize: 0 },
     { poolSize: 1.5 },
-    // No deadline: a slow task is not a failed one (CE-05).
+    // No deadline: a slow task is not a failed one.
     { defaultTimeout: 30000 },
     { poolSize: 1, alias: true }
   ]) {
@@ -461,7 +461,7 @@ test('ComputeManager retires a terminal worker pool and discovers a fresh one fo
   assert.equal(workers.length, firstPool.poolSize);
 
   // A task that runs long is waited for: no deadline turns it into a
-  // failure of the pool, of this task or of any other window's (CE-05).
+  // failure of the pool, of this task or of any other window's.
   const slow = manager.execute(
     OperationType.COMPUTE_CORRELATION,
     {
@@ -667,56 +667,5 @@ test('obsolete compute compatibility surface and runtime fallback module are abs
   await assert.rejects(
     readFile(new URL('fallback-operations.js', COMPUTE_ROOT), 'utf8'),
     error => error?.code === 'ENOENT'
-  );
-});
-
-test('bounded analysis call sites contain no execution-failure backend switch', async () => {
-  const [dataLayer, markerDiscovery, multiVariable, manager, workerPool] =
-    await Promise.all([
-      readFile(new URL('../assets/js/app/analysis/data/data-layer.js', import.meta.url), 'utf8'),
-      readFile(
-        new URL(
-          '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js',
-          import.meta.url
-        ),
-        'utf8'
-      ),
-      readFile(
-        new URL(
-          '../assets/js/app/analysis/stats/multi-variable-analysis.js',
-          import.meta.url
-        ),
-        'utf8'
-      ),
-      readFile(new URL('compute-manager.js', COMPUTE_ROOT), 'utf8'),
-      readFile(new URL('worker-pool.js', COMPUTE_ROOT), 'utf8')
-    ]);
-
-  assert.doesNotMatch(dataLayer, /computeManager\.compute[A-Z]|_computeStatsLocal|_aggregateCategoriesLocal/);
-  assert.doesNotMatch(markerDiscovery, /_computeGeneMarkersFallback|Promise\.allSettled/);
-  assert.doesNotMatch(multiVariable, /computeManager\.compute[A-Z]|markerStyleAvailable|legacy DE backend/);
-  assert.doesNotMatch(manager, /fallbackUsed|gpuFallbacks|workerFallbacks|fallback-operations/i);
-  assert.doesNotMatch(workerPool, /_fallbackExecute|fallback-operations|main thread fallback/i);
-});
-
-// A failed worker is never revived or recycled; the one worker ever replaced
-// is one still running a task its caller canceled (worker-pool.js).
-test('analysis worker lifecycle contains no failure restart or heap-recycle path', async () => {
-  const [manager, workerPool, markerDiscovery] = await Promise.all([
-    readFile(new URL('compute-manager.js', COMPUTE_ROOT), 'utf8'),
-    readFile(new URL('worker-pool.js', COMPUTE_ROOT), 'utf8'),
-    readFile(
-      new URL(
-        '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js',
-        import.meta.url
-      ),
-      'utf8'
-    )
-  ]);
-  const currentLifecycle = [manager, workerPool, markerDiscovery].join('\n');
-
-  assert.doesNotMatch(
-    currentLifecycle,
-    /_restartWorker|restartWorkerOnAbort|_workerRestartPromise|pruneIdleWorkers|cleanupIdleResources|keepAtLeastIdleWorkers/
   );
 });

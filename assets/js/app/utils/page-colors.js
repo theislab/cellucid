@@ -41,10 +41,9 @@ export function getPageColor(pageIndex) {
  * The color a new highlight page takes beside the pages there are: the
  * default of its place (`getPageColor`) when it can be told apart from every
  * page's color (`distinct-colors.js`), else the first of the page colors,
- * then of the category colors, that can. Before, a page took the default of
- * the page count: after a page was removed the next one repeated a remaining
- * page's color, the thirteenth repeated the first, and the ninth (rose) read
- * as the second (red).
+ * then of the category colors, that can. (The default of the page count would
+ * repeat a remaining page's color after a page was removed, repeat the first
+ * on the thirteenth, and make the ninth (rose) read as the second (red).)
  *
  * @param {ReadonlyArray<string>} pageColors - The pages' `#rrggbb` colors
  * @returns {string} `#rrggbb`

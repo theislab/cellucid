@@ -82,7 +82,7 @@ test('the share of a cell-major matrix a subsample reads is the share of its chu
   assert.equal(keptChunkShare(pointers, Uint32Array.from([1, 2]), 6), 2 / 5);
 });
 
-test('a link names the cells asked for, never a growing opening\'s step (F60)', () => {
+test('a link names the cells asked for, never a growing opening\'s step', () => {
   const uniform = { method: 'uniform', k: 131072, seed: 0 };
   const share = { method: 'uniform', k: 300000, seed: 7 };
   // A dataset opened whole, growing from its first 131,072 cells: every cell.
@@ -100,7 +100,7 @@ test('a link names the cells asked for, never a growing opening\'s step (F60)', 
   assert.equal(linkedSubsampleSpec(null), null);
 });
 
-test('a chunked growth step is named by its share\'s size, the same for a link and the session (F64)', async () => {
+test('a chunked growth step is named by its share\'s size, the same for a link and the session', async () => {
   const { openCellsValueOf } = await import('../assets/js/app/state/domains/cells.js');
   const spec = { method: 'uniform', k: 4096, seed: 3 };
   const chunkedStep = { nObs: 100000, kept: new Uint32Array(3), spec, autoFit: null, reproduced: null, chunks: { target: 30000 } };

@@ -1,8 +1,7 @@
 // What the person has published, what is not published yet, and an agent's
-// votes and suggestions published alone (B1 and should-fix 4 of the community
-// annotation UI audit, 2026-11-05): they write the file as published plus
+// votes and suggestions published alone: they write the file as published plus
 // them, never the person's drafts; votes that change nothing write nothing.
-// One call is one composed file, so one commit (bug hunt F145).
+// One call is one composed file, so one commit.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -63,7 +62,7 @@ test('a vote alone is the published view plus that vote, nothing else', () => {
   assert.equal(withChanges(published, { ...who }), published, 'no changes: unchanged');
 });
 
-test('many votes and suggestions are one composed file: the published view plus all of them, nothing else (F145)', () => {
+test('many votes and suggestions are one composed file: the published view plus all of them, nothing else', () => {
   const published = view();
   const gamma = { id: 'ghid_42_g', label: 'Gamma cell', proposedBy: 'ghid_42', proposedAt: NOW, ontologyId: 'CL:0000173', evidence: 'Sst+', editedAt: null, markers: null };
   const delta = { id: 'ghid_42_d', label: 'Delta cell ✓ δ-Zelle', proposedBy: 'ghid_42', proposedAt: NOW, ontologyId: null, evidence: null, editedAt: null, markers: null };

@@ -14,10 +14,6 @@ import {
 } from '../assets/js/rendering/viewer/presented-view-layout.js';
 import { placeSelectBar } from '../assets/js/app/ui/modules/select-bar-placement.js';
 
-const VIEWER_URL = new URL(
-  '../assets/js/rendering/viewer.js',
-  import.meta.url,
-);
 const SIDEBAR_LAYOUT_URL = new URL(
   '../assets/js/app/ui/core/sidebar-layout.js',
   import.meta.url,
@@ -201,19 +197,6 @@ test('presented layout respects a sidebar covering nearly the whole canvas', () 
   assert.ok(single.panes[0].visibleCssWidth > 0);
 });
 
-test('the viewer resolves its layout only on geometry change and maps every pane through it', async () => {
-  const source = await readFile(VIEWER_URL, 'utf8');
-  assert.doesNotMatch(source, /cachedGridProjection/);
-  assert.doesNotMatch(source, /computePaneCenterNdcX|getProjectionCenterNdcX/);
-  assert.doesNotMatch(source, /Math\.ceil\(Math\.sqrt\(viewCount\)\)/);
-  assert.match(source, /function getPresentedLayout\(\)/);
-  assert.match(
-    source,
-    /presentedLayoutKey\.leftOcclusionRatio === viewportLeftOcclusionRatio/,
-  );
-  assert.match(source, /getPresentedPaneAtCssPoint\(layout, localX, localY\)/);
-});
-
 test('the sidebar keeps the open presented area until its slide animation ends', async () => {
   const source = await readFile(SIDEBAR_CONTROLS_URL, 'utf8');
   assert.match(source, /sidebar\.getAnimations\(\)\.length > 0/);
@@ -255,7 +238,7 @@ test('the hidden sidebar is inert', async () => {
 
 test('grid panes keep a usable size: the arrangement follows the presented area\'s shape (phone upright, wide screen)', () => {
   // A 390 × 700 phone held upright, no sidebar over the canvas: three views
-  // stack, each the full width (found 2026-11-11: three ~120 px panes in one row).
+  // stack, each the full width (not three ~120 px panes in one row).
   const phone = (viewIds, leftOcclusionRatio = 0) => resolvePresentedLayout({
     canvasHeight: 2100, canvasWidth: 1170, cssHeight: 700, cssWidth: 390,
     focusedViewId: viewIds[0], leftOcclusionRatio, mode: 'grid', viewIds,

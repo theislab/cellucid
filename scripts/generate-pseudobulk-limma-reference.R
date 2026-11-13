@@ -1,14 +1,12 @@
 # Pseudobulk differential expression references: edgeR TMM + log-CPM and
 # limma lmFit + eBayes(trend = TRUE), on fixed small fixtures.
 #
-# Writes tests/fixtures/analysis/pseudobulk-limma-reference.json and its
-# SHA-256 (pseudobulk-limma-reference.json.sha256). The web app's pseudobulk
+# Writes tests/fixtures/analysis/pseudobulk-limma-reference.json. The web app's pseudobulk
 # fit (assets/js/app/analysis/stats/pseudobulk.js, limma.js,
 # edger-normalization.js) is held to every number in it at 1e-6 by
 # tests/analysis-pseudobulk-limma.test.mjs.
 #
-# Run from the web repository with Bioconductor edgeR and limma installed
-# (the workspace's R environment has them: .environments/bootstrap.sh r):
+# Run from the web repository with Bioconductor edgeR and limma installed:
 #
 #     Rscript scripts/generate-pseudobulk-limma-reference.R
 #
@@ -236,6 +234,4 @@ document <- list(
 text <- toJSON(document, auto_unbox = TRUE, digits = NA, null = "null", na = "null", pretty = FALSE)
 dir.create(dirname(out), recursive = TRUE, showWarnings = FALSE)
 writeLines(text, out, sep = "")
-digest <- sub(" .*", "", system2("shasum", c("-a", "256", shQuote(out)), stdout = TRUE))
-writeLines(paste0(digest, "  ", basename(out)), paste0(out, ".sha256"))
-cat("wrote", out, digest, "\n")
+cat("wrote", out, "\n")

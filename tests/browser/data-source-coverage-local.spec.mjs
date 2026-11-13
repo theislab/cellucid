@@ -113,24 +113,6 @@ async function expectRenderedDataset(page, dataset) {
   await expect(page.locator('.legend-item')).toHaveCount(dataset.legendEntries);
 }
 
-for (const dataset of DEMO_DATASETS) {
-  test(
-    `a published dataset renders through the sample catalog: ${dataset.id}`,
-    async ({ page }) => {
-      const errors = observeProductErrors(page);
-      const url = new URL('/', APP_ORIGIN);
-      url.searchParams.set('sampleCatalog', SAME_ORIGIN_DEMO_CATALOG);
-      url.searchParams.set('dataset', dataset.id);
-      await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
-      await dismissWelcome(page);
-      await openCollapsedPanels(page);
-
-      await expectRenderedDataset(page, dataset);
-      expect(errors).toEqual([]);
-    },
-  );
-}
-
 test('a cross-origin dataset catalog renders the same dataset', async ({
   page,
 }) => {

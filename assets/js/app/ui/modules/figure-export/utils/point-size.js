@@ -30,9 +30,9 @@ import { pointSpriteSize } from '../../../../../rendering/point-sprite.js';
  * draws every cell 1.7x too large; at the smallest point size the same floor is
  * 5.1x. The minimum that does keep a point visible is the shaders' own
  * (`POINT_SPRITE_MIN_PX`, rendering/point-sprite.js), which is applied to
- * the rendered size where it belongs. The PNG renderer floored and the hybrid-SVG renderer did
- * not, so the same view exported twice disagreed with itself; both now resolve
- * the size here.
+ * the rendered size where it belongs. The PNG and the hybrid-SVG renderers
+ * both resolve the size here, so the same view exported in either agrees with
+ * itself.
  *
  * @param {number} diameterViewportPx - `pointSize x lodSizeMultiplier`
  * @param {number} viewportScale - raster pixels per viewport pixel
@@ -80,9 +80,9 @@ function paneFrame(renderState) {
  * the camera is drawn larger than one far away. The vector strategies draw
  * their circles at this size (times the plot's scale), as the shader-drawn
  * PNG and Hybrid points are, so a 3-D figure keeps the sizes the screen
- * shows. (Found 2026-11-11, L6-1: the vector circles took `u_pointSize` as
- * the pixel diameter, so with the default attenuation of 0.8 a 3-D figure's
- * cells were specks where the screen showed spheres several times larger.)
+ * shows. A circle that took `u_pointSize` as the pixel diameter would draw a
+ * 3-D figure's cells as specks where the screen shows spheres several times
+ * larger.
  *
  * @param {{ viewMatrix: ArrayLike<number>, modelMatrix: ArrayLike<number>,
  *   lightDir: ArrayLike<number>, viewportHeight: number, fov: number,

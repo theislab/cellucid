@@ -77,44 +77,48 @@ function compareDraws(page) {
   });
 }
 
-for (const [label, every] of [['every cell', 1], ['every other cell', 2]]) {
-  test(`highlights of ${label} drawn from the point store are the highlights drawn from records`, async ({ page }) => {
-    test.setTimeout(300_000);
-    await loadAtlas(page);
-    await page.evaluate(({ pointCount, every, level }) => {
-      const viewer = window._cellucidViewer;
-      viewer.setAntialiasing(false);
-      viewer.setAdaptiveLOD(true);
-      viewer.setFrustumCulling(false);
-      viewer.setForceLOD(level);
-      viewer.setPulseLayerCaching(false);
-      viewer.setHighlightAnimationTime(12.375);
-      const cells = new Uint32Array(Math.ceil(pointCount / every));
-      for (let i = 0; i < cells.length; i++) cells[i] = i * every;
-      window._cellucidState.addHighlightDirect({ type: 'annotation', label: 'store', cellIndices: cells });
-    }, { pointCount: POINT_COUNT, every, level: LEVEL });
-    // The tree has landed and the store drawn in its order at the level.
-    await expect
-      .poll(() => page.evaluate(() => window._cellucidViewer.getCurrentLODLevel('live')), { timeout: 60_000 })
-      .toBe(LEVEL);
-    // Nothing but the pulse still changes the frame (fades, bakes, levels).
-    await expect
-      .poll(() => page.evaluate(() => {
-      // A pulse frame drawn, only the pulse left, and no change still owed a
-      // frame (the cause of the last frame drawn alone says nothing of that).
-      const schedule = window._cellucidViewer.getFrameScheduleState();
-      return schedule.lastCause === 'highlight' && schedule.animationCause === 'highlight' && !schedule.invalidated
-        ? 'highlight'
-        : `${schedule.lastCause}/${schedule.animationCause}${schedule.invalidated ? '/invalidated' : ''}`;
-    }), { timeout: 60_000 })
-      .toBe('highlight');
-    const result = await compareDraws(page);
-    expect(result.recordViews).toBe(0);
-    expect(result.storeViews).toBe(1);
-    expect(result.lit).toBeGreaterThan(1_000);
-    expect(
-      result.mismatched,
-      `${result.mismatched} of ${result.lit} lit pixels differ, max delta ${result.maxDelta}, first ${JSON.stringify(result.first)}`
-    ).toBe(0);
-  });
-}
+test('highlights drawn from the point store are the highlights drawn from records', async ({ page }) => {
+  test.setTimeout(300_000);
+  await loadAtlas(page);
+  for (const [label, every] of [['every cell', 1], ['every other cell', 2]]) {
+    await test.step(`highlights of ${label} drawn from the point store are the highlights drawn from records`, async () => {
+      await page.evaluate(({ pointCount, every, level }) => {
+        const viewer = window._cellucidViewer;
+        // One highlight at a time: the one of the step before is removed.
+        window._cellucidState.clearHighlightsOnAllPages();
+        viewer.setAntialiasing(false);
+        viewer.setAdaptiveLOD(true);
+        viewer.setFrustumCulling(false);
+        viewer.setForceLOD(level);
+        viewer.setPulseLayerCaching(false);
+        viewer.setHighlightAnimationTime(12.375);
+        const cells = new Uint32Array(Math.ceil(pointCount / every));
+        for (let i = 0; i < cells.length; i++) cells[i] = i * every;
+        window._cellucidState.addHighlightDirect({ type: 'annotation', label: 'store', cellIndices: cells });
+      }, { pointCount: POINT_COUNT, every, level: LEVEL });
+      // The tree has landed and the store drawn in its order at the level.
+      await expect
+        .poll(() => page.evaluate(() => window._cellucidViewer.getCurrentLODLevel('live')), { timeout: 60_000 })
+        .toBe(LEVEL);
+      // Nothing but the pulse still changes the frame (fades, bakes, levels).
+      await expect
+        .poll(() => page.evaluate(() => {
+        // A pulse frame drawn, only the pulse left, and no change still owed a
+        // frame (the cause of the last frame drawn alone says nothing of that).
+        const schedule = window._cellucidViewer.getFrameScheduleState();
+        return schedule.lastCause === 'highlight' && schedule.animationCause === 'highlight' && !schedule.invalidated
+          ? 'highlight'
+          : `${schedule.lastCause}/${schedule.animationCause}${schedule.invalidated ? '/invalidated' : ''}`;
+      }), { timeout: 60_000 })
+        .toBe('highlight');
+      const result = await compareDraws(page);
+      expect(result.recordViews).toBe(0);
+      expect(result.storeViews).toBe(1);
+      expect(result.lit).toBeGreaterThan(1_000);
+      expect(
+        result.mismatched,
+        `${result.mismatched} of ${result.lit} lit pixels differ, max delta ${result.maxDelta}, first ${JSON.stringify(result.first)}`
+      ).toBe(0);
+    });
+  }
+});

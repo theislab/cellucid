@@ -104,7 +104,7 @@ function requireTrimmedString(value, label) {
  * dispatches: its display name (`categoryDisplayName`: `(empty)`, `(blank)`,
  * `" x "` for one with white space at an end), which every step resolves
  * (`targets/fields.js` `resolveCategory`). An action naming a category by an
- * empty name was refused ("must have at least 1 character"), so a category
+ * empty name is refused ("must have at least 1 character"), so a category
  * with no name could not be hidden, colored, merged or renamed.
  */
 function formatCategoryLabel(value) {
@@ -144,8 +144,8 @@ export function computeTopConsensusSummary(session, fieldKey, catIdx) {
     }
     const net = up - down;
     // The consensus's rank (`session.js` `consensusOf`): net votes, then
-    // upvotes; equal on both is a tie (bug hunt R9A-2: by net alone, the
-    // legend named a tie the voting dialog's banner did not).
+    // upvotes; equal on both is a tie (by net alone, the legend would name a tie
+    // the voting dialog's banner does not).
     if (bestNet === null || net > bestNet || (net === bestNet && up > bestUp)) {
       bestNet = net;
       bestUp = up;
@@ -800,8 +800,8 @@ export function initCategoricalLegend(options) {
       // A redraw of the field shown (a rename, a vote, a count, a choice of
       // the field it is already colored by) keeps the list where the person
       // scrolled it: every redraw builds the list anew, and a new list starts
-      // at its top (found 2026-11-12: in a 70,000-category legend a redraw a
-      // moment after a scroll to row 65,536 put the list back at row 1).
+      // at its top, so a redraw a moment after a scroll would put a long legend
+      // back at its first row.
       const sameField = renderedField !== null && renderedField.key === field.key
         && renderedField.categories?.length === field.categories?.length;
       const scrollTop = sameField
@@ -1043,7 +1043,7 @@ export function initCategoricalLegend(options) {
     const labels = categories.map(formatCategoryLabel);
     // The field's own category order, as the file (Scanpy), the Group
     // dialog, the figure legend and the analysis plots show it: a trajectory
-    // stays in its order, groups in the order they were typed (F124).
+    // stays in its order, groups in the order they were typed.
     const rowIndices = categories.map((_category, idx) => idx);
 
     // Community annotation keys the field and its categories on the

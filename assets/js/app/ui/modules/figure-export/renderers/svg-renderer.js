@@ -222,7 +222,7 @@ async function rasterizePointsToDataUrl(session, {
   }
 
   // The points are drawn at 300 dpi at the figure's size, as a 300 DPI PNG is: the resolution
-  // journals ask of images (found 2026-11-10: a fixed 2×, ~192 dpi).
+  // journals ask of images, not a fixed 2× of the screen.
   const rasterScale = HYBRID_RASTER_DPI / CSS_PX_PER_INCH;
   const pxW = Math.round(plotRect.width * rasterScale);
   const pxH = Math.round(plotRect.height * rasterScale);

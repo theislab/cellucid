@@ -63,9 +63,10 @@ test('a remote link is reported as measured, and not before', () => {
 
 test('a read is priced at the link\'s round trip under load, not its shortest; large reads sharing the bandwidth do not lengthen it', () => {
   // S3 us-west-2 from Europe: the shortest request 230 ms, a small request
-  // 0.35-0.5 s with 42 in flight. Priced at the shortest, an .h5ad export of
-  // 21,285 cells said 198 s and took 271-386 s (`linkReadMs`). The object
-  // on its seven S3 addresses: 42 connections, every request on one.
+  // 0.35-0.5 s with 42 in flight. Priced at the shortest, an .h5ad export's
+  // time falls far short of the real one (`linkReadMs`; measured:
+  // 22_decisions_link_model_and_request_planning.md). The object on its
+  // seven S3 addresses: 42 connections, every request on one.
   let now = 0;
   const link = new LinkMeter({ ...REMOTE_POLICY, concurrency: 42 }, { clock: () => now });
   // A first read measures the round trip and a rate (3 MB/s).
@@ -214,8 +215,9 @@ test('a remembered host link seeds the first guess only: the visit\'s own measur
 test('a file on seven addresses (six connections each) is measured at its round trip: time waiting for a connection is no round trip, and the host is not taken to multiplex', () => {
   // A public S3 object: its own host and six mirrors, HTTP/1.1, 235 ms.
   // Requests dispatched at the streams (100) wait in the browser for one of
-  // the 42 connections; measured from dispatch, they looked like 0.6-1.3 s
-  // round trips and a multiplexing host (Genes read for at 100% priced ~10x).
+  // the 42 connections; measured from dispatch, they would look like 0.6-1.3 s
+  // round trips and a multiplexing host, pricing Genes read for at 100% about
+  // 10x too high (measured: 22_decisions_link_model_and_request_planning.md).
   let now = 0;
   const meter = new LinkMeter({ ...REMOTE_POLICY, concurrency: 6 * 7 }, { clock: () => now });
   const slots = new Array(42).fill(0);
@@ -280,9 +282,9 @@ test('the var field loader reaches the open dataset\'s measurement through its a
 });
 
 test('connection setup is no part of the round trip under load, and a host that completes only so many requests a second prices each at its rate', () => {
-  // CELLxGENE's S3 mirrors from Europe, as an export measured them: 42
-  // connections, 365 ms a small request once they are open, the first
-  // requests 883 ms (each also set up its connection).
+  // CELLxGENE's S3 mirrors from Europe: 42 connections, 365 ms a small
+  // request once they are open, the first requests 883 ms (each also set up
+  // its connection).
   let now = 0;
   const link = new LinkMeter({ ...REMOTE_POLICY, concurrency: 42 }, { clock: () => now });
   // One of them a large read: the bandwidth (4 MB/s) is known, and a small

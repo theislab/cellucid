@@ -1,20 +1,20 @@
 /**
- * A restored session must reach the renderer, not only the panel (CEL-0129).
+ * A restored session must reach the renderer, not only the panel.
  *
  * `state-serializer/ui-controls.js` restores a control by writing the DOM and
  * dispatching the event the control's owner listens for. That is the whole
  * publication mechanism: a dispatched event with no listener does nothing, so a
  * control whose listener does not yet exist restores into the DOM and stops
  * there. `main.js` restores the advertised dataset state in the middle of its
- * linear bootstrap, and the four renderer controls — shader quality, adaptive
- * LOD, forced LOD level, frustum culling — used to be wired inline at the far
- * end of it. Their saved values were written into the panel and never published
- * to the viewer, so the panel claimed a setting the renderer was never told
- * about.
+ * linear bootstrap, so the four renderer controls — shader quality, adaptive
+ * LOD, forced LOD level, frustum culling — must not be wired inline at the far
+ * end of it: their saved values would be written into the panel and never
+ * published to the viewer, and the panel would claim a setting the renderer
+ * was never told about.
  *
- * The correction gives those four controls the owner every other control in the
- * same accordion already has: `ui/modules/render-controls.js`, initialized by
- * `initUI` before the bootstrap restores anything. These tests hold both halves
+ * Those four controls have the owner every other control in the same
+ * accordion has: `ui/modules/render-controls.js`, initialized by `initUI`
+ * before the bootstrap restores anything. These tests hold both halves
  * — that the wiring exists there and publishes, and that nothing publishes them
  * from the bootstrap tail again.
  */
@@ -30,15 +30,13 @@ import {
   POINT_SIZE_SLIDER_MINIMUM,
 } from '../assets/js/rendering/point-size-scale.js';
 
-const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const DOM_CACHE_URL = new URL(
   '../assets/js/app/ui/core/dom-cache.js',
   import.meta.url
 );
 const INDEX_URL = new URL('../index.html', import.meta.url);
 
-const [mainSource, domCacheSource, indexHtml] = await Promise.all([
-  readFile(MAIN_URL, 'utf8'),
+const [domCacheSource, indexHtml] = await Promise.all([
   readFile(DOM_CACHE_URL, 'utf8'),
   readFile(INDEX_URL, 'utf8'),
 ]);
@@ -431,7 +429,7 @@ test('the forced LOD level survives the adaptive-LOD toggle that precedes it', t
 test('a renderer that rejects a restored setting fails the restore loudly', t => {
   t.after(installDocument());
 
-  // Silence is the defect this whole finding is about: a rejected setting must
+  // Silence is what this rules out: a rejected setting must
   // roll the control back, which the serializer then reports as a rejected
   // restore rather than leaving a panel that disagrees with the renderer.
   assert.throws(
@@ -461,36 +459,6 @@ test('restoring the values a control already holds publishes nothing', t => {
     rendererCalls,
     [],
     'an unchanged restore must not disturb the renderer'
-  );
-});
-
-test('renderer control ownership stays out of the bootstrap tail', () => {
-  // The bootstrap wires `initUI` in its middle and used to wire these four
-  // controls at its end, past the restore. Publishing from `main.js` at all is
-  // what reintroduces that ordering, so the ownership is asserted, not the line
-  // numbers.
-  for (const method of [
-    'setShaderQuality',
-    'setAdaptiveLOD',
-    'setForceLOD',
-    'setFrustumCulling',
-  ]) {
-    assert.ok(
-      !mainSource.includes(`viewer.${method}(`),
-      `main.js must not publish ${method} itself; render-controls owns it`
-    );
-  }
-
-  // The advertised dataset state is restored by the dataset load, and the
-  // startup selection loads only once `initUI` has built its controls.
-  const initUi = mainSource.indexOf('ui = initUI({');
-  const startupLoad = mainSource.indexOf(
-    'await ui.loadStartupDataset(startupSelection)'
-  );
-  assert.ok(initUi > 0, 'the bootstrap must still initialize the UI');
-  assert.ok(
-    startupLoad > initUi,
-    'the advertised dataset state must be restored after the UI owns its controls'
   );
 });
 

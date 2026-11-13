@@ -1,9 +1,8 @@
 /**
- * L20-2 (live every-action sweep, History group): `history.replay` never
- * answered, the turn's Stop did not end it, and the undo after it waited
- * forever. A Stop must reach every wait of a replay: reading the saved state
- * (a read: it ends at once, the source cancelled), waiting for its turn
- * (it never runs), and between the steps it applies; and the history's
+ * `history.replay` answers, the turn's Stop ends it, and the undo after it
+ * does not wait forever. A Stop must reach every wait of a replay: reading the
+ * saved state (a read: it ends at once, the source cancelled), waiting for its
+ * turn (it never runs), and between the steps it applies; and the history's
  * exclusive lock is free again however the replay ends (stopped, refused,
  * failed), so the next move runs.
  *
@@ -167,7 +166,7 @@ test('a replay whose step is refused, fails or is stopped between steps ends, an
 test('a history.share stopped while it waits (for an action still running, or for the session operation before it) ends at once and frees the session', async () => {
   const { SessionSerializer } = await import('../assets/js/app/session/session-serializer.js');
   const stuck = deferred();
-  const dispatcher = { idle: () => stuck.promise };
+  const dispatcher = { whenApplied: () => stuck.promise };
   const serializer = new SessionSerializer({ state: {}, dataSourceManager: null, getHistory: () => null, dispatcher, onLoaded: () => {} });
   // Waiting for the actions still running.
   const first = new AbortController();

@@ -1,25 +1,24 @@
 /**
- * Antialiasing is a live render setting whose default comes from the dataset
- * (CEL-0213).
+ * Antialiasing is a live render setting whose default comes from the dataset.
  *
- * It was neither of those things. `antialias` is a WebGL context-creation
- * attribute, `rendering/viewer.js` fixed it in its single `getContext` call, and
- * Cellucid has no path to a second context — so the setting was a stored
- * preference read once before the viewer existed, and the control told the user
- * it applied on the next load. That was honest about the constraint and wrong
- * about the product: multisampling is the difference between a view that turns
- * and one that does not at millions of cells, costs nothing worth measuring at a
- * few thousand, and datasets are switched in place with no reload, so the right
+ * `antialias` is a WebGL context-creation attribute, and Cellucid has no path
+ * to a second context, so a context-time setting would be a stored preference
+ * read once before the viewer exists, with a control that says it applies on
+ * the next load. That is honest about the constraint and wrong about the
+ * product: multisampling is the difference between a view that turns and one
+ * that does not at millions of cells, costs nothing worth measuring at a few
+ * thousand, and datasets are switched in place with no reload, so the right
  * answer changes while the page is open.
  *
- * `rendering/scene-msaa-target.js` moved multisampling into a renderbuffer the
+ * `rendering/scene-msaa-target.js` holds multisampling in a renderbuffer the
  * application owns and blits, so the drawing buffer is single-sampled and the
  * app owns the switch. Four things are held here:
  *
- *   - the preference has three states, not two, and the third is `auto` — which
+ *   - the preference has three states, not two, and the third is `auto` - which
  *     is what an absent key means, and what defers to the cell count;
  *   - the viewer must not take antialiasing as a construction argument, and must
- *     not create a multisampled drawing buffer, or the old constraint returns;
+ *     not create a multisampled drawing buffer, or the context-time constraint
+ *     returns;
  *   - the control must publish to the viewer rather than only to storage, and an
  *     explicit click must end automatic selection in both directions;
  *   - a session must still capture the control and must still not apply it: it
@@ -53,7 +52,7 @@ import {
 } from '../assets/js/rendering/point-size-scale.js';
 import { infoTipText } from './helpers/info-tip-text.mjs';
 
-const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
+const PUBLICATION_URL = new URL('../assets/js/app/dataset/publication.js', import.meta.url);
 const VIEWER_URL = new URL('../assets/js/rendering/viewer.js', import.meta.url);
 const DOM_CACHE_URL = new URL(
   '../assets/js/app/ui/core/dom-cache.js',
@@ -71,14 +70,14 @@ const COORDINATOR_URL = new URL(
 );
 
 const [
-  mainSource,
+  publicationSource,
   viewerSource,
   domCacheSource,
   indexHtml,
   smokeRendererSource,
   coordinatorSource,
 ] = await Promise.all([
-  readFile(MAIN_URL, 'utf8'),
+  readFile(PUBLICATION_URL, 'utf8'),
   readFile(VIEWER_URL, 'utf8'),
   readFile(DOM_CACHE_URL, 'utf8'),
   readFile(INDEX_URL, 'utf8'),
@@ -211,8 +210,8 @@ test('the automatic answer turns over at five million cells in 3D', () => {
 
 test('a flat view turns automatic antialiasing over far earlier', () => {
   // A 1D or 2D view draws without depth testing, so every overlapping point is
-  // blended, per sample under multisampling: orbiting 1M cells in 2D measured a
-  // GPU timer total of 25.5 ms a frame antialiased against 11.6 ms without.
+  // blended, per sample under multisampling, so the cost is much higher than in 3D
+  // (measured: 28_decisions_rendering_layers.md).
   assert.equal(AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT, 200_000);
   for (const dimension of [1, 2]) {
     assert.equal(automaticAntialiasing(3_696, dimension), true);
@@ -296,29 +295,14 @@ test('nothing mid-frame binds the default framebuffer behind the target', () => 
   );
 });
 
-test('the bootstrap no longer reads the preference at all', () => {
-  // One reader, and it is the control that owns the setting. Reading it in the
-  // bootstrap too would be a second answer to the same question, resolved
-  // before the cell count that decides it is known.
-  assert.equal(
-    (mainSource.match(/resolveAntialiasPreference\(/g) ?? []).length,
-    0,
-    'the bootstrap must not resolve the antialiasing preference'
-  );
-  assert.ok(
-    !/createViewer\(\{[^}]*antialias/s.test(mainSource),
-    'the viewer must not be constructed with an antialiasing value'
-  );
-});
-
 test('the dataset re-decides antialiasing on every publication', () => {
   // Datasets are switched in place, so a page that opened on four thousand cells
   // and now holds eighteen million has to answer for the eighteen million.
   // A progressive opening (`app/open-cells-resize.js`) is drawn from its
   // first view as the cells it grows to.
   assert.match(
-    mainSource,
-    /ui\.applyDatasetRenderDefaults\(\s*shownAnnDataSource\(\)\?\.getCellSubset\?\.\(\)\?\.growth\?\.target\s*\?\? publication\.stage\.generation\.identity\.stats\.n_cells,\s*publication\.stage\.generation\.identity\.embeddings\.default_dimension/,
+    publicationSource,
+    /getUi\(\)\.applyDatasetRenderDefaults\(\s*shownAnnDataSource\(\)\?\.getCellSubset\?\.\(\)\?\.growth\?\.target\s*\?\? publication\.stage\.generation\.identity\.stats\.n_cells,\s*publication\.stage\.generation\.identity\.embeddings\.default_dimension/,
     'the cell count must reach the render defaults'
   );
   assert.match(
@@ -679,8 +663,8 @@ test('a browser that refuses multisampling is reported as a refusal', t => {
 
 test('a preference the browser does not keep is made for this page', t => {
   // A full or refusing store (or none: site data blocked) keeps nothing for
-  // the next visit, but the person's click is still the choice (R9E-5: it was
-  // rolled back, so antialiasing could not be changed at all there).
+  // the next visit, but the person's click is still the choice (a click rolled back
+  // would leave antialiasing unchangeable there).
   const storage = makeStorage();
   t.after(installDocument(storage));
 
@@ -716,11 +700,11 @@ function savedSession() {
 }
 
 test('a session is restored without touching the antialiasing preference', () => {
-  // The defect this replaces: a restore dispatched `change`, the owner
-  // persisted it, and a session became the last writer of a device preference.
-  // Every sample publishes an advertised default state, so turning
-  // antialiasing off and reloading re-applied the saved value and stored it -
-  // the setting could never stay off.
+  // A restore must not dispatch `change`: the owner would persist it, and a
+  // session would become the last writer of a device preference. Every sample
+  // publishes an advertised default state, so turning antialiasing off and
+  // reloading would re-apply the saved value and store it - the setting could
+  // never stay off.
   for (const chosen of ['on', 'off']) {
     const storage = makeStorage();
     const restoreDocument = installDocument(storage);
@@ -858,8 +842,8 @@ test('the control closes the Performance group, outside every block smoke mode h
 });
 
 test('the tooltip states both halves of the trade', () => {
-  // A scientific viewer must not present this as a free speed-up. The measured
-  // cost in pixels belongs where the user makes the choice.
+  // A scientific viewer must not present this as a free speed-up. The cost in
+  // pixels belongs where the user makes the choice.
   const tooltip = infoTipText(indexHtml, 'antialias-info-tooltip');
   assert.match(tooltip, /faster/, 'the speed the user gains must be stated');
   assert.match(tooltip, /pixels change/, 'the picture the user loses must be stated beside it');

@@ -2,29 +2,30 @@
  * The dockable panel system must read its owners, never keep copies of them.
  *
  * Four things about a floating panel are owned somewhere else, and
- * `dockable-accordions.js` used to keep a private copy of each:
+ * `dockable-accordions.js` must not keep a private copy of any:
  *
- * - **Which panel is on top.** A `zIndexCounter` counted this module's own
- *   calls, but `--z-layer` on the panels is what the browser stacks by. When a
- *   saved layout still carried each panel's layer and its restore wrote it
- *   directly, the counter was back at its base while the restored panels sat
- *   far above it, so every panel torn off afterwards opened *behind* them and
- *   clicking it raised it by one from the same stale base — it could never be
- *   brought to the front. A layout now holds no layer at all (the `layout`
- *   state domain, `state/domains/layout.js`), and the stack is still read from
- *   the panels.
+ * - **Which panel is on top.** `--z-layer` on the panels is what the browser
+ *   stacks by; a counter of this module's own calls would be back at its base
+ *   after a restore that wrote a saved layer directly, while the restored
+ *   panels sat far above it, so every panel torn off afterwards would open
+ *   *behind* them and clicking it would raise it by one from the same stale
+ *   base: it could never be brought to the front. A layout holds no layer at
+ *   all (the `layout` state domain, `state/domains/layout.js`), and the stack
+ *   is read from the panels.
  * - **Where a panel belongs when docked.** The placeholder holds the slot, and
- *   whether to leave one was passed in by the caller rather than read off the
- *   panel. A layout restore floats a panel that is standing in the sidebar but
- *   shares an entry point with analysis windows, which have no slot, so a
- *   restored panel docked to the end of the sidebar instead of to its place.
+ *   whether to leave one is read off the panel, not passed in by the caller. A
+ *   layout restore floats a panel that is standing in the sidebar but shares
+ *   an entry point with analysis windows, which have no slot; were that passed
+ *   in, a restored panel would dock to the end of the sidebar instead of to
+ *   its place.
  * - **How big a panel is.** `--pos-width/height` is the panel's box;
  *   `getBoundingClientRect()` is what the stylesheet drew, and the stylesheet
- *   forces `height: auto` on a collapsed panel. Capturing the measurement threw
- *   away the size a collapsed panel would reopen at.
- * - **Whether a gesture was a drag.** `suppressNextClick` was armed on
- *   pointerup and disarmed only by the click that followed. A canceled pointer
- *   produces no click, so the flag survived to eat the user's next real one.
+ *   forces `height: auto` on a collapsed panel. Capturing the measurement
+ *   would throw away the size a collapsed panel reopens at.
+ * - **Whether a gesture was a drag.** `suppressNextClick` is armed on
+ *   pointerup and disarmed only by the click that follows. A canceled pointer
+ *   produces no click, so a flag with no other disarm would survive to eat the
+ *   user's next real one.
  *
  * The DOM here is a fake, but the rules it models are copied from
  * `assets/css/components/_accordion.css`: a panel stands in a frame, a floating
@@ -561,7 +562,7 @@ function layoutOf(sidebar, dockable) {
     showSidebar() { throw new Error('the sidebar is not shown or hidden in these cases'); },
     setSidebarWidth() { throw new Error('the sidebar is not resized in these cases'); },
   };
-  return createLayoutDomain({ sidebar, getDockable: () => dockable, analysis: async () => null, sidebarLayout });
+  return createLayoutDomain({ sidebar, getDockable: () => dockable, analysis: () => null, analysisArrived: async () => null, sidebarLayout });
 }
 
 /** One floating panel of a layout value: its id and its box. */
@@ -1180,8 +1181,8 @@ test(
 test(
   'Dock all shows while a section floats and docks each into its own slot',
   async (t) => {
-    // F126 (bug hunt): with its sections undocked the sidebar stayed a column
-    // of logo and footer, and the way back was each window's own button.
+    // With its sections undocked the sidebar is not left a column of logo and
+    // footer with each window's own button as the way back.
     const doc = installDom(t);
     const { sidebar, accordion, panels } = buildSidebar(doc, ['alpha', 'beta', 'gamma']);
     const dispatcher = freshActions();
@@ -1264,10 +1265,10 @@ test(
 test(
   'the windows\' height cap and their clamp take one area: the visible screen',
   async (t) => {
-    // F126 (bug hunt): the CSS cap took the screen's height from `100dvh`
-    // and the area's edges from the dockable owner, two measures; and a
-    // phone's keyboard shortens only the visual viewport, so a window behind
-    // it was out of reach. The owner publishes the area's height it clamps by.
+    // The CSS cap must not take the screen's height from `100dvh` and the
+    // area's edges from the dockable owner, two measures; and a phone's
+    // keyboard shortens only the visual viewport, so a window behind it would
+    // be out of reach. The owner publishes the area's height it clamps by.
     const doc = installDom(t, { viewportWidth: 1600, viewportHeight: 900 });
     const listeners = new Map();
     const visual = {

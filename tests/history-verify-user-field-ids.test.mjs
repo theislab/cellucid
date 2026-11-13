@@ -1,14 +1,14 @@
 /**
  * Verify compares a replay with its branch but for generated ids, in every
- * domain (live pass 3, L12-12). A step that makes a user field ("Grouped
+ * domain. A step that makes a user field ("Grouped
  * clusters … as stage") gives it a new generated id each time it runs, and
  * other domains name the field by that id (its colors, a filter of it, a
- * view colored by it). Only `field-overlays` renamed its ids for the
- * comparison, so every branch that made a field and colored or filtered it
- * was reported "not reproduced" ("user_cat_…: default color for Endocrine;
- * stage: recolored Endocrine"), and a delete applied such steps again for an
- * input that had not changed. A value now names each user field as the
- * `field-overlays` value of its state names it (`user_1`, …).
+ * view colored by it). A value names each user field as the
+ * `field-overlays` value of its state names it (`user_1`, …), in every domain
+ * and not in `field-overlays` alone: otherwise every branch that made a field
+ * and colored or filtered it is reported "not reproduced" ("user_cat_…:
+ * default color for Endocrine; stage: recolored Endocrine"), and a delete
+ * applies such steps again for an input that has not changed.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

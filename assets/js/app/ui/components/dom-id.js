@@ -18,7 +18,7 @@
 /**
  * The separator a minted id, and only a minted id, holds: `<prefix>--<n>`.
  * No id written by hand in the page or the sources holds it, and no prefix
- * does (`tests/dom-id-contract.test.mjs`), so an id holding it was minted on
+ * does (`tests/dom-id-owner-contract.test.mjs`), so an id holding it was minted on
  * this page, or made from one (`<minted>-trigger`, `<scope>-method`): it
  * names nothing on another page. Recognized by its form, nothing is kept per
  * id minted.

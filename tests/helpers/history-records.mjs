@@ -1,5 +1,5 @@
 /**
- * History v2 records for the persistence tests (the session file, the share
+ * History records for the persistence tests (the session file, the share
  * scope, the autosave), made with the model's own constructors
  * (`app/history/model.js`) and independent of the history controller:
  *

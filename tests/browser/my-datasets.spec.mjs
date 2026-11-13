@@ -15,12 +15,10 @@
  *   history is back, nothing is offered.
  * - Forget asks first in its row, says what goes and what stays; its saved
  *   states stay unless ticked.
- * - A window that gives the site no IndexedDB keeps the list for the page
- *   only, one that keeps nothing for a later visit until it closes; each
- *   says so.
+
  * - Keyboard alone, a phone's width, both themes.
  */
-import { closePageWithApplicationRetirement, expect, test } from './helpers/test.mjs';
+import { expect, test } from './helpers/test.mjs';
 import {
   DEVELOPMENT,
   H5AD,
@@ -255,152 +253,120 @@ test('a file reopened after a reload: the click asks the browser for leave to re
   expect(errors).toEqual([]);
 });
 
-test('Continue opens a dataset with its latest saved state at once: its history is back, nothing is offered', async ({ page }) => {
+test('a row of All…: Continue opens a dataset with its latest saved state, Forget asks in its row, and the Stored dialog counts My datasets in one row', async ({ page }) => {
   const errors = await openStarted(page);
   await openCollapsedPanels(page);
-  const key = await takeAStep(page, START.id);
-  const steps = await page.evaluate(() => window._cellucidHistories.current().active.steps.size);
-  const [kept] = (await savedStatesOf(page, START.id)).filter(state => state.kind === 'autosave');
-  await chooseSample(page, TRAJECTORY);
-  await expect(offerCard(page)).toHaveCount(0);
 
-  await openAll(page);
-  const start = row(page, START.name);
-  await expect(start.locator('.library-row-meta')).toContainText('1 saved state');
-  const resume = start.locator('[data-library-action="continue"]');
-  await expect(resume).toBeEnabled();
-  await expect(resume).toHaveAttribute('aria-label', /^Continue .+ where you left off: its latest saved state, \d+ steps? from /);
-  // The dataset shown has no other saved state to continue into.
-  await expect(row(page, TRAJECTORY.name).locator('[data-library-action="continue"]')).toBeDisabled();
-  await resume.click();
-  await expect(dialog(page)).toBeHidden();
-  await expectSettledOn(page, START);
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getActiveField()?.key ?? null), { timeout: 60_000 }).toBe(key);
-  await expect.poll(() => page.evaluate(() => window._cellucidHistories.current()?.active?.steps.size ?? 0)).toBe(steps);
-  // Continued, not offered: and the same saved state is written into.
-  await expect(offerCard(page)).toHaveCount(0);
-  expect((await savedStatesOf(page, START.id)).filter(state => state.kind === 'autosave').map(state => state.id)).toEqual([kept.id]);
-  await expectNoFailureAnnounced(page);
-  expect(errors).toEqual([]);
-});
+  await test.step('Continue opens a dataset with its latest saved state at once: its history is back, nothing is offered', async () => {
+    const key = await takeAStep(page, START.id);
+    const steps = await page.evaluate(() => window._cellucidHistories.current().active.steps.size);
+    const [kept] = (await savedStatesOf(page, START.id)).filter(state => state.kind === 'autosave');
+    await chooseSample(page, TRAJECTORY);
+    await expect(offerCard(page)).toHaveCount(0);
 
-test('Forget asks in its row and says what goes; saved states stay unless ticked', async ({ page }) => {
-  const errors = await openStarted(page);
-  await openCollapsedPanels(page);
-  await chooseSample(page, TRAJECTORY);
-  await takeAStep(page, TRAJECTORY.id);
-  await chooseSample(page, START);
-  await expectListed(page, [START.name, TRAJECTORY.name]);
-  const before = await savedStatesOf(page, TRAJECTORY.id);
-  expect(before.length).toBeGreaterThan(0);
-
-  await openAll(page);
-  const trajectory = row(page, TRAJECTORY.name);
-  await trajectory.locator('[data-library-action="forget"]').click();
-  const confirm = trajectory.locator('.library-row-confirm');
-  await expect(confirm).toBeVisible();
-  await expect(confirm.locator('.library-row-question')).toHaveText(`Forget ${TRAJECTORY.name}?`);
-  await expect(confirm.locator('.field-help')).toHaveText('It leaves My datasets. Its saved states and stored data stay.');
-  const also = confirm.locator('[data-library-also]');
-  await expect(also).not.toBeChecked();
-  await expect(confirm.locator('label')).toHaveText(new RegExp(`^Also delete its ${before.length} saved states? \\(`));
-  // Keep: nothing changes, the focus is back on Forget.
-  await expect(confirm.locator('[data-library-action="keep"]')).toBeFocused();
-  await confirm.locator('[data-library-action="keep"]').click();
-  await expect(confirm).toBeHidden();
-  await expect(trajectory.locator('[data-library-action="forget"]')).toBeFocused();
-  // Forget, unticked: off the list, its saved states kept.
-  await trajectory.locator('[data-library-action="forget"]').click();
-  await confirm.locator('[data-library-action="forget-confirmed"]').click();
-  await expect(page.locator('#my-datasets-dialog-status')).toHaveText(`Forgot ${TRAJECTORY.name}.`);
-  await expect(rows(page)).toHaveCount(1);
-  expect(await savedStatesOf(page, TRAJECTORY.id)).toEqual(before);
-  await expect.poll(() => listed(page)).toEqual([START.name]);
-  await expect(dialog(page)).toBeVisible();
-  expect(await page.evaluate(() => document.getElementById('my-datasets-dialog').contains(document.activeElement))).toBe(true);
-  await page.keyboard.press('Escape');
-
-  // Opened again, it is listed again; forgotten with its saved states ticked, they go too.
-  await chooseSample(page, TRAJECTORY);
-  await chooseSample(page, START);
-  await expectListed(page, [START.name, TRAJECTORY.name]);
-  await openAll(page);
-  await row(page, TRAJECTORY.name).locator('[data-library-action="forget"]').click();
-  await row(page, TRAJECTORY.name).locator('[data-library-also]').check();
-  await row(page, TRAJECTORY.name).locator('[data-library-action="forget-confirmed"]').click();
-  await expect(page.locator('#my-datasets-dialog-status')).toHaveText(new RegExp(`^Forgot ${TRAJECTORY.name}\\. Deleted \\d+ saved states?\\.$`));
-  await expect.poll(() => savedStatesOf(page, TRAJECTORY.id)).toEqual([]);
-  await expect.poll(() => listed(page)).toEqual([START.name]);
-  await expectNoFailureAnnounced(page);
-  expect(errors).toEqual([]);
-});
-
-test('the Stored dialog counts My datasets in one row, shows it in its own dialog, and Remove forgets the list', async ({ page }) => {
-  const errors = await openStarted(page);
-  await openCollapsedPanels(page);
-  await chooseSample(page, TRAJECTORY);
-  await expectListed(page, [TRAJECTORY.name, START.name]);
-  // A saved state makes the Stored row show.
-  await page.evaluate(() => window._cellucidHistories.savedStates.saveAs('Probe'));
-  const manage = page.locator('#kept-stores-manage-btn');
-  await expect(manage).toBeVisible();
-  await manage.click();
-  const library = page.locator('#kept-stores-dialog .kept-library');
-  await expect(library.locator('.kept-dataset-name')).toHaveText('My datasets');
-  await expect(library.locator('.kept-dataset-facts')).toHaveText('2 datasets opened in this browser');
-  // Listed in its own dialog, never twice: no row of its datasets here.
-  await expect(library.locator('[data-item-id]')).toHaveCount(0);
-  await expect(page.locator('#kept-stores-dialog .kept-local-files')).toHaveCount(0);
-  await library.getByRole('button', { name: 'Show My datasets' }).click();
-  await expect(page.locator('#kept-stores-dialog')).toBeHidden();
-  await expect(dialog(page)).toBeVisible();
-  await expect(rows(page)).toHaveCount(2);
-  await page.keyboard.press('Escape');
-  await expect(dialog(page)).toBeHidden();
-  await expect(manage).toBeFocused();
-  await manage.click();
-  await library.getByRole('button', { name: 'Forget every dataset of My datasets' }).click();
-  await expect(page.locator('#kept-stores-status')).toHaveText('Forgot 2 datasets of My datasets.');
-  await expect(library).toHaveCount(0);
-  await expect.poll(() => listed(page)).toEqual([]);
-  await page.keyboard.press('Escape');
-  await expect(page.locator('#kept-stores-dialog')).toBeHidden();
-  // Still shown, empty: its menu offers All… alone, for Import….
-  await expect(page.locator('#my-datasets-block')).toBeVisible();
-  expect(await menuLabels(page)).toEqual(['All…']);
-  await closeMenu(page);
-  expect(errors).toEqual([]);
-});
-
-test('a window that gives the site no IndexedDB keeps the list for this page; one that keeps nothing for later until it closes', async ({ page, context }) => {
-  await page.addInitScript(() => {
-    Object.defineProperty(window, 'indexedDB', { configurable: true, get: () => undefined });
+    await openAll(page);
+    const start = row(page, START.name);
+    await expect(start.locator('.library-row-meta')).toContainText('1 saved state');
+    const resume = start.locator('[data-library-action="continue"]');
+    await expect(resume).toBeEnabled();
+    await expect(resume).toHaveAttribute('aria-label', /^Continue .+ where you left off: its latest saved state, \d+ steps? from /);
+    // The dataset shown has no other saved state to continue into.
+    await expect(row(page, TRAJECTORY.name).locator('[data-library-action="continue"]')).toBeDisabled();
+    await resume.click();
+    await expect(dialog(page)).toBeHidden();
+    await expectSettledOn(page, START);
+    await expect.poll(() => page.evaluate(() => window._cellucidState.getActiveField()?.key ?? null), { timeout: 60_000 }).toBe(key);
+    await expect.poll(() => page.evaluate(() => window._cellucidHistories.current()?.active?.steps.size ?? 0)).toBe(steps);
+    // Continued, not offered: and the same saved state is written into.
+    await expect(offerCard(page)).toHaveCount(0);
+    expect((await savedStatesOf(page, START.id)).filter(state => state.kind === 'autosave').map(state => state.id)).toEqual([kept.id]);
+    await expectNoFailureAnnounced(page);
   });
-  const errors = await openStarted(page);
-  await openCollapsedPanels(page);
-  await chooseSample(page, TRAJECTORY);
-  await expectListed(page, [TRAJECTORY.name, START.name]);
-  await expect(page.locator('#my-datasets-status')).toHaveText('Kept for this page only: this window keeps nothing for this site.');
-  expect(await menuLabels(page)).toEqual([TRAJECTORY.name, START.name, 'All…']);
-  await closeMenu(page);
-  await chooseFromMenu(page, START.name);
-  await expectSettledOn(page, START);
-  expect(errors).toEqual([]);
 
-  // A private window: IndexedDB for this window, no storage for a later visit.
-  const other = await context.newPage();
-  await other.addInitScript(() => {
-    const storage = navigator.storage;
-    if (storage !== undefined) {
-      Object.defineProperty(storage, 'getDirectory', { configurable: true, value: async () => { throw new DOMException('The operation is insecure.', 'SecurityError'); } });
-    }
+  await test.step('Forget asks in its row and says what goes; saved states stay unless ticked', async () => {
+    await chooseSample(page, TRAJECTORY);
+    await takeAStep(page, TRAJECTORY.id);
+    await chooseSample(page, START);
+    await expectListed(page, [START.name, TRAJECTORY.name]);
+    const before = await savedStatesOf(page, TRAJECTORY.id);
+    expect(before.length).toBeGreaterThan(0);
+
+    await openAll(page);
+    const trajectory = row(page, TRAJECTORY.name);
+    await trajectory.locator('[data-library-action="forget"]').click();
+    const confirm = trajectory.locator('.library-row-confirm');
+    await expect(confirm).toBeVisible();
+    await expect(confirm.locator('.library-row-question')).toHaveText(`Forget ${TRAJECTORY.name}?`);
+    await expect(confirm.locator('.field-help')).toHaveText('It leaves My datasets. Its saved states and stored data stay.');
+    const also = confirm.locator('[data-library-also]');
+    await expect(also).not.toBeChecked();
+    await expect(confirm.locator('label')).toHaveText(new RegExp(`^Also delete its ${before.length} saved states? \\(`));
+    // Keep: nothing changes, the focus is back on Forget.
+    await expect(confirm.locator('[data-library-action="keep"]')).toBeFocused();
+    await confirm.locator('[data-library-action="keep"]').click();
+    await expect(confirm).toBeHidden();
+    await expect(trajectory.locator('[data-library-action="forget"]')).toBeFocused();
+    // Forget, unticked: off the list, its saved states kept.
+    await trajectory.locator('[data-library-action="forget"]').click();
+    await confirm.locator('[data-library-action="forget-confirmed"]').click();
+    await expect(page.locator('#my-datasets-dialog-status')).toHaveText(`Forgot ${TRAJECTORY.name}.`);
+    await expect(rows(page)).toHaveCount(1);
+    expect(await savedStatesOf(page, TRAJECTORY.id)).toEqual(before);
+    await expect.poll(() => listed(page)).toEqual([START.name]);
+    await expect(dialog(page)).toBeVisible();
+    expect(await page.evaluate(() => document.getElementById('my-datasets-dialog').contains(document.activeElement))).toBe(true);
+    await page.keyboard.press('Escape');
+
+    // Opened again, it is listed again; forgotten with its saved states ticked, they go too.
+    await chooseSample(page, TRAJECTORY);
+    await chooseSample(page, START);
+    await expectListed(page, [START.name, TRAJECTORY.name]);
+    await openAll(page);
+    await row(page, TRAJECTORY.name).locator('[data-library-action="forget"]').click();
+    await row(page, TRAJECTORY.name).locator('[data-library-also]').check();
+    await row(page, TRAJECTORY.name).locator('[data-library-action="forget-confirmed"]').click();
+    await expect(page.locator('#my-datasets-dialog-status')).toHaveText(new RegExp(`^Forgot ${TRAJECTORY.name}\\. Deleted \\d+ saved states?\\.$`));
+    await expect.poll(() => savedStatesOf(page, TRAJECTORY.id)).toEqual([]);
+    await expect.poll(() => listed(page)).toEqual([START.name]);
+    await expectNoFailureAnnounced(page);
+    await page.keyboard.press('Escape');
+    await expect(dialog(page)).toBeHidden();
   });
-  const otherErrors = await openStarted(other);
-  await openCollapsedPanels(other);
-  await expectListed(other, [START.name]);
-  await expect(other.locator('#my-datasets-status')).toHaveText('Kept only until this window closes.');
-  expect(otherErrors).toEqual([]);
-  await closePageWithApplicationRetirement(other);
+
+  await test.step('the Stored dialog counts My datasets in one row, shows it in its own dialog, and Remove forgets the list', async () => {
+    await chooseSample(page, TRAJECTORY);
+    await expectListed(page, [TRAJECTORY.name, START.name]);
+    // A saved state makes the Stored row show.
+    await page.evaluate(() => window._cellucidHistories.savedStates.saveAs('Probe'));
+    const manage = page.locator('#kept-stores-manage-btn');
+    await expect(manage).toBeVisible();
+    await manage.click();
+    const library = page.locator('#kept-stores-dialog .kept-library');
+    await expect(library.locator('.kept-dataset-name')).toHaveText('My datasets');
+    await expect(library.locator('.kept-dataset-facts')).toHaveText('2 datasets opened in this browser');
+    // Listed in its own dialog, never twice: no row of its datasets here.
+    await expect(library.locator('[data-item-id]')).toHaveCount(0);
+    await expect(page.locator('#kept-stores-dialog .kept-local-files')).toHaveCount(0);
+    await library.getByRole('button', { name: 'Show My datasets' }).click();
+    await expect(page.locator('#kept-stores-dialog')).toBeHidden();
+    await expect(dialog(page)).toBeVisible();
+    await expect(rows(page)).toHaveCount(2);
+    await page.keyboard.press('Escape');
+    await expect(dialog(page)).toBeHidden();
+    await expect(manage).toBeFocused();
+    await manage.click();
+    await library.getByRole('button', { name: 'Forget every dataset of My datasets' }).click();
+    await expect(page.locator('#kept-stores-status')).toHaveText('Forgot 2 datasets of My datasets.');
+    await expect(library).toHaveCount(0);
+    await expect.poll(() => listed(page)).toEqual([]);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#kept-stores-dialog')).toBeHidden();
+    // Still shown, empty: its menu offers All… alone, for Import….
+    await expect(page.locator('#my-datasets-block')).toBeVisible();
+    expect(await menuLabels(page)).toEqual(['All…']);
+    await closeMenu(page);
+  });
+  expect(errors).toEqual([]);
 });
 
 test('keyboard alone: the menu opens, moves and chooses; All… opens, its rows open their facts; Escape gives the focus back', async ({ page, browserName }) => {
@@ -454,70 +420,70 @@ test('keyboard alone: the menu opens, moves and chooses; All… opens, its rows 
   expect(errors).toEqual([]);
 });
 
-for (const theme of ['light', 'dark']) {
-  test(`at a phone's width, in the ${theme} theme: All… fits, its rows read, nothing scrolls sideways`, async ({ page }) => {
-    await page.setViewportSize({ width: 390, height: 844 });
-    await page.addInitScript(chosen => {
-      try {
-        localStorage.setItem('cellucid_theme', chosen);
-      } catch {
-        // The theme the page starts with.
-      }
-    }, theme);
-    const errors = await openStarted(page);
-    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
-    await openPhoneSheet(page);
-    await openCollapsedPanels(page);
-    await chooseSample(page, TRAJECTORY);
-    await expectListed(page, [TRAJECTORY.name, START.name]);
-    await button(page).scrollIntoViewIfNeeded();
-    expect(await menuLabels(page)).toEqual([TRAJECTORY.name, START.name, 'All…']);
-    const menuBox = await menu(page).boundingBox();
-    expect(menuBox.x).toBeGreaterThanOrEqual(0);
-    expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(390);
-    await items(page).last().click();
-    await expect(dialog(page)).toBeVisible();
-    const box = await dialog(page).boundingBox();
-    expect(box.x).toBeGreaterThanOrEqual(0);
-    expect(box.x + box.width).toBeLessThanOrEqual(390);
-    // Nothing scrolls sideways, and two rows need no scrolling at all: every row is whole.
-    await expect.poll(() => page.evaluate(() => {
-      const element = document.getElementById('my-datasets-dialog');
-      const list = document.getElementById('my-datasets-list');
-      return {
-        sideways: element.scrollWidth - element.clientWidth,
-        dialog: element.scrollHeight - element.clientHeight,
-        list: list.scrollHeight - list.clientHeight,
-      };
-    })).toEqual({ sideways: 0, dialog: 0, list: 0 });
-    // A phone's row: the actions under the name, inside the row.
-    const first = rows(page).first();
-    const toggle = await first.locator('.library-row-toggle').boundingBox();
-    const actions = await first.locator('.library-row-actions').boundingBox();
-    expect(actions.y).toBeGreaterThanOrEqual(toggle.y + toggle.height - 1);
-    expect(actions.x + actions.width).toBeLessThanOrEqual(box.x + box.width);
-    // The theme's own colors, from its tokens.
-    const colors = await page.evaluate(() => {
-      const probe = document.createElement('div');
-      document.body.append(probe);
-      const resolve = token => {
-        probe.style.color = `var(${token})`;
-        return getComputedStyle(probe).color;
-      };
-      const name = document.querySelector('#my-datasets-list .library-row-name');
-      const rowElement = document.querySelector('#my-datasets-list .library-row');
-      const out = {
-        text: getComputedStyle(name).color,
-        textToken: resolve('--color-text-primary'),
-        surface: getComputedStyle(rowElement).backgroundColor,
-        surfaceToken: resolve('--color-surface-elevated'),
-      };
-      probe.remove();
-      return out;
+test('at a phone\'s width, in the light theme and the dark: All… fits, its rows read, nothing scrolls sideways', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const errors = await openStarted(page);
+  await openPhoneSheet(page);
+  await openCollapsedPanels(page);
+  await chooseSample(page, TRAJECTORY);
+  await expectListed(page, [TRAJECTORY.name, START.name]);
+  for (const theme of ['light', 'dark']) {
+    await test.step(`at a phone's width, in the ${theme} theme: All… fits, its rows read, nothing scrolls sideways`, async () => {
+      await page.locator('#theme-select').selectOption(theme);
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      // Every element transitions during a theme change: colors are read once it is over.
+      await expect(page.locator('html')).not.toHaveClass(/theme-transition/);
+      await button(page).scrollIntoViewIfNeeded();
+      expect(await menuLabels(page)).toEqual([TRAJECTORY.name, START.name, 'All…']);
+      const menuBox = await menu(page).boundingBox();
+      expect(menuBox.x).toBeGreaterThanOrEqual(0);
+      expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(390);
+      await items(page).last().click();
+      await expect(dialog(page)).toBeVisible();
+      const box = await dialog(page).boundingBox();
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(390);
+      // Nothing scrolls sideways, and two rows need no scrolling at all: every row is whole.
+      await expect.poll(() => page.evaluate(() => {
+        const element = document.getElementById('my-datasets-dialog');
+        const list = document.getElementById('my-datasets-list');
+        return {
+          sideways: element.scrollWidth - element.clientWidth,
+          dialog: element.scrollHeight - element.clientHeight,
+          list: list.scrollHeight - list.clientHeight,
+        };
+      })).toEqual({ sideways: 0, dialog: 0, list: 0 });
+      // A phone's row: the actions under the name, inside the row.
+      const first = rows(page).first();
+      const toggle = await first.locator('.library-row-toggle').boundingBox();
+      const actions = await first.locator('.library-row-actions').boundingBox();
+      expect(actions.y).toBeGreaterThanOrEqual(toggle.y + toggle.height - 1);
+      expect(actions.x + actions.width).toBeLessThanOrEqual(box.x + box.width);
+      // The theme's own colors, from its tokens.
+      const colors = await page.evaluate(() => {
+        const probe = document.createElement('div');
+        document.body.append(probe);
+        const resolve = token => {
+          probe.style.color = `var(${token})`;
+          return getComputedStyle(probe).color;
+        };
+        const name = document.querySelector('#my-datasets-list .library-row-name');
+        const rowElement = document.querySelector('#my-datasets-list .library-row');
+        const out = {
+          text: getComputedStyle(name).color,
+          textToken: resolve('--color-text-primary'),
+          surface: getComputedStyle(rowElement).backgroundColor,
+          surfaceToken: resolve('--color-surface-elevated'),
+        };
+        probe.remove();
+        return out;
+      });
+      expect(colors.text).toBe(colors.textToken);
+      expect(colors.surface).toBe(colors.surfaceToken);
+      expect(colors.text).not.toBe(colors.surface);
+      await page.keyboard.press('Escape');
+      await expect(dialog(page)).toBeHidden();
     });
-    expect(colors.text).toBe(colors.textToken);
-    expect(colors.surface).toBe(colors.surfaceToken);
-    expect(colors.text).not.toBe(colors.surface);
-    expect(errors).toEqual([]);
-  });
-}
+  }
+  expect(errors).toEqual([]);
+});

@@ -4,10 +4,9 @@
  * (`annotationGroupName`), the other tools by the tool; the list shows the
  * count beside the name, so no name carries one.
  *
- * Found 2026-11-10 on Suo: NK (Alt+click) and ILCP (Shift+Alt+click),
- * confirmed, read "Annotation (2 steps) (36,214 cells) (36,214)": the count
- * twice, the content nowhere, and "Create categorical" made a category of
- * that name.
+ * On Suo, NK (Alt+click) and ILCP (Shift+Alt+click), confirmed, must not read
+ * "Annotation (2 steps) (36,214 cells) (36,214)": the count twice, the content
+ * nowhere, and "Create categorical" would make a category of that name.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

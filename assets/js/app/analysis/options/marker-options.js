@@ -92,7 +92,7 @@ export function geneFilterOptions(group) {
   return [
     {
       key: 'excludeGenes', kind: 'flags', label: 'Exclude genes', tip: 'analysis-gene-filters', group,
-      // An agent sent gene names here ("Exclude genes has no choice \"GSC\"", live-7 L25-5).
+      // `means` says where gene names go: a name sent here is no choice of this list.
       means: 'gene families by name: mito (MT-), ribo (RPS, RPL), hemo (hemoglobins); genes by name go in excludePattern',
       default: [],
       choices: context => Object.entries(GENE_FAMILIES).map(([value, family]) => ({

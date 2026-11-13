@@ -36,8 +36,8 @@ const TEXT_SURFACES = Object.freeze([
   '--color-surface-elevated',
 ]);
 
-/* WCAG 2.2 SC 1.4.3 Contrast (Minimum), AA. Every element measured in the
-   OBJ-8 audit renders below 18.66px bold / 24px regular, so the normal-text
+/* WCAG 2.2 SC 1.4.3 Contrast (Minimum), AA. Every element under test
+   renders below 18.66px bold / 24px regular, so the normal-text
    threshold applies to all of them, not the 3:1 large-text threshold. */
 const NORMAL_TEXT_MINIMUM = 4.5;
 
@@ -270,7 +270,7 @@ test('the disabled text color only paints rules that select a disabled state', (
   assert.deepEqual(offenders, []);
 });
 
-/* The history's branch lanes (History v2 §3.9) are lines and glyphs, so
+/* The history's branch lanes are lines and glyphs, so
    WCAG 2.2 SC 1.4.11 Non-text Contrast applies: 3:1 against the panel
    surfaces they are drawn on, in both themes, for all eight slots. */
 test('the eight history lane colors clear 3:1 on the panel surfaces in every theme', () => {

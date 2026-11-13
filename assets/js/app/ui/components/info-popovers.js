@@ -12,6 +12,7 @@
  * @module ui/components/info-popovers
  */
 
+import { holdPlace } from '../../utils/dom-utils.js';
 import { renderInfoTip, renderStaticInfoTips } from './info-tips.js';
 
 const TRIGGER_SELECTOR = 'button.info-btn[aria-controls]';
@@ -324,23 +325,12 @@ export function initInfoPopovers({ root }) {
   }
 
   function restorePopoverLocation(entry) {
-    const {
-      popover,
-      originalParent,
-      originalNextSibling
-    } = entry;
+    const { popover, originalParent, returnToPlace } = entry;
     if (!originalParent.isConnected) {
       popover.remove();
       return;
     }
-    if (
-      originalNextSibling !== null
-      && originalNextSibling.parentNode === originalParent
-    ) {
-      originalParent.insertBefore(popover, originalNextSibling);
-      return;
-    }
-    originalParent.appendChild(popover);
+    if (!returnToPlace()) originalParent.appendChild(popover);
   }
 
   function cancelScheduledPosition() {
@@ -413,7 +403,7 @@ export function initInfoPopovers({ root }) {
     active = {
       ...pair,
       originalParent: pair.popover.parentNode,
-      originalNextSibling: pair.popover.nextSibling
+      returnToPlace: holdPlace(pair.popover)
     };
     // Inside an open modal <dialog> the rest of the page is inert and drawn
     // beneath the dialog's top layer, so the tip stays in the dialog there.

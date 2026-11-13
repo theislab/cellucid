@@ -9,7 +9,7 @@
  * nothing offers to do it again (`offersRetry`: no Try again on their notes);
  * `seen` is the history as its agent's last turn ended (`history-link.js`
  * `historySeen`, or null), kept with it so the next message says what the
- * person did since even after a reload or in a shared session (F270).
+ * person did since even after a reload or in a shared session.
  * Messages are the providers' neutral messages (`providers/contract.js`)
  * with what the chat shows besides:
  *
@@ -123,8 +123,8 @@ function attachedText(message) {
  * What Cellucid tells the model with a message of a turn the conversation
  * received (a session file or a saved state opened): it was another person's,
  * answered by their agent in their browser. Without it a model continuing a
- * colleague's conversation took the work for its own and the newcomer for the
- * sender ("all 37 steps were taken by me at your request", L24-10).
+ * colleague's conversation takes the work for its own and the newcomer for the
+ * sender ("all 37 steps were taken by me at your request").
  */
 export const RECEIVED_TOLD = 'This message, and the work that answered it, came with the conversation from another browser '
   + '(a session file or a saved state someone shared): another person wrote it and their agent did that work; its steps are '
@@ -348,8 +348,8 @@ export const SAVED_MID_CALL_TEXT = 'This call was still running when this conver
  * The words the call that made the save itself is answered with: an agent's
  * `history_share` or `history_save` holds the conversation as it stood while
  * it ran. Answered "still running … what it did is not in this save", the
- * colleague's agent reading the file said "the session-file export didn't
- * finish" of the very file it was reading (live-7 L25-14).
+ * colleague's agent reading the file would say "the session-file export
+ * didn't finish" of the very file it was reading.
  */
 export const SAVED_BY_CALL_TEXT = 'This call made the save this conversation is kept in (the session file or saved state it was opened from); its own answer came after, so it is not in the save.';
 
@@ -467,7 +467,7 @@ export function sentOf(conversation, turn) {
 
 /**
  * What the person is told when the conversations kept with a tracker cannot
- * be shown (F155: never lost silently): `chats` holds some, and the newest
+ * be shown (never lost silently): `chats` holds some, and the newest
  * this version reads (`latestConversation`) is null or `error` was thrown
  * reading it. A transcript of another schema was saved by another version
  * of Cellucid, which this one cannot read, and is said as that; any other

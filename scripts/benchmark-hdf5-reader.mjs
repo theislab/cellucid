@@ -23,8 +23,8 @@
  * every request waits `latency` ms, then its bytes share one `bandwidth`
  * MB/s link, and the reader issues its requests concurrently (6 at a time,
  * as a browser does). h5wasm reads synchronously and has no remote
- * scenario here: the comparison over a simulated link with the earlier app
- * reader, which ran h5wasm, is `scripts/benchmark-anndata.mjs --baseline
+ * scenario here: the comparison over a simulated link with a revision whose
+ * reader ran h5wasm is `scripts/benchmark-anndata.mjs --baseline
  * REF` (`npm run bench:anndata`). Each run is its own process, so peak
  * memory (resident set size) is the run's own.
  *

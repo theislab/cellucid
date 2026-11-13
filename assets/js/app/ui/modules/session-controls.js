@@ -22,6 +22,30 @@ import { cancellationKind } from '../../../utils/abort.js';
 import { isReported } from '../../../utils/errors.js';
 import { upperFirst } from '../../../utils/text-case.js';
 
+/** The page's session file opener (`initSessionControls`), or null on a page without one. */
+let pageSessionFileOpener = null;
+
+function registerSessionFileOpener(opener) {
+  pageSessionFileOpener = opener;
+  return () => {
+    if (pageSessionFileOpener === opener) pageSessionFileOpener = null;
+  };
+}
+
+/**
+ * Load a session file given to the page (dropped on it, chosen in Open… ›
+ * File…) as Load… › Open a session file… loads one: its dataset opens when
+ * another is shown, then its history is loaded beside the person's.
+ *
+ * @param {File} file
+ * @returns {boolean} whether the page could take it (false: no session controls here)
+ */
+export function openSessionFile(file) {
+  if (pageSessionFileOpener === null) return false;
+  void pageSessionFileOpener(file);
+  return true;
+}
+
 /**
  * @param {object} options
  * @param {object} options.dom
@@ -54,37 +78,12 @@ import { upperFirst } from '../../../utils/text-case.js';
  * @param {((genes: {cells: number, order: Object|null, digest: string}|null) => Promise<void>)|undefined} options.restoreGeneSample
  *   Reads genes for the open cells a session read them for (its `genes`,
  *   `session/cell-subset-record.js`), once its cells are open.
- * @param {{read: (id: string) => Promise<object>, load: (source: object) => Promise<void>}|null} [options.savedStates]
+ * @param {{read: (id: string) => Promise<object>, load: (source: object, options?: {heavy?: Function|null, signal?: AbortSignal|null}) => Promise<void>}|null} [options.savedStates]
  *   The saved states of this browser (`app/history/dataset-history.js`):
  *   a saved state's source (`autosave.js` `openSavedState`), and its load
  *   into the shown history.
  * @param {(() => Promise<void>|void)|undefined} options.onAfterLoad
  */
-/** The page's session file opener (`initSessionControls`), or null on a page without one. */
-let pageSessionFileOpener = null;
-
-function registerSessionFileOpener(opener) {
-  pageSessionFileOpener = opener;
-  return () => {
-    if (pageSessionFileOpener === opener) pageSessionFileOpener = null;
-  };
-}
-
-/**
- * Load a session file given to the page (dropped on it, chosen in Open… ›
- * File…) as Load… › Open a session file… loads one: its dataset opens when
- * another is shown, then its history is loaded beside the person's (bug hunt
- * L25-8: a dropped session file was refused with directions).
- *
- * @param {File} file
- * @returns {boolean} whether the page could take it (false: no session controls here)
- */
-export function openSessionFile(file) {
-  if (pageSessionFileOpener === null) return false;
-  void pageSessionFileOpener(file);
-  return true;
-}
-
 export function initSessionControls({
   dom,
   sessionSerializer,
@@ -408,7 +407,7 @@ export function initSessionControls({
   if (loadStateBtn && sessionSerializer) {
     listen(loadStateBtn, 'click', () => loadSessionFile(null));
   }
-  // A session file dropped on the page or chosen in Open… › File… loads as Load…'s does (L25-8).
+  // A session file dropped on the page or chosen in Open… › File… loads as Load…'s does.
   const unregisterSessionFiles = sessionSerializer ? registerSessionFileOpener(file => loadSessionFile(file)) : () => {};
 
   /** A session file as a session to open: its dataset from its manifest, its load. */
@@ -459,7 +458,7 @@ export function initSessionControls({
         const loaded = await session.load();
         if (!ownsOperation(operationGeneration)) return NOT_OPENED;
         if (typeof onAfterLoad === 'function') await onAfterLoad();
-        // The parts it could not restore, as the person was told (F155), or null.
+        // The parts it could not restore, as the person was told, or null.
         return { opened: true, problem: null, code: null, notRestored: loaded?.notRestored ?? null };
       } catch (err) {
         if (!ownsOperation(operationGeneration)) return NOT_OPENED;

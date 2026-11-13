@@ -368,8 +368,8 @@ test('Times-family axes and legends remain well-formed escaped SVG attributes', 
 });
 
 test('multiview SVG draws axes where they are rulers, the 3-D orientation where they are not', async () => {
-  // Found 2026-11-11 (F86): a grid of 3-D views carried X/Y rulers in camera
-  // units on the focal plane, read by everyone as embedding coordinates.
+  // A grid of 3-D views carries no X/Y rulers in camera units on the focal
+  // plane: everyone reads them as embedding coordinates.
   const exact = payload({
     views: [
       makeView({ id: 'live', label: 'Live', dimension: 2 }),
@@ -561,7 +561,7 @@ test('tiny multiview SVG panes keep finite geometry and grow to keep their legen
   }
 });
 
-test('a grid panel is titled by the name its view was given, escaped; its provenance carries the name (F130)', async () => {
+test('a grid panel is titled by the name its view was given, escaped; its provenance carries the name', async () => {
   const views = [
     makeView({ id: 'live', label: 'cluster', name: 'Early' }),
     makeView({ id: 'snap_1', label: 'cluster', name: 'Late <b>&amp; "co"' }),

@@ -7,12 +7,12 @@
  * - **The device** is what the browser lets a page learn of its memory
  *   (`estimatedDeviceMemory`): `navigator.deviceMemory` (Chromium, secure
  *   contexts; rounded down to a power of two, and capped at 8 GiB by earlier
- *   Chromium releases: Chromium 151 reports 16 on a 16 GiB Mac), and the
+ *   Chromium releases), and the
  *   JavaScript heap limit (`performance.memory.jsHeapSizeLimit`, Chromium
- *   pages only), which V8 sizes at about a quarter of physical memory
- *   (3.76 GB on that Mac), up to its pointer-compression cage. The heap limit
- *   raises the estimate past an 8 GiB report that may be a cap (that Mac is
- *   then 14 GiB, not 8) and stands in when deviceMemory is not reported. A
+ *   pages only), which V8 sizes at about a quarter of physical memory, up to
+ *   its pointer-compression cage. The heap limit
+ *   raises the estimate past an 8 GiB report that may be a cap and stands in
+ *   when deviceMemory is not reported. A
  *   browser that reports neither (Firefox, Safari) is taken to be 8 GiB, the
  *   report earlier Chromium gave any larger device. The page estimates it
  *   once and hands it to every worker it starts (`connectMemoryWorker`), so
@@ -96,17 +96,15 @@ const ALLOWANCE_OF_DEVICE = 1 / 2;
 
 /**
  * Bytes one cell holds in the page's working set however a dataset is
- * shown, as measured, not modeled: 64.6 bytes of physical memory a cell for
+ * shown, as measured, not modeled: the physical memory a cell takes for
  * the points themselves -- 3D positions and colors in the page and on the
  * GPU with the GPU process's own overhead, visibility, the spatial tree and
- * the draw order levels of detail need, and its permutation -- measured
- * steady at 100,000,000 synthetic 3D cells with levels of detail (renderer
- * and GPU processes together, Chromium on Apple M1 Pro; 53.3 in 2D), rounded
- * up, plus the codes of the field the cells are colored by (4), one
- * continuous field (4) and its outlier quantile (4). It was 54 (a model that
- * left out the tree, the draw order and the GPU process's overhead), which
- * fitted 148M cells to a 16 GB machine where 125M already swapped while the
- * levels of detail were built.
+ * the draw order levels of detail need, and its permutation (renderer and
+ * GPU processes together, 3D cells with levels of detail; measured:
+ * 27_decisions_memory_model.md), rounded up, plus the codes of the field the
+ * cells are colored by (4), one continuous field (4) and its outlier
+ * quantile (4). A model that leaves out the tree, the draw order or the GPU
+ * process's overhead fits more cells to a device than it holds.
  */
 export const CELL_WORKING_SET_BYTES = 77;
 

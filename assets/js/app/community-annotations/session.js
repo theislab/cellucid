@@ -2061,8 +2061,8 @@ export class CommunityAnnotationSession extends EventEmitter {
     };
     const netOf = (s) => s.upvotes.length - s.downvotes.length;
     // The consensus's own rank (`consensusOf`): net votes, then upvotes, so
-    // the first suggestion listed is the one the consensus line names (bug
-    // hunt R9A-2: a leader by upvotes was listed after a tied-net label).
+    // the first suggestion listed is the one the consensus line names (a
+    // leader by upvotes alone could be listed after a tied-net label).
     const memberOrder = (a, b) =>
       (netOf(b) - netOf(a)) ||
       (b.upvotes.length - a.upvotes.length) ||

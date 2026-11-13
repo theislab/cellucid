@@ -1,17 +1,15 @@
 /**
- * @fileoverview The records of every state domain's value, declared once
- * (round 9 close, the class of F244 and F181): each record's required,
- * optional, added and dropped keys (`record-keys.js`). The state domains read
+ * @fileoverview The records of every state domain's value, declared once:
+ * each record's required,
+ * optional and added keys (`record-keys.js`). The state domains read
  * every value they restore or describe through these (`index.js`
- * `installStateDomains`), so a value written before a key was added or
- * dropped still reads, and only a truly wrong record is refused, naming
- * where it is wrong.
+ * `installStateDomains`), so a value written before a key was added still
+ * reads, and only a truly wrong record is refused, naming where it is wrong.
  *
  * Adding a key to a domain's record: add it here as `added` with the value
  * its absence means (its writer leaves it out at that value, so the records
- * of before hash as they did); dropping one: move it to `dropped`.
- * `tests/state-record-added-keys.test.mjs` reads every published starting
- * view and an older saved state through every shape here.
+ * of before hash as they did). `tests/state-record-added-keys.test.mjs` reads
+ * every published starting view and a saved state through every shape here.
  *
  * A record whose keys another module owns and reads exactly is that
  * module's (its shape stops at it): a view's `embedding` (the data
@@ -19,8 +17,8 @@
  * keys (`rendering/camera-state-contract.js`), the analyses' windows and
  * modes (the analysis tools), a user field (`field-overlays.js`, whose items
  * name their kind's keys), the data mapping (`data/data-mapping.js`, a
- * contract with Python and R), the settings (read one control at a time,
- * F181) and the Camera Path's own state (`cinematic-camera`, R9R-13).
+ * contract with Python and R), the settings (read one control at a time)
+ * and the Camera Path's own state (`cinematic-camera`).
  *
  * @module app/state/domains/records
  */
@@ -111,8 +109,6 @@ export const RECORDS = Object.freeze({
   camera: record({ required: ['views'], fields: { views: listOf(CAMERA_STATE) } }),
   analysis: record({
     required: ['windows', 'docked'],
-    // The sizes remembered per analysis moved to the layout (2026-11-06): a saved state of before holds them here.
-    dropped: ['sizes'],
     fields: { docked: nullable(record({ required: ['openMode', 'modes'] })) },
   }),
   layout: record({

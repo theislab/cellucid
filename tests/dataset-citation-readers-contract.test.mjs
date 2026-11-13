@@ -4,10 +4,10 @@
  * `uns['cellucid']`, or the provider that served the file); its `source` is
  * where the data comes from and never holds one (the identity check refuses a
  * `source.citation`). The methods paragraph, the history report, a figure's
- * provenance and the agents' `dataset_summary` once read `source.citation`,
- * so every one of them said nothing of how to cite any dataset, and an agent
- * writing a methods paragraph told the person "the dataset has no citation
- * recorded" for a sample that has one (live pass 3, L12-2).
+ * provenance and the agents' `dataset_summary` read `citation`: were one to
+ * read `source.citation`, it would say nothing of how to cite any dataset, and
+ * an agent writing a methods paragraph would tell the person "the dataset has
+ * no citation recorded" for a sample that has one.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';

@@ -94,7 +94,7 @@ test('the module adopts the token from the page memory once and restores the res
 });
 
 /**
- * LG-3 (login CSRF): the worker hands the token to the page in the address
+ * Login CSRF: the worker hands the token to the page in the address
  * fragment, which anyone can write into a link. A token is adopted only when
  * the callback names the state of a sign-in this tab started, so a link
  * carrying someone else's token cannot sign the person in as them (their

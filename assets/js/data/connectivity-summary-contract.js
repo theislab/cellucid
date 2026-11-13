@@ -28,7 +28,7 @@ const KEYS = Object.freeze([
  * @param {Object} summary
  * @returns {boolean}
  */
-export function isDeferredConnectivitySummary(summary) {
+function isDeferredConnectivitySummary(summary) {
   return summary?.n_edges === null && summary?.max_neighbors === null;
 }
 

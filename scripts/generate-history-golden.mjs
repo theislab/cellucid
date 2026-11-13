@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Write the golden history the web app, cellucid-python and cellucid-r all
- * read: one session file of format 4 in the History v2 shape
+ * read: one session file of format 4 in the history model's shape
  * (`assets/js/app/session/README.md`, every record `app/history/model.js`'s),
  * and what reading it and applying it must give.
  *
@@ -13,7 +13,7 @@
  *   the session again as `inst/extdata/history_golden.cellucid-session`, the
  *   example its help pages read (`system.file("extdata", …)`);
  *
- * byte for byte the same, each pinned by SHA-256 in its repository's tests.
+ * byte for byte the same (`tests/shared-files-contract.test.mjs` compares them).
  *
  * The history holds every kind of record the model has: three trackers (one
  * replayed from another, with its report and name mapping and each replayed
@@ -52,9 +52,8 @@
  * `cellucid_gene_set__<name>`, one boolean per var row) and the
  * provenance the first records. Python, R and the browser's AnnData copy
  * (`app/history/exports/anndata-copy.js`) follow the same plan rules and
- * compare with these rows field by field. The rules are written out in
- * `cellucid-private/plans/history-v2.md` §7 ("H4 notes") and in the packages'
- * session docs.
+ * compare with these rows field by field. The rules are written out in the
+ * packages' session docs.
  *
  *   node scripts/generate-history-golden.mjs           # write all three
  *   node scripts/generate-history-golden.mjs --check   # exit 1 when one differs
@@ -62,12 +61,11 @@
  * `--check` compares what the files hold (the manifest and every chunk's
  * payload once inflated), not gzip's bytes, which another zlib may make
  * differently. The sibling repositories are found next to this one, or where
- * `CELLUCID_PYTHON_ROOT` and `CELLUCID_R_ROOT` say. After writing, pin the
- * printed digests in the three tests.
+ * `CELLUCID_PYTHON_ROOT` and `CELLUCID_R_ROOT` say (`scripts/shared-files.mjs`
+ * lists the copies).
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,24 +91,13 @@ import { createCellsDomain } from '../assets/js/app/state/domains/cells.js';
 import { methodsParagraph } from '../assets/js/app/history/exports/methods.js';
 import { historyPseudocode } from '../assets/js/app/history/exports/pseudocode.js';
 import { renderActionCatalog } from './generate-action-catalog.mjs';
+import { copyPaths, sharedFile } from './shared-files.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const HISTORY_GOLDEN_SESSION_PATH = path.join(ROOT, 'tests', 'fixtures', 'history-golden.cellucid-session');
 export const HISTORY_GOLDEN_EXPECTED_PATH = path.join(ROOT, 'tests', 'fixtures', 'history-golden.expected.json');
 /** The golden's current state only (Share › Current state only), as the web app writes it. */
 export const HISTORY_GOLDEN_STATE_PATH = path.join(ROOT, 'tests', 'fixtures', 'history-golden-state.cellucid-session');
-
-/**
- * Where each package keeps its copies, relative to its repository; `example`:
- * a folder that ships the session with the package (its help pages' example).
- */
-export const HISTORY_GOLDEN_MIRRORS = Object.freeze([
-  Object.freeze({ repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', dir: 'tests/fixtures/history_golden', example: null }),
-  Object.freeze({ repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', dir: 'tests/testthat/fixtures/history_golden', example: 'inst/extdata' }),
-]);
-export const PACKAGE_SESSION_NAME = 'history_golden.cellucid-session';
-export const PACKAGE_EXPECTED_NAME = 'history_golden.expected.json';
-export const PACKAGE_STATE_NAME = 'history_golden_state.cellucid-session';
 
 const catalog = createActionCatalog(ACTION_DEFINITIONS);
 
@@ -666,7 +653,7 @@ async function writeSession(trackers, { activeTracker, header, app, actions, sco
   }
   const blob = await writeHistoryFile({
     header, app, actions, scope, history: { activeTracker, trackers }, valueOf: hash => pool.get(hash),
-    // The page chrome sessions carry outside the history: the selection tool pressed (CEL-0249).
+    // The page chrome sessions carry outside the history: the selection tool pressed.
     chrome: GOLDEN_CHROME,
   });
   return { bytes: new Uint8Array(await blob.arrayBuffer()), valueCount: referenced.size };
@@ -688,7 +675,7 @@ function pathTo(tracker, stepId) {
 }
 
 /**
- * Stale results at the tracker's head (`history-v2.md` §3.4): a step on the
+ * Stale results at the tracker's head: a step on the
  * head's path whose output is still current at the head, one of whose read
  * domains differs there, with the first step after it on the path that
  * changed that domain as the cause.
@@ -1047,8 +1034,8 @@ export function historyGoldenContent(bytes) {
 /**
  * A reading made afresh, as it reads for the session file `session`. A reading
  * names the digest of the file it goes with, and that digest is of gzip's
- * bytes, which differ between one zlib and another (three digests from one
- * content on the Linux, macOS and Windows runners of CI run 42129386525):
+ * bytes, which differ between one zlib and another (one content gives
+ * different digests on Linux, macOS and Windows):
  * everything else in a reading is the same on every machine.
  */
 export function historyGoldenExpectedOf(expectedText, session) {
@@ -1056,20 +1043,21 @@ export function historyGoldenExpectedOf(expectedText, session) {
   return expectedText.replace(/"(sha256|session_sha256)": "[0-9a-f]{64}"/g, (_, key) => `"${key}": "${sha}"`);
 }
 
-/** Each place the files go: this repository's, then each package's (null when absent). */
+/**
+ * Each place the files go: this repository's, then each package's (`null`
+ * paths when it is not there). A package's first copy of the session is the
+ * one its tests read; a second (cellucid-r's `inst/extdata`) ships with the
+ * package as its help pages' example.
+ */
 export function historyGoldenTargets(env = process.env) {
+  const copies = (home, repository) => copyPaths(sharedFile(home), env).filter(copy => copy.repository === repository);
   return [
     { repository: 'cellucid', session: HISTORY_GOLDEN_SESSION_PATH, expected: HISTORY_GOLDEN_EXPECTED_PATH, state: HISTORY_GOLDEN_STATE_PATH, example: null },
-    ...HISTORY_GOLDEN_MIRRORS.map(mirror => {
-      const root = env[mirror.env] ?? path.join(ROOT, '..', mirror.repository);
-      const present = existsSync(root);
-      return {
-        repository: mirror.repository, env: mirror.env,
-        session: present ? path.join(root, mirror.dir, PACKAGE_SESSION_NAME) : null,
-        expected: present ? path.join(root, mirror.dir, PACKAGE_EXPECTED_NAME) : null,
-        state: present ? path.join(root, mirror.dir, PACKAGE_STATE_NAME) : null,
-        example: present && mirror.example !== null ? path.join(root, mirror.example, PACKAGE_SESSION_NAME) : null,
-      };
+    ...[...new Set(sharedFile('tests/fixtures/history-golden.cellucid-session').copies.map(copy => copy.repository))].map(repository => {
+      const [session, example = null] = copies('tests/fixtures/history-golden.cellucid-session', repository);
+      const [expected] = copies('tests/fixtures/history-golden.expected.json', repository);
+      const [state] = copies('tests/fixtures/history-golden-state.cellucid-session', repository);
+      return { repository, env: session.env, session: session.path, expected: expected.path, state: state.path, example: example?.path ?? null };
     }),
   ];
 }
@@ -1118,13 +1106,8 @@ async function main() {
     }
     console.log(`wrote   ${target.repository}`);
   }
-  if (!check) {
-    console.log(`sha256  ${createHash('sha256').update(written).digest('hex')}  session`);
-    console.log(`sha256  ${createHash('sha256').update(expectedText).digest('hex')}  expected`);
-    console.log(`sha256  ${createHash('sha256').update(state).digest('hex')}  state`);
-  }
   if (stale > 0) {
-    console.log('Run node scripts/generate-history-golden.mjs and pin the printed digests in the three repositories.');
+    console.log('Run node scripts/generate-history-golden.mjs.');
     process.exitCode = 1;
   }
 }

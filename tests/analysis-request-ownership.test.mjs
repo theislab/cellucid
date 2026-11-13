@@ -70,8 +70,8 @@ test('only the newest of two runs publishes, whichever completes first', async (
   const older = deferred();
   const newer = deferred();
   const { ui } = createHarness([older, newer]);
-  const olderRun = ui._runAnalysis();
-  const newerRun = ui._runAnalysis();
+  const olderRun = ui._runForm();
+  const newerRun = ui._runForm();
   older.resolve({ data: { owner: 'older' } });
   await olderRun;
   assert.deepEqual(ui.renders, [], 'an older completion never renders');
@@ -87,9 +87,9 @@ test('an older run\'s failure is not published', async () => {
   const older = deferred();
   const newer = deferred();
   const { ui } = createHarness([older, newer]);
-  const olderRun = ui._runAnalysis();
+  const olderRun = ui._runForm();
   const olderJob = ui._shownJob;
-  const newerRun = ui._runAnalysis();
+  const newerRun = ui._runForm();
   older.reject(new Error('older failure'));
   await olderRun;
   assert.notEqual(olderJob.state, 'failed', 'a superseded run is cancelled, never failed');
@@ -107,7 +107,7 @@ test('an invalidated render is never adopted as the result', async () => {
     renderStarted.resolve();
     await renderSettlement.promise;
   };
-  const running = ui._runAnalysis();
+  const running = ui._runForm();
   run.resolve({ data: { owner: 'older' } });
   await renderStarted.promise;
   ui._invalidateAnalysisRequest();
@@ -121,7 +121,7 @@ test('an invalidated render is never adopted as the result', async () => {
 test('invalidating a run frees Run at once and cancels its job', async () => {
   const run = deferred();
   const { ui, button } = createHarness([run]);
-  const running = ui._runAnalysis();
+  const running = ui._runForm();
   assert.equal(button.textContent, 'Running…');
   assert.equal(button.disabled, true);
   const job = ui._shownJob;
@@ -140,8 +140,8 @@ test('a newer run never captures an older Running label', async () => {
   const older = deferred();
   const newer = deferred();
   const { ui, button } = createHarness([older, newer]);
-  const olderRun = ui._runAnalysis();
-  const newerRun = ui._runAnalysis();
+  const olderRun = ui._runForm();
+  const newerRun = ui._runForm();
   newer.resolve({ data: { owner: 'newer' } });
   await newerRun;
   assert.equal(button.textContent, 'Run');
@@ -161,7 +161,7 @@ test('a highlight change marks a shown result stale; it neither discards nor re-
   ui._selectedPages = ['page_1'];
   ui._updatePageSelectorCounts = () => {};
   run.resolve({ data: { owner: 'shown' } });
-  await ui._runAnalysis();
+  await ui._runForm();
   assert.deepEqual(await ui.getStaleReasons(), []);
   page.highlightedGroups = [{ id: 'g', enabled: true, cellIndices: Uint32Array.of(0, 1, 2) }];
   ui.onHighlightChanged();

@@ -1,8 +1,8 @@
 /**
  * The settings domain names a recorded value as the sidebar reads it, at any
- * step (R9R-3): `history.diff` said "Grid density: 37" and "Render mode:
- * smoke" where the sidebar and the step's own label read "48³" and
- * "Volumetric smoke cloud (beta)". A slider's position is not always what it
+ * step: `history.diff` says "48³" and "Volumetric smoke cloud (beta)" as the
+ * sidebar and the step's own label do, not "Grid density: 37" and "Render
+ * mode: smoke". A slider's position is not always what it
  * means, and its readout element shows only the value it holds now, so each
  * owner defines the readout of any value (`app/ui/core/control-readout.js`)
  * and uses it for its own readout.

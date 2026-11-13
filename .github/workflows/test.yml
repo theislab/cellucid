@@ -32,24 +32,29 @@ jobs:
         node: ["22", "24", "26"]
     # The repository is checked out beside the sibling repositories its
     # cross-repository contracts read: `../cellucid-datasets` (the published
-    # session presets), and `../cellucid-python` and `../cellucid-r` (the
+    # session presets), `../cellucid-python` and `../cellucid-r` (the
     # notebook widget's front end both packages ship, driven by
-    # `tests/notebook-widget-requests-contract.test.mjs`; the shared documents
-    # and golden history they hold copies of; the documentation site), so those
-    # contracts run here. Each list holds every file a contract reads of that
-    # sibling: `tests/ci-sibling-checkouts-contract.test.mjs` compares them with
-    # the generators' lists. Only `anndata-copy-cross-language` reads more (a
-    # whole package, with a Python of its dependencies): it runs where those
-    # are, never here. The siblings are checked out at their default branch when the
-    # job starts: a cross-repository change pushed here before its sibling's
-    # push lands fails these contracts until the next run (run 41213981681:
-    # cellucid-python's widget push landed after the job had checked out the
-    # previous commit). The widget contract names each checkout's commit and
-    # runs the behavior contracts on both copies, so its failure says which
-    # repository is behind. Push the siblings first.
+    # `tests/notebook-widget-requests-contract.test.mjs`; their copies of every
+    # shared file, which `tests/shared-files-contract.test.mjs` compares byte
+    # for byte with this repository's; the documentation site) and
+    # `../cellucid-annotation` (the contract corpus this repository holds a
+    # copy of), so those contracts run here, and a sibling that is missing is
+    # a failure (`CELLUCID_REQUIRE_SIBLINGS`). Each list holds every file a
+    # contract reads of that sibling: `tests/ci-sibling-checkouts-contract.test.mjs`
+    # compares them with the list of shared files (`scripts/shared-files.mjs`)
+    # and with what the other contracts read. Only `anndata-copy-cross-language`
+    # reads more (a whole package, with a Python of its dependencies): it runs
+    # in the `viewers` job, never here. The siblings are checked out at their
+    # default branch when the job starts: a cross-repository change that lands
+    # here before its sibling's change does fails these contracts until the
+    # next run. The widget contract names each checkout's commit and runs the
+    # behavior contracts on both copies, so its failure says which repository
+    # is behind. A sibling's change goes first.
     defaults:
       run:
         working-directory: cellucid
+    env:
+      CELLUCID_REQUIRE_SIBLINGS: "1"
 
     steps:
       - name: Check out the exact source
@@ -77,12 +82,32 @@ jobs:
           path: cellucid-python
           filter: blob:none
           sparse-checkout: |
-            src/cellucid/jupyter/static/widget.js
+            docs/**/*.md
+            docs/conf.py
             src/cellucid/action_catalog.json
             src/cellucid/history_model.schema.json
+            src/cellucid/input_formats.json
+            src/cellucid/jupyter/static/widget.js
             src/cellucid/mcp_tools.json
-            tests/fixtures/history_golden/
-            docs/**/*.md
+            tests/fixtures/category_default_colors.json
+            tests/fixtures/data_mapping_conformance.json
+            tests/fixtures/gene_sets.gmt
+            tests/fixtures/history_golden/history_golden.cellucid-session
+            tests/fixtures/history_golden/history_golden.expected.json
+            tests/fixtures/history_golden/history_golden_state.cellucid-session
+            tests/fixtures/latent_outlier_conformance.json
+            tests/fixtures/obs_columns.csv
+            tests/fixtures/older_anndata/legacy-0.6-compound-obsm.h5ad
+            tests/fixtures/older_anndata/legacy-0.6-twin-current.h5ad
+            tests/fixtures/older_anndata/legacy-0.6.h5ad
+            tests/fixtures/older_anndata/legacy-0.7-csr.h5ad
+            tests/fixtures/older_anndata/legacy-0.7-dense.h5ad
+            tests/fixtures/older_anndata/legacy-0.7.zarr.zip
+            tests/fixtures/older_anndata/legacy-h5sparse.h5ad
+            tests/fixtures/older_anndata/legacy-seuratdisk.h5ad
+            tests/fixtures/older_anndata/legacy-twin-current.h5ad
+            tests/fixtures/subsample_conformance.json
+            tests/fixtures/viewer_protocol.json
           sparse-checkout-cone-mode: false
 
       - name: Check out the R package's copies of the shared documents and golden history
@@ -92,12 +117,32 @@ jobs:
           path: cellucid-r
           filter: blob:none
           sparse-checkout: |
-            inst/widget/widget.js
             inst/action_catalog.json
-            inst/history_model.schema.json
-            inst/mcp_tools.json
             inst/extdata/history_golden.cellucid-session
-            tests/testthat/fixtures/history_golden/
+            inst/history_model.schema.json
+            inst/input_formats.json
+            inst/mcp_tools.json
+            inst/widget/widget.js
+            tests/testthat/fixtures/category_default_colors.json
+            tests/testthat/fixtures/data_mapping_conformance.json
+            tests/testthat/fixtures/gene_sets.gmt
+            tests/testthat/fixtures/history_golden/history_golden.cellucid-session
+            tests/testthat/fixtures/history_golden/history_golden.expected.json
+            tests/testthat/fixtures/history_golden/history_golden_state.cellucid-session
+            tests/testthat/fixtures/latent_outlier_conformance.json
+            tests/testthat/fixtures/obs_columns.csv
+            tests/testthat/fixtures/subsample_conformance.json
+            tests/testthat/fixtures/viewer_protocol.json
+          sparse-checkout-cone-mode: false
+
+      - name: Check out the annotation repository's contract corpus
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-annotation
+          path: cellucid-annotation
+          filter: blob:none
+          sparse-checkout: |
+            tests/fixtures/contract-corpus.json
           sparse-checkout-cone-mode: false
 
       - name: Install Node.js
@@ -136,8 +181,8 @@ jobs:
       # no duplicates. WebKit on Windows is left out: Safari does not exist on
       # Windows, and Playwright's Windows WebKit build has no origin-private
       # file system and no OffscreenCanvas, which every Safari Cellucid
-      # supports has, so it failed on every run whatever the code did
-      # (decided 2026-10-31). Safari is covered by WebKit on macOS and Linux.
+      # supports has, so it would fail whatever the code does. Safari is
+      # covered by WebKit on macOS and Linux.
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
         browser: [chromium, firefox, webkit]
@@ -219,10 +264,9 @@ jobs:
       # mirror, the engine from Playwright's CDN. apt cannot leave a mirror
       # connection that trickles (its timeout fires only on silence), and
       # about one runner in two dozen gets one: 30-50 kB/s from the package
-      # pool while the same runner read the index from the same mirror at
-      # 13 MB/s, so a run of 48 Linux browser jobs lost one to the step bound
-      # (runs 42274413675 and 42275099689; 42180485733 and 42262565061
-      # before). The script takes the download from apt: Playwright names the
+      # pool while the same runner reads the index from the same mirror at
+      # 13 MB/s, so a run of 48 Linux browser jobs can lose one to the step
+      # bound. The script takes the download from apt: Playwright names the
       # missing packages, each is fetched under a speed floor and, when it
       # falls under it, again from the next mirror of the runner's own mirror
       # list, its hash checked, and apt installs from those files only
@@ -376,11 +420,11 @@ jobs:
 
   # The control walk (`tests/browser/helpers/control-walk.mjs`): a test per
   # part of the page, each minutes long, declared by the files
-  # `tests/browser/control-walk-<k>-of-<n>.spec.mjs`, a share each, and
-  # Chromium only. Playwright shards by test count, so in the browser job its
-  # few long tests fell into one shard together (Chromium 3/8: a batch of 36
-  # tests took 40.8 minutes in run 42334173086, against about 9 minutes for
-  # the whole shard without them). Here each share is a job of its own
+  # `tests/browser/control-walk-<k>-of-<n>.spec.mjs`, a share each (filled by
+  # weight, `tests/browser/helpers/control-walk-parts.mjs`), and Chromium
+  # only. Playwright shards by test count, so in the browser job its few long
+  # tests would fall into one shard together and that shard would run several
+  # times as long as the others. Here each share is a job of its own
   # (`CELLUCID_CONTROL_WALK=only`, one shard a file), on the operating
   # systems the browser job runs Chromium on, through the same bounded
   # runner and with the same setup and evidence steps.
@@ -415,4 +459,129 @@ jobs:
       - *record-linux-host
       - *record-windows-host
       - *record-macos-host
+      - *upload-failure-evidence
+
+  # The specs that run the viewer against the real Python and R packages
+  # (`viewer-channel`, `viewer-history`, `viewer-round-trip`, `mcp-local`,
+  # `notebook-widget-jupyterlab` with `CELLUCID_PYTHON`; `r-viewer-channel`,
+  # `r-viewer-history` with `CELLUCID_RSCRIPT`) skip on a machine that names no
+  # interpreter, so the browser shards above never run them. This job installs
+  # both packages from their checkouts and names the interpreters;
+  # `CELLUCID_REQUIRE_VIEWERS=1` makes an interpreter that is missing a
+  # failure, not a skip. Chromium on Linux: the Python and R sides, not the
+  # engines, are what these specs add. The contract test of the web app's
+  # copies read by Python (`anndata-copy-cross-language`) needs the same Python
+  # and runs here too. The siblings are checked out inside the workspace of
+  # this repository, and named by their roots.
+  viewers:
+    name: ${{ matrix.os }} / ${{ matrix.browser }} / viewer against the Python and R packages
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        browser: [chromium]
+
+    env:
+      CELLUCID_REQUIRE_VIEWERS: "1"
+      CELLUCID_PYTHON_ROOT: ${{ github.workspace }}/siblings/cellucid-python
+      CELLUCID_R_ROOT: ${{ github.workspace }}/siblings/cellucid-r
+
+    steps:
+      - *check-out
+      - *install-node
+      - *install-dependencies
+      - *install-linux-libraries
+      - *install-engine
+
+      # What `pip install -e` builds from, the sources the specs run
+      # (`PYTHONPATH` names `src`) and the golden history `viewer-channel` loads:
+      # the package's own files, not its documentation.
+      - name: Check out cellucid-python
+        timeout-minutes: 5
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-python
+          path: siblings/cellucid-python
+          filter: blob:none
+          sparse-checkout: |
+            /pyproject.toml
+            /README.md
+            /LICENSE
+            /MANIFEST.in
+            /src/
+            /tests/fixtures/history_golden/history_golden.cellucid-session
+          sparse-checkout-cone-mode: false
+
+      - name: Check out cellucid-r
+        timeout-minutes: 5
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-r
+          path: siblings/cellucid-r
+
+      - name: Install Python
+        timeout-minutes: 5
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The package with the extras the specs need (the MCP server, MuData),
+      # and JupyterLab with its kernel for the notebook widget spec.
+      - name: Install cellucid-python and JupyterLab
+        timeout-minutes: 15
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "${CELLUCID_PYTHON_ROOT}[mcp,mudata]" "jupyterlab>=4,<5" ipykernel
+
+      - name: Install R
+        timeout-minutes: 10
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+          use-public-rspm: true
+
+      # cellucid-r's hard dependencies, and SingleCellExperiment (Bioconductor),
+      # which the specs' R objects are; IRkernel (with IRdisplay) is the R
+      # kernel of the notebook widget spec, which registers it for its own
+      # JupyterLab, and pkgload loads the checkout in that kernel.
+      - name: Install cellucid-r's dependencies
+        timeout-minutes: 20
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          working-directory: siblings/cellucid-r
+          dependencies: '"hard"'
+          extra-packages: any::SingleCellExperiment any::IRkernel any::pkgload
+
+      # The specs `library(cellucid)`: the package as installed, built from
+      # the checkout.
+      - name: Install cellucid-r from its checkout
+        timeout-minutes: 10
+        run: R CMD INSTALL "${CELLUCID_R_ROOT}"
+
+      - name: Name the Python and R the specs run
+        run: |
+          echo "CELLUCID_PYTHON=$(which python)" >> "$GITHUB_ENV"
+          echo "CELLUCID_RSCRIPT=$(which Rscript)" >> "$GITHUB_ENV"
+          echo "CELLUCID_R=$(which R)" >> "$GITHUB_ENV"
+
+      - name: Run the viewer specs against the real packages
+        timeout-minutes: 30
+        run: >-
+          npm run test:browser --
+          --project=${{ matrix.browser }}
+          tests/browser/viewer-channel.spec.mjs
+          tests/browser/viewer-history.spec.mjs
+          tests/browser/viewer-round-trip.spec.mjs
+          tests/browser/mcp-local.spec.mjs
+          tests/browser/notebook-widget-jupyterlab.spec.mjs
+          tests/browser/r-viewer-channel.spec.mjs
+          tests/browser/r-viewer-history.spec.mjs
+
+      - name: Run the contract test of Python reading the web app's copies
+        timeout-minutes: 10
+        run: node --test tests/anndata-copy-cross-language.test.mjs
+
+      - *record-linux-host
       - *upload-failure-evidence

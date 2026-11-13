@@ -150,7 +150,7 @@ test('a saved session holds the history and the dataset part, taken once; loadin
   assert.deepEqual({ ...described }, { datasetId: 'pancreas', name: null, source: { kind: 'sample', dataset: 'pancreas' }, cells: null, genes: null });
 });
 
-test('a session carries the page chrome outside its history (the selection tool, CEL-0249): written at a save, planned before the load replaces anything, put back once its head is shown', async () => {
+test('a session carries the page chrome outside its history (the selection tool): written at a save, planned before the load replaces anything, put back once its head is shown', async () => {
   const chrome = { pressed: { 'highlight-mode': 'highlight-mode-lasso' } };
   const events = [];
   const source = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
@@ -191,8 +191,8 @@ test('trackers loaded beside the person\'s are offered back with one Undo, which
   let offer = null;
   await withNotificationRecorder(async recorded => {
     await loading.restoreFromBlob(blob);
-    // One notice announces the restore, names what it added and offers Undo (found 2026-11-10: a
-    // second notice said the same beside "Session fully restored."); the progress notice gives way to it.
+    // One notice announces the restore, names what it added and offers Undo (a second notice saying
+    // the same beside "Session fully restored." is not shown); the progress notice gives way to it.
     assert.equal(recorded.filter(event => event.kind === 'complete').length, 0, 'the progress notice does not also complete');
     assert.equal(recorded.filter(event => event.kind === 'dismiss').length, 1);
     const shown = recorded.filter(event => event.kind === 'ui-show');
@@ -410,7 +410,7 @@ test('a load that stops early releases the file it was reading', async () => {
   assert.equal(serializer.colors(), 'red');
 });
 
-test('a value that cannot be put back is one part not restored (F155): the rest of the file is read and shown, the part named with its words under Details', async () => {
+test('a value that cannot be put back is one part not restored: the rest of the file is read and shown, the part named with its words under Details', async () => {
   const blob = await twoTrackerSession();
   const serializer = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), value => {
     if (value === 'blue') throw new Error('That color cannot be put back');
@@ -428,10 +428,10 @@ test('a value that cannot be put back is one part not restored (F155): the rest 
   assert.equal(names.filter(name => /Red|Blue/.test(name)).length >= 2, true, 'both trackers of the file are loaded');
 });
 
-test('a part another version wrote that this version cannot read is said as that, never as a problem inside Cellucid (F155)', async () => {
+test('a part another version wrote that this version cannot read is said as that, never as a problem inside Cellucid', async () => {
   const blob = await twoTrackerSession();
   const serializer = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), value => {
-    // As the Expression values' owner refused `{normalise, log1p}` after the F149 rename.
+    // As the Expression values' owner refuses `{normalise, log1p}` after a rename of its keys.
     if (value === 'blue') throw new TypeError('The colors to restore is exactly {name: string}');
   });
   // This page is a later release than the one that wrote the file.
@@ -454,7 +454,7 @@ test('a part another version wrote that this version cannot read is said as that
   });
 });
 
-test('parts of the state this version does not have are said once, as left out, with the version that wrote them (F164)', () => {
+test('parts of the state this version does not have are said once, as left out, with the version that wrote them', () => {
   const parts = [
     { part: 'unknown-domain', domain: 'holograms' },
     { part: 'unknown-domain', domain: 'sounds' },
@@ -468,7 +468,7 @@ test('parts of the state this version does not have are said once, as left out, 
   assert.equal(view.message, 'Starting view restored but for 1 part. A part of the state this version of Cellucid does not have ("holograms") is left out.');
 });
 
-test('heavy work a person\'s load finds is named on its progress line, in the words of the work, with its Cancel (F167)', async () => {
+test('heavy work a person\'s load finds is named on its progress line, in the words of the work, with its Cancel', async () => {
   const totals = { ms: 20_000, bytes: 1e9, what: 'Sums all 3 genes of X once for each cell\'s total (normalized values)', doing: CELL_TOTALS_DOING };
   const restoring = () => serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), async (value, signal, heavy) => {
     if (value === 'blue') await heavy(totals);
@@ -671,7 +671,7 @@ test('a starting view is put back without a step, before the first tracker, on a
       refreshUi: ({ phase }) => { phases.push(phase); },
     });
     // A sample's own view restores without a word, and with no transfer line: it is a part of its
-    // dataset's opening, not a download ("Loading Starting view 0 B/s" at every start, round 9 close).
+    // dataset's opening, not a download (never "Loading Starting view 0 B/s" at every start).
     assert.deepEqual(events, []);
   });
   assert.deepEqual(phases, ['commit']);

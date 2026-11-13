@@ -15,7 +15,7 @@ const model = (categories, { hidden = [], empty = [] } = {}) => ({
 const types = Array.from({ length: 69 }, (_, i) => `Type ${i}`);
 
 test('every category shown: the title names the field, not its categories', () => {
-  // Found 2026-11-10 on Suo: "… • cell_type: AXL+ and SIGLEC6+ DCs, B1 cells +67" over all 69.
+  // On Suo: "… • cell_type: AXL+ and SIGLEC6+ DCs, B1 cells +67" over all 69.
   assert.equal(figureAutoTitle({ datasetName: 'Suo', fieldLabel: 'cell_type', legendModel: model(types) }), 'Suo • cell_type');
   // A category with no cell passing the other filters is not hidden by the person.
   assert.equal(figureAutoTitle({ datasetName: 'Suo', fieldLabel: 'cell_type', legendModel: model(types, { empty: [3] }) }), 'Suo • cell_type');
@@ -38,7 +38,7 @@ test('a continuous field or none: the dataset and the field', () => {
 });
 
 test('a grid whose panels show different fields is titled by the dataset alone', () => {
-  // Found 2026-11-10: a grid of a cell_type panel and an organ panel was titled "… • organ".
+  // A grid of a cell_type panel and an organ panel was titled "… • organ".
   const fields = { live: 'cell_type', snap_1: 'organ', snap_2: 'cell_type' };
   const fieldKeyOf = viewId => fields[viewId] ?? null;
   assert.equal(gridPanelsDifferInField({ viewLayout: { mode: 'grid' }, snapshotViewIds: ['snap_1'], fieldKeyOf }), true);
@@ -50,7 +50,7 @@ test('a grid whose panels show different fields is titled by the dataset alone',
 });
 
 
-test('one view: the filters on other fields follow the field, as its view label says them (F113)', () => {
+test('one view: the filters on other fields follow the field, as its view label says them', () => {
   // He, colored by LVL2 with only the epithelial cells kept: the legend lists the 11 epithelial
   // types with cells, so the title says why the other 30 are absent.
   const lvl2 = model(['Aerocyte', 'Lung_AT_cells', 'Lung_club_cells'], { empty: [0] });
@@ -65,7 +65,7 @@ test('one view: the filters on other fields follow the field, as its view label 
   );
 });
 
-test('a named view: the dataset and the name it was given (F130)', () => {
+test('a named view: the dataset and the name it was given', () => {
   const hiding = model(['B', 'T', 'NK', 'Mono'], { hidden: [3] });
   assert.equal(
     figureAutoTitle({ datasetName: 'He', fieldLabel: 'LVL2', legendModel: hiding, otherFilters: ['LVL0: showing only Epithelial'], viewName: 'Early epithelium' }),

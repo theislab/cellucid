@@ -147,7 +147,7 @@ const SNAKE_CASE = /^[a-z][a-z0-9_]*$/;
 export const LOAD_METHODS = Object.freeze(Object.values(DATA_LOAD_METHODS));
 
 /** The input format ids a dataset is read as. */
-export const DATA_FORMATS = Object.freeze(INPUT_FORMATS.map(format => format.id));
+const DATA_FORMATS = Object.freeze(INPUT_FORMATS.map(format => format.id));
 
 export const SOURCE_TYPES = Object.freeze([
   'local-demo', 'local-user', 'remote', 'link', 'jupyter',
@@ -159,7 +159,7 @@ export const STARTUP_PHASES = Object.freeze([
 ]);
 
 /** Stable codes the loaders publish on `error.code`; anything else is `other`. */
-export const ERROR_CODES = Object.freeze([
+const ERROR_CODES = Object.freeze([
   ...Object.values(DataSourceErrorCode),
   STARTUP_STALL_CODE,
   'CODE_LOAD_FAILED',
@@ -168,7 +168,7 @@ export const ERROR_CODES = Object.freeze([
 ]);
 
 /** Error constructor / DOMException names; anything else is `other`. */
-export const ERROR_NAMES = Object.freeze([
+const ERROR_NAMES = Object.freeze([
   'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
   'DataSourceError', 'ConfigurationError', 'TimeoutError', 'AbortError',
   'NotFoundError', 'NotReadableError', 'NotAllowedError', 'SecurityError',
@@ -176,15 +176,15 @@ export const ERROR_NAMES = Object.freeze([
   'DataCloneError', 'other',
 ]);
 
-export const DURATION_BUCKETS = Object.freeze([
+const DURATION_BUCKETS = Object.freeze([
   '<1s', '1-3s', '3-10s', '10-30s', '30-120s', '120s+',
 ]);
 
-export const COUNT_BUCKETS = Object.freeze([
+const COUNT_BUCKETS = Object.freeze([
   '<1k', '1k-10k', '10k-100k', '100k-1M', '1M-10M', '10M+',
 ]);
 
-export const DIMENSIONS = Object.freeze([
+const DIMENSIONS = Object.freeze([
   '1', '2', '3', '1+2', '1+3', '2+3', '1+2+3',
 ]);
 
@@ -202,7 +202,7 @@ export const METRIC_NAMES = Object.freeze([
   'LCP', 'CLS', 'INP', 'FCP', 'TTFB', 'LONGTASK_TOTAL', 'LONGTASK_MAX',
 ]);
 
-export const RATINGS = Object.freeze(['good', 'needs_improvement', 'poor']);
+const RATINGS = Object.freeze(['good', 'needs_improvement', 'poor']);
 
 /** `PerformanceNavigationTiming.type`; anything else is `other`. */
 export const NAVIGATION_TYPES = Object.freeze([

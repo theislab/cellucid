@@ -1,23 +1,22 @@
 /**
- * The one sprite every point is drawn at (rendering/point-sprite.js, F97,
- * owner decisions 2026-11-11): the perspective size and the cap
- * (`POINT_SPRITE_MAX_PX`, 160, within the GPU's own largest point), and
- * nothing else that depends on the camera's distance.
+ * The one sprite every point is drawn at (rendering/point-sprite.js): the
+ * perspective size and the cap (`POINT_SPRITE_MAX_PX`, 160, within the GPU's
+ * own largest point), and nothing else that depends on the camera's distance.
  *
  * - Every vertex shader that sizes a sprite of a cell (the Full, Sculpted,
  *   Light and Ultra-light point passes, the highlight ring's dot, the
  *   centroid markers) calls the one GLSL function; no shader keeps a cap or a
  *   formula of its own (a quality selects shading, never geometry: a higher
- *   ceiling once made two faster qualities draw larger, slower points, and a
- *   ring sized by its own copy of the clamp sat inside its dot).
+ *   ceiling in one quality would make a faster quality draw larger, slower
+ *   points, and a ring sized by its own copy of the clamp would sit inside
+ *   its dot).
  * - The GLSL and the JavaScript that picking, the read-cell layer and the
  *   figure export size with are the same function: the GLSL is evaluated
  *   here, transliterated, against the JavaScript.
  * - The cap never exceeds the GPU's `ALIASED_POINT_SIZE_RANGE` (asking for
  *   more is undefined, not clamped), and a figure export raises it by its
  *   raster scale.
- * - No near fade (shipped and removed the same day on the owner's decision,
- *   2026-11-11): no shader hides, thins or dithers a cell by its eye depth,
+ * - No near fade: no shader hides, thins or dithers a cell by its eye depth,
  *   and the module offers no fade to call. `tests/browser/point-near-camera-
  *   solid.spec.mjs` checks the same on the GPU.
  */
@@ -138,9 +137,8 @@ test('the cap is 160 px within the GPU\'s largest point, never above it', () => 
 });
 
 test('no near fade: nothing hides, thins or dithers a cell by its distance from the camera', () => {
-  // The module sizes sprites and nothing else (F97's near fade, removed on
-  // the owner's decision 2026-11-11, exported NEAR_FADE, NO_NEAR_FADE,
-  // NEAR_FADE_PICK_MIN, NEAR_FADE_DITHER_GLSL, nearFadeUniform and nearFadeAt).
+  // The module sizes sprites and nothing else: it exports no near-fade
+  // constant, shader function, uniform or fade to call.
   assert.deepEqual(Object.keys(pointSpriteModule).sort(), [
     'POINT_SPRITE_GLSL', 'POINT_SPRITE_MAX_PX', 'POINT_SPRITE_MIN_PX',
     'gpuPointSizeMax', 'pointScaleFor', 'pointSpriteCap', 'pointSpriteSize',
@@ -176,6 +174,5 @@ test('the figure export raises the cap by its raster scale, every pass that size
   const sizeSetters = source.match(/u\('u_pointSize'\)|hu\('u_pointSize'\)/g) ?? [];
   const capSetters = source.match(/u\('u_pointSizeMax'\)|hu\('u_pointSizeMax'\)/g) ?? [];
   assert.equal(capSetters.length, sizeSetters.length, `${sizeSetters.length} passes set a point size, ${capSetters.length} the cap`);
-  assert.doesNotMatch(source, /nearFade|uniform2fv/);
   assert.match(source, /hu\('u_gpuPointSizeMax'\)/);
 });

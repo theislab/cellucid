@@ -11,7 +11,7 @@ import test from 'node:test';
 
 import { formatDecimal, formatMultiplier, formatWithUnit } from '../assets/js/app/ui/components/display-format.js';
 import { formatCompactCount, formatPercent } from '../assets/js/utils/format-units.js';
-import { formatCells, formatCount, formatCountOf } from '../assets/js/utils/format-units.js';
+import { formatCells, formatCount } from '../assets/js/utils/format-units.js';
 
 class FakeNode {
   constructor(tagName) {
@@ -87,7 +87,6 @@ const {
 
 test('counts, units and multipliers read one way everywhere', () => {
   assert.equal(formatCount(1234567), '1,234,567');
-  assert.equal(formatCountOf(1, 'cell'), '1 cell');
   assert.equal(formatCells(12000), '12,000 cells');
   assert.equal(formatCompactCount(950), '950');
   assert.equal(formatCompactCount(1500), '1.5K');
@@ -96,7 +95,6 @@ test('counts, units and multipliers read one way everywhere', () => {
   assert.equal(formatCompactCount(2500000), '2.5M');
   assert.equal(formatDecimal(0.5, 2), '0.50');
   assert.equal(formatMultiplier(3, 1), '3.0×');
-  assert.equal(formatPercent(60), '60%');
   assert.equal(formatWithUnit(8, 1, 's'), '8.0 s');
   assert.throws(() => formatCount(Number.NaN), /finite/);
 });

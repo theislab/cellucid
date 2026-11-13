@@ -175,7 +175,7 @@ test('an answer bounds the cheapest frame, and its spread is only what the sampl
   assert.deepEqual(answer(exact(400), exact(120), exact(130)),
     { gpu: { lo: 120, hi: 120 }, frame: { lo: 120, hi: 120 }, spread: 10 });
   // Overlapping bounds prove no spread: the instrument's resolution is not
-  // counted as frame-to-frame variation (it was, before 2026-11-01).
+  // counted as frame-to-frame variation.
   const coarse = (lo, hi) => sampleOf(0, { lo, hi });
   assert.deepEqual(answer(coarse(170, 324), coarse(180, 330), coarse(300, 400)),
     { gpu: { lo: 170, hi: 324 }, frame: { lo: 170, hi: 324 }, spread: 0 });
@@ -185,10 +185,9 @@ test('an answer bounds the cheapest frame, and its spread is only what the sampl
 test('the verdict is what the bounds prove: faster, no faster, or closer than the instrument times', () => {
   const coarse = (lo, hi) => sampleOf(0, { lo, hi });
   const of = (lo, hi) => answer(coarse(lo, hi), coarse(lo, hi), coarse(lo, hi));
-  // Web contracts run 41307458156 (Linux Chromium): 174 against 324 ms,
-  // a 150 ms poll on a busy runner. The old rule added that 150 ms to the
-  // faster frame's upper bound and said "no faster here"; the bounds say
-  // the frames cannot be told apart.
+  // A 150 ms poll (a loaded runner): 174 against 324 ms. The poll's 150 ms is
+  // not added to the faster frame's upper bound, which would say "no faster
+  // here"; the bounds say the frames cannot be told apart.
   assert.equal(verdictOf(of(174, 324), of(150, 174)), 'unresolved');
   // Resolved by a finer instrument, the same frames are faster.
   assert.equal(verdictOf(of(320, 324), of(170, 174)), 'faster');
@@ -198,9 +197,8 @@ test('the verdict is what the bounds prove: faster, no faster, or closer than th
   assert.equal(verdictOf(answer(exact(60), exact(60), exact(60)), answer(exact(60), exact(60), exact(60))), 'not-faster');
   // A gain within the proven spread is no gain.
   assert.equal(verdictOf(answer(exact(438), exact(441), exact(445)), answer(exact(436), exact(437), exact(439))), 'not-faster');
-  // Polls 8 ms apart (WebKit, idle Apple M1 Pro): 68 against 65 ms within
-  // one interval is not faster (culling kept for 120 cells, Web contracts
-  // run 41255961977), and frames proven the same are no faster.
+  // Polls 8 ms apart: 68 against 65 ms within one interval is not faster
+  // (culling would be kept for 120 cells), and frames proven the same are no faster.
   assert.equal(verdictOf(of(60, 68), of(57, 65)), 'unresolved');
   assert.equal(verdictOf(of(66, 68), of(66, 68)), 'unresolved', 'alike within one interval: either may be the faster');
 });
@@ -413,8 +411,7 @@ test('the viewer arms a measurement only once what it measures is committed, and
   const viewer = await readFile(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   const body = (start, end) => viewer.slice(viewer.indexOf(start), viewer.indexOf(end, viewer.indexOf(start)));
   // A publication of cells: the last thing it does, once everything else
-  // is published (a publication that failed changed nothing, camera-defaults
-  // spec, Web contracts run 41307458156).
+  // is published (a publication that failed changed nothing).
   const publication = body('  function publishLiveData(', '\n  }\n');
   assert.match(publication, /publishSmokeSourceChange\(\);\n(\s*\/\/.*\n)*\s*armFullDetailFrameCost\(\);\s*$/);
   assert.equal(publication.match(/armFullDetailFrameCost\(\)/g).length, 1);

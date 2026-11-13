@@ -1667,7 +1667,7 @@ export function docsUrl(link) {
   return link.anchor === null ? page : `${page}#${link.anchor}`;
 }
 
-export function requireInfoTip(key) {
+function requireInfoTip(key) {
   if (typeof key !== 'string' || !Object.hasOwn(INFO_TIPS, key)) {
     throw new TypeError(`Unknown info tip "${String(key)}"`);
   }

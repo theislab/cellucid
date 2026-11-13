@@ -4,16 +4,12 @@
  * A loop that asks the product's state once a frame (or once a task) and
  * gives up after a number of frames, or at a time it set itself, guesses how
  * fast the machine is. Where a frame takes a second, or a worker builds a
- * tree for longer than the frames beside it, the count ran out first:
- * "The live store never adopted its tree order" (`frustum-culling-parity`,
- * Linux Firefox); a frame read before any pulse frame had been drawn under
- * its rings, 126,568 pixels off (`highlight-pulse-layer-parity`, Linux
- * Firefox, a loop that went on in silence after 600 frames); ten minutes of a
- * test spent on 1,800 frames of a condition that could not hold
- * (`segmented-point-stores`, macOS and Windows Firefox); "the sidebar toggle
- * started no slide" (`presented-layout`, Linux WebKit). Such a loop runs
- * until its state holds, and the test's timeout is the one fence: it is as
- * patient as the slowest runner and loses nothing on a fast one.
+ * tree for longer than the frames beside it, the count runs out first: the
+ * live store has not yet adopted its tree order, a frame is read before any
+ * pulse frame has been drawn under its rings, a condition that cannot hold
+ * costs ten minutes of a test, a sidebar toggle has started no slide. Such a
+ * loop runs until its state holds, and the test's timeout is the one fence:
+ * it is as patient as the slowest runner and loses nothing on a fast one.
  *
  * This sweeps `tests/browser/` for both shapes:
  * - a `for` loop that counts from 0 to a number, awaits a frame or a timer in
@@ -27,9 +23,9 @@
  * The same holds for the time an assertion or a wait is given. The suite's
  * own is a minute for an assertion (`playwright.config.mjs`, `expect.timeout`)
  * and the test's timeout for everything else; a spec that gives one less
- * (`{ timeout: 10_000 }`) says how fast the machine must be, and 107 of them
- * did. Every `timeout:` of less than the suite's minute, and every
- * `…TIMEOUT_MS` constant of less, must be listed in `ALLOWED_SHORT`.
+ * (`{ timeout: 10_000 }`) says how fast the machine must be. Every `timeout:`
+ * of less than the suite's minute, and every `…TIMEOUT_MS` constant of less,
+ * must be listed in `ALLOWED_SHORT`.
  */
 
 import assert from 'node:assert/strict';

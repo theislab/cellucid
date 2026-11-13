@@ -4,22 +4,19 @@
  *
  * - **The inverse of the kept rows** (`KeptPositions`) is a table of the kept
  *   rows for a small share and an array of every row once that holds fewer
- *   bytes: every cell of a 50M-cell priority-ordered store held 1.07 GB as a
- *   table (2^27 slots of 8 bytes) and holds 200 MB as an array; its graph's
- *   first rows were read in 2.26 s, then in 0.18 s.
+ *   bytes (measured: 23_decisions_partial_reading.md).
  * - **What they hold is counted** in the memory model's working set, as this
  *   thread's part (`CellRows` `onHeld`; the reader's `cell rows` part), and
- *   let go when the reader closes: at 50M the reader worker held 2.34 GB
- *   after collection against 0.6 GB counted.
+ *   let go when the reader closes (measured: 27_decisions_memory_model.md).
  * - **Kept row pointers are found a run at a time** (`keptEntries`): rows in
  *   file order walk the pointers forward, no lookup at all; the rows the
  *   pointers were read for, in their own order, look each run up once
  *   (`runIndexFor`) and never again; others, one lookup a run, each through
- *   the bucket of its row (`RowPointers.indexOf`). A lookup a row by a
- *   binary search over millions of ranges took 11 s of a 5M-cell induced
- *   subgraph. The pointers are read in one pass over the rows ascending
- *   (`CellRows.ascending`), ranges a few pointers apart one: a 50% uniform
- *   share's ranges are a few, not one a row.
+ *   the bucket of its row (`RowPointers.indexOf`); a lookup a row by a
+ *   binary search over millions of ranges is far slower (measured:
+ *   23_decisions_partial_reading.md). The pointers are read in one pass over
+ *   the rows ascending (`CellRows.ascending`), ranges a few pointers apart
+ *   one: a 50% uniform share's ranges are a few, not one a row.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -212,8 +209,8 @@ test('the ranks a subsample was drawn from are counted with the open rows, each 
   await last.open(root, { format: ZARR_FORMAT, name: 'grow.zarr', decodedChunkBytes: 0, cellSubset: { mode: 'subsample', method: 'uniform', k: 2000, seed: 1 }, carry: step });
   step.releaseStore();
   step.close();
-  // Speed before memory (owner, 2026-10-30): the ranks stay for the next size
-  // (no second rank pass), counted.
+  // Speed before memory: the ranks stay for the next size (no second rank
+  // pass), counted.
   assert.equal(last._subsampleCache.stats.passes, 1, 'one rank pass for both sizes');
   assert.ok(last._subsampleCache.buffers().size > 0, 'the ranks kept');
   assert.deepEqual(part(), [heldBy(last)], 'its rows, open order and ranks, counted once');
@@ -245,4 +242,45 @@ test('the row pointers an open subsample\'s matrix holds are counted in the gene
   assert.ok(viewBytes >= 2500 * 8, 'at least the kept rows\' pointers, 8 bytes a row');
   assert.ok(reader._rowPointerBytes() >= viewBytes, 'counted in the gene-index share');
   reader.close();
+});
+
+test('the row pointers a later subsample of the same store takes over are counted with its reader\'s, and let go with them', async () => {
+  const n = 5_000;
+  const perRow = 3;
+  const indptr = Int32Array.from({ length: n + 1 }, (_, r) => r * perRow);
+  const indices = Int32Array.from({ length: n * perRow }, (_, e) => e % perRow);
+  const tree = annData({
+    obs: dataFrame({ _index: strings(Array.from({ length: n }, (_, i) => `c${i}`), { chunks: [1000] }) }),
+    var: dataFrame({ _index: strings(['g0', 'g1', 'g2']) }),
+    obsm: mapping({ X_umap: array(new Float32Array(n * 2), { shape: [n, 2], chunks: [1000, 2] }) }),
+    X: sparse({ data: new Float32Array(n * perRow).fill(1), indices, indptr, shape: [n, perRow], chunks: 1024 }),
+  });
+  const { AnnDataReader } = await import('../assets/js/data/anndata/reader.js');
+  const { ZARR_FORMAT } = await import('../assets/js/data/anndata/elements.js');
+  const root = await openZarr(memoryStore(zarrEntries(tree), { name: 'x.zarr' }));
+  const first = new AnnDataReader();
+  await first.open(root, { format: ZARR_FORMAT, name: 'x.zarr', decodedChunkBytes: 0, cellSubset: { mode: 'subsample', method: 'uniform', k: 2500, seed: 3 } });
+  await first.getMatrixColumn('X', 1);
+  const next = new AnnDataReader();
+  await next.open(root, { format: ZARR_FORMAT, name: 'x.zarr', decodedChunkBytes: 0, cellSubset: { mode: 'subsample', method: 'uniform', k: 2000, seed: 3 }, carry: first });
+  first.releaseStore();
+  first.close();
+  // Nothing read yet by the later opening: the pointers it holds are the earlier one's.
+  const taken = next._root.knownRowPointers();
+  assert.ok(taken.size > 0, 'the earlier subsample\'s pointers are taken over');
+  const buffers = new Set();
+  for (const pointers of taken.values()) {
+    for (const array of ArrayBuffer.isView(pointers) ? [pointers] : Object.values(pointers)) {
+      if (ArrayBuffer.isView(array) && array.byteLength > 0) buffers.add(array.buffer);
+    }
+  }
+  const takenBytes = [...buffers].reduce((sum, buffer) => sum + buffer.byteLength, 0);
+  assert.ok(takenBytes > 0);
+  assert.ok(next._rowPointerBytes() >= takenBytes, 'counted in the gene-index share');
+  assert.ok(next.trimResident(0).includes('row pointers'));
+  assert.equal(next._root.knownRowPointers().size, 0, 'let go when the row pointers go');
+  const column = await next.getMatrixColumn('X', 1);
+  assert.equal(column.length, 2000);
+  assert.ok(column.every(value => value === 1), 'read again when asked for');
+  next.close();
 });

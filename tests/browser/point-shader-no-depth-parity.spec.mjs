@@ -10,8 +10,9 @@
  * it stands for: the same pixels, single-sampled and multisampled, whatever
  * the overlap, size, sub-pixel position or alpha of the points — hidden ones
  * included. Each is compared with itself rewritten to discard exactly where it
- * writes zero, within one rounding step per channel: both programs compute the
- * antialiased rim's coverage, and each compiles that arithmetic anew.
+ * writes zero, byte for byte: both programs compute the antialiased rim's
+ * coverage from the same source, and the zero they differ in leaves the
+ * destination as it was.
  */
 import { expect, test } from './helpers/test.mjs';
 
@@ -195,17 +196,6 @@ test('the no-depth point shaders draw what discarding draws where they write zer
       )) {
         const discarded = draw(quality, framebuffer, pointSize);
         const zeroAlpha = draw(`${quality}NoDepth`, framebuffer, pointSize);
-        // Every quality computes the rim's coverage, and light's alpha is its
-        // vertex alpha times that coverage, so no quality outputs a value the
-        // two programs must agree on to the bit. The arithmetic is compiled
-        // twice, once per program, and a driver may contract it into fused
-        // multiply-adds differently in each. That moves a channel by at most
-        // one step, including where the coverage test itself flips: there the
-        // coverage is within rounding of zero, and so is the alpha it blends
-        // with. A coverage difference of substance moves a pixel by far more.
-        // (Light was held to the bit after it gained a rim, and hosted macOS
-        // Firefox, a software renderer, then drew one pixel differently.)
-        const tolerance = 1;
         let differing = 0;
         let largestDelta = 0;
         let painted = 0;
@@ -217,7 +207,7 @@ test('the no-depth point shaders draw what discarding draws where they write zer
               Math.abs(discarded[index + channel] - zeroAlpha[index + channel])
             );
           }
-          if (delta > tolerance) differing++;
+          if (delta > 0) differing++;
           largestDelta = Math.max(largestDelta, delta);
           if (discarded[index] !== 51 || discarded[index + 1] !== 102 || discarded[index + 2] !== 153) {
             painted++;

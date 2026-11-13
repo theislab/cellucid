@@ -51,7 +51,7 @@ export function isSingleCellExperiment(node) {
 }
 
 /** The SingleCellExperiment version that wrote an object, or null. */
-export function sceVersion(node) {
+function sceVersion(node) {
   const version = item(attribute(node, 'int_metadata'), 'version');
   const numbers = version?.kind === 'list' ? version.items?.[0]?.values : null;
   return numbers ? Array.from(numbers).join('.') : null;

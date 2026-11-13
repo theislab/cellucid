@@ -15,8 +15,8 @@
  * The geometry lives here too, so the SVG rectangle and the Canvas rectangle
  * are the same rectangle, and so do the two drawers of it
  * (`renderSvgSelectionBadge`, `drawCanvasSelectionBadge`), which the PNG, the
- * SVG and the export preview all call: the SVG drew rounded corners the PNG
- * did not, and the preview computed its own rectangle (F158).
+ * SVG and the export preview all call, so no format draws other corners or
+ * another rectangle.
  *
  * @module ui/modules/figure-export/utils/selection-badge
  */

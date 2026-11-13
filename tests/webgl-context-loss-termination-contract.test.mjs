@@ -8,10 +8,10 @@
  * imports it. So the two agree on a name instead, and the frame loop tests
  * against that name to tell a handled loss from a defect.
  *
- * That agreement was prose. Nothing executed it, and nothing caught the
- * refusal: a context lost between a frame starting and `webglcontextlost` being
- * delivered reached the GL preflight, and the refusal escaped the animation
- * callback to `window.onerror`. It surfaced as an intermittent
+ * This agreement is executed here, and the refusal is caught: a context lost
+ * between a frame starting and `webglcontextlost` being delivered reaches the
+ * GL preflight, and the refusal must not escape the animation callback to
+ * `window.onerror`, where it would surface as an intermittent
  * `viewer-terminal-disposal` failure — a page error asserted absent, present —
  * on one engine at a time, because it needs the loss to land inside that
  * window.

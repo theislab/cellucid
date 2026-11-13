@@ -229,7 +229,7 @@ export function createCellIdentity({ nObs, kept = null, openOrder = null, choice
     }
     // Each open cell once: a bit per cell of the file, set for the open
     // ones and cleared as the order names each -- a read of a small table,
-    // not a search of `kept` per cell (10M cells of 20M: 0.08 s, not 3.3 s).
+    // not a search of `kept` per cell (measured: 23_decisions_partial_reading.md).
     const open = openCellBits(nObs, kept);
     for (let i = 0; i < n; i++) {
       const original = openOrder[i];
@@ -290,8 +290,9 @@ export function createCellIdentity({ nObs, kept = null, openOrder = null, choice
    * The open position of each original position, -1 where the cell is not
    * open. Ascending input walks `kept` once; many in any other order are
    * placed by the bits of the open cells (`keptRanks`: a step a cell, where
-   * a search of `kept` a cell took 2.4 s of a 50% share of 10M cells put
-   * in priority order in place); a few, by a search of `kept` each.
+   * a search of `kept` a cell is far slower on a large share put in priority
+   * order in place; measured: 23_decisions_partial_reading.md); a few, by a
+   * search of `kept` each.
    */
   function openPositionsOf(originals) {
     const openOf = placeOf();
@@ -410,7 +411,7 @@ export function createCellIdentity({ nObs, kept = null, openOrder = null, choice
     for (let i = 1; i < originals.length && sorted; i++) sorted = originals[i - 1] < originals[i];
     if (sorted) return { cells: originals, values };
     // Linear in the cells (a radix sort of the original positions), never a
-    // comparator call per comparison: seconds at 10M cells.
+    // comparator call per comparison, which takes seconds at 10M cells.
     const order = orderByKey(originals);
     const cells = allocateTypedArray(Uint32Array, order.length, 'Original cell positions');
     const ordered = values === null ? null : allocateTypedArray(values.constructor, order.length, 'Cell values');

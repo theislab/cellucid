@@ -215,11 +215,11 @@ out vec4 fragColor;
 void main() {
   vec2 coord = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(coord, coord);
-  // One discard for both cases — a hidden point (second line of defence
+  // One discard for both cases: a hidden point (second line of defence
   // behind HP_VS_FULL's clip-volume rejection) and a sprite corner outside the
-  // disc. Two separate discards, the first ahead of everything else, cost 12%
-  // of a dense antialiased 2-D frame (1M points, 4x MSAA, ANGLE Metal on an
-  // Apple M1 Pro: 35.6 ms against 31.4 ms) for the same pixels.
+  // disc. Two separate discards, the first ahead of everything else, cost more
+  // on a dense antialiased frame for the same pixels (measured:
+  // 28_decisions_rendering_layers.md).
   if (v_alpha < 0.01 || r2 > 1.0) discard;
 
   // Sphere normal for lighting
@@ -247,8 +247,8 @@ void main() {
  * The rim is antialiased. Coverage is 1 inside the disc, falls across one
  * pixel centered on the edge, and is 0 beyond it. MSAA cannot smooth this edge
  * itself, because a fragment shader runs once per pixel and a discard (or a
- * zero alpha) removes every sample of it, so the disc used to be a hard,
- * jagged staircase on a DPR-1 screen, antialiasing on or off. `(1 - r^2) / 2`
+ * zero alpha) removes every sample of it, so a hard-edged disc is a jagged
+ * staircase on a DPR-1 screen, antialiasing on or off. `(1 - r^2) / 2`
  * is the distance from the edge in sprite units to first order, exact at the
  * rim where it matters. The ramp is one pixel wide from a radius of four pixels
  * up and narrows below that (`rimSharpness`): a disc of a few pixels has no
@@ -379,11 +379,10 @@ void main() {
 
   // The same sprite as HP_VS_FULL and HP_VS_HIGHLIGHT (one GLSL function,
   // rendering/point-sprite.js). Shader quality selects shading, never
-  // geometry: a higher ceiling here once made "light" and "ultralight" draw
+  // geometry: a higher ceiling here would make "light" and "ultralight" draw
   // larger points than "full" at close range, which is both a different
-  // picture and — because point area is quadratic in the size — more fill
-  // (a ceiling of 192 measured 1.23x the GPU frame time at point size 40 and
-  // 1.90x at 60).
+  // picture and, because point area is quadratic in the size, more fill
+  // (measured: 28_decisions_rendering_layers.md).
   gl_PointSize = pointSpriteSize(eyeDepth);
 
   // Reject invisible points before rasterisation — see HP_VS_FULL. This shader
@@ -450,9 +449,8 @@ void main() {
  * the destination exactly as it was, so the frame is byte-identical. What
  * changes is the cost: a shader that may discard makes the GPU resolve each
  * fragment's coverage before it can blend the next one into the same pixel,
- * and in a dense 2-D embedding drawn with antialiasing that serialization was
- * most of the frame (1M points, 4x MSAA: 30 ms with the discard, 17 ms
- * without, ANGLE Metal on an Apple M1 Pro).
+ * and in a dense 2-D embedding drawn with antialiasing that serialization is
+ * most of the frame (measured: 28_decisions_rendering_layers.md).
  *
  * Only a pass without depth may use it. With depth writes on, the zero-alpha
  * corners and hidden points would write depth and occlude what lies behind
@@ -758,13 +756,13 @@ export const HIGHLIGHT_STYLES_BY_QUALITY = Object.freeze({
  * The color highlighted cells are drawn in (RGB, 0 to 1), on screen and in a
  * figure alike: the viewer's highlight renderer, the figure's point raster and
  * its vector points, and the figure legend's entry for the highlighted cells
- * (F158) all read it here. Each highlighted cell is a dot of this color inside
+ * all read it here. Each highlighted cell is a dot of this color inside
  * a ring of `highlightRingColorFor(HIGHLIGHT_COLOR)` (`HIGHLIGHT_RING_COLOR`).
  */
 export const HIGHLIGHT_COLOR = Object.freeze([0.4, 0.85, 1.0]);
 
-const HIGHLIGHT_RING_BLACK = Object.freeze([0, 0, 0]);
-const HIGHLIGHT_RING_WHITE = Object.freeze([1, 1, 1]);
+const HIGHLIGHT_RING_BLACK = Object.freeze(/** @type {[number, number, number]} */ ([0, 0, 0]));
+const HIGHLIGHT_RING_WHITE = Object.freeze(/** @type {[number, number, number]} */ ([1, 1, 1]));
 
 const linearChannel = channel => (channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
 
@@ -773,16 +771,15 @@ const linearChannel = channel => (channel <= 0.04045 ? channel / 12.92 : ((chann
  * has the higher contrast with the dot's color (WCAG relative luminance). One
  * rule for every coloring, background, shader quality and figure format.
  *
- * Why (F162): a dot alone, in a fixed color, vanishes wherever the cells
- * around it are colored like it: Garcia colored by LVL1, whose germ cells are
- * sky blue, showed its 10,993 highlighted germ cells exactly as before. The
- * cells' own colors cannot be known to the ring (a highlight is drawn over
- * every coloring, categorical or continuous), so the pair is chosen to read
- * against all of them: a light dot is ringed in black, a dark one in white,
- * and the cyan in black keeps any color at least 0.42 (OKLab) from one of the
- * two, five times the
- * distance two colors need to be told apart (`data/distinct-colors.js`), and
- * a background is one more such color (tests/highlight-ring-contrast.test.mjs).
+ * Why: a dot alone, in a fixed color, vanishes wherever the cells around it
+ * are colored like it (a sky-blue cell type colored sky blue shows its
+ * highlighted cells exactly as before). The cells' own colors cannot be known
+ * to the ring (a highlight is drawn over every coloring, categorical or
+ * continuous), so the pair is chosen to read against all of them: a light dot
+ * is ringed in black, a dark one in white, and the cyan in black keeps any
+ * color at least 0.42 (OKLab) from one of the two, five times the distance two
+ * colors need to be told apart (`data/distinct-colors.js`), and a background is
+ * one more such color (tests/highlight-ring-contrast.test.mjs).
  *
  * @param {ArrayLike<number>} dotColor - RGB, 0 to 1
  * @returns {readonly [number, number, number]}
@@ -888,10 +885,10 @@ void main() {
   // the size alone does not hide anything: the driver clamps it back to one
   // pixel, so the point is still assembled, rasterised and shaded.
   //
-  // Two facts elsewhere used to make that harmless, and this shader relies on
+  // Two facts elsewhere make that harmless, and this shader relies on
   // neither. Both producers pack only points at or above MIN_VISIBLE_ALPHA_BYTE
   // — 3/255 = 0.0118, above this 0.01 threshold — so nothing can reach this
-  // branch today (highlight-renderer.js, and the figure-export path in
+  // branch (highlight-renderer.js, and the figure-export path in
   // app/ui/modules/figure-export/utils/webgl-point-rasterizer.js); and both draw
   // sites run depthMask(false). A producer that stops compacting, or a pass that
   // starts writing depth, is then a change to those files and not to this one.
@@ -920,7 +917,7 @@ flat in float v_fogOpacity; // The opacity fog leaves this ring (HP_VS_HIGHLIGHT
 
 uniform vec3 u_highlightColor; // The dot (HIGHLIGHT_COLOR)
 // The ring around it (highlightRingColorFor(u_highlightColor)): black around
-// a light dot, so the pair reads against any coloring (F162).
+// a light dot, so the pair reads against any coloring.
 uniform vec3 u_highlightRingColor;
 uniform float u_ringWidth;
 uniform float u_haloStrength;

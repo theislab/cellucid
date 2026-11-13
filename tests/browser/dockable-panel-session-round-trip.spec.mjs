@@ -6,19 +6,19 @@ import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 /* The floating panels in the `layout` state domain's value
    (`app/state/domains/layout.js`): what it records is what a restore (a
    history step shown, a session) gets back. Three of the things it records
-   used to be read from the wrong owner, and each of them is only observable
+   are read from their own owner, and each of them is only observable
    against real CSS:
 
-   - the panel's size was measured off the rendered box, and
+   - the panel's size is not measured off the rendered box, because
      `_accordion.css` forces `height: auto` on a collapsed floating panel, so
-     collapsing one before saving threw away the size it reopens at;
-   - the stacking order was assigned from a counter private to
-     `dockable-accordions.js`, which a restore wrote past — so a panel torn
-     off after a restore opened underneath the restored ones (the value holds
-     no stacking order now: raising a panel is not a step);
-   - a restored panel was floated through the entry point analysis windows use,
-     which leaves no placeholder, so docking it dropped it at the end of the
-     sidebar instead of back in its own place.
+     collapsing one before saving would throw away the size it reopens at;
+   - the stacking order is not assigned from a counter private to
+     `dockable-accordions.js`, which a restore would write past, so a panel
+     torn off after a restore would open underneath the restored ones (the
+     value holds no stacking order: raising a panel is not a step);
+   - a restored panel is floated through the entry point that leaves a
+     placeholder, not the one analysis windows use, so docking it puts it back
+     in its own place in the sidebar instead of at the end.
 
    The unit contract exercises the same three against a fake DOM. This runs them
    through the real modules, the real stylesheet and the real layout engine. */
@@ -40,8 +40,8 @@ async function openPreparedDataset(page) {
   // The opening is over before a panel's control is pressed: the sidebar
   // still grows under the pointer while it goes on (the dataset's facts, its
   // first coloring's legend), and a press landed on the undock button and
-  // its release 50 px lower, on another element (Windows Firefox, nightly
-  // run 43141748516, caught by `split-clicks.mjs`).
+  // its release 50 px lower, on another element (Windows Firefox,
+  // caught by `split-clicks.mjs`).
   await waitForPageAtRest(page);
 }
 
@@ -108,122 +108,129 @@ function setPanelOpen(page, panelId, open) {
   }, { id: panelId, value: open });
 }
 
-test('a floating layout captured from the live DOM restores to itself', async ({
+test('a floating layout through a capture and a restore', async ({
   page,
 }) => {
   await openPreparedDataset(page);
+  // Every panel docked, as the page opened: shown again between the steps,
+  // the way a step back in the history shows it.
+  const docked = await captureLayout(page);
+  expect(docked.panels).toEqual([]);
+  const dockAll = async () => {
+    await restoreLayout(page, docked);
+    expect(await captureLayout(page)).toEqual(docked);
+  };
 
-  const dockedOrder = await sidebarPanelOrder(page);
-  expect(dockedOrder).toContain(FIRST_PANEL);
-  expect(dockedOrder).toContain(SECOND_PANEL);
+  await test.step('a floating layout captured from the live DOM restores to itself', async () => {
+    const dockedOrder = await sidebarPanelOrder(page);
+    expect(dockedOrder).toContain(FIRST_PANEL);
+    expect(dockedOrder).toContain(SECOND_PANEL);
 
-  await undockFromHeader(page, FIRST_PANEL);
-  await undockFromHeader(page, SECOND_PANEL);
+    await undockFromHeader(page, FIRST_PANEL);
+    await undockFromHeader(page, SECOND_PANEL);
 
-  const first = await captureLayout(page);
-  expect(first.panels.map(panel => panel.id)).toEqual([FIRST_PANEL, SECOND_PANEL].sort());
-  for (const panel of first.panels) {
-    expect(Object.keys(panel).sort()).toEqual(['id', 'rect']);
-    expect(panel.rect.width).toBeGreaterThan(0);
-    expect(panel.rect.height).toBeGreaterThan(0);
-  }
+    const first = await captureLayout(page);
+    expect(first.panels.map(panel => panel.id)).toEqual([FIRST_PANEL, SECOND_PANEL].sort());
+    for (const panel of first.panels) {
+      expect(Object.keys(panel).sort()).toEqual(['id', 'rect']);
+      expect(panel.rect.width).toBeGreaterThan(0);
+      expect(panel.rect.height).toBeGreaterThan(0);
+    }
 
-  // Docked again, then restored: the same panels float at the same boxes.
-  await headerControl(page, FIRST_PANEL, 'accordion-dock-btn').click();
-  await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
-  expect((await captureLayout(page)).panels).toEqual([]);
-  await restoreLayout(page, first);
-  const second = await captureLayout(page);
-  expect(second).toEqual(first);
-  // Restoring what is shown changes nothing.
-  await restoreLayout(page, second);
-  expect(await captureLayout(page)).toEqual(first);
-});
+    // Docked again, then restored: the same panels float at the same boxes.
+    await headerControl(page, FIRST_PANEL, 'accordion-dock-btn').click();
+    await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
+    expect((await captureLayout(page)).panels).toEqual([]);
+    await restoreLayout(page, first);
+    const second = await captureLayout(page);
+    expect(second).toEqual(first);
+    // Restoring what is shown changes nothing.
+    await restoreLayout(page, second);
+    expect(await captureLayout(page)).toEqual(first);
 
-test('a panel collapsed before the capture reopens at its own height', async ({
-  page,
-}) => {
-  await openPreparedDataset(page);
-  await undockFromHeader(page, FIRST_PANEL);
+    await dockAll();
+  });
 
-  const open = await captureLayout(page);
-  const openHeight = open.panels[0].rect.height;
-  expect(openHeight).toBeGreaterThan(100);
+  await test.step('a panel collapsed before the capture reopens at its own height', async () => {
+    await undockFromHeader(page, FIRST_PANEL);
 
-  /* `_accordion.css`:
-     `.accordion-panel.accordion-floating:has(> .accordion-section:not([open]))
-      { height: auto }` —
-     so the rendered box is now the header, and the panel's own height is not. */
-  await setPanelOpen(page, FIRST_PANEL, false);
-  const renderedHeight = await panelFrame(page, FIRST_PANEL).evaluate(
-    frame => frame.getBoundingClientRect().height
-  );
-  expect(renderedHeight).toBeLessThan(openHeight);
+    const open = await captureLayout(page);
+    const openHeight = open.panels[0].rect.height;
+    expect(openHeight).toBeGreaterThan(100);
 
-  const collapsed = await captureLayout(page);
-  expect(collapsed.sections[FIRST_PANEL]).toBe(false);
-  expect(collapsed.panels[0].rect.height).toBe(openHeight);
+    /* `_accordion.css`:
+       `.accordion-panel.accordion-floating:has(> .accordion-section:not([open]))
+        { height: auto }` —
+       so the rendered box is now the header, and the panel's own height is not. */
+    await setPanelOpen(page, FIRST_PANEL, false);
+    const renderedHeight = await panelFrame(page, FIRST_PANEL).evaluate(
+      frame => frame.getBoundingClientRect().height
+    );
+    expect(renderedHeight).toBeLessThan(openHeight);
 
-  // Docked and opened, then the collapsed layout restored: it floats collapsed, at its own height.
-  await headerControl(page, FIRST_PANEL, 'accordion-dock-btn').click();
-  await setPanelOpen(page, FIRST_PANEL, true);
-  await restoreLayout(page, collapsed);
-  /* Floating a panel opens it; whether it is open is one fact of the value
-     (`sections`), put back after the panels float. */
-  const restored = await captureLayout(page);
-  expect(restored.sections[FIRST_PANEL]).toBe(false);
-  expect(restored.panels[0].rect.height).toBe(openHeight);
+    const collapsed = await captureLayout(page);
+    expect(collapsed.sections[FIRST_PANEL]).toBe(false);
+    expect(collapsed.panels[0].rect.height).toBe(openHeight);
 
-  await setPanelOpen(page, FIRST_PANEL, true);
-  const reopened = await captureLayout(page);
-  expect(reopened.panels[0].rect.height).toBe(openHeight);
-});
+    // Docked and opened, then the collapsed layout restored: it floats collapsed, at its own height.
+    await headerControl(page, FIRST_PANEL, 'accordion-dock-btn').click();
+    await setPanelOpen(page, FIRST_PANEL, true);
+    await restoreLayout(page, collapsed);
+    /* Floating a panel opens it; whether it is open is one fact of the value
+       (`sections`), put back after the panels float. */
+    const restored = await captureLayout(page);
+    expect(restored.sections[FIRST_PANEL]).toBe(false);
+    expect(restored.panels[0].rect.height).toBe(openHeight);
 
-test('a panel torn off after a restore opens above the restored panels', async ({
-  page,
-}) => {
-  await openPreparedDataset(page);
-  await undockFromHeader(page, FIRST_PANEL);
-  await undockFromHeader(page, SECOND_PANEL);
+    await setPanelOpen(page, FIRST_PANEL, true);
+    const reopened = await captureLayout(page);
+    expect(reopened.panels[0].rect.height).toBe(openHeight);
 
-  const captured = await captureLayout(page);
-  // Docked again, then floated back by a restore.
-  await headerControl(page, FIRST_PANEL, 'accordion-dock-btn').click();
-  await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
-  await restoreLayout(page, captured);
-  const restoredLayers = await Promise.all([
-    panelLayer(page, FIRST_PANEL),
-    panelLayer(page, SECOND_PANEL),
-  ]);
-  expect(restoredLayers.every(layer => Number.isSafeInteger(layer))).toBe(true);
+    await dockAll();
+  });
 
-  await undockFromHeader(page, THIRD_PANEL);
-  const thirdLayer = await panelLayer(page, THIRD_PANEL);
-  expect(thirdLayer).toBeGreaterThan(Math.max(...restoredLayers));
-  // Which panel is in front is not part of the value: raising one is not a change.
-  expect((await captureLayout(page)).panels.map(panel => panel.id)).toEqual([FIRST_PANEL, SECOND_PANEL, THIRD_PANEL].sort());
-});
+  await test.step('a panel torn off after a restore opens above the restored panels', async () => {
+    await undockFromHeader(page, FIRST_PANEL);
+    await undockFromHeader(page, SECOND_PANEL);
 
-test('a restored panel docks back into its own place in the sidebar', async ({
-  page,
-}) => {
-  await openPreparedDataset(page);
-  const dockedOrder = await sidebarPanelOrder(page);
+    const captured = await captureLayout(page);
+    // Docked again, then floated back by a restore.
+    await headerControl(page, FIRST_PANEL, 'accordion-dock-btn').click();
+    await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
+    await restoreLayout(page, captured);
+    const restoredLayers = await Promise.all([
+      panelLayer(page, FIRST_PANEL),
+      panelLayer(page, SECOND_PANEL),
+    ]);
+    expect(restoredLayers.every(layer => Number.isSafeInteger(layer))).toBe(true);
 
-  await undockFromHeader(page, SECOND_PANEL);
-  const captured = await captureLayout(page);
-  await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
+    await undockFromHeader(page, THIRD_PANEL);
+    const thirdLayer = await panelLayer(page, THIRD_PANEL);
+    expect(thirdLayer).toBeGreaterThan(Math.max(...restoredLayers));
+    // Which panel is in front is not part of the value: raising one is not a change.
+    expect((await captureLayout(page)).panels.map(panel => panel.id)).toEqual([FIRST_PANEL, SECOND_PANEL, THIRD_PANEL].sort());
 
-  /* Restoring re-floats a panel that is standing in the sidebar. */
-  await restoreLayout(page, captured);
-  await expect(panelFrame(page, SECOND_PANEL)).toHaveClass(
-    /accordion-floating/
-  );
+    await dockAll();
+  });
 
-  await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
-  await expect(panelFrame(page, SECOND_PANEL)).not.toHaveClass(
-    /accordion-floating/
-  );
+  await test.step('a restored panel docks back into its own place in the sidebar', async () => {
+    const dockedOrder = await sidebarPanelOrder(page);
 
-  expect(await sidebarPanelOrder(page)).toEqual(dockedOrder);
+    await undockFromHeader(page, SECOND_PANEL);
+    const captured = await captureLayout(page);
+    await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
+
+    /* Restoring re-floats a panel that is standing in the sidebar. */
+    await restoreLayout(page, captured);
+    await expect(panelFrame(page, SECOND_PANEL)).toHaveClass(
+      /accordion-floating/
+    );
+
+    await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
+    await expect(panelFrame(page, SECOND_PANEL)).not.toHaveClass(
+      /accordion-floating/
+    );
+
+    expect(await sidebarPanelOrder(page)).toEqual(dockedOrder);
+  });
 });

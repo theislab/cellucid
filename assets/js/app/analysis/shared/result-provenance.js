@@ -68,7 +68,7 @@ import {
   parseSamplePageId,
 } from './page-derivation-utils.js';
 
-export const PROVENANCE_KEYS = Object.freeze(['cells', 'dataset', 'genesReadFor', 'mapping', 'options', 'pages', 'values', 'visible']);
+const PROVENANCE_KEYS = Object.freeze(['cells', 'dataset', 'genesReadFor', 'mapping', 'options', 'pages', 'values', 'visible']);
 
 const VISIBLE = new WeakMap();
 

@@ -51,6 +51,7 @@ import { onAbort } from '../utils/abort.js';
 import { createDeadline } from '../utils/deadline.js';
 import { createListenerSet } from '../utils/listener-set.js';
 import { onWaitingOnPerson } from '../utils/person-wait.js';
+import { promiseWithResolvers } from '../utils/promise-resolvers.js';
 
 /**
  * Phases in startup order. `ready` is published once the startup dataset has
@@ -243,10 +244,8 @@ export function createStartupPhaseOwner(options) {
       // The person's time is not the network's: the deadline stands still.
       const stopPersonWaits = personWaits(waiting => (waiting ? deadline.pause() : deadline.resume()));
       const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
-      let stopStalling = null;
-      const stalled = new Promise((_resolve, reject) => {
-        stopStalling = onAbort(deadline.signal, () => reject(stallError()));
-      });
+      const { promise: stalled, reject: stall } = promiseWithResolvers();
+      const stopStalling = onAbort(deadline.signal, () => stall(stallError()));
       const work = Promise.resolve().then(() => operation(signal));
       // Whichever loses the race is still observed, never unhandled.
       stalled.catch(() => {});

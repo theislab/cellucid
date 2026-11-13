@@ -35,7 +35,6 @@ import {
   DataStateFieldMethods
 } from '../assets/js/app/state/managers/field-manager.js';
 import {
-  MAX_CATEGORICAL_CATEGORIES,
   categoricalStorageForCount
 } from '../assets/js/data/categorical-storage-contract.js';
 import { getCategoryColor } from '../assets/js/data/palettes.js';
@@ -418,7 +417,6 @@ test('a user-defined field past 65,535 categories is kept, with uint32 codes', (
     { pointCount: 2, dimensionManager: oneLayoutManager(new Map()) }
   );
   assert.ok(field);
-  assert.equal(MAX_CATEGORICAL_CATEGORIES, 4_294_967_295);
 });
 
 // ---------------------------------------------------------------------------
@@ -489,7 +487,7 @@ test('a categorical update that changes the inventory still validates every code
   );
 });
 
-test('a field made from pages opens in its pages\' colors, and keeps them by label through an edit in place (F124)', () => {
+test('a field made from pages opens in its pages\' colors, and keeps them by label through an edit in place', () => {
   const pages = Array.from({ length: 3 }, (_v, index) => ({
     id: `p${index}`,
     name: `P${index}`,
@@ -517,7 +515,7 @@ test('a field made from pages opens in its pages\' colors, and keeps them by lab
   assert.deepEqual(edited.palette.map(hex), ['#dc2626', '#9333ea', rest]);
 });
 
-test('a field the person made has no original name: renamed, it shows no `*` and offers no "Put name back", before and after a session round trip (R9F-8)', async () => {
+test('a field the person made has no original name: renamed, it shows no `*` and offers no "Put name back", before and after a session round trip', async () => {
   const { createCellIdentity } = await import('../assets/js/data/cell-identity.js');
   const everyCell = () => createCellIdentity({ nObs: POINTS, kept: null, openOrder: null });
   const source = makeState({ obsFields: [categoricalField('ct', ['a', 'b'], POINTS)] });

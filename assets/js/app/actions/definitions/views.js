@@ -66,7 +66,7 @@ export const viewActions = Object.freeze([
       },
     },
     touches: VIEW_SET_TOUCHES,
-    // With a branch, that branch's last step (History v2 §3.4).
+    // With a branch, that branch's last step.
     reads: ['history'],
     effect: 'view',
     describe: (params, outcome, quote = PLAIN_QUOTE) => `Kept the view${params.branch === undefined ? '' : ` of branch ${quote(params.branch)}`}`

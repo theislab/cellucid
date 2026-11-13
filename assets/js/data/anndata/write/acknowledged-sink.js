@@ -17,6 +17,7 @@
  */
 
 import { onAbort, abortReason } from '../../../utils/abort.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /** Bytes gathered into one message to the page (a message per chunk would be thousands). */
 export const COPY_BATCH_BYTES = 4 * 1024 * 1024;
@@ -62,9 +63,9 @@ export function createAcknowledgedSink(post, { ticket, signal = null, batchBytes
   /** Wait until no more than `limit` bytes are posted and unanswered. */
   const settle = async limit => {
     while (failure === null && inFlight > limit) {
-      await new Promise(resolve => {
-        waiting = resolve;
-      });
+      const wake = promiseWithResolvers();
+      waiting = wake.resolve;
+      await wake.promise;
     }
     if (failure !== null) throw failure;
   };

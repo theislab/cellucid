@@ -138,7 +138,7 @@ export async function wasmCodecs() {
  */
 export async function zstdStream() {
   const { module } = await wasmCodecs();
-  const { exports } = new WebAssembly.Instance(module, {});
+  const { exports } = /** @type {{exports: CodecExports}} */ (new WebAssembly.Instance(module, {}));
   const begun = exports.codecs_zstd_stream_begin();
   if (begun < 0) throw new WasmCodecError('A Zstandard stream could not be started.', codeOf(begun));
   const input = exports.codecs_zstd_stream_input();
@@ -171,11 +171,41 @@ export async function zstdStream() {
   };
 }
 
+/**
+ * What the codecs module exports (`scripts/wasm-codecs/codecs.c`, each
+ * `EXPORT`): its memory and its functions, which take and return numbers
+ * (addresses in the memory, byte counts, a negative count for a failure).
+ *
+ * @typedef {{
+ *   memory: WebAssembly.Memory,
+ *   codecs_buffers: (inputBytes: number, outputBytes: number) => number,
+ *   codecs_output: () => number,
+ *   codecs_zstd_content_size: (source: number, sourceBytes: number) => number,
+ *   codecs_zstd: (source: number, sourceBytes: number, target: number, targetBytes: number) => number,
+ *   codecs_zstd_stream_begin: () => number,
+ *   codecs_zstd_stream_input: () => number,
+ *   codecs_zstd_stream_input_size: () => number,
+ *   codecs_zstd_stream_output: () => number,
+ *   codecs_zstd_stream_output_size: () => number,
+ *   codecs_zstd_stream_consumed: () => number,
+ *   codecs_zstd_stream_ended: () => number,
+ *   codecs_zstd_stream_step: (from: number, to: number) => number,
+ *   codecs_lz4_block: (source: number, sourceBytes: number, target: number, targetBytes: number) => number,
+ *   codecs_blosc: (source: number, sourceBytes: number, target: number, targetBytes: number) => number,
+ *   codecs_blosc_zlib_record: (source: number, sourceBytes: number, target: number, targetBytes: number) => number,
+ *   codecs_blosc_zlib_streams: () => number,
+ *   codecs_blosc_unshuffle: (header: number, source: number, target: number, bytes: number) => number,
+ *   codecs_bitshuffle_chunk: (source: number, sourceBytes: number, target: number, targetBytes: number,
+ *     elementBytes: number, blockElements: number, compression: number) => number,
+ *   codecs_bitshuffle_untranspose: (source: number, target: number, count: number, typeBytes: number) => number,
+ * }} CodecExports
+ */
+
 class Codecs {
   /** @param {WebAssembly.Module} module */
   constructor(module) {
     this.module = module;
-    this.exports = new WebAssembly.Instance(module, {}).exports;
+    this.exports = /** @type {CodecExports} */ (new WebAssembly.Instance(module, {}).exports);
   }
 
   /** The bytes of the module's memory (a fresh view: memory growth detaches the old one). */

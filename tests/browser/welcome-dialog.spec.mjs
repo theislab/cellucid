@@ -60,82 +60,30 @@ async function expectDefaultLoadedAndSelectInactive(page) {
   ).not.toBe('dataset-select');
 }
 
-test('Start exploring closes the dialog and opens nothing else', async ({
+/** Show the dialog again on the open page, as the control that reopens it does. */
+async function reopenWelcome(page) {
+  await page.evaluate(async () => {
+    const { showWelcomeModal } = await import(
+      '/assets/js/app/ui/onboarding/welcome-modal.js'
+    );
+    if (showWelcomeModal() !== true) {
+      throw new Error('Welcome modal did not reopen');
+    }
+  });
+  await expectWelcomeShown(page);
+}
+
+test('every way of closing the dialog closes it and nothing else', async ({
   page,
-}) => {
-  const errors = observeProductErrors(page);
-  await openPlainStart(page);
-  const start = page.locator('#welcome-start-btn');
-  await expect(start).toHaveText(/Start exploring/);
-  const sessionOpen = await page.locator('#session-section').evaluate(section => section.open);
-
-  // Chosen before the default sample has finished loading: nothing queued
-  // for later may move focus into the dropdown when the catalog arrives.
-  await start.click();
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  expect(await page.locator('#session-section').evaluate(section => section.open)).toBe(sessionOpen);
-  await expect(page.locator('#session-section > summary')).not.toBeFocused();
-
-  await expectDefaultLoadedAndSelectInactive(page);
-  expect(errors).toEqual([]);
-});
-
-test('Start exploring from the keyboard closes the dialog and leaves the dropdown inactive', async ({
-  page,
+  context,
   browserName,
 }) => {
   const errors = observeProductErrors(page);
-  await openPlainStart(page);
-  await page.keyboard.press(tabKey(browserName));
-  await expect(page.locator('#welcome-start-btn')).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  await expect(page.locator('#session-section > summary')).not.toBeFocused();
-
-  await expectDefaultLoadedAndSelectInactive(page);
-  // The next key press does not land in the dropdown either.
-  await page.keyboard.press('ArrowDown');
-  await expect(page.locator('#dataset-select')).toHaveValue(CATALOG_DEFAULT);
-  expect(errors).toEqual([]);
-});
-
-test('Escape closes onboarding without activating the dropdown', async ({
-  page,
-}) => {
-  const errors = observeProductErrors(page);
-  await openPlainStart(page);
-  await page.keyboard.press('Escape');
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  await expectDefaultLoadedAndSelectInactive(page);
-  expect(errors).toEqual([]);
-});
-
-test('the backdrop closes onboarding without activating the dropdown', async ({
-  page,
-}) => {
-  const errors = observeProductErrors(page);
-  await openPlainStart(page);
-  // The dialog is a layer over the whole screen; its corner, outside the
-  // card, is the backdrop.
-  await page.locator('#welcome-modal').click({
-    position: { x: 8, y: 8 },
-  });
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  await expectDefaultLoadedAndSelectInactive(page);
-  expect(errors).toEqual([]);
-});
-
-test('Learn more leaves the dropdown inactive before and after closing', async ({
-  page,
-  context,
-}) => {
-  const errors = observeProductErrors(page);
-  // The window asks for the documentation and is refused, so it never shows
-  // an http(s) page: macOS WebKit can end its browser process when a window
-  // is closed moments after it showed one (its Screen Time observer,
-  // `helpers/downloads.mjs`). Measured on macOS WebKit r2388: a fulfilled
-  // Docs page started that observer in 1 of 3 runs, 19 ms before this close;
-  // a refused one never does.
+  // The window Learn more opens asks for the documentation and is refused,
+  // so it never shows an http(s) page: macOS WebKit can end its browser
+  // process when a window is closed moments after it showed one (its Screen
+  // Time observer, `helpers/downloads.mjs`). A fulfilled Docs page starts
+  // that observer; a refused one never does.
   const asked = [];
   await context.route(`${DOCS_ORIGIN}/**`, route => {
     asked.push(route.request().url());
@@ -143,22 +91,68 @@ test('Learn more leaves the dropdown inactive before and after closing', async (
   });
   await openPlainStart(page);
 
-  const popupPromise = page.waitForEvent('popup');
-  await page.locator('#welcome-modal').getByRole('link', {
-    name: /Learn more/,
-  }).click();
-  const popup = await popupPromise;
-  await popup.close();
-  await page.bringToFront();
+  await test.step('Start exploring closes the dialog and opens nothing else', async () => {
+    const start = page.locator('#welcome-start-btn');
+    await expect(start).toHaveText(/Start exploring/);
+    const sessionOpen = await page.locator('#session-section').evaluate(section => section.open);
 
-  // The link opens the documentation beside the app; the dialog stays.
-  expect(asked).toEqual([`${DOCS_ORIGIN}/en/latest/`]);
-  await expectWelcomeShown(page);
-  await expect(page.locator('#dataset-select')).not.toBeFocused();
-  await page.keyboard.press('Escape');
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  await expectDefaultLoadedAndSelectInactive(page);
-  expect(errors).toEqual([]);
+    // Chosen before the default sample has finished loading: nothing queued
+    // for later may move focus into the dropdown when the catalog arrives.
+    await start.click();
+    await expect(page.locator('#welcome-modal')).toBeHidden();
+    expect(await page.locator('#session-section').evaluate(section => section.open)).toBe(sessionOpen);
+    await expect(page.locator('#session-section > summary')).not.toBeFocused();
+
+    await expectDefaultLoadedAndSelectInactive(page);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step('Start exploring from the keyboard closes the dialog and leaves the dropdown inactive', async () => {
+    await reopenWelcome(page);
+    await page.keyboard.press(tabKey(browserName));
+    await expect(page.locator('#welcome-start-btn')).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#welcome-modal')).toBeHidden();
+    await expect(page.locator('#session-section > summary')).not.toBeFocused();
+
+    await expectDefaultLoadedAndSelectInactive(page);
+    // The next key press does not land in the dropdown either.
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('#dataset-select')).toHaveValue(CATALOG_DEFAULT);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step('the backdrop closes onboarding without activating the dropdown', async () => {
+    await reopenWelcome(page);
+    // The dialog is a layer over the whole screen; its corner, outside the
+    // card, is the backdrop.
+    await page.locator('#welcome-modal').click({
+      position: { x: 8, y: 8 },
+    });
+    await expect(page.locator('#welcome-modal')).toBeHidden();
+    await expectDefaultLoadedAndSelectInactive(page);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step('Learn more leaves the dropdown inactive before and after closing', async () => {
+    await reopenWelcome(page);
+    const popupPromise = page.waitForEvent('popup');
+    await page.locator('#welcome-modal').getByRole('link', {
+      name: /Learn more/,
+    }).click();
+    const popup = await popupPromise;
+    await popup.close();
+    await page.bringToFront();
+
+    // The link opens the documentation beside the app; the dialog stays.
+    expect(asked).toEqual([`${DOCS_ORIGIN}/en/latest/`]);
+    await expectWelcomeShown(page);
+    await expect(page.locator('#dataset-select')).not.toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#welcome-modal')).toBeHidden();
+    await expectDefaultLoadedAndSelectInactive(page);
+    expect(errors).toEqual([]);
+  });
 });
 
 /** What a phone shows of the dialog, read in the page. */
@@ -203,8 +197,8 @@ async function expectCardFits(page, label) {
 /** Once the dialog has closed and the dataset is drawn, a touch on the plot reaches the plot. */
 async function expectPlotReachable(page) {
   // The sample's opening is shown over the plot until its first view is
-  // drawn, a moment after its name is in the panel: on WebKit the point was
-  // read in between, 1 run in 12, and was the opening's panel.
+  // drawn, a moment after its name is in the panel: on WebKit a point read
+  // in between is the opening's panel.
   await expect(page.locator('.opening-overlay')).toBeHidden();
   expect(await page.evaluate(() => (
     document.elementFromPoint(innerWidth / 2, innerHeight * 0.4)?.id
@@ -218,24 +212,27 @@ for (const [layout, viewport] of [
   test.describe(`on ${layout}`, () => {
     test.use({ viewport, hasTouch: true });
 
-    test('the card fits the screen, and Start exploring leaves the plot', async ({ page }) => {
+    test('a tap outside the card closes it; shown again, the card fits and Start exploring leaves the plot', async ({ page }) => {
       const errors = observeProductErrors(page);
       await openPlainStart(page);
-      await expectCardFits(page, layout);
-      await page.locator('#welcome-start-btn').tap();
-      await expect(page.locator('#welcome-modal')).toBeHidden();
-      await expectDefaultLoadedAndSelectInactive(page);
-      await expectPlotReachable(page);
-      expect(errors).toEqual([]);
-    });
 
-    test('a tap outside the card closes it', async ({ page }) => {
-      await openPlainStart(page);
-      await page.touchscreen.tap(4, 4);
-      await expect(page.locator('#welcome-modal')).toBeHidden();
-      // Once the sample behind it is drawn (until then its opening shows there).
-      await expectDefaultLoadedAndSelectInactive(page);
-      await expectPlotReachable(page);
+      await test.step('a tap outside the card closes it', async () => {
+        await page.touchscreen.tap(4, 4);
+        await expect(page.locator('#welcome-modal')).toBeHidden();
+        // Once the sample behind it is drawn (until then its opening shows there).
+        await expectDefaultLoadedAndSelectInactive(page);
+        await expectPlotReachable(page);
+      });
+
+      await test.step('the card fits the screen, and Start exploring leaves the plot', async () => {
+        await reopenWelcome(page);
+        await expectCardFits(page, layout);
+        await page.locator('#welcome-start-btn').tap();
+        await expect(page.locator('#welcome-modal')).toBeHidden();
+        await expectDefaultLoadedAndSelectInactive(page);
+        await expectPlotReachable(page);
+        expect(errors).toEqual([]);
+      });
     });
   });
 }

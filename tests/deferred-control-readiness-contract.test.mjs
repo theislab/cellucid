@@ -1,13 +1,13 @@
 /**
  * The renderer and benchmark controls are wired only after the linear bootstrap
  * in `main.js` has already blocked on something. `index.html` paints them
- * before any of that, so for the whole of startup they were offered and did
- * nothing (CEL-0121): a click reached no listener, and the renderer toggles
- * additionally seeded their rollback baselines from whatever the user had
+ * before any of that, so for the whole of startup they would be offered and do
+ * nothing: a click would reach no listener, and the renderer toggles would
+ * additionally seed their rollback baselines from whatever the user had
  * changed, so the panel could claim a setting the renderer was never told
  * about.
  *
- * These tests hold the three parts of the correction together: the controls
+ * These tests hold the three parts of the rule together: the controls
  * named here are the ones actually wired late, they are retired before the
  * first await and admitted only after the last listener, and the benchmark
  * disclosure — which cannot be disabled and opens itself — is reconciled at the
@@ -18,7 +18,7 @@
  * controls belong to `ui/modules/render-controls`, built by `initUI` *before*
  * the bootstrap restores a saved session, because restoring one publishes each
  * control by dispatching its own event and a dispatch with no listener is
- * silently lost (CEL-0129).
+ * silently lost.
  */
 
 import assert from 'node:assert/strict';
@@ -41,14 +41,19 @@ const RENDER_CONTROLS_URL = new URL(
   '../assets/js/app/ui/modules/render-controls.js',
   import.meta.url
 );
+const BENCHMARK_CONTROLS_URL = new URL(
+  '../assets/js/app/ui/modules/benchmark/benchmark-controls.js',
+  import.meta.url
+);
 
-const [mainSource, indexHtml, renderControlsSource] = await Promise.all([
+const [mainSource, indexHtml, renderControlsSource, benchmarkSource] = await Promise.all([
   readFile(MAIN_URL, 'utf8'),
   readFile(INDEX_URL, 'utf8'),
   readFile(RENDER_CONTROLS_URL, 'utf8'),
+  readFile(BENCHMARK_CONTROLS_URL, 'utf8'),
 ]);
 
-/** The wiring site in `main.js` for every benchmark control. */
+/** The wiring site in `benchmark-controls.js` for every benchmark control. */
 const BENCHMARK_WIRING_SITES = Object.freeze({
   'benchmark-run': "benchmarkRunBtn.addEventListener('click'",
   'benchmark-report-btn': "benchmarkReportBtn.addEventListener('click'",
@@ -142,17 +147,22 @@ test('retirement happens before the first await and admission after the last lis
   const initUiCall = mainSource.indexOf('ui = initUI({');
   assert.ok(initUiCall > firstAwait, 'initUI must still be findable');
 
+  // The benchmark controls are wired where `initBenchmarkControls` is made,
+  // which is synchronous: its call sits where its wiring runs.
+  const benchmarkCall = mainSource.indexOf('initBenchmarkControls({');
+  assert.ok(
+    benchmarkCall > initUiCall,
+    'the benchmark is wired after the bootstrap blocks, so it must be deferred'
+  );
+  assert.ok(
+    benchmarkCall < admission,
+    'the benchmark must be wired before the controls are admitted'
+  );
+  const factory = benchmarkSource.indexOf('export function initBenchmarkControls(');
   for (const [control, site] of Object.entries(BENCHMARK_WIRING_SITES)) {
-    const wiring = mainSource.indexOf(site);
-    assert.ok(wiring > 0, `${control} must still be wired at ${site}`);
-    assert.ok(
-      wiring > initUiCall,
-      `${control} is wired after the bootstrap blocks, so it must be deferred`
-    );
-    assert.ok(
-      wiring < admission,
-      `${control} must be wired before the controls are admitted`
-    );
+    const wiring = benchmarkSource.indexOf(site);
+    assert.ok(wiring > factory && factory > 0, `${control} must still be wired by initBenchmarkControls at ${site}`);
+    assert.ok(!mainSource.includes(site), `${control} must not also be wired by the bootstrap`);
   }
 
   // Every control is admitted before the startup selection starts loading, so
@@ -186,11 +196,11 @@ test('retirement happens before the first await and admission after the last lis
 test('the benchmark disclosure is reconciled where its listener is attached', () => {
   // `<details>` cannot be disabled and the browser opens it with no script
   // involved, so the correction is to read its state when the listener lands.
-  const listener = mainSource.indexOf(
-    "benchmarkSection.addEventListener(\n        'toggle',"
+  const listener = benchmarkSource.indexOf(
+    "benchmarkSection.addEventListener(\n      'toggle',"
   );
-  const reconcile = mainSource.indexOf(
-    'ownBenchmarkPanelSynchronization();\n    }'
+  const reconcile = benchmarkSource.indexOf(
+    'ownBenchmarkPanelSynchronization();\n  }'
   );
   assert.ok(listener > 0, 'the benchmark toggle listener must still exist');
   assert.ok(

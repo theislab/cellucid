@@ -1,5 +1,5 @@
 /**
- * @fileoverview Share this history (History v2 §3.10, §3.11, §3.15.3): what
+ * @fileoverview Share this history: what
  * the session file holds, chosen, never total.
  *
  * - **Share:** the History (the trackers and branches ticked; by default

@@ -529,7 +529,7 @@ test('a stylesheet names what it imports and uses by their bytes, and a page pre
   );
 });
 
-test('a page with a boot script starts its sources on this machine and its bundle anywhere else', () => {
+test('a page with a boot script starts its sources on this machine and its bundle anywhere else', async () => {
   const versions = new Map([['assets/js/app/main.js', 'aaaaaaaaaaaa']]);
   const page = { entry: 'assets/page/main.ABCDEFGH.js', preload: ['assets/page/chunk.IJKLMNOP.js'] };
   const html = '<head><script type="importmap"></script><script id="cellucid-page-boot"></script></head>';
@@ -554,11 +554,13 @@ test('a page with a boot script starts its sources on this machine and its bundl
   );
 
   // Run in a page of either kind: what it preloads, what it imports, and the
-  // code cache it registers once the page has loaded.
-  const run = (hostname, { styleLoadFailed = false } = {}) => {
+  // code cache it registers once the page has loaded, and the files it names
+  // to keep once every startup file is in.
+  const run = async (hostname, { styleLoadFailed = false } = {}) => {
     const appended = [];
     const imported = [];
     const registered = [];
+    const posted = [];
     const failures = [];
     const listeners = new Map();
     const windowListeners = new Map();
@@ -569,7 +571,13 @@ test('a page with a boot script starts its sources on this machine and its bundl
         readyState: 'loading',
         // What the style gate leaves on the root when the stylesheet did not load.
         documentElement: { dataset: styleLoadFailed ? { styleLoadFailed: 'true' } : {} },
-        createElement: () => ({}),
+        createElement: () => {
+          const linkListeners = new Map();
+          return {
+            addEventListener: (type, listener) => linkListeners.set(type, listener),
+            fire: type => linkListeners.get(type)?.(),
+          };
+        },
         head: { append: element => appended.push(element) },
         addEventListener: (type, listener) => listeners.set(type, listener),
         querySelector: selector => (selector === 'link[rel="stylesheet"]'
@@ -581,11 +589,12 @@ test('a page with a boot script starts its sources on this machine and its bundl
         serviceWorker: {
           register: url => {
             registered.push(url);
-            return new Promise(() => {});
+            return Promise.resolve();
           },
+          ready: Promise.resolve({ active: { postMessage: message => posted.push(message) } }),
         },
       },
-      performance: { getEntriesByType: () => [] },
+      performance: { getEntriesByType: () => [{ name: `https://${hostname}/assets/css/main.css?v=0123456789ab` }, { name: `https://${hostname}/assets/page/chunk.IJKLMNOP.js` }] },
       URL,
       CustomEvent: class {
         constructor(type, { detail }) {
@@ -602,22 +611,48 @@ test('a page with a boot script starts its sources on this machine and its bundl
     assert.deepEqual(imported, [], 'nothing is imported before the document is parsed');
     listeners.get('DOMContentLoaded')();
     windowListeners.get('load')?.();
-    return { preloaded: appended.map(link => `${link.rel} ${link.href}`), imported, registered, failures };
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+    await settle();
+    // Nothing is named while a startup file is still arriving; a file that
+    // failed is named too (the worker refuses what is not there).
+    const beforeAllIn = posted.length;
+    appended[0]?.fire('load');
+    await settle();
+    const withOneIn = posted.length;
+    appended[1]?.fire('error');
+    await settle();
+    return {
+      preloaded: appended.map(link => `${link.rel} ${link.href}`),
+      imported,
+      registered,
+      postedBefore: [beforeAllIn, withOneIn],
+      kept: posted.map(message => message.keep),
+      failures,
+    };
   };
-  assert.deepEqual(run('localhost'), {
+  assert.deepEqual(await run('localhost'), {
     preloaded: [],
     imported: ['https://localhost/assets/js/app/main.js'],
     registered: [],
+    postedBefore: [0, 0],
+    kept: [],
     failures: [],
   });
-  assert.deepEqual(run('www.cellucid.com'), {
+  assert.deepEqual(await run('www.cellucid.com'), {
     preloaded: ['modulepreload assets/page/main.ABCDEFGH.js', 'modulepreload assets/page/chunk.IJKLMNOP.js'],
     imported: ['https://www.cellucid.com/assets/page/main.ABCDEFGH.js'],
     registered: ['service-worker.js?build=2026-10-29.0123abcd'],
+    postedBefore: [0, 0],
+    // Every startup file, whether or not the page's resource timing has it, then the rest it loaded, once each.
+    kept: [[
+      'https://www.cellucid.com/assets/page/main.ABCDEFGH.js',
+      'https://www.cellucid.com/assets/page/chunk.IJKLMNOP.js',
+      'https://www.cellucid.com/assets/css/main.css?v=0123456789ab',
+    ]],
     failures: [],
   });
   // A page whose stylesheet did not load starts no code: it reports the stylesheet.
-  const unstyled = run('www.cellucid.com', { styleLoadFailed: true });
+  const unstyled = await run('www.cellucid.com', { styleLoadFailed: true });
   assert.deepEqual(unstyled.imported, []);
   assert.deepEqual(
     unstyled.failures.map(event => [event.type, event.detail]),

@@ -1,9 +1,9 @@
 /**
- * An agent's or a notebook's turn can start another tracker (live pass 3,
- * L12-11). The new tracker's opening was recorded with the turn of the
- * meta, and the tracker held no record of that turn, so the model refused
- * the whole tracker ("step "s0" belongs to the turn …, which it does not
- * hold") and `history_tracker_start` failed for every agent. The opening is
+ * An agent's or a notebook's turn can start another tracker. The new tracker's
+ * opening is recorded with the turn of the meta, but the tracker holds no
+ * record of that turn, so the model would refuse the whole tracker ("step
+ * "s0" belongs to the turn …, which it does not hold") and
+ * `history_tracker_start` would fail for every agent. The opening is
  * no step of a turn: it says who started it; the turn's next step in the new
  * tracker makes the turn's record there.
  */

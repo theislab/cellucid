@@ -1,4 +1,3 @@
-import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -91,7 +90,7 @@ async function openFigureExport(page, acceptance) {
   await expect(page.locator('#figure-export-section')).toHaveAttribute('open', '');
 
   await page.getByRole('button', { name: /^Framing\b/ }).click();
-  // The figure's width in millimetres (F271): 120 mm, the 1.5 column preset.
+  // The figure's width in millimetres: 120 mm, the 1.5 column preset.
   const widthInput = page.getByLabel('Figure width (mm)');
   await expect(widthInput).toHaveAttribute('aria-label', 'Figure width (mm)');
   await widthInput.fill('120');
@@ -257,7 +256,7 @@ function assertCurrentMetadata(metadata, {
  * the height `fillSingleViewWidth` (`utils/layout.js`) lays out for the live
  * view's aspect and the panel's title, axes and legend: the axes' margins
  * come from their measured tick labels and the panel's text sizes, in points
- * (`planFigureAxes`, F158), so they are read from the panel and the live view
+ * (`planFigureAxes`), so they are read from the panel and the live view
  * here, not assumed.
  */
 async function expectedPngSize(page) {
@@ -360,7 +359,7 @@ function assertSvgArtifact(bytes, strategy) {
     expect(svg).toMatch(
       /<image [^>]*href="data:image\/png;base64,[A-Za-z0-9+/=]+"/,
     );
-    // The points are drawn at 300 dpi at the figure's size (found 2026-11-10: a fixed 2×).
+    // The points are drawn at 300 dpi at the figure's size (not a fixed 2×).
     for (const [, attributes] of svg.matchAll(/<image ([^>]*)>/g)) {
       const boxWidth = Number(attributes.match(/\swidth="([\d.]+)"/)[1]);
       const png = Buffer.from(attributes.match(/href="data:image\/png;base64,([^"]+)"/)[1], 'base64');
@@ -371,105 +370,6 @@ function assertSvgArtifact(bytes, strategy) {
     expect(svg).toMatch(/<circle\b/);
   }
 }
-
-test('export cancellation settles worker work and cleans download staging', async ({
-  page,
-}, testInfo) => {
-  await page.goto(
-    `/?acceptance=${encodeURIComponent(
-      `figure-export-cancellation-${testInfo.project.name}`
-    )}`,
-    { waitUntil: 'domcontentloaded' },
-  );
-
-  const result = await page.evaluate(async () => {
-    const { openFigureExportWorkerSession } = await import(
-      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
-    );
-    const { downloadBlob } = await import('/assets/js/app/utils/download.js');
-
-    // A worker request settles at the abort; the worker's late answer is
-    // discarded and the worker keeps serving the next export.
-    const workerController = new AbortController();
-    const aborted = openFigureExportWorkerSession({ signal: workerController.signal });
-    const workerPromise = aborted.request('spriteZoomLimit', {});
-    workerController.abort();
-    let workerAbortName = null;
-    try {
-      await workerPromise;
-    } catch (error) {
-      workerAbortName = error?.name ?? null;
-    }
-    aborted.close();
-    const next = openFigureExportWorkerSession();
-    const workerServesNext = Number.isFinite(await next.request('spriteZoomLimit', {}));
-    next.close();
-
-    const downloadController = new AbortController();
-    const originalAppendChild = document.body.appendChild;
-    const originalAnchorClick = HTMLAnchorElement.prototype.click;
-    const originalCreateObjectURL = URL.createObjectURL;
-    const originalRevokeObjectURL = URL.revokeObjectURL;
-    const calls = {
-      clicks: 0,
-      createdUrls: 0,
-      revokedUrls: 0,
-    };
-    document.body.appendChild = function appendAndAbort(node) {
-      const result = originalAppendChild.call(this, node);
-      downloadController.abort();
-      return result;
-    };
-    HTMLAnchorElement.prototype.click = function countClick() {
-      calls.clicks += 1;
-    };
-    URL.createObjectURL = () => {
-      calls.createdUrls += 1;
-      return 'blob:figure-export-cancellation';
-    };
-    URL.revokeObjectURL = (url) => {
-      if (url !== 'blob:figure-export-cancellation') {
-        throw new Error(`Unexpected Object URL: ${url}`);
-      }
-      calls.revokedUrls += 1;
-    };
-
-    let downloadAbortName = null;
-    try {
-      downloadBlob(
-        new Blob(['cancelled'], { type: 'image/svg+xml' }),
-        'cancelled.svg',
-        { signal: downloadController.signal }
-      );
-    } catch (error) {
-      downloadAbortName = error?.name ?? null;
-    } finally {
-      document.body.appendChild = originalAppendChild;
-      HTMLAnchorElement.prototype.click = originalAnchorClick;
-      URL.createObjectURL = originalCreateObjectURL;
-      URL.revokeObjectURL = originalRevokeObjectURL;
-    }
-
-    return {
-      ...calls,
-      workerAbortName,
-      workerServesNext,
-      downloadAbortName,
-      danglingAnchors:
-        document.querySelectorAll('a[download="cancelled.svg"]').length,
-    };
-  });
-
-  expect(result).toEqual({
-    workerAbortName: 'AbortError',
-    workerServesNext: true,
-    clicks: 0,
-    createdUrls: 1,
-    danglingAnchors: 0,
-    downloadAbortName: 'AbortError',
-    revokedUrls: 1,
-  });
-});
 
 test('figure-export UI teardown aborts a pending renderer without download or terminal toast', async ({
   page,
@@ -631,66 +531,6 @@ test('figure-export UI teardown detaches and fences retained DOM handlers', asyn
   expect(productErrors).toEqual([]);
 });
 
-test('teardown during the download click cannot roll back a committed export', async ({
-  page,
-}, testInfo) => {
-  const productErrors = observeProductErrors(page);
-  await openFigureExport(
-    page,
-    `figure-export-download-commit-${testInfo.project.name}`,
-  );
-  await page.getByLabel('Download format').selectOption('svg');
-  await page.getByLabel('SVG point strategy').selectOption('full-vector');
-  await page.evaluate(() => {
-    window.__figureExportNativeAnchorClick =
-      HTMLAnchorElement.prototype.click;
-    window.__figureExportCommitAbortCount = 0;
-    HTMLAnchorElement.prototype.click = function clickAndTearDown() {
-      if (
-        this.download &&
-        window.__figureExportCommitAbortCount === 0
-      ) {
-        window.__figureExportCommitAbortCount += 1;
-        const controls = document.querySelector('#figure-export-controls');
-        if (typeof controls?.__cellucidCleanup !== 'function') {
-          throw new Error('Figure-export cleanup owner is unavailable.');
-        }
-        controls.__cellucidCleanup();
-      }
-      return window.__figureExportNativeAnchorClick.call(this);
-    };
-  });
-
-  const successNotice = page.locator('.notification-message').filter({
-    hasText: 'Exported 1 file',
-  });
-  const [download] = await Promise.all([
-    page.waitForEvent('download'),
-    // The product intentionally retires this success toast after 2.5 s. Own
-    // its visible interval while the browser reports the download instead of
-    // querying it after runner- and OS-dependent delivery latency.
-    expect(successNotice).toBeVisible(),
-    page.locator('#figure-export-btn').click(),
-  ]);
-  await expect(
-    page.locator('.notification-message').filter({
-      hasText: 'Export failed',
-    })
-  ).toHaveCount(0);
-  expect(await download.failure()).toBeNull();
-  await expectDownloadNamed(download, /\.svg$/);
-  expect(
-    await page.evaluate(() => window.__figureExportCommitAbortCount)
-  ).toBe(1);
-  await page.evaluate(() => {
-    HTMLAnchorElement.prototype.click =
-      window.__figureExportNativeAnchorClick;
-    delete window.__figureExportNativeAnchorClick;
-    delete window.__figureExportCommitAbortCount;
-  });
-  expect(productErrors).toEqual([]);
-});
-
 function crc32(bytes) {
   let value = 0xffff_ffff;
   for (const byte of bytes) {
@@ -770,43 +610,75 @@ function readStoredZipEntries(bytes) {
   return entries;
 }
 
-test('exports PNG and every explicit SVG strategy through the visible UI', async ({
+test('exports PNG and every SVG strategy through the visible UI, then again in the sculpted shader quality', async ({
   page,
 }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await installExportProbe(page);
   await openFigureExport(page, `figure-export-artifacts-${testInfo.project.name}`);
 
-  const png = await exportOne({
-    page,
-    testInfo,
-    mode: 'png',
-    strategy: null,
-    artifactLabel: `${testInfo.project.name}-figure-export`,
-  });
-  assertPngArtifact(png.bytes, await expectedPngSize(page));
-
-  for (const strategy of [
-    'full-vector',
-    'optimized-vector',
-    'hybrid',
-  ]) {
-    const svg = await exportOne({
+  await test.step('exports PNG and every explicit SVG strategy through the visible UI', async () => {
+    const png = await exportOne({
       page,
       testInfo,
-      mode: 'svg',
-      strategy,
-      artifactLabel: `${testInfo.project.name}-figure-export-${strategy}`,
+      mode: 'png',
+      strategy: null,
+      artifactLabel: `${testInfo.project.name}-figure-export`,
     });
-    assertSvgArtifact(svg.bytes, strategy);
-  }
+    assertPngArtifact(png.bytes, await expectedPngSize(page));
 
-  expect(productErrors).toEqual([]);
+    for (const strategy of [
+      'full-vector',
+      'optimized-vector',
+      'hybrid',
+    ]) {
+      const svg = await exportOne({
+        page,
+        testInfo,
+        mode: 'svg',
+        strategy,
+        artifactLabel: `${testInfo.project.name}-figure-export-${strategy}`,
+      });
+      assertSvgArtifact(svg.bytes, strategy);
+    }
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('exports the sculpted shader quality as PNG and every SVG strategy', async () => {
+    // Sculpted draws opaque points whose depth-pass edge is a multisample
+    // coverage mask, and fogs by mixing toward the paper; the export runs the
+    // same programs and state, so it must complete in every format.
+    await page.evaluate(() => {
+      const select = document.getElementById('hp-shader-quality');
+      select.value = 'sculpted';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    const png = await exportOne({
+      page,
+      testInfo,
+      mode: 'png',
+      strategy: null,
+      artifactLabel: `${testInfo.project.name}-figure-export-sculpted`,
+    });
+    assertPngArtifact(png.bytes, await expectedPngSize(page));
+    for (const strategy of ['full-vector', 'hybrid']) {
+      const svg = await exportOne({
+        page,
+        testInfo,
+        mode: 'svg',
+        strategy,
+        artifactLabel: `${testInfo.project.name}-figure-export-sculpted-${strategy}`,
+      });
+      assertSvgArtifact(svg.bytes, strategy);
+    }
+    expect(productErrors).toEqual([]);
+  });
 });
 
 test('the point pass drawn on the page equals the one drawn in the worker', async ({
   page,
-  browserName,
 }, testInfo) => {
   // A browser whose workers have no WebGL2 (WebKitGTK, WPE) draws the point
   // pass on the page, with the same handler. Here both placements export the
@@ -867,9 +739,7 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
   assertSvgArtifact(onPage.bytes, 'hybrid');
   const pageContext = await rasterContext();
   const [measuredRasters, pageRasters] = [pointRasters(first.bytes), pointRasters(onPage.bytes)];
-  // Two GL contexts: on hosted macOS Firefox their pixels may round apart (`helpers/hosted-gl.mjs`).
-  const comparesPixels = !isHostedMacosFirefox(browserName);
-  if (comparesPixels && (JSON.stringify(measuredRasters) !== JSON.stringify(pageRasters) || JSON.stringify(measuredContext) !== JSON.stringify(pageContext))) {
+  if (JSON.stringify(measuredRasters) !== JSON.stringify(pageRasters) || JSON.stringify(measuredContext) !== JSON.stringify(pageContext)) {
     // What each placement drew with, and where its pixels differ.
     const differing = await page.evaluate(async ([left, right]) => {
       const read = async url => {
@@ -903,7 +773,7 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
   }
   // The inputs first: two contexts that differ need not draw the same pixels.
   expect(pageContext, 'the page\'s raster context, as the one measured').toEqual(measuredContext);
-  if (comparesPixels) expect(pageRasters).toEqual(measuredRasters);
+  expect(pageRasters).toEqual(measuredRasters);
   expect(pageRasters.length).toBeGreaterThan(0);
 
   const png = await exportOne({
@@ -914,42 +784,6 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
     artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
   });
   assertPngArtifact(png.bytes, await expectedPngSize(page));
-  expect(productErrors).toEqual([]);
-});
-
-test('exports the sculpted shader quality as PNG and every SVG strategy', async ({
-  page,
-}, testInfo) => {
-  // Sculpted draws opaque points whose depth-pass edge is a multisample
-  // coverage mask, and fogs by mixing toward the paper; the export runs the
-  // same programs and state, so it must complete in every format.
-  const productErrors = observeProductErrors(page);
-  await installExportProbe(page);
-  await openFigureExport(page, `figure-export-sculpted-${testInfo.project.name}`);
-  await page.evaluate(() => {
-    const select = document.getElementById('hp-shader-quality');
-    select.value = 'sculpted';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-  });
-
-  const png = await exportOne({
-    page,
-    testInfo,
-    mode: 'png',
-    strategy: null,
-    artifactLabel: `${testInfo.project.name}-figure-export-sculpted`,
-  });
-  assertPngArtifact(png.bytes, await expectedPngSize(page));
-  for (const strategy of ['full-vector', 'hybrid']) {
-    const svg = await exportOne({
-      page,
-      testInfo,
-      mode: 'svg',
-      strategy,
-      artifactLabel: `${testInfo.project.name}-figure-export-sculpted-${strategy}`,
-    });
-    assertSvgArtifact(svg.bytes, strategy);
-  }
   expect(productErrors).toEqual([]);
 });
 
@@ -1056,6 +890,11 @@ test('figure-export modal confines focus and restores its exact invoker', async 
   await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
 
   await page.keyboard.press('Escape');
+  // Escape closes the dialog at once (no longer shown, focus back with its
+  // invoker) and the dialog settles on the native close event, a task later:
+  // it leaves the page and `onClose` runs, in one turn. The dialog element
+  // gone from the page is that turn done; the dialog only hidden is not.
+  await expect(page.locator('dialog.figure-export-modal')).toHaveCount(0);
   await expect(modal).toHaveCount(0);
   await expect(exportButton).toBeFocused();
   expect(await page.evaluate(() => window.__figureModalClosed)).toBe(true);

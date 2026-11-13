@@ -23,7 +23,7 @@ import { attributeValue, encodingType, valueKind } from '../elements.js';
 import { currentLayoutView, isOlderAnnDataLayout } from '../older-layouts.js';
 import { frameRows } from '../views/modalities.js';
 import { readPriorityLayout } from '../priority-layout.js';
-import { readUnsCellucid, readUnsCellucidRecords } from '../reader.js';
+import { readUnsCellucid, readUnsCellucidRecords } from '../uns.js';
 import { zarrV2Dtype } from '../../../formats/zarr/format-v2.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
 import { throwIfAborted } from '../../../utils/abort.js';

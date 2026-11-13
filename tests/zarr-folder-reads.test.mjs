@@ -311,8 +311,9 @@ test('the limiter serves waiting tasks in order, background work last and never 
 
 test('the limiter queues tens of thousands of tasks in linear time', async () => {
   // Choosing the next task looks at each waiting activity, not each task: a
-  // pass over every waiting task per start made 25,000 background reads
-  // cost 2.4 s of queue work alone, and 100,000 over a minute. The queue's
+  // pass over every waiting task per start would make tens of thousands of
+  // background reads cost seconds of queue work alone (measured:
+  // 22_decisions_link_model_and_request_planning.md). The queue's
   // work is counted, not timed: each look at a task's activity (whether it is
   // background) is one step. Linear time is the same steps per task at every
   // length of queue (a pass over the waiting tasks adds steps per task as

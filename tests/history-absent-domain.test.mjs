@@ -1,10 +1,10 @@
 /**
  * A saved state that does not hold a domain (a file written before the
- * domain existed, or by hand) restored onto an open dataset (F153): the
+ * domain existed, or by hand) restored onto an open dataset: the
  * domain's owner says what its absence stands for (`absent()`), and the
  * restore puts that back, as part of the restore itself; an owner without
- * one keeps the value shown. The Expression values say "as stored" (plan
- * §3: a record without the field means off), so the same file restores
+ * one keeps the value shown. The Expression values say "as stored" (a
+ * record without the field means off), so the same file restores
  * the same values whatever was shown before; Load, a session file and an
  * agent's `history.saved.open` all read a saved state through
  * `history.load` / `importTrackers`.

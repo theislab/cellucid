@@ -6,8 +6,8 @@ import { BasePlot } from '../assets/js/app/analysis/plots/plot-base.js';
 import { getPageColor } from '../assets/js/app/utils/page-colors.js';
 
 test('a page is drawn in the color its data carries, whatever its place among the pages drawn', () => {
-  // Found 2026-11-10: Detailed drew pages CD4 T (red swatch) and Page 1 (blue swatch), picked in
-  // that order, as blue and red: plots colored by pick order.
+  // Plots color a page by its data, not by pick order: pages CD4 T (red swatch) and Page 1
+  // (blue swatch), picked in that order, are drawn red and blue.
   const pageData = [
     { pageId: 'cd4', pageName: 'CD4 T', pageColor: '#dc2626', values: Float32Array.of(1, 2) },
     { pageId: 'nk', pageName: 'Page 1', pageColor: '#2563eb', values: Float32Array.of(3, 4) },

@@ -2,14 +2,13 @@
  * A highlight page's analysis cache identity is the *set* of its cell indices —
  * never its cardinality, and never a fixed-size sample of that set.
  *
- * Regression guard for CEL-AUDIT-0019: page versions used to be built from the
- * first five, last five, and (only when the count exceeded 100) a tenth-step
- * middle sample of the page's indices, and the cache key then discarded even
- * those samples down to `pageId@count`. Replacing almost every cell in a page
- * while keeping its cardinality therefore produced a byte-identical cache key,
- * and Correlation, Detailed Analysis, Quick Insights, Gene Signature, the
- * and the comparison module all served results computed over
- * the previous cell set.
+ * A version built from the first five, last five, and (only when the count
+ * exceeds 100) a tenth-step middle sample of the page's indices, or a cache
+ * key reduced to `pageId@count`, would let replacing almost every cell in a
+ * page while keeping its cardinality produce a byte-identical cache key, and
+ * Correlation, Detailed Analysis, Quick Insights, Gene Signature and the
+ * comparison module would all serve results computed over the previous cell
+ * set.
  */
 
 import assert from 'node:assert/strict';
@@ -66,8 +65,8 @@ function keysFor(layer, pageIds = ['page_1']) {
 /**
  * Swap `replacedCount` cells out of a page while preserving:
  * - the cell count,
- * - the five lowest and five highest indices (the old first/last sample),
- * - every index the old tenth-step middle sample would have read.
+ * - the five lowest and five highest indices (a first/last sample),
+ * - every index a tenth-step middle sample would read.
  *
  * Any version derived from a bounded sample of the set is blind to this edit;
  * only a version derived from the whole set can see it.
@@ -429,9 +428,10 @@ test('indices outside the dataset are still reported, as before', t => {
 
 test('a page\'s count and cells never copy a group\'s cells', t => {
   // The page selectors count every page on every highlight change, and every
-  // analysis reads its pages' cells: copying a 5,000,000-cell selection into
-  // an array cost 85 ms of a change at 10 million cells, and 0.3 s and
-  // 40-80 MB a read. A page of one group is that group's own cell list.
+  // analysis reads its pages' cells: copying a selection of millions of cells
+  // into an array costs time on every change and time and memory on every read
+  // (measured: 37_decisions_analysis.md). A page of one group is that group's
+  // own cell list.
   const cells = new Uint32Array(200_000);
   for (let i = 0; i < cells.length; i++) cells[i] = i * 3;
   const pages = [{

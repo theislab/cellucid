@@ -143,9 +143,8 @@ export function categoricalStorageForCount(nCategories, label) {
  * Resolve the storage a codes array is already in.
  *
  * Use this when a typed array is in hand and the question is which code it
- * reserves for "missing". Every caller that asked that question used to answer
- * it inline, and an inline answer is one edit away from disagreeing with the
- * format.
+ * reserves for "missing". Every caller asks it here: an inline answer is one
+ * edit away from disagreeing with the format.
  *
  * @param {unknown} codes - A categorical codes array.
  * @param {string} label - What to name in the failure.

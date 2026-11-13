@@ -154,7 +154,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
     return out;
   });
 
-  // Five kept views: more than the four views there used to be room for.
+  // Five kept views: more than four views.
   for (let index = 0; index < 5; index++) await keepView();
   await setLayout('grid');
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPresentedLayout().panes.length)).toBe(6);
@@ -175,8 +175,8 @@ test('six kept views draw in a grid, and views released under memory pressure co
   await setLayout('single');
   // The layout is changed by an action: a kept view is dormant once a frame
   // has presented the one view alone. Settled before that frame is the grid
-  // still (WebKit, 1 run in 7: nothing was dormant, so the refused
-  // allocation had nothing to release and was thrown).
+  // still (on WebKit nothing is dormant then, so the refused
+  // allocation has nothing to release and is thrown).
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPresentedLayout().panes.length)).toBe(1);
   await settled();
   await page.evaluate(() => {
@@ -219,11 +219,8 @@ test('six kept views draw in a grid, and views released under memory pressure co
   const storesAfter = await storeFingerprints();
   const pixelDifferences = await differences('grid-before', 'grid-after');
   // The rebuilt stores hold the bytes the released ones held, in the same
-  // order: a view that draws differently with identical GPU data names the
-  // rasterizer, not the rebuild.
+  // order, and are drawn with the same cameras and viewports: the same pixels.
   expect(storesAfter).toEqual(storesBefore);
-  // With the stores, cameras and viewports proven identical, the picture may
-  // differ only by the rasterizer's last bit (helpers/pixel-parity.mjs).
   for (const pane of pixelDifferences) {
     expect(pixelParityVerdict(pane, `pane ${pane.viewId}`)).toBeNull();
   }

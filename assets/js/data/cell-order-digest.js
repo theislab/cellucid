@@ -100,8 +100,8 @@ export function addCellOrderSums(sums, values, width, originalOf) {
   const cells = values.length / width;
   let low = sums.low | 0;
   let high = sums.high | 0;
-  // An axis' word, scrambled; the words in locals (an array of three cost a
-  // 10M-cell opening's digest a third of its time).
+  // An axis' word, scrambled; the words in locals (an array of three costs a
+  // third of the digest's time at 10M cells).
   const word = index => scramble(bits === null ? float32Bits(values[index]) : canonical(bits[index]));
   for (let row = 0, index = 0; row < cells; row++) {
     const w0 = word(index);

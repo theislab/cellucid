@@ -805,9 +805,9 @@ test('mixed-dimension restore reapplies distinct unlocked live and kept-view cam
 /**
  * A viewer that reports the free-fly half of an orbit camera the way the real
  * one does: derived from the orbit half with its own `Math.sin`/`Math.atan2`/
- * `Math.asin`, whose last bits ECMAScript leaves to the engine. The published
- * He and Kanemaru sample views were saved in WebKit, whose derived pitch is
- * `-0.16539816339745403`; Chromium and Firefox derive `-0.16539816339745406`.
+ * `Math.asin`, whose last bits ECMAScript leaves to the engine. A view saved
+ * in WebKit has the derived pitch `-0.16539816339745403`; Chromium and
+ * Firefox derive `-0.16539816339745406`.
  */
 function deriveFreeflyLikeAnotherEngine(camera) {
   const derived = structuredClone(camera);

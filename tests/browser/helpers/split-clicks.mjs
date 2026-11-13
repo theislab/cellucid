@@ -5,19 +5,22 @@
  * click, checks what the press lands on, and releases a moment later at the
  * same point: if the page lays itself out in between (the Session panel's
  * Dataset box filling in while the start dataset opens moves everything
- * under it, 718 px in six steps for the foot of the panel), the release
+ * under it, the foot of the panel by hundreds of pixels), the release
  * lands on something else, the browser sends the `click` to their common
  * ancestor, and the control pressed hears nothing. No error anywhere: the
  * spec then waits a minute for what the click should have done
- * (`ui-visual-consistency.spec.mjs`, the license link, Linux WebKit, Web
- * contracts run 42180485733; the Benchmark run button, WebKit, 1 run in 24,
- * `synthetic-dataset.mjs`).
+ * (`ui-visual-consistency.spec.mjs`, the license link; the Benchmark run
+ * button of `synthetic-dataset.mjs`).
  *
  * The cure is the spec's: click once the page has stopped moving (the
  * opening over, `waitForPageAtRest`). Every context of every test is watched
  * here, so a spec that does not fails naming the cause instead of waiting
- * for a consequence: a trusted mouse press and release at the same point,
- * the pressed element still drawn and no longer under that point. A drag
+ * for a consequence: a trusted mouse press the page heard and its release at
+ * the same point, the pressed element still drawn and no longer under that
+ * point. A press that lands on another element than the one aimed at is
+ * stopped by Playwright before the page hears it, and Playwright clicks again
+ * (its hit-target check, at the first event of the click): no click was
+ * split, and the page heard nothing. A drag
  * moves the pointer; an element its own press removes, hides (a menu's
  * option, chosen on the press) or covers is gone, has no box, or is still
  * under the pointer; a touch is not a mouse: none of those is reported.
@@ -85,13 +88,18 @@ export async function watchSplitClicks(context) {
     let press = null;
     window.addEventListener('pointerdown', event => {
       press = event.isTrusted && event.pointerType === 'mouse'
-        ? { target: event.target, x: event.clientX, y: event.clientY, above: layoutAbove(event.target) }
+        ? { event, heard: false, target: event.target, x: event.clientX, y: event.clientY, above: layoutAbove(event.target) }
         : null;
+    }, true);
+    // A press Playwright's hit-target check stops on the window never reaches
+    // the document: the page did not hear it.
+    document.addEventListener('pointerdown', event => {
+      if (press !== null && press.event === event) press.heard = true;
     }, true);
     window.addEventListener('pointerup', event => {
       const pressed = press;
       press = null;
-      if (pressed === null || !event.isTrusted || event.pointerType !== 'mouse') return;
+      if (pressed === null || !pressed.heard || !event.isTrusted || event.pointerType !== 'mouse') return;
       if (event.clientX !== pressed.x || event.clientY !== pressed.y) return;
       const target = pressed.target;
       if (!(target instanceof Element) || !target.isConnected) return;

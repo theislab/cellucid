@@ -13,7 +13,8 @@ version of it is being read. The data-source classes that use these
 | `remote-file.js` | One file on a web host described without downloading it (`describeRemoteFile`: format, exact size, identity, whether ranges are served); `downloadRemoteFile` for hosts that serve no ranges (resumes a cut body from its byte). |
 | `anndata-catalog.js` | A dataset catalog (`datasets.json` and the files it lists). |
 | `identity.js` | **The** identity and version rule every keeper files under (kept stores, kept parts, the page's range cache, Zarr store objects): `fileIdentityOf`, `persistsAcrossVisits`, `strongEtag`. |
-| `link-credentials.js` | A link's two forms: what it is read with, and what it may be shown or kept as (`publicLink`, `linkIdentity`): tokens and signatures never reach logs, sessions or identities. |
+| `link-credentials.js` | A link's two forms: what it is read with, and what it may be shown or kept as (`publicLink`, `linkIdentity`): tokens and signatures never reach logs, sessions or identities. What a kept directory is filed under, so the code fingerprints of kept data cover it: only what says what a link is lives here. |
+| `link-text.js` | What a message says of a link, built on the public form: `textWithPublicLinks` (every address in a text made public), `linkLeavesOutParts`. Apart from `link-credentials.js`, so that wording a link changes no code fingerprint. |
 | `access.js` | Access of files behind a sign-in or an expiring link, owned by the page; registered once a file is described, released with the source that reads it (or an opening not adopted); revocation. |
 | `api-request.js` | One JSON request to a provider API (Drive, Graph, Figshare) with the byte layer's retry rules. |
 | `auth/` | Google and Microsoft sign-in with no server (`google.js`, `microsoft.js`, `pkce.js`), the tab's token store (`token-store.js`, `sessionStorage` only), sign-in steps waiting on the person (`sign-in.js`). |

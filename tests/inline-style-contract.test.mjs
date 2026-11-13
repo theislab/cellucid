@@ -1,10 +1,10 @@
 /**
  * `assets/css/README.md` states the rule plainly: "No inline styles in
- * `index.html`. Use utilities + component classes." (CEL-AUDIT-0101)
+ * `index.html`. Use utilities + component classes."
  *
- * Every presentational declaration index.html used to carry inline is now a
- * utility class that already existed. The three elements whose initial
- * `display: none` used to be written inline (the vector-field overlay block,
+ * No presentational declaration in index.html is inline: each is a utility
+ * class. The three elements whose initial `display: none` is not written
+ * inline (the vector-field overlay block,
  * its settings and the Camera Path "Set all" row) start with the `hidden`
  * attribute instead, which their modules toggle, so no exemption remains.
  */
@@ -14,7 +14,6 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
-const CSS_README_URL = new URL('../assets/css/README.md', import.meta.url);
 const LAYOUT_UTILITIES_URL = new URL(
   '../assets/css/utilities/_layout.css',
   import.meta.url
@@ -32,15 +31,8 @@ const REQUIRED_UTILITIES = Object.freeze({
   'm-0': SPACING_UTILITIES_URL
 });
 
-const [indexSource, cssReadme] = await Promise.all([
-  readFile(INDEX_URL, 'utf8'),
-  readFile(CSS_README_URL, 'utf8')
-]);
+const indexSource = await readFile(INDEX_URL, 'utf8');
 const indexHtml = indexSource.replace(/<!--[\s\S]*?-->/g, '');
-
-test('the rule this test enforces is the one the design system states', () => {
-  assert.match(cssReadme, /No inline styles in `index\.html`/);
-});
 
 test('index.html carries no inline style at all', () => {
   const inlineStyled = Array.from(

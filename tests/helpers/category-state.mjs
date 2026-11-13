@@ -26,12 +26,6 @@ export function rgbListOf(field) {
   return Array.from({ length: colors.length / 3 }, (_, index) => [colors[index * 3] / 255, colors[index * 3 + 1] / 255, colors[index * 3 + 2] / 255]);
 }
 
-/** A field's colors as byte triplets. */
-export function byteListOf(field) {
-  const colors = field._categoryColors;
-  return Array.from({ length: colors.length / 3 }, (_, index) => [colors[index * 3], colors[index * 3 + 1], colors[index * 3 + 2]]);
-}
-
 /** A field's visibility as booleans. */
 export function visibleListOf(field) {
   return Array.from(field._categoryVisible, flag => flag === 1);

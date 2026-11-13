@@ -77,6 +77,7 @@ export const colorOutlierMethods = {
    * or failed, the threshold is back at 1 and the field's outlier status
    * says why.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} threshold
    * @returns {Promise<void>} Settles once the threshold is applied, or the
    *   quantiles were canceled or failed.
@@ -115,6 +116,7 @@ export const colorOutlierMethods = {
    *
    * User-defined categoricals never have these stats, so this prevents outlier
    * filtering from being applied silently when the UI control is hidden.
+   * @this {import('../core/data-state.js').DataState}
    * @returns {boolean}
    */
   isOutlierFilterEnabledForActiveField() {
@@ -140,6 +142,7 @@ export const colorOutlierMethods = {
    * array is immutable once published, and every view that colors by the
    * field reads the same one.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Float32Array|null}
    */
   getActiveOutlierQuantiles() {
@@ -150,6 +153,7 @@ export const colorOutlierMethods = {
     );
   },
 
+  /** @this {import('../core/data-state.js').DataState} */
   getCurrentOutlierThreshold() {
     const field = this.getActiveField();
     if (field && field._outlierThreshold != null) return field._outlierThreshold;

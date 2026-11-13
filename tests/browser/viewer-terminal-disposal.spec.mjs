@@ -15,8 +15,7 @@ test.beforeEach(async ({ page }) => {
   );
   // The opening is over before its owners are torn down. The fence's audit
   // counts every animation frame the page asks for, whoever asks, and work
-  // the opening still has under way is not the viewer's (2 counted in Web
-  // contracts run 41269083996, macOS Firefox; who asked was not recorded).
+  // the opening still has under way is not the viewer's.
   await waitForPageAtRest(page);
   await page.evaluate(async () => {
     const ui = window._cellucidUi;
@@ -211,7 +210,7 @@ test('real WebGL loss fences every owner with no GL work while the context is aw
       };
       requestAnimationFrame(advance);
     });
-    // The renderer builds no UI of its own (F146): the app's one dialog.
+    // The renderer builds no UI of its own: the app's one dialog.
     const overlayCount = document.querySelectorAll(
       '#graphics-reset-dialog[open]',
     ).length;

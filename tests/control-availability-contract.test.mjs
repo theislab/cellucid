@@ -1,9 +1,9 @@
 /**
- * Every input and select the app turns off says why (F127 and its class):
+ * Every input and select the app turns off says why 
  * `ui/core/control-availability.js` is the one way, so the dimmed control's
  * tooltip and a refused `setting.set` give the owner's reason, never a guess
- * ("switched off by another setting" was said of a dataset with no vector
- * field). A new `.disabled =` / `toggleAttribute('disabled')` in the app is
+ * (such as "switched off by another setting" said of a dataset with no
+ * vector field). A new `.disabled =` / `toggleAttribute('disabled')` in the app is
  * refused here until it goes through `setControlAvailability`, or is listed
  * below as a button, an option or not a control at all.
  */

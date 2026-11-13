@@ -1,9 +1,9 @@
 /**
  * A file URL is turned into a path of this system with `fileURLToPath()`,
  * never by its `pathname`: on Windows that is `/D:/a/...`, which
- * `path.join()` and `path.resolve()` make `D:\D:\a\...`, so three contracts
- * read no file there and four more compared `\`-separated names with
- * `'app/...'` (CI run 43106620008). The contracts that read every module of a
+ * `path.join()` and `path.resolve()` make `D:\D:\a\...`, so contracts would
+ * read no file there and others would compare `\`-separated names with
+ * `'app/...'`. The contracts that read every module of a
  * folder do it through `tests/helpers/source-files.mjs`.
  */
 import assert from 'node:assert/strict';

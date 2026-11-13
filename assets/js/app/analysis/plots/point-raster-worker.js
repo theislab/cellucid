@@ -140,7 +140,7 @@ export function rasterizePoints({ xs, ys, width, height, scale, radius, rgb, alp
  * @param {{xs: Float32Array, ys: Float32Array, colorIndex: Uint8Array|Uint16Array|Uint32Array, palette: number[][], width: number, height: number, scale: number, radius: number}} request
  * @returns {{width: number, height: number, pixels: Uint8ClampedArray}} Straight RGBA
  */
-export function rasterizeColoredPoints({ xs, ys, colorIndex, palette, width, height, scale, radius }) {
+function rasterizeColoredPoints({ xs, ys, colorIndex, palette, width, height, scale, radius }) {
   const w = Math.max(1, Math.ceil(width * scale));
   const h = Math.max(1, Math.ceil(height * scale));
   // Premultiplied color and the light still passing through, per pixel.

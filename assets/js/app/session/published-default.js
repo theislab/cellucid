@@ -12,7 +12,7 @@
  * - one tracker of one branch, whose root is its head and its only step (no
  *   step was ever made: `nextStep` 1), with no journal and no conversation;
  * - every chunk eager (the root's values are all it holds);
- * - its page chrome (the selection tool, CEL-0249) as the capture carried it;
+ * - its page chrome (the selection tool) as the capture carried it;
  * - no `source` (it ships beside its dataset), no `cells` and no `genes`
  *   (it is captured on every cell and applies to any subsample of its
  *   dataset, `verifySessionFingerprint`);
@@ -62,7 +62,7 @@ export const STARTING_VIEW_OMITTED_DOMAINS = Object.freeze(['cells', 'expression
  * The settings a starting view holds but leaves as shown: the viewer's
  * background, the person's own look as the theme is (a background never
  * chosen follows the theme, `rendering/viewer-backgrounds.js`
- * `backgroundForTheme`; owner, 2026-11-10). The settings value lists every
+ * `backgroundForTheme`). The settings value lists every
  * control, so the file still holds one; it is not applied.
  */
 export const STARTING_VIEW_SHOWN_CONTROL_IDS = Object.freeze(['background-select']);
@@ -86,7 +86,7 @@ export function keepShownControls(values, shownOf) {
 }
 
 /** The name of a starting view's one tracker. */
-export const STARTING_VIEW_TRACKER_NAME = 'Starting view';
+const STARTING_VIEW_TRACKER_NAME = 'Starting view';
 
 function refuse(what) {
   return new TypeError(`This is not a starting view: ${what}`);
@@ -153,14 +153,14 @@ export function rebindPublishedDefaultFingerprint(captured, published) {
   if (typeof published.datasetId !== 'string' || published.datasetId === '') {
     throw new TypeError('A starting view must name the dataset it ships beside.');
   }
-  const describing = [
+  const describing = /** @type {const} */ ([
     [fingerprint => fingerprint.cellCount, 'cell count'],
     [fingerprint => fingerprint.varCount, 'gene count'],
     [fingerprint => JSON.stringify(fingerprint.cellOrder.embedding), 'cell-order embedding'],
     [fingerprint => fingerprint.cellOrder.dimension, 'embedding dimension'],
     [fingerprint => fingerprint.cellOrder.digest, 'cell-order digest'],
     [fingerprint => JSON.stringify(fingerprint.dataMapping), 'data mapping'],
-  ];
+  ]);
   for (const [read, label] of describing) {
     if (read(captured) !== read(published)) {
       throw new Error(
@@ -225,7 +225,7 @@ export async function trimToPublishedDefault(source, publishedIdentity) {
   });
   return writeHistoryFile({
     header: { createdAt: header.createdAt, datasetFingerprint: fingerprint, source: null, requires: header.requires },
-    // The page chrome the capture carried (its selection tool, CEL-0249), as it was.
+    // The page chrome the capture carried (its selection tool), as it was.
     chrome: header.chrome,
     // What wrote the capture wrote this: the starting view holds no step, so no action.
     app: header.app,

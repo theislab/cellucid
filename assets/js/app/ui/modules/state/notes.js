@@ -1,6 +1,6 @@
 /**
- * @fileoverview Notes on a step, a branch, a group, a turn or the tracker
- * (History v2 §3.13): each with its author and time ("edited" once edited),
+ * @fileoverview Notes on a step, a branch, a group, a turn or the tracker:
+ * each with its author and time ("edited" once edited),
  * its text in the Markdown subset (emphasis, inline code, http(s) links)
  * built from text nodes only, Edit and Remove, and "Add note". Every change is
  * a history action (`history.note.add`, `.edit`, `.remove`), kept in the
@@ -8,7 +8,7 @@
  * Ctrl+Z stays for the state.
  *
  * The person may edit or remove any note; an agent only its own (the core
- * refuses it, §5 #30).
+ * refuses it).
  *
  * @module ui/modules/state/notes
  */

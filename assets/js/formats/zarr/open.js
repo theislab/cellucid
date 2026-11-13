@@ -25,8 +25,8 @@
  * its fetch, its wait to be made again, its place in the queue -- whoever
  * asked for it, background work with no signal of its own included, so
  * nothing of a closed store reads on (a source disconnected while an index
- * was being kept read its host's `X/indptr` on, retrying, for as long as
- * the worker lived).
+ * was being kept would otherwise read its host's `X/indptr` on, retrying,
+ * for as long as the worker lived).
  *
  * @module formats/zarr/open
  */

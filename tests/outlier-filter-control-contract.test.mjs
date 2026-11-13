@@ -2,12 +2,12 @@
  * The outlier filter's slider: a value given and not committed yet is the
  * person's, and a redraw of the control leaves it.
  *
- * Found 2026-11-12 (WebKit, 1 run in 5 of `outlier-filtering.spec.mjs`): the
- * legend is drawn again a moment after a field is shown, the control's render
- * put the thumb back at the threshold in effect between the slider's `input`
- * and its `change`, and the commit read that value: nothing was filtered.
- * The same redraw while a committed value was still being applied (its
- * action waiting behind a coloring) jumped the thumb back likewise; that
+ * The legend is drawn again a moment after a field is shown; the control's
+ * render must not put the thumb back at the threshold in effect between the
+ * slider's `input` and its `change`, or the commit reads that value and
+ * nothing is filtered (WebKit, `outlier-filtering.spec.mjs`).
+ * The same redraw while a committed value is still being applied (its
+ * action waiting behind a coloring) must not jump the thumb back likewise; that
  * path is exercised in the browser (`outlier-filtering.spec.mjs`), where the
  * action runs.
  */

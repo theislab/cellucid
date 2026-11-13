@@ -340,7 +340,7 @@ async function main() {
       const client = await json(registered);
       must(registered.status === 201 && client.client_id.startsWith('cd1.'), `register: ${registered.status}`);
       // Registered with a loopback redirect and no client document: no site vouches for it, so it is
-      // an app on this computer, its own name only quoted (R9Z-2).
+      // an app on this computer, its own name only quoted.
       dcr = await connectClient(page, {
         clientId: client.client_id, redirectUri, via: 'link', expectWho: 'An app on this computer, which calls itself “Cellucid live check”, asks',
       });
@@ -440,7 +440,7 @@ async function main() {
       must(body?.step != null, 'no step');
       const history = dataOf(((await call(access, 'history_get')).result));
       const step = history.steps.find(each => each.id === body.step.id);
-      // No site vouches for this registered app: its steps carry the name Manage… gives it (R9Z-5).
+      // No site vouches for this registered app: its steps carry the name Manage… gives it.
       const named = 'An app on this computer (calls itself “Cellucid live check”)';
       must(step.origin === 'agent' && step.agent === named, `origin ${step.origin} ${step.agent}`);
       return `"${body.step.label}" by ${step.agent}`;
@@ -472,8 +472,7 @@ async function main() {
 
     await check('a picture larger than a chat takes is left out with a sentence', async () => {
       // The picture fits the pane inside the box asked for and keeps its shape (`reads/views.js`), so
-      // the box must be large on both sides for the picture to pass 8,000 px on its longer side
-      // (8,200 by 300 drew a picture about 500 px wide, rightly sent).
+      // the box must be large on both sides for the picture to pass 8,000 px on its longer side.
       const { result } = await call(access, 'view_picture', { width: 8200, height: 8200, legend: false });
       must(!result.content.some(item => item.type === 'image'), 'sent anyway');
       must(/more than a chat takes \(/.test(textOf(result)), textOf(result).slice(-200));

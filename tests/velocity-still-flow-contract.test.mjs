@@ -1,5 +1,5 @@
 /**
- * F103: under reduced motion the velocity overlay draws a still picture of
+ * Under reduced motion the velocity overlay draws a still picture of
  * the flow (the design rule: `prefers-reduced-motion` stops motion). The
  * picture is traced once from fixed seeds at fixed times, held, traced again
  * only when what it shows changes, and asks for no frame; a change of the

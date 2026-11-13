@@ -3,9 +3,10 @@
  * agent reads (`_resultTable`): one table (`compositionTable`), so every
  * column they share holds the same value for every cell type, and the file
  * says what a reader of it alone needs — the samples each condition's mean is
- * over and, for a paired test, the pairs the test took (F108: a paired run's
- * file gave every sample as the test's, `n_samples_Liver 14` beside a paired
- * t over 7 donors, and left out the per-sample proportions the result shows).
+ * over and, for a paired test, the pairs the test took (a paired run's file
+ * does not give every sample as the test's, `n_samples_Liver 14` beside a
+ * paired t over 7 donors, and does not leave out the per-sample proportions
+ * the result shows).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -49,7 +50,7 @@ function pairedComposition({ paired }) {
     [50, 4, 61, 3, 47, 6, 30, 2],
     [100, 80, 120, 95, 90, 70, 60, 40],
     [5, 30, 4, 28, 6, 35, 2, 20],
-    // Cells in one pair (D1's spleen) and in D5: paired, too few pairs to test (F109).
+    // Cells in one pair (D1's spleen) and in D5: paired, too few pairs to test.
     [0, 2, 0, 0, 0, 0, 0, 1],
   ].flat());
   const testResult = testComposition({
@@ -75,7 +76,7 @@ function exported(composition) {
 }
 
 for (const paired of [true, false]) {
-  test(`the ${paired ? 'paired' : 'unpaired'} composition CSV is the result table, plus the statistic and the samples behind each number (F108)`, () => {
+  test(`the ${paired ? 'paired' : 'unpaired'} composition CSV is the result table, plus the statistic and the samples behind each number`, () => {
     const composition = pairedComposition({ paired });
     const { file, header, lines, table } = exported(composition);
     assert.equal(file.name, 'composition_results');
@@ -102,7 +103,7 @@ for (const paired of [true, false]) {
       lines.map(() => ['4', '4']));
     if (paired) {
       // Each type's test took the pairs holding its cells: said, so the file is not read as a
-      // test over four samples each, nor Langerhans as tested over three pairs (F109).
+      // test over four samples each, nor Langerhans as tested over three pairs.
       assert.equal(composition.test.pairs, 3);
       assert.deepEqual(lines.map(line => [line[0], line[header.indexOf('n_pairs')], line[header.indexOf('test')]]).sort(), [
         ['DC1', '3', 'paired t-test'], ['Kupffer-like', '3', 'paired t-test'],

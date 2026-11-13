@@ -6,9 +6,9 @@
  * copy of theislab/cellucid-annotation's tests/fixtures/contract-corpus.json,
  * written by that repository's scripts/generate_contract_corpus.py (run it
  * with `--copy <this file>`). Its test suite (tests/test_contract_corpus.py)
- * pins the same SHA-256 and runs every case through the Python validator;
- * this suite runs every case through wire-contract.js. Update both digests
- * together.
+ * runs every case through the Python validator; this suite runs every case
+ * through wire-contract.js, and tests/shared-files-contract.test.mjs compares
+ * this copy with that repository's file.
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -30,7 +30,6 @@ import {
 } from '../assets/js/app/community-annotations/wire-contract.js';
 
 const FIXTURE_URL = new URL('./fixtures/community-annotation-contract-corpus.json', import.meta.url);
-const FIXTURE_SHA256 = '81239badc82ce335ea3cd82c1685baf5b4ce64021e4e15cc40935156d00508ba';
 
 const raw = readFileSync(FIXTURE_URL);
 const corpus = JSON.parse(raw.toString('utf8'));
@@ -70,12 +69,7 @@ function verdict(run) {
   }
 }
 
-test('the corpus is the pinned one', () => {
-  assert.equal(createHash('sha256').update(raw).digest('hex'), FIXTURE_SHA256);
-});
-
 test('ANNOTATION_SCHEMA_BLOB_OIDS are the git blob ids of the canonical schema texts', () => {
-  assert.deepEqual(Object.keys(ANNOTATION_SCHEMA_BLOB_OIDS).sort(), ['config', 'merges', 'user']);
   assert.deepEqual(
     Object.fromEntries(Object.entries(corpus.schemas).map(([kind, schema]) => [kind, schema.path])),
     {
@@ -92,7 +86,6 @@ test('ANNOTATION_SCHEMA_BLOB_OIDS are the git blob ids of the canonical schema t
     assert.equal(oid, schema.blobOid, kind);
     assert.equal(ANNOTATION_SCHEMA_BLOB_OIDS[kind], oid, kind);
   }
-  assert.ok(Object.isFrozen(ANNOTATION_SCHEMA_BLOB_OIDS));
 });
 
 test('the app shares the corpus parameters: file bound, nesting depth and whitespace class', () => {

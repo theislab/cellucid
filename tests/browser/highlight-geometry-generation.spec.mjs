@@ -6,9 +6,8 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 
 /**
  * What each engine calls a request the page cancelled: Chromium
- * `net::ERR_ABORTED`, WebKit `cancelled` on macOS (hosted macOS WebKit reported
- * five of the reader's module requests so) and `Load request cancelled` on Linux
- * (`utils/sha256.js`, nightly run 41382954122).
+ * `net::ERR_ABORTED`, WebKit `cancelled` on macOS and `Load request cancelled` on Linux
+ * (`utils/sha256.js`).
  */
 const CANCELLED_BY_THE_PAGE = new Set(['net::ERR_ABORTED', 'cancelled', 'Load request cancelled']);
 
@@ -183,7 +182,7 @@ test('highlight upload follows exact same-reference geometry generations', async
       }
     };
     // Frame by frame until the uploads are made, however slow a frame is
-    // (120 frames were two seconds).
+    // (a count of frames runs out on a slow one).
     const waitForUploadCount = async expectedCount => {
       while (audit.snapshot().length < expectedCount) {
         await new Promise(resolve => requestAnimationFrame(resolve));
@@ -443,7 +442,7 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
       }
     };
     // Frame by frame until the uploads are made, however slow a frame is
-    // (120 frames were two seconds).
+    // (a count of frames runs out on a slow one).
     const waitForUploadCount = async expectedCount => {
       while (audit.snapshot().length < expectedCount) {
         await new Promise(resolve => requestAnimationFrame(resolve));

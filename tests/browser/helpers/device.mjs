@@ -11,12 +11,11 @@
  * (`data/opening-cost.js`), worker pools from the cores the browser reports
  * (`formats/io/decode-pool.js`, `analysis/shared/performance-config.js`),
  * memory budgets from the memory it reports (`data/memory-budget.js`). On
- * hosted runners (software GL, 3 or 4 cores, loaded) those measurements came
+ * hosted runners (software GL, 3 or 4 cores, loaded) those measurements come
  * out otherwise, and at other times, than on a developer's machine, so specs
- * about none of those choices saw the page change state under them, at a
- * time the runner decided (five CI rounds, Web contracts runs 41213981681
- * to 41307458156): culling turned on by an opening and off again by a
- * publication that failed, a verdict reached before the spec watched, an
+ * about none of those choices would see the page change state under them, at
+ * a time the runner decides: culling turned on by an opening and off again by
+ * a publication that failed, a verdict reached before the spec watched, an
  * opening "at once" made progressive by the start sample's own record.
  *
  * The same holds for what the reader plans from, in its worker: which
@@ -26,11 +25,11 @@
  * index is read or built again, from how fast kept copies were read; which
  * pass indexes a share, from what a pass's work cost. A loaded runner
  * measures each otherwise, and plans otherwise: a share raised with Apply
- * was read anew instead of shown in place because genes were read for 864
- * of its 1,500 cells (`open-cells-in-place.spec.mjs`, WebKit in a run of six
- * workers, 2026-11-06), where the same page at rest reads them for every
- * cell; `held-machine.spec.mjs` shows it in every engine with the file's
- * answers held back 370 ms.
+ * is read anew instead of shown in place when genes are read for only part
+ * of its cells (`open-cells-in-place.spec.mjs`), where the same page at rest
+ * reads them for every cell; `held-machine.spec.mjs` shows it in every
+ * engine with the file's answers held back 370 ms
+ * (measured: 38_decisions_testing_and_hosted_runners.md).
  *
  * The defaults are a fast device whose measures nothing moves:
  * - `gpu`: the GPU's time for every frame, given exactly through the GPU

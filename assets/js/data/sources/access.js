@@ -27,7 +27,7 @@
  * the provider's words instead of after the generic repeats.
  *
  * A provider whose reads cannot name the version they read (Google Drive's
- * public reads: its API key may not read a revision, measured, and its
+ * public reads: its API key may not read a revision, and its
  * answers carry no validator) says, from its own evidence, whether the
  * version the file was opened as still holds (`version.confirm()`: Drive
  * asks for the file's checksum again): what a reader keeps of the file

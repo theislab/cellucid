@@ -1,6 +1,6 @@
 /**
  * @fileoverview The addresses the person has seen in this tab: what an agent
- * may make the tab request without asking them (F121).
+ * may make the tab request without asking them.
  *
  * An agent reads text others wrote (a category label, a dataset's
  * description, a community annotation, a tool result). Misled by it, it could
@@ -43,7 +43,7 @@ const WEB_ADDRESS = /\bhttps?:\/\/[^\s<>"'`]+/gi;
  * @param {{registry?: object}} [options]
  * @returns {string|null}
  */
-export function addressKeyOf(text, options = {}) {
+function addressKeyOf(text, options = {}) {
   if (typeof text !== 'string') return null;
   const route = routeAddress(text, options);
   if (route.kind === 'invalid') return null;

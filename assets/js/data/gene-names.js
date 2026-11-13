@@ -1,7 +1,7 @@
 /**
  * Gene names read from a `var` column, in the words `cellucid serve` uses.
  *
- * The data-mapping gene-name rule (design §1.3): a column of strings,
+ * The data-mapping gene-name rule: a column of strings,
  * categories or integers names the genes; an empty or missing value takes the
  * gene's var-index name, and the list is then made unique with
  * `makeUniqueNames` (`data-mapping.js`). A value is turned into text exactly

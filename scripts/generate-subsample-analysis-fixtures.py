@@ -24,8 +24,8 @@ through the app's analysis windows):
   default ``Rscript``), as the browser reads it.
 - ``tests/fixtures/subsample-analysis/reference.json``: per opening, the kept
   cells (``cellucid.subsample_cells``, original positions, ascending) and the
-  reference of each analysis on them; ``reference.json.sha256`` catches a
-  hand edit.
+  reference of each analysis on them, and the digest of each file it was
+  made over.
 
 The data: 1,200 cells x 24 genes. ``obs``: ``cell_type`` (``T``, ``B``,
 ``Mono``, ``NK``, ``rare`` of 6 cells, ``single`` of one cell, ``unused`` of
@@ -815,9 +815,6 @@ def main() -> None:
     text = json.dumps(reference, separators=(",", ":"), allow_nan=False) + "\n"
     path = OUT / "reference.json"
     path.write_text(text, encoding="utf-8")
-    (OUT / "reference.json.sha256").write_text(
-        f"{hashlib.sha256(text.encode('utf-8')).hexdigest()}  reference.json\n", encoding="utf-8"
-    )
 
 
 if __name__ == "__main__":

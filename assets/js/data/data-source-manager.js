@@ -142,9 +142,9 @@ export class DataSourceManager {
      * None): what a stage is checked against when it commits. Unlike the
      * revision it does not move when the shown dataset grows or is cut in
      * place (`adoptResizedMetadata`): that growth runs until another dataset
-     * is published and never invalidates the change that replaces it (bug
-     * hunt R9V-2: a link opened while Suo grew failed "superseded before
-     * publication" and Suo stayed).
+     * is published and never invalidates the change that replaces it (were it
+     * to, a link opened while a dataset grows would fail "superseded before
+     * publication" and the growing dataset would stay).
      * @type {number}
      */
     this._selectionCommits = 0;

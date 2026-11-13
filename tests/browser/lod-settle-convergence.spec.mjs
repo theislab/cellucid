@@ -4,9 +4,9 @@
  *
  * Hysteresis moves a view's LOD one level per drawn frame, so a camera jump
  * across several levels takes several frames to show its final level. The
- * viewer used to cover that with a blanket floor of twelve frames after every
- * change; it now names the convergence as a frame cause (`'lod'`) and the
- * floor covers only the frame that shows the change. This spec jumps the
+ * viewer names the convergence as a frame cause (`'lod'`), so the floor covers
+ * only the frame that shows the change, not a blanket twelve frames after every
+ * change. This spec jumps the
  * camera far out in one step and checks that the scene keeps drawing for the
  * LOD, settles, and settles at the level the camera asks for: drawing more
  * frames from there changes nothing.
@@ -50,8 +50,8 @@ test('a camera jump keeps drawing until the adaptive LOD reaches its level, then
     viewer.setAdaptiveLOD(true);
     // The LOD levels are built off the main thread, and until they land the
     // view draws full detail (level -1) with nothing left to draw: the scene
-    // is settled while the build runs. On a software-GL runner it was still
-    // running when the near level was read, so the near level was -1 and the
+    // is settled while the build runs. On a software-GL runner it can still be
+    // running when the near level is read, which would then be -1 and the
     // comparison below meaningless. The landed tree draws a frame of its own
     // (`onAsyncTreeReady`); wait for that level.
     while (viewer.getCurrentLODLevel('live') < 0) await frames(1);

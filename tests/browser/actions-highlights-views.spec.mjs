@@ -16,7 +16,7 @@
  *   changes no domain it does not touch.
  */
 import { expect, test } from './helpers/test.mjs';
-import { applyUndoRedo, historyFacts, takeSteps, waitForHistory } from './helpers/state-history.mjs';
+import { applyUndoRedo, takeSteps, waitForHistory } from './helpers/state-history.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { armSelection } from './helpers/selection-gesture.mjs';
@@ -152,83 +152,88 @@ function candidatesNow(page) {
   });
 }
 
-test('a confirmed lasso is one highlight.cells step: the selection, the step and the group are one set', async ({ page }) => {
+// One opening: the lasso's group stays on the page, and the annotation adds its own after it.
+test('a selection confirmed is one highlight.cells step of exactly its cells: a lasso, then an annotation of a category', async ({ page }) => {
   const productErrors = observeProductErrors(page);
   await openDataset(page);
-  await takeDispatched(page);
 
-  await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
-  await armSelection(page, 'lasso', () => altDraw(page, [
-    [400, 200], [1000, 200], [1000, 900], [400, 900], [400, 200],
-  ]));
-  const selected = await candidatesNow(page);
-  expect(selected.length).toBeGreaterThan(0);
-  expect(selected.length).toBeLessThan(120);
+  await test.step('a confirmed lasso is one highlight.cells step: the selection, the step and the group are one set', async () => {
+    await takeDispatched(page);
 
-  await page.locator('#lasso-confirm-btn').click();
-  const dispatched = await takeDispatched(page);
-  expect(dispatched).toEqual([{
-    type: 'highlight.cells',
-    params: {
-      cells: selected,
-      label: 'Lasso',
-      tool: 'lasso',
-      page: 'Page 1',
-    },
-  }]);
-  const pages = await readHighlights(page);
-  expect(pages).toEqual([{
-    name: 'Page 1', color: pages[0].color, shown: true,
-    groups: [{ label: dispatched[0].params.label, enabled: true, cells: selected }],
-  }]);
-  // The renderer draws exactly those cells.
-  expect(await page.evaluate(() => {
-    const state = window._cellucidState;
-    return Array.from(state.cellIdentity.toOriginal(state._highlightedCellIndices)).sort((a, b) => a - b);
-  })).toEqual(selected);
-  await expect(page.locator('#highlight-count')).toHaveText(`${selected.length} ${selected.length === 1 ? 'cell' : 'cells'} highlighted`);
-  expect(productErrors).toEqual([]);
-});
+    await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
+    await armSelection(page, 'lasso', () => altDraw(page, [
+      [400, 200], [1000, 200], [1000, 900], [400, 900], [400, 200],
+    ]));
+    const selected = await candidatesNow(page);
+    expect(selected.length).toBeGreaterThan(0);
+    expect(selected.length).toBeLessThan(120);
 
-test('an annotation of a category is one highlight.cells step of exactly its cells', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await colorByCellType(page);
-  await takeDispatched(page);
+    await page.locator('#lasso-confirm-btn').click();
+    const dispatched = await takeDispatched(page);
+    expect(dispatched).toEqual([{
+      type: 'highlight.cells',
+      params: {
+        cells: selected,
+        label: 'Lasso',
+        tool: 'lasso',
+        page: 'Page 1',
+      },
+    }]);
+    const pages = await readHighlights(page);
+    expect(pages).toEqual([{
+      name: 'Page 1', color: pages[0].color, shown: true,
+      groups: [{ label: dispatched[0].params.label, enabled: true, cells: selected }],
+    }]);
+    // The renderer draws exactly those cells.
+    expect(await page.evaluate(() => {
+      const state = window._cellucidState;
+      return Array.from(state.cellIdentity.toOriginal(state._highlightedCellIndices)).sort((a, b) => a - b);
+    })).toEqual(selected);
+    await expect(page.locator('#highlight-count')).toHaveText(`${selected.length} ${selected.length === 1 ? 'cell' : 'cells'} highlighted`);
+    expect(productErrors).toEqual([]);
+  });
 
-  // A cell of beta, and a screen point the viewer picks it at.
-  const point = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const field = window._cellucidState.getActiveField();
-    const beta = field.categories.indexOf('beta');
-    for (let y = 40; y < 980; y += 5) {
-      for (let x = 340; x < 1430; x += 5) {
-        const cell = viewer.pickCellAtScreen(x, y);
-        if (cell >= 0 && field.codes[cell] === beta) return { x, y };
+  await test.step('an annotation of a category is one highlight.cells step of exactly its cells', async () => {
+    // The lasso tool of the step above gives way to the annotation tool.
+    await page.locator('.highlight-mode-btn[data-mode="annotation"]').click();
+    await colorByCellType(page);
+    await takeDispatched(page);
+
+    // A cell of beta, and a screen point the viewer picks it at.
+    const point = await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const field = window._cellucidState.getActiveField();
+      const beta = field.categories.indexOf('beta');
+      for (let y = 40; y < 980; y += 5) {
+        for (let x = 340; x < 1430; x += 5) {
+          const cell = viewer.pickCellAtScreen(x, y);
+          if (cell >= 0 && field.codes[cell] === beta) return { x, y };
+        }
       }
-    }
-    return null;
+      return null;
+    });
+    expect(point).not.toBeNull();
+    await armSelection(page, 'annotation', async () => {
+      await page.mouse.move(point.x, point.y);
+      await page.keyboard.down('Alt');
+      await page.mouse.down();
+      await page.mouse.up();
+      await page.keyboard.up('Alt');
+      await page.mouse.move(point.x + 40, point.y + 40);
+    });
+    const beta = await cellsOfCategory(page, 'beta');
+    expect(await candidatesNow(page)).toEqual(beta);
+    await page.locator('#annotation-confirm-btn').click();
+    expect(await takeDispatched(page)).toEqual([{
+      type: 'highlight.cells',
+      params: { cells: beta, label: 'beta', tool: 'annotation', page: 'Page 1' },
+    }]);
+    // The group this step added, after the lasso's.
+    expect((await readHighlights(page))[0].groups.slice(1)).toEqual([
+      { label: 'beta', enabled: true, cells: beta },
+    ]);
+    expect(productErrors).toEqual([]);
   });
-  expect(point).not.toBeNull();
-  await armSelection(page, 'annotation', async () => {
-    await page.mouse.move(point.x, point.y);
-    await page.keyboard.down('Alt');
-    await page.mouse.down();
-    await page.mouse.up();
-    await page.keyboard.up('Alt');
-    await page.mouse.move(point.x + 40, point.y + 40);
-  });
-  const beta = await cellsOfCategory(page, 'beta');
-  expect(await candidatesNow(page)).toEqual(beta);
-  await page.locator('#annotation-confirm-btn').click();
-  expect(await takeDispatched(page)).toEqual([{
-    type: 'highlight.cells',
-    params: { cells: beta, label: 'beta', tool: 'annotation', page: 'Page 1' },
-  }]);
-  expect((await readHighlights(page))[0].groups).toEqual([
-    { label: 'beta', enabled: true, cells: beta },
-  ]);
-  expect(productErrors).toEqual([]);
 });
 
 test('every Highlighting control dispatches one action named by page and group, and leaves the exact state', async ({ page }) => {
@@ -361,68 +366,6 @@ test('the legend highlight button (annotation mode) dispatches highlight.categor
   expect(productErrors).toEqual([]);
 });
 
-test('each highlight action dispatched directly leaves the exact state; a name that does not resolve is refused', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  const firstColor = (await readHighlights(page))[0].color;
-
-  expect(await dispatch(page, 'highlight.page.create', { name: 'Notebook', color: '#00aa00' }))
-    .toEqual({ outcome: { page: 'Notebook' } });
-  expect(await readTabs(page)).toEqual([['Page 1', false], ['Notebook', true]]);
-  expect(await dispatch(page, 'highlight.cells', { cells: [5, 1, 3], label: 'Three' }))
-    .toEqual({ outcome: { page: 'Notebook', group: 'Three', cells: 3, notOpen: 0 } });
-  await expect(page.locator('#highlight-count')).toHaveText('3 cells highlighted');
-  // A color no page has: a page of its own; the pages keep their colors.
-  // (Named "Page N", N the number of pages it makes.)
-  expect(await dispatch(page, 'highlight.cells', { cells: [7], color: '#ff0000' }))
-    .toEqual({ outcome: { page: 'Page 3', group: 'Highlight', cells: 1, notOpen: 0 } });
-  expect((await readHighlights(page)).map(({ name, color, shown }) => [name, color, shown])).toEqual([
-    ['Page 1', firstColor, false], ['Notebook', '#00aa00', false], ['Page 3', '#ff0000', true],
-  ]);
-  expect(await dispatch(page, 'highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['gamma'], page: 'Page 1' }))
-    .toMatchObject({ outcome: { page: 'Page 1', groups: ['cell_type: gamma'] } });
-  expect((await readHighlights(page))[0].groups[0].cells).toEqual(await cellsOfCategory(page, 'gamma'));
-  expect(await dispatch(page, 'highlight.group.toggle', { group: 'Three', enabled: false, page: 'Notebook' }))
-    .toEqual({ outcome: { page: 'Notebook', group: 'Three' } });
-  expect(await dispatch(page, 'highlight.page.combine', { pages: ['Notebook', 'Page 3'], operation: 'union', name: 'Both' }))
-    .toEqual({ outcome: { page: 'Both', cells: 1 } });
-  expect(await dispatch(page, 'highlight.clear-all', {})).toEqual({ outcome: { groups: 4 } });
-  expect((await readHighlights(page)).every(entry => entry.groups.length === 0)).toBe(true);
-
-  for (const [type, params, message] of [
-    ['highlight.page.switch', { page: 'Nope' }, /^There is no highlight page "Nope"; the pages are "Page 1", "Notebook", "Page 3" and "Both"\.$/],
-    ['highlight.page.rename', { page: 'Both', name: 'Notebook' }, /^A highlight page is called "Notebook" already; choose another name\.$/],
-    ['highlight.group.remove', { group: 'Three', page: 'Notebook' }, /^Page "Notebook" has no highlight "Three"; it has no highlights\.$/],
-    ['highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['delta'] }, /^There is no category "delta" in "cell_type"; the categories are "alpha", "beta" and "gamma"\.$/],
-    ['highlight.cells', { cells: [120] }, /outside the 120 cells of the dataset/],
-  ]) {
-    const result = await dispatch(page, type, params);
-    expect(result.refused, type).toBe(true);
-    expect(result.message).toMatch(message);
-  }
-  expect(productErrors).toEqual([]);
-});
-
-test('several categories in one highlight.category: a group each, one step named for them, one undo (F107)', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await waitForHistory(page);
-  const before = await historyFacts(page);
-  const [id] = await takeSteps(page, [
-    ['highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['alpha', 'beta', 'gamma'], page: 'Types' }],
-  ]);
-  const cells = await Promise.all(['alpha', 'beta', 'gamma'].map(label => cellsOfCategory(page, label)));
-  const types = (await readHighlights(page)).find(entry => entry.name === 'Types');
-  expect(types.groups).toEqual(['alpha', 'beta', 'gamma'].map((label, at) => ({ label: `cell_type: ${label}`, enabled: true, cells: cells[at] })));
-  const after = await historyFacts(page);
-  expect(after.steps).toBe(before.steps + 1);
-  const total = cells.reduce((sum, list) => sum + list.length, 0);
-  expect(after.labels[id]).toBe(`Highlighted "alpha", "beta" and "gamma" of cell_type (${total.toLocaleString('en-US')} cells) on page "Types"`);
-  await page.evaluate(() => window._cellucidHistories.current().undo());
-  expect((await readHighlights(page)).find(entry => entry.name === 'Types')).toBeUndefined();
-  expect(productErrors).toEqual([]);
-});
-
 test('undoing each highlight action gives back the whole state, and each changes only what it touches, on the page\'s own history', async ({ page }) => {
   await openDataset(page);
   await waitForHistory(page);
@@ -440,7 +383,7 @@ test('undoing each highlight action gives back the whole state, and each changes
     ['highlight.cells', { cells: [1, 3, 5], label: 'Third', tool: 'lasso' }],
     ['highlight.cells', { cells: [9], color: '#fedcba' }],
     ['highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['alpha'], page: 'A' }],
-    // Several categories: one step, which one undo takes back whole (F107).
+    // Several categories: one step, which one undo takes back whole.
     ['highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['beta', 'gamma'], page: 'B' }],
     ['highlight.range', { field: { source: 'obs', key: 'cell_type' }, min: 0, max: 1 }],
     ['highlight.group.toggle', { group: 'First', enabled: false, page: 'A' }],

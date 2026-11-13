@@ -1,12 +1,11 @@
 /**
  * A request asked again after a transient failure says so on whatever
- * progress line owns it (R9A-4, found 2026-11-11 by the annotation lane): a
- * community annotation Pull against repeated 502s read "Checking the
- * repository… 5%" while the shared transport retried in silence. Every
- * retrying transport repeats through `withRetries`, which now tells each
- * repeat in one sentence (`hostRetrySentence`) through the request's
- * `onWait` (or the link it runs on, `clock.onWait`), and takes it back once
- * the request settles.
+ * progress line owns it: a community annotation Pull against repeated 502s
+ * must not read "Checking the repository… 5%" while the shared transport
+ * retries in silence. Every retrying transport repeats through
+ * `withRetries`, which tells each repeat in one sentence
+ * (`hostRetrySentence`) through the request's `onWait` (or the link it runs
+ * on, `clock.onWait`), and takes it back once the request settles.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

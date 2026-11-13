@@ -84,6 +84,13 @@ async function openDE(page) {
   return panel;
 }
 
+/** Puts back every option the panel opened with (kept on the page by the test). */
+function resetOptions(page) {
+  return page.evaluate(() => {
+    window._comparisonModule.getUI('differential')._setOptions(structuredClone(window.__openedWith));
+  });
+}
+
 function setOptions(page, patch) {
   return page.evaluate(next => {
     const ui = window._comparisonModule.getUI('differential');
@@ -121,96 +128,101 @@ const categories = (a, b) => ({
   categoriesB: { mode: 'subset', ids: b },
 });
 
-test('categories as groups, swap, and a free p threshold drawn without testing again', async ({ page }) => {
+// One opening, the runs in turn. A step starts from the options the panel opened with.
+test('differential expression options: categories and swap, overlapping and small groups, Within, and a field made while the panel is open', async ({ page }) => {
   const errors = observeProductErrors(page);
   const panel = await openDE(page);
-  await setOptions(page, categories(['A'], ['B', 'C']));
-  await run(panel);
-  let result = await summary(page);
-  expect(result.groupASize).toBe(120);
-  expect(result.groupBSize).toBe(180);
-  expect(result.g0).toBeGreaterThan(1);
-  expect(result.g0p).toBeLessThan(1e-6);
+  await page.evaluate(() => { window.__openedWith = structuredClone(window._comparisonModule.getUI('differential')._options); });
 
-  await panel.getByRole('button', { name: 'Swap A and B' }).click();
-  await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
-  await run(panel);
-  result = await summary(page);
-  expect(result.groupASize).toBe(180);
-  expect(result.g0).toBeLessThan(-1);
+  await test.step('categories as groups, swap, and a free p threshold drawn without testing again', async () => {
+    await setOptions(page, categories(['A'], ['B', 'C']));
+    await run(panel);
+    let result = await summary(page);
+    expect(result.groupASize).toBe(120);
+    expect(result.groupBSize).toBe(180);
+    expect(result.g0).toBeGreaterThan(1);
+    expect(result.g0p).toBeLessThan(1e-6);
 
-  // Any threshold in [0, 1]: the volcano is re-drawn from the same tests.
-  await page.evaluate(() => { window.__deResults = window._comparisonModule.getUI('differential')._lastResult.full; });
-  await setOptions(page, { maxAdjP: 0.37 });
-  await expect.poll(async () => (await summary(page)).threshold).toBe(0.37);
-  expect(await page.evaluate(() => window._comparisonModule.getUI('differential')._lastResult.full === window.__deResults)).toBe(true);
-  await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
-  expect(errors).toEqual([]);
-});
+    await panel.getByRole('button', { name: 'Swap A and B' }).click();
+    await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
+    await run(panel);
+    result = await summary(page);
+    expect(result.groupASize).toBe(180);
+    expect(result.g0).toBeLessThan(-1);
 
-test('overlapping groups are refused with the reason; a small group runs flagged low n', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openDE(page);
-  await setOptions(page, categories(['A', 'B'], ['B']));
-  await expect(panel.getByRole('button', { name: 'Run differential expression' })).toBeDisabled();
-  await expect(panel.locator('.analysis-run-reason')).toHaveText('A category is in both groups: B');
-
-  await setOptions(page, categories(['tiny'], ['A']));
-  await run(panel);
-  const result = await summary(page);
-  expect(result.groupASize).toBe(4);
-  expect(result.lowN).toEqual(['tiny']);
-  await expect(panel.locator('.analysis-chip', { hasText: 'low n' })).toBeVisible();
-  expect(errors).toEqual([]);
-});
-
-test('Within keeps only the cells of the chosen categories', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openDE(page);
-  await setOptions(page, {
-    ...categories(['A'], ['B', 'C']),
-    within: 'category',
-    withinField: 'cluster',
-    withinCategories: { mode: 'subset', ids: ['A', 'B'] },
+    // Any threshold in [0, 1]: the volcano is re-drawn from the same tests.
+    await page.evaluate(() => { window.__deResults = window._comparisonModule.getUI('differential')._lastResult.full; });
+    await setOptions(page, { maxAdjP: 0.37 });
+    await expect.poll(async () => (await summary(page)).threshold).toBe(0.37);
+    expect(await page.evaluate(() => window._comparisonModule.getUI('differential')._lastResult.full === window.__deResults)).toBe(true);
+    await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
+    expect(errors).toEqual([]);
   });
-  await run(panel);
-  const result = await summary(page);
-  expect(result.groupASize).toBe(120);
-  expect(result.groupBSize).toBe(100);
-  expect(errors).toEqual([]);
-});
 
-test('a field made while the panel is open is a choice at once, and an agent\'s groups keep one form (L25-6, L25-2)', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openDE(page);
-  await setOptions(page, categories(['A'], ['B']));
-  const outcome = await page.evaluate(async () => {
-    const { getActions } = await import('/assets/js/app/actions/index.js');
-    const actions = getActions();
-    const tree = () => window._cellucidHistories.current().active;
-    const stepsBefore = tree().steps.size;
-    await actions.dispatch('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['A'], page: 'Probe' });
-    await actions.dispatch('field.create-from-pages', { key: 'probe_field', pages: [{ page: 'Probe', label: 'In A' }], uncovered_label: 'Elsewhere' });
-    // Named at once, with groups in another order than the field's: kept in the field's order.
-    const set = await actions.dispatch('analysis.differential.set', {
-      options: { field: 'probe_field', categoriesA: { mode: 'subset', ids: ['Elsewhere'] }, categoriesB: { mode: 'subset', ids: ['In A'] } },
-    });
-    const ab = await actions.dispatch('analysis.differential.set', {
-      options: { field: 'cluster', categoriesA: { mode: 'subset', ids: ['C', 'A'] }, categoriesB: { mode: 'subset', ids: ['B'] } },
-    });
-    // Every step the actions and their observed state changes record is in
-    // once the history is idle (no fixed wait: the condition itself).
-    await window._cellucidHistories.current().idle();
-    // The steps from the first action on (the setup's own `_setOptions` above is a change outside the history).
-    const all = [...tree().steps.values()].slice(stepsBefore).map(step => step.type);
-    const steps = all.slice(all.indexOf('highlight.category'));
-    return { changed: set.outcome?.changed ?? null, abChanged: ab.outcome?.changed ?? null, steps, options: window._comparisonModule.getUI('differential')._options.categoriesA };
+  await test.step('overlapping groups are refused with the reason; a small group runs flagged low n', async () => {
+    // Every option back to what the panel opened with: the step sets its own in full.
+    await resetOptions(page);
+    await setOptions(page, categories(['A', 'B'], ['B']));
+    await expect(panel.getByRole('button', { name: 'Run differential expression' })).toBeDisabled();
+    await expect(panel.locator('.analysis-run-reason')).toHaveText('A category is in both groups: B');
+
+    await setOptions(page, categories(['tiny'], ['A']));
+    await run(panel);
+    const result = await summary(page);
+    expect(result.groupASize).toBe(4);
+    expect(result.lowN).toEqual(['tiny']);
+    await expect(panel.locator('.analysis-chip', { hasText: 'low n' })).toBeVisible();
+    expect(errors).toEqual([]);
   });
-  expect(outcome.changed).toContain('field');
-  expect(outcome.abChanged).toContain('categoriesA');
-  expect(outcome.options).toEqual({ mode: 'subset', ids: ['A', 'C'] });
-  expect(outcome.steps).not.toContain('history.outside-change');
-  // The person's selects offer it too (Field, Within and Replicates list the categorical fields).
-  await expect.poll(() => panel.locator('select option[value="probe_field"]').count()).toBeGreaterThan(0);
-  expect(errors).toEqual([]);
+
+  await test.step('Within keeps only the cells of the chosen categories', async () => {
+    // Every option back to what the panel opened with: the step sets its own in full.
+    await resetOptions(page);
+    await setOptions(page, {
+      ...categories(['A'], ['B', 'C']),
+      within: 'category',
+      withinField: 'cluster',
+      withinCategories: { mode: 'subset', ids: ['A', 'B'] },
+    });
+    await run(panel);
+    const result = await summary(page);
+    expect(result.groupASize).toBe(120);
+    expect(result.groupBSize).toBe(100);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step("a field made while the panel is open is a choice at once, and an agent's groups keep one form", async () => {
+    // Every option back to what the panel opened with: the step sets its own in full.
+    await resetOptions(page);
+    await setOptions(page, categories(['A'], ['B']));
+    const outcome = await page.evaluate(async () => {
+      const { getActions } = await import('/assets/js/app/actions/index.js');
+      const actions = getActions();
+      const tree = () => window._cellucidHistories.current().active;
+      const stepsBefore = tree().steps.size;
+      await actions.dispatch('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['A'], page: 'Probe' });
+      await actions.dispatch('field.create-from-pages', { key: 'probe_field', pages: [{ page: 'Probe', label: 'In A' }], uncovered_label: 'Elsewhere' });
+      // Named at once, with groups in another order than the field's: kept in the field's order.
+      const set = await actions.dispatch('analysis.differential.set', {
+        options: { field: 'probe_field', categoriesA: { mode: 'subset', ids: ['Elsewhere'] }, categoriesB: { mode: 'subset', ids: ['In A'] } },
+      });
+      const ab = await actions.dispatch('analysis.differential.set', {
+        options: { field: 'cluster', categoriesA: { mode: 'subset', ids: ['C', 'A'] }, categoriesB: { mode: 'subset', ids: ['B'] } },
+      });
+      // Every step the actions and their observed state changes record is in
+      // once the history is idle (no fixed wait: the condition itself).
+      await window._cellucidHistories.current().idle();
+      // The steps from the first action on (the setup's own `_setOptions` above is a change outside the history).
+      const all = [...tree().steps.values()].slice(stepsBefore).map(step => step.type);
+      const steps = all.slice(all.indexOf('highlight.category'));
+      return { changed: set.outcome?.changed ?? null, abChanged: ab.outcome?.changed ?? null, steps, options: window._comparisonModule.getUI('differential')._options.categoriesA };
+    });
+    expect(outcome.changed).toContain('field');
+    expect(outcome.abChanged).toContain('categoriesA');
+    expect(outcome.options).toEqual({ mode: 'subset', ids: ['A', 'C'] });
+    expect(outcome.steps).not.toContain('history.outside-change');
+    // The person's selects offer it too (Field, Within and Replicates list the categorical fields).
+    await expect.poll(() => panel.locator('select option[value="probe_field"]').count()).toBeGreaterThan(0);
+    expect(errors).toEqual([]);
+  });
 });

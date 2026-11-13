@@ -40,8 +40,8 @@ test('a percentile needs enough samples beyond it to be reported', () => {
 });
 
 test('an under-powered window withholds the percentile it cannot support', () => {
-  // The rolling 120-sample window this recorder replaces reported a "p99"
-  // that was the second-worst frame of a two-second window. Withholding it is
+  // A rolling 120-sample window would report a "p99" that is the
+  // second-worst frame of a two-second window. Withholding it is
   // the honest outcome, and the required count is stated so it can be fixed.
   const recorder = new FrameRecorder({ capacity: 120 });
   fill(recorder, Array.from({ length: 120 }, (_unused, i) => 16 + i * 0.01));

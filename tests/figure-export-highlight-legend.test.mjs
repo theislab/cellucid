@@ -1,15 +1,14 @@
 /**
- * F158 (L24-15's open part, 2026-11-11): a figure that draws highlighted
- * cells says so in its legend.
+ * A figure that draws highlighted cells says so in its legend.
  *
  * Screen, figure and export alike draw the active highlight page's cells over
- * the coloring in the highlight's color. A picture's notes said so (L24-15),
- * but an exported figure did not: its legend had no entry for that color, and
- * a reader of the figure who never saw the app read the cyan highlight of the
- * germ cells over a gene's viridis as "the cells with high NANOS3". Now the
- * legend of every panel that draws highlighted cells carries an entry for
- * them — the highlight's color, the page's name and its cell count — in the
- * PNG and the SVG alike, and the layout sizes the legend with it.
+ * the coloring in the highlight's color. A reader of an exported figure who
+ * never saw the app would read the cyan highlight of the germ cells over a
+ * gene's viridis as "the cells with high NANOS3" if the legend had no entry
+ * for that color. So the legend of every panel that draws highlighted cells
+ * carries an entry for them — the highlight's color, the page's name and its
+ * cell count — in the PNG and the SVG alike, and the layout sizes the legend
+ * with it.
  */
 
 import assert from 'node:assert/strict';

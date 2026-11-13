@@ -32,6 +32,7 @@ import { createInputLatencyTracker } from './input-latency.js';
 import { createLongTaskProbe } from './long-task-probe.js';
 import { createPassProfiler } from './pass-profiler.js';
 import { yieldToMacrotask } from '../../../../utils/yield-macrotask.js';
+import { promiseWithResolvers } from '../../../../utils/promise-resolvers.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -203,10 +204,7 @@ export function installRenderProbes(options = {}) {
     const token = openWindow(label);
     let firstFrameAt = null;
     let conditionMetAt = until === null ? -Infinity : null;
-    let resolveFrame;
-    const framePromise = new Promise(resolve => {
-      resolveFrame = resolve;
-    });
+    const { promise: framePromise, resolve: resolveFrame } = promiseWithResolvers();
     const startedAt = performance.now();
     const unsubscribe = sampler.subscribe(event => {
       if (conditionMetAt === null) {

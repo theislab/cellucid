@@ -296,7 +296,7 @@ test(
       'Showing all 120 cells',
     );
     // Accumulate real frames until the rebuilt generation renders. Resetting
-    // inside the poll discarded valid evidence and multiplied GPU work on a
+    // inside the poll would discard valid evidence and multiply GPU work on a
     // slow native renderer.
     await resetAudit(page);
     await expect.poll(async () => {
@@ -431,8 +431,8 @@ test(
     // gather (`high-perf/gpu-permute.js`) once level of detail or culling is
     // on, which a frame of every cell measured slow turns on
     // (`rendering/full-detail-frame-cost.js`: hosted runners' software GL).
-    // A failure of the next framebuffer anyone asked for reached the overlay
-    // or not by that race (Web contracts run 41213981681, Linux WebKit).
+    // A failure of the next framebuffer anyone asked for would reach the overlay
+    // or not by that race.
     await page.locator('#glcanvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2');
       const original = gl.createFramebuffer.bind(gl);
@@ -448,7 +448,7 @@ test(
     // A click, not `check()`: the failed allocation takes the box back
     // off, in the frame the overlay first draws, which `check()` reads as a
     // click that did nothing where that frame comes before its own look at
-    // the box (Web contracts run 41269083996, Windows Chromium and Firefox).
+    // the box.
     await page.locator('#velocity-overlay-enabled').click();
     await expect(page.locator('#velocity-overlay-enabled')).not.toBeChecked();
     await expect(page.locator('#velocity-overlay-info')).toHaveText(

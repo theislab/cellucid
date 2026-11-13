@@ -6,30 +6,31 @@
  * box lands on top of something in the other, and the result reads to a user as
  * a rendering bug rather than as a layout constant that was never checked.
  *
- * Two collisions this pins down, both reported against the committed
- * documentation screenshots:
+ * What this pins down is the collision a constant that works in one box
+ * causes in the other:
  *
- * 1. The volcano plot's x-axis title `log₂ Fold Change` was drawn across the
- *    `Down (n)` entry of its own legend, in the sidebar preview and in the
- *    expanded overlay alike. The legend sat at `y: -0.14` — a fraction of the
- *    plot area's height — while Plotly places a bottom axis title within the
- *    bottom margin, which is a fixed pixel band. Two independent offsets into
+ * 1. The volcano plot's x-axis title `log₂ Fold Change` clears the `Down (n)`
+ *    entry of its own legend, in the sidebar preview and in the expanded
+ *    overlay alike. The legend is not at `y: -0.14` (a fraction of the plot
+ *    area's height) because Plotly places a bottom axis title within the
+ *    bottom margin, which is a fixed pixel band: two independent offsets into
  *    one band collide as soon as the box changes size.
  *
- * 2. Categorical tick labels ran into each other in the 224-pixel sidebar
- *    preview: every category was drawn however many of them there were. Ten
- *    pairs genuinely overlapped at 224×180 and none at 720×380, so the axis is
- *    thinned to what the drawn box can hold rather than to a fixed count.
+ * 2. Categorical tick labels do not run into each other in the 224-pixel
+ *    sidebar preview: the axis is thinned to what the drawn box can hold
+ *    rather than to a fixed count, because drawing every category overlaps
+ *    pairs at 224×180 and none at 720×380.
  *
- * 3. The dot plot's size legend title ran into its color bar in the sidebar
- *    preview, its dots into each other in the expanded view, and its gene names
- *    into each other where the panel was narrow: the legends were placed in
- *    fractions of a plot area whose height the preview does not fix.
+ * 3. The dot plot's size legend title clears its color bar in the sidebar
+ *    preview, its dots do not run into each other in the expanded view, and
+ *    its gene names do not where the panel is narrow: the legends are not
+ *    placed in fractions of a plot area whose height the preview does not
+ *    fix.
  *
- * 4. The correlation plot's per-page R² boxes were stacked 15% of the plot's
- *    height apart, less than one box is tall, so the second covered the first
- *    in the two-page preview and in the expanded view, and they ran under the
- *    legend in a narrow panel.
+ * 4. The correlation plot's per-page R² boxes are stacked more than one box
+ *    is tall apart (not 15% of the plot's height), so the second does not
+ *    cover the first in the two-page preview or in the expanded view, nor
+ *    run under the legend in a narrow panel.
  *
  * Every plot laid out for its size is laid out again when it is resized
  * (`plots/size-fit.js`), so the checks also resize a drawn plot.
@@ -49,7 +50,7 @@ import { openPlotHarness } from './helpers/plot-harness.mjs';
  *
  * `sidebar` is the accordion preview: `--analysis-panel-width` minus its
  * padding, at the preview height the form-based UIs request. `expanded` is the
- * overlay's plot pane at the 860-pixel viewport the screenshots were taken at.
+ * overlay's plot pane at the 860-pixel viewport of the screenshots.
  */
 const SURFACES = Object.freeze([
   Object.freeze({ name: 'sidebar', width: 224, height: 180 }),
@@ -568,8 +569,8 @@ async function measureLabels(page, { modulePath, data, options = {}, width, heig
     // `getBoundingClientRect` reports). Text is measured by its glyph cells
     // (`getExtentOfChar`: each character's advance and the font's height),
     // not by its client rectangle or `getBBox`: Firefox pads both past the
-    // glyphs (a 7 px name turned to run down is 10.8 px across in its client
-    // rectangle, 8.8 px in its box, and its advance is narrower still), and
+    // glyphs (a 7 px name turned to run down is wider in its client
+    // rectangle and in its box than its advance), and
     // Plotly frames an annotation by that padded box, so an annotation is
     // measured by its frame only where the frame is drawn.
     const toHost = (element, box) => {

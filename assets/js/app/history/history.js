@@ -1,5 +1,5 @@
 /**
- * @fileoverview The action history of the open dataset (History v2): its
+ * @fileoverview The action history of the open dataset: its
  * trackers, each a tree of steps with branches, groups, turns, notes,
  * bookmarks and a journal of its own edits; the recorder the dispatcher
  * tells of every action; every move (undo, redo, jump, switch); every edit
@@ -18,14 +18,14 @@
  * record of its own (`turns.js`); an agent whose branch the person left
  * mid-turn is refused (`moved`).
  *
- * **Paused** (`Tracker.paused`, §3.15.1): changes apply and make no step;
+ * **Paused** (`Tracker.paused`): changes apply and make no step;
  * the draft of what differs from the head is kept on the tracker (the
  * autosave keeps it); resuming adds one squashed step for it. A move while
  * paused with changes keeps them as one step first or discards them, as
  * `setPausedChoice` says (keep when nothing was said: work is never lost
  * silently).
  *
- * **Detail switches** (§3.15.5, `offDomains()`): a domain switched off
+ * **Detail switches** (`offDomains()`): a domain switched off
  * (camera, layout) is not recorded (its change makes no step and is never a
  * change "outside the history"), is not moved by the history (a move leaves
  * it as it is), and is still captured (a step made while it is off holds its
@@ -39,7 +39,7 @@
  * a restore puts them back exactly, or as new objects when later edits
  * changed what they made (a deleted step or branch is applied again by name
  * on its nearest surviving step). Deleting a step applies again only the
- * steps below it that changed or read what it changed (§3.3.4), with Cancel.
+ * steps below it that changed or read what it changed, with Cancel.
  *
  * Subscribers hear `{kind, tracker, ...}`: `step` (`steps`: records
  * written), `moved` (`head`), `edited` (`op`, `journal`, `steps`, `removed`;
@@ -70,13 +70,14 @@ import { searchSteps } from './search.js';
 import { createValuePool, hashValue } from './value-pool.js';
 import { createDeleteRestore } from './delete-restore.js';
 import { createHistoryActions } from './actions.js';
-import { isReplayable, mapParams, namesCells, replayPlanOf, stepParamsIn } from './replay.js';
+import { isReplayable, mapParams, namesCells, stepParamsIn } from './replay.js';
 import { quoteName } from '../actions/targets/names.js';
 import { viewLabelsInValue, viewNameInValue } from '../actions/targets/views.js';
 import { sameValue } from '../state/domains/same-value.js';
 import { HISTORY_WAITS_FOR_DATASET } from '../ui/no-dataset.js';
 import { onNextMacrotask } from '../../utils/yield-macrotask.js';
 import { createListenerSet } from '../../utils/listener-set.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 /** Keep only what a timeline needs of an outcome (counts, names), never arrays of cells. */
 function summarizeOutcome(outcome) {
@@ -187,8 +188,8 @@ export function createHistory({
    * Values a capture added to the pool that no record holds yet: only what is
    * shown, the head's values or the paused draft of the tracker in use name
    * them. Each goes from the pool once none of those does (`sweep`), or stays
-   * once a record takes it (`claim`). §3.5: an action that changed nothing,
-   * a canceled one and a paused change keep nothing.
+   * once a record takes it (`claim`). An action that changed nothing, a
+   * canceled one and a paused change keep nothing.
    */
   const transient = new Set();
   /**
@@ -319,7 +320,7 @@ export function createHistory({
    * totals of normalized values: the running action's `ctx.heavy`, null
    * otherwise, and for a rollback, which puts back what was shown).
    *
-   * `failed`: a load's list of the parts it could not put back (F155). Given,
+   * `failed`: a load's list of the parts it could not put back. Given,
    * a domain whose owner refuses its value (a value written by an earlier
    * version of Cellucid, which this one cannot read; a failure while it was
    * put back) keeps what is shown and is listed `{part: 'domain', domain,
@@ -339,7 +340,7 @@ export function createHistory({
         const partial = failed !== null && !destroyed && !isCancellation(error) && signal?.aborted !== true;
         if (partial && was !== undefined) {
           // A part left as it was shown: its owner may have put back some of it before it refused
-          // (a control set, its renderer refusing), so what it showed is put back in turn (R9H-11).
+          // (a control set, its renderer refusing), so what it showed is put back in turn.
           try {
             await domains.owner(id).restore(pool.get(was), { signal: null, heavy: null, target: id2 => (id2 === id ? pool.get(was) : valueOf(id2)) });
           } catch { /* what it shows now is captured below; the restore's own failure is reported */ }
@@ -395,7 +396,7 @@ export function createHistory({
    *
    * `signal`: what stops it (the dispatch of the history's action: the
    * person's Stop of an agent, the page closing). Stopped while it waits for
-   * its turn, it never runs (bug hunt LB-2), as an action stopped at the
+   * its turn, it never runs, as an action stopped at the
    * dispatcher's gate never does, and its caller hears so at once; a move
    * passes it on to its restore (stopped there, what was shown comes back
    * and the caller hears once it has).
@@ -409,7 +410,7 @@ export function createHistory({
       // off is recorded first: a move never starts before the change it would
       // move away from is a step.
       await dispatcher.settle();
-      await dispatcher.idle();
+      await dispatcher.whenApplied();
       for (;;) {
         const tail = observedTail;
         await Promise.all([tail, ...pendingObserved]);
@@ -420,8 +421,8 @@ export function createHistory({
       exclusiveBusy = true;
       // Every value it holds stays readable while it runs (a rollback puts back what was shown).
       const unhold = pool.hold();
-      let release;
-      exclusiveDone = new Promise(resolve => { release = resolve; });
+      const { promise: done, resolve: release } = promiseWithResolvers();
+      exclusiveDone = done;
       exclusiveHeavy = heavy;
       try {
         return await task();
@@ -644,8 +645,8 @@ export function createHistory({
 
   /**
    * A step's label naming the views it changed, when several views are open
-   * and it changed some of them, not all (F157: with several views, "Colored
-   * by gene Sox9" in the history and the methods text could not say which
+   * and it changed some of them, not all (with several views, "Colored
+   * by gene Sox9" in the history and the methods text must say which
    * panel it changed). The views are found from what changed: each touched
    * per-view domain (an owner with `readPart`) compared view by view, and
    * named as the Compare views list names them (`viewNameInValue`, with a
@@ -681,7 +682,7 @@ export function createHistory({
     return `${label} in ${listed}`;
   }
 
-  async function recordAction(tracker, { definition, params, meta, after, outcome, reads, startedAt, observed = false, unrecorded = () => {} }) {
+  async function recordAction(tracker, { definition, params, meta, after, outcome, reads, startedAt, observed = false, unrecorded = /** @type {(why: 'paused'|'unchanged'|'off'|'retracted') => void} */ (() => {}) }) {
     const offIds = new Set(off());
     shown = { ...shown, ...after };
     const by = byOfMeta(meta, person());
@@ -854,7 +855,7 @@ export function createHistory({
    * The actions recorded now (from `before` to `after` or `failed`), each
    * with the domains a person's own act changed meanwhile (`meanwhile`,
    * `observed`'s `person`): a stopped action's rollback leaves those as the
-   * person made them (R9W-5).
+   * person made them.
    */
   const openTokens = new Set();
 
@@ -1240,7 +1241,7 @@ export function createHistory({
    * is on the source's own path (`keptSteps`). Returns the report
    * (`ReplayEntry[]`).
    */
-  async function replaySteps(tracker, steps, { source, mapping = null, signal = null, onStep = null, made = new Map(), keptSteps = () => false, values = null, failures = null }) {
+  async function replaySteps(tracker, steps, { source, mapping = null, signal = null, onStep = null, made = new Map(), keptSteps = /** @type {(id: string) => boolean} */ (() => false), values = null, failures = null }) {
     requireExclusive('A replay');
     const report = [];
     // The steps' own dataset (a branch applied here, a verify: `source.own`), or the same file by its
@@ -1390,7 +1391,7 @@ export function createHistory({
   /**
    * Read a saved history: show its active tracker's head, read the rest, and
    * hand back its trackers live (`replace`: every tracker; `add`: beside the
-   * ones there), with what it could not restore (`unrestored`, F155).
+   * ones there), with what it could not restore (`unrestored`).
    *
    * It is restored part by part: each domain of the head (`putBack`'s
    * `failed`) and each tracker on its own. A domain whose value this
@@ -1799,7 +1800,7 @@ export function createHistory({
      * when given, returns the values to put back once what is shown is known
      * (`shownOf(domainId)`): what the state leaves as it is. A state domain
      * this version does not have (a starting view another version wrote) is
-     * left out and named, the rest put back (F164). Resolves `{leftOut}`:
+     * left out and named, the rest put back. Resolves `{leftOut}`:
      * those domains' ids. `heavy`: what heavy work a restore finds goes to
      * (the load's progress line).
      */
@@ -1897,7 +1898,7 @@ export function createHistory({
       return exclusive(() => useTrackerNow(ref, meta, { signal }), { signal });
     },
     /**
-     * Undo one turn on the branch shown (§3.3.10): back to before its first
+     * Undo one turn on the branch shown: back to before its first
      * step (`onlyOwn` false, kept for redo), or only its own steps deleted
      * with their dependants applied again (journaled).
      */
@@ -1960,7 +1961,7 @@ export function createHistory({
       return pool.get(valuesAt(tracker, stepId)[domainId]);
     },
     /**
-     * Where the history's memory goes (History v2 §3.5, §3.15.4: "Highlights
+     * Where the history's memory goes (for example "Highlights
      * at step 31: 8 MB"): each part that holds typed arrays no part before
      * it holds, largest first. A part is a domain's value a step brought
      * (`step`), what a Recently deleted entry keeps (`deleted`: its steps,
@@ -2097,7 +2098,7 @@ export function createHistory({
       }, { signal: options.signal ?? null, heavy: options.heavy ?? null });
     },
     /**
-     * Load a session file's trackers beside the ones here (§3.3.7, Q2): each
+     * Load a session file's trackers beside the ones here: each
      * says it was loaded (`start.kind 'import'` with the file; a replay keeps
      * its own start), gets a new id when its id is taken (every reference to
      * it remapped) and "(shared)" when its name is; the file's active
@@ -2196,7 +2197,7 @@ export function createHistory({
 
 /**
  * The label of the step a load records for the parts of a saved head it
- * could not put back (F155): what is shown there is what was shown before.
+ * could not put back: what is shown there is what was shown before.
  * @param {string[]} ids - domain ids
  */
 export function unrestoredLabel(ids) {

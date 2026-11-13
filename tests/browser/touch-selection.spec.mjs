@@ -1,6 +1,6 @@
 /**
- * A touch screen has no Alt key, and every highlight tool used to start only
- * from an Alt press, so a phone or tablet could not select a single cell.
+ * A touch screen has no Alt key, and every highlight tool starts from an Alt
+ * press, so without Select mode a phone or tablet could not select a single cell.
  * Select mode is the on-screen stand-in: while it is on, one finger runs the
  * active tool exactly as an Alt press does, and two fingers still pinch and
  * pan the camera. With it off, nothing a mouse or a finger does has changed.
@@ -65,8 +65,7 @@ async function colorByCellType(page) {
  * next rendering update, before that frame is painted
  * (`select-bar-placement.js`). Until then the layout still has the dock where
  * it stood with no bar, over the bar's switch, in a state no frame shows: a
- * point read and pressed in between reaches the dock (`select-bar.spec.mjs`,
- * hosted macOS Firefox, full-matrix run 42320991390).
+ * point read and pressed in between reaches the dock (`select-bar.spec.mjs`).
  */
 async function closeSidebar(page) {
   await page.locator('#sidebar-toggle').tap();
@@ -201,109 +200,132 @@ async function turnOnSelectMode(page) {
 test.describe('on a phone', () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
-  test('a press held on the plot is never a text selection', async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openDataset(page);
-    // iOS starts a text selection on a long press wherever the element under
-    // the finger is selectable, and Safari reads only -webkit-user-select: on
-    // the plot the selection grew to the whole page.
-    const surfaces = await page.evaluate(() => [
-      '#glcanvas',
-      '.select-bar',
-      '.split-view-badges',
-    ].map(selector => {
-      const element = document.querySelector(selector);
-      if (!element) return { selector, missing: true };
-      const style = getComputedStyle(element);
-      return {
-        selector,
-        webkit: style.getPropertyValue('-webkit-user-select'),
-        standard: style.getPropertyValue('user-select'),
-        callout: style.getPropertyValue('-webkit-touch-callout'),
-      };
-    }));
-    for (const surface of surfaces) {
-      expect(surface.missing, `${surface.selector} exists`).toBeUndefined();
-      // Each engine reports the property it implements; none may be selectable.
-      for (const value of [surface.webkit, surface.standard]) {
-        if (value !== '') expect(value, surface.selector).toBe('none');
-      }
-      // WebKit, the engine iOS uses, implements the callout property.
-      if (surface.callout !== '') expect(surface.callout, surface.selector).toBe('none');
-    }
-    // A held finger on the plot leaves nothing selected.
-    const box = await page.locator('#glcanvas').boundingBox();
-    const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-    await touchGesture(page, [line(centre, centre)]);
-    expect(await page.evaluate(() => window.getSelection()?.toString() ?? '')).toBe('');
-    expect(productErrors).toEqual([]);
-  });
-
-  test('Select mode is a named switch in the panel and on the selection bar', async ({
+  test('with Select mode off: no text selection, the named switch, and a finger still orbits and pans', async ({
     page,
   }) => {
     const productErrors = observeProductErrors(page);
     await openDataset(page);
 
-    // While the full-screen menu is open only the panel's switch is shown.
-    const panelToggle = page.getByRole('switch', { name: 'Select mode' });
-    await expect(panelToggle).toHaveCount(1);
-    await expect(panelToggle).toHaveAttribute('aria-checked', 'false');
-    await expect(page.locator('#highlight-select-combine')).toBeHidden();
-
-    await turnOnSelectMode(page);
-    const combine = page.getByRole('group', {
-      name: 'How each selection gesture combines',
+    await test.step('a press held on the plot is never a text selection', async () => {
+      // iOS starts a text selection on a long press wherever the element under
+      // the finger is selectable, and Safari reads only -webkit-user-select: on
+      // the plot the selection grows to the whole page.
+      const surfaces = await page.evaluate(() => [
+        '#glcanvas',
+        '.select-bar',
+        '.split-view-badges',
+      ].map(selector => {
+        const element = document.querySelector(selector);
+        if (!element) return { selector, missing: true };
+        const style = getComputedStyle(element);
+        return {
+          selector,
+          webkit: style.getPropertyValue('-webkit-user-select'),
+          standard: style.getPropertyValue('user-select'),
+          callout: style.getPropertyValue('-webkit-touch-callout'),
+        };
+      }));
+      for (const surface of surfaces) {
+        expect(surface.missing, `${surface.selector} exists`).toBeUndefined();
+        // Each engine reports the property it implements; none may be selectable.
+        for (const value of [surface.webkit, surface.standard]) {
+          if (value !== '') expect(value, surface.selector).toBe('none');
+        }
+        // WebKit, the engine iOS uses, implements the callout property.
+        if (surface.callout !== '') expect(surface.callout, surface.selector).toBe('none');
+      }
+      // A held finger on the plot leaves nothing selected.
+      const box = await page.locator('#glcanvas').boundingBox();
+      const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      await touchGesture(page, [line(centre, centre)]);
+      expect(await page.evaluate(() => window.getSelection()?.toString() ?? '')).toBe('');
+      expect(productErrors).toEqual([]);
     });
-    await expect(combine).toBeVisible();
-    await expect(combine.getByRole('button', { name: 'Intersect' }))
-      .toHaveAttribute('aria-pressed', 'true');
-    await combine.getByRole('button', { name: 'Add' }).tap();
-    await expect.poll(() => selectModeOf(page)).toEqual({ enabled: true, combine: 'union' });
-    await combine.getByRole('button', { name: 'Intersect' }).tap();
 
-    // On a phone the full-screen sidebar is closed to reach the plot; the
-    // same switch sits on the selection bar over it, on screen, drawn 36px
-    // tall with a hit area that reaches 42px.
-    await closeSidebar(page);
-    const barToggle = page.locator('#select-bar')
-      .getByRole('switch', { name: 'Select mode' });
-    await expect(barToggle).toHaveCount(1);
-    await expect(barToggle).toBeVisible();
-    await expect(barToggle).toHaveAttribute('aria-checked', 'true');
-    const box = await barToggle.boundingBox();
-    expect(box.x).toBeGreaterThanOrEqual(0);
-    expect(box.x + box.width).toBeLessThanOrEqual(390);
-    expect(box.y + box.height).toBeLessThanOrEqual(844);
-    expect(box.height).toBeGreaterThanOrEqual(36);
-    const hitArea = await barToggle.evaluate(element => {
-      const area = element.getBoundingClientRect();
-      const x = area.left + area.width / 2;
-      const owns = y => {
-        const hit = document.elementFromPoint(x, y);
-        return hit !== null && (hit === element || element.contains(hit));
-      };
-      let top = area.top;
-      let bottom = area.bottom;
-      while (top > area.top - 8 && owns(top - 1)) top -= 1;
-      while (bottom < area.bottom + 8 && owns(bottom + 0.5)) bottom += 1;
-      return bottom - top;
+    await test.step('Select mode is a named switch in the panel and on the selection bar', async () => {
+
+      // While the full-screen menu is open only the panel's switch is shown.
+      const panelToggle = page.getByRole('switch', { name: 'Select mode' });
+      await expect(panelToggle).toHaveCount(1);
+      await expect(panelToggle).toHaveAttribute('aria-checked', 'false');
+      await expect(page.locator('#highlight-select-combine')).toBeHidden();
+
+      await turnOnSelectMode(page);
+      const combine = page.getByRole('group', {
+        name: 'How each selection gesture combines',
+      });
+      await expect(combine).toBeVisible();
+      await expect(combine.getByRole('button', { name: 'Intersect' }))
+        .toHaveAttribute('aria-pressed', 'true');
+      await combine.getByRole('button', { name: 'Add' }).tap();
+      await expect.poll(() => selectModeOf(page)).toEqual({ enabled: true, combine: 'union' });
+      await combine.getByRole('button', { name: 'Intersect' }).tap();
+
+      // On a phone the full-screen sidebar is closed to reach the plot; the
+      // same switch sits on the selection bar over it, on screen, drawn 36px
+      // tall with a hit area that reaches 42px.
+      await closeSidebar(page);
+      const barToggle = page.locator('#select-bar')
+        .getByRole('switch', { name: 'Select mode' });
+      await expect(barToggle).toHaveCount(1);
+      await expect(barToggle).toBeVisible();
+      await expect(barToggle).toHaveAttribute('aria-checked', 'true');
+      const box = await barToggle.boundingBox();
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(390);
+      expect(box.y + box.height).toBeLessThanOrEqual(844);
+      expect(box.height).toBeGreaterThanOrEqual(36);
+      const hitArea = await barToggle.evaluate(element => {
+        const area = element.getBoundingClientRect();
+        const x = area.left + area.width / 2;
+        const owns = y => {
+          const hit = document.elementFromPoint(x, y);
+          return hit !== null && (hit === element || element.contains(hit));
+        };
+        let top = area.top;
+        let bottom = area.bottom;
+        while (top > area.top - 8 && owns(top - 1)) top -= 1;
+        while (bottom < area.bottom + 8 && owns(bottom + 0.5)) bottom += 1;
+        return bottom - top;
+      });
+      expect(hitArea).toBeGreaterThanOrEqual(42);
+      // The combine choice made in the panel shows on the bar.
+      await expect(page.locator('#select-bar-combine-intersect'))
+        .toHaveAttribute('aria-pressed', 'true');
+
+      await barToggle.tap();
+      await expect(barToggle).toHaveAttribute('aria-checked', 'false');
+      await expect(page.locator('#highlight-select-mode'))
+        .toHaveAttribute('aria-checked', 'false');
+      await expect(page.locator('#select-bar-combine')).toBeHidden();
+      expect((await selectModeOf(page)).enabled).toBe(false);
+      expect(productErrors).toEqual([]);
+      // Back to the open panel, where the next step starts.
+      await openSidebar(page);
     });
-    expect(hitArea).toBeGreaterThanOrEqual(42);
-    // The combine choice made in the panel shows on the bar.
-    await expect(page.locator('#select-bar-combine-intersect'))
-      .toHaveAttribute('aria-pressed', 'true');
 
-    await barToggle.tap();
-    await expect(barToggle).toHaveAttribute('aria-checked', 'false');
-    await expect(page.locator('#highlight-select-mode'))
-      .toHaveAttribute('aria-checked', 'false');
-    await expect(page.locator('#select-bar-combine')).toBeHidden();
-    expect((await selectModeOf(page)).enabled).toBe(false);
-    expect(productErrors).toEqual([]);
+    await test.step('with Select mode off, a one-finger drag still orbits or pans', async () => {
+      await page.locator('.highlight-mode-btn[data-mode="lasso"]').tap();
+
+      for (const mode of ['orbit', 'planar']) {
+        await useNavigationMode(page, mode);
+        await closeSidebar(page);
+        const before = await cameraOf(page);
+        await touchGesture(page, [line({ x: 120, y: 300 }, { x: 260, y: 420 })]);
+        await expect.poll(async () => {
+          const motion = cameraMotion(before, await cameraOf(page));
+          return mode === 'orbit' ? motion.turned : motion.panned;
+        }, { message: `a finger ${mode === 'orbit' ? 'orbits' : 'pans'} in ${mode}` })
+          .toBeGreaterThan(mode === 'orbit' ? 0.1 : 1e-3);
+        await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+        expect((await unifiedState(page)).inProgress).toBe(false);
+        await openSidebar(page);
+      }
+      expect(productErrors).toEqual([]);
+    });
   });
 
-  test('with Select mode on, a one-finger tap selects the tapped cell', async ({
+  test('with Select mode on: a tap, Add and Subtract, a pinch, and a lasso that Escape cancels', async ({
     page,
   }) => {
     const productErrors = observeProductErrors(page);
@@ -311,164 +333,135 @@ test.describe('on a phone', () => {
     await colorByCellType(page);
     await turnOnSelectMode(page);
     await closeSidebar(page);
-    const [point] = await findCellPoints(page, 1);
-    const cameraBefore = await cameraOf(page);
 
-    // The browser's own touch input: if the tap were replayed as mouse
-    // events the mouse path would act on it a second time.
-    await page.evaluate(() => {
-      window.__touchSelectionMouseDowns = 0;
-      document.getElementById('glcanvas').addEventListener('mousedown', () => {
-        window.__touchSelectionMouseDowns += 1;
+    await test.step('with Select mode on, a one-finger tap selects the tapped cell', async () => {
+      const [point] = await findCellPoints(page, 1);
+      const cameraBefore = await cameraOf(page);
+
+      // The browser's own touch input: if the tap were replayed as mouse
+      // events the mouse path would act on it a second time.
+      await page.evaluate(() => {
+        window.__touchSelectionMouseDowns = 0;
+        document.getElementById('glcanvas').addEventListener('mousedown', () => {
+          window.__touchSelectionMouseDowns += 1;
+        });
       });
-    });
-    await armSelection(page, 'annotation', () => page.touchscreen.tap(point.x, point.y));
+      await armSelection(page, 'annotation', () => page.touchscreen.tap(point.x, point.y));
 
-    const state = await unifiedState(page);
-    expect(state.inProgress).toBe(true);
-    expect(state.candidates).toContain(point.cellIndex);
-    expect(await page.evaluate(() => window.__touchSelectionMouseDowns)).toBe(0);
-    const cameraAfter = await cameraOf(page);
-    expect(cameraAfter.orbit.theta).toBeCloseTo(cameraBefore.orbit.theta, 6);
-    expect(cameraAfter.orbit.phi).toBeCloseTo(cameraBefore.orbit.phi, 6);
+      const state = await unifiedState(page);
+      expect(state.inProgress).toBe(true);
+      expect(state.candidates).toContain(point.cellIndex);
+      expect(await page.evaluate(() => window.__touchSelectionMouseDowns)).toBe(0);
+      const cameraAfter = await cameraOf(page);
+      expect(cameraAfter.orbit.theta).toBeCloseTo(cameraBefore.orbit.theta, 6);
+      expect(cameraAfter.orbit.phi).toBeCloseTo(cameraBefore.orbit.phi, 6);
 
-    // The selection is confirmed from the panel, as with Alt+click.
-    await openSidebar(page);
-    await expect(page.locator('#annotation-step-controls')).toBeVisible();
-    expect(productErrors).toEqual([]);
-  });
-
-  test('with Select mode on, a one-finger drag draws a lasso', async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openDataset(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').tap();
-    await turnOnSelectMode(page);
-    await closeSidebar(page);
-    const cameraBefore = await cameraOf(page);
-
-    await armSelection(page, 'lasso', () => touchGesture(page, [loop([
-      { x: 20, y: 70 }, { x: 370, y: 70 }, { x: 370, y: 740 },
-      { x: 20, y: 740 }, { x: 20, y: 70 },
-    ])]));
-
-    const state = await unifiedState(page);
-    expect(state.inProgress).toBe(true);
-    expect(state.candidateCount).toBeGreaterThan(0);
-    const cameraAfter = await cameraOf(page);
-    expect(cameraAfter.orbit.theta).toBeCloseTo(cameraBefore.orbit.theta, 6);
-    expect(cameraAfter.orbit.phi).toBeCloseTo(cameraBefore.orbit.phi, 6);
-
-    // Escape cancels the selection in progress first, then leaves the mode.
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
-    expect((await selectModeOf(page)).enabled).toBe(true);
-    await page.keyboard.press('Escape');
-    expect((await selectModeOf(page)).enabled).toBe(false);
-    await expect(page.locator('#select-bar-mode'))
-      .toHaveAttribute('aria-checked', 'false');
-    expect(productErrors).toEqual([]);
-  });
-
-  test('with Select mode off, a one-finger drag still orbits or pans', async ({
-    page,
-  }) => {
-    const productErrors = observeProductErrors(page);
-    await openDataset(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').tap();
-
-    for (const mode of ['orbit', 'planar']) {
-      await useNavigationMode(page, mode);
-      await closeSidebar(page);
-      const before = await cameraOf(page);
-      await touchGesture(page, [line({ x: 120, y: 300 }, { x: 260, y: 420 })]);
-      await expect.poll(async () => {
-        const motion = cameraMotion(before, await cameraOf(page));
-        return mode === 'orbit' ? motion.turned : motion.panned;
-      }, { message: `a finger ${mode === 'orbit' ? 'orbits' : 'pans'} in ${mode}` })
-        .toBeGreaterThan(mode === 'orbit' ? 0.1 : 1e-3);
-      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
-      expect((await unifiedState(page)).inProgress).toBe(false);
+      // The selection is confirmed from the panel, as with Alt+click.
       await openSidebar(page);
-    }
-    expect(productErrors).toEqual([]);
-  });
+      await expect(page.locator('#annotation-step-controls')).toBeVisible();
+      expect(productErrors).toEqual([]);
+      // Discard the selection, and choose the lasso for the steps below.
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
+      expect((await selectModeOf(page)).enabled).toBe(true);
+      await page.locator('.highlight-mode-btn[data-mode="lasso"]').tap();
+      await useNavigationMode(page, 'orbit');
+      await closeSidebar(page);
+    });
 
-  test('two fingers pinch and pan while Select mode is on, and abandon a lasso', async ({
-    page,
-  }) => {
-    const productErrors = observeProductErrors(page);
-    await openDataset(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').tap();
-    await useNavigationMode(page, 'orbit');
-    await turnOnSelectMode(page);
-    await closeSidebar(page);
-    const before = await cameraOf(page);
+    await test.step('Select mode Add and Subtract stand in for Shift and Ctrl', async () => {
+      const top = loop([
+        { x: 20, y: 70 }, { x: 370, y: 70 }, { x: 370, y: 400 },
+        { x: 20, y: 400 }, { x: 20, y: 70 },
+      ]);
+      const bottom = loop([
+        { x: 20, y: 400 }, { x: 370, y: 400 }, { x: 370, y: 740 },
+        { x: 20, y: 740 }, { x: 20, y: 400 },
+      ]);
+      await armSelection(page, 'lasso', () => touchGesture(page, [top]));
+      const first = await unifiedState(page);
+      expect(first.candidateCount).toBeGreaterThan(0);
 
-    // The first finger starts drawing; the second lands three steps later and
-    // the two spread apart while their midpoint moves down and right.
-    await touchGesture(
-      page,
-      [
-        line({ x: 170, y: 380 }, { x: 110, y: 380 + 60 }),
-        line({ x: 220, y: 380 }, { x: 330, y: 380 + 60 }),
-      ],
-      [0, 3],
-    );
+      // The combine is chosen on the selection bar, without the menu.
+      await page.locator('#select-bar-combine-union').tap();
+      await expect(page.locator('#highlight-select-combine-union'))
+        .toHaveAttribute('aria-pressed', 'true');
+      await touchGesture(page, [bottom]);
+      await expect.poll(async () => (await unifiedState(page)).candidateCount)
+        .toBeGreaterThan(first.candidateCount);
+      const added = await unifiedState(page);
+      for (const cell of first.candidates) expect(added.candidates).toContain(cell);
 
-    await expect.poll(async () => (await cameraOf(page)).orbit.targetRadius)
-      .toBeLessThan(before.orbit.targetRadius * 0.8);
-    const motion = cameraMotion(before, await cameraOf(page));
-    expect(motion.panned, 'the midpoint drag pans the camera').toBeGreaterThan(1e-4);
-    expect(motion.turned, 'two fingers never orbit').toBeLessThan(1e-6);
+      await page.locator('#select-bar-combine-subtract').tap();
+      await touchGesture(page, [top]);
+      await expect.poll(async () => (await unifiedState(page)).candidateCount)
+        .toBe(added.candidateCount - first.candidateCount);
+      const subtracted = await unifiedState(page);
+      for (const cell of first.candidates) {
+        expect(subtracted.candidates).not.toContain(cell);
+      }
+      expect(productErrors).toEqual([]);
+      // Discard the selection and put the combine choice back.
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+      await page.locator('#select-bar-combine-intersect').tap();
+      await expect.poll(() => selectModeOf(page)).toEqual({ enabled: true, combine: 'intersect' });
+    });
 
-    // The half-drawn lasso is abandoned, never committed, and says why.
-    expect((await unifiedState(page)).inProgress).toBe(false);
-    await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
-    await expect(page.locator('#highlight-mode-description'))
-      .toContainText('interrupted');
-    expect((await selectModeOf(page)).enabled).toBe(true);
-    expect(productErrors).toEqual([]);
-  });
+    await test.step('two fingers pinch and pan while Select mode is on, and abandon a lasso', async () => {
+      const before = await cameraOf(page);
 
-  test('Select mode Add and Subtract stand in for Shift and Ctrl', async ({
-    page,
-  }) => {
-    const productErrors = observeProductErrors(page);
-    await openDataset(page);
-    await page.locator('.highlight-mode-btn[data-mode="lasso"]').tap();
-    await turnOnSelectMode(page);
-    await closeSidebar(page);
-    const top = loop([
-      { x: 20, y: 70 }, { x: 370, y: 70 }, { x: 370, y: 400 },
-      { x: 20, y: 400 }, { x: 20, y: 70 },
-    ]);
-    const bottom = loop([
-      { x: 20, y: 400 }, { x: 370, y: 400 }, { x: 370, y: 740 },
-      { x: 20, y: 740 }, { x: 20, y: 400 },
-    ]);
-    await armSelection(page, 'lasso', () => touchGesture(page, [top]));
-    const first = await unifiedState(page);
-    expect(first.candidateCount).toBeGreaterThan(0);
+      // The first finger starts drawing; the second lands three steps later and
+      // the two spread apart while their midpoint moves down and right.
+      await touchGesture(
+        page,
+        [
+          line({ x: 170, y: 380 }, { x: 110, y: 380 + 60 }),
+          line({ x: 220, y: 380 }, { x: 330, y: 380 + 60 }),
+        ],
+        [0, 3],
+      );
 
-    // The combine is chosen on the selection bar, without the menu.
-    await page.locator('#select-bar-combine-union').tap();
-    await expect(page.locator('#highlight-select-combine-union'))
-      .toHaveAttribute('aria-pressed', 'true');
-    await touchGesture(page, [bottom]);
-    await expect.poll(async () => (await unifiedState(page)).candidateCount)
-      .toBeGreaterThan(first.candidateCount);
-    const added = await unifiedState(page);
-    for (const cell of first.candidates) expect(added.candidates).toContain(cell);
+      await expect.poll(async () => (await cameraOf(page)).orbit.targetRadius)
+        .toBeLessThan(before.orbit.targetRadius * 0.8);
+      const motion = cameraMotion(before, await cameraOf(page));
+      expect(motion.panned, 'the midpoint drag pans the camera').toBeGreaterThan(1e-4);
+      expect(motion.turned, 'two fingers never orbit').toBeLessThan(1e-6);
 
-    await page.locator('#select-bar-combine-subtract').tap();
-    await touchGesture(page, [top]);
-    await expect.poll(async () => (await unifiedState(page)).candidateCount)
-      .toBe(added.candidateCount - first.candidateCount);
-    const subtracted = await unifiedState(page);
-    for (const cell of first.candidates) {
-      expect(subtracted.candidates).not.toContain(cell);
-    }
-    expect(productErrors).toEqual([]);
+      // The half-drawn lasso is abandoned, never committed, and says why.
+      expect((await unifiedState(page)).inProgress).toBe(false);
+      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+      await expect(page.locator('#highlight-mode-description'))
+        .toContainText('interrupted');
+      expect((await selectModeOf(page)).enabled).toBe(true);
+      expect(productErrors).toEqual([]);
+    });
+
+    await test.step('with Select mode on, a one-finger drag draws a lasso', async () => {
+      const cameraBefore = await cameraOf(page);
+
+      await armSelection(page, 'lasso', () => touchGesture(page, [loop([
+        { x: 20, y: 70 }, { x: 370, y: 70 }, { x: 370, y: 740 },
+        { x: 20, y: 740 }, { x: 20, y: 70 },
+      ])]));
+
+      const state = await unifiedState(page);
+      expect(state.inProgress).toBe(true);
+      expect(state.candidateCount).toBeGreaterThan(0);
+      const cameraAfter = await cameraOf(page);
+      expect(cameraAfter.orbit.theta).toBeCloseTo(cameraBefore.orbit.theta, 6);
+      expect(cameraAfter.orbit.phi).toBeCloseTo(cameraBefore.orbit.phi, 6);
+
+      // Escape cancels the selection in progress first, then leaves the mode.
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+      expect((await selectModeOf(page)).enabled).toBe(true);
+      await page.keyboard.press('Escape');
+      expect((await selectModeOf(page)).enabled).toBe(false);
+      await expect(page.locator('#select-bar-mode'))
+        .toHaveAttribute('aria-checked', 'false');
+      expect(productErrors).toEqual([]);
+    });
   });
 });
 
@@ -599,54 +592,62 @@ test.describe('with a mouse', () => {
   });
 });
 
-for (const theme of ['light', 'dark']) {
-  test.describe(`in ${theme} theme on a phone`, () => {
-    test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+test.describe('in both themes on a phone', () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
-    test('the bar switch shows its state as clearly as the panel switch', async ({ page }) => {
-      await page.addInitScript(value => {
-        localStorage.setItem('cellucid_theme', value);
-      }, theme);
-      await openDataset(page);
-      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
-      await closeSidebar(page);
-      const toggle = page.locator('#select-bar-mode');
-      const look = () => toggle.evaluate(element => {
-        const track = element.querySelector('.switch-track');
-        const trackStyle = getComputedStyle(track);
-        const knobStyle = getComputedStyle(track, '::after');
-        return {
-          track: trackStyle.backgroundColor,
-          knob: knobStyle.backgroundColor,
-          knobAt: knobStyle.transform,
-          width: trackStyle.width,
-        };
-      });
-      // A color sampled mid-transition is neither state, so every sample
-      // waits until the switch's own transitions (track and knob) have ended.
-      const settled = () => expect.poll(() => toggle.evaluate(element =>
-        element.getAnimations({ subtree: true }).length)).toBe(0);
-      await settled();
-      const off = await look();
-      await toggle.tap();
-      await expect(toggle).toHaveAttribute('aria-checked', 'true');
-      await expect.poll(async () => (await look()).knobAt).not.toBe(off.knobAt);
-      await settled();
-      const on = await look();
-      expect(on.track).not.toBe(off.track);
-      expect(on.knob).not.toBe(on.track);
-      expect(off.knob).not.toBe(off.track);
-      // The panel's switch is the same component, drawn the same way.
-      await openSidebar(page);
-      const trackOf = id => page.locator(`#${id} .switch-track`)
-        .evaluate(element => {
-          const style = getComputedStyle(element);
-          return `${style.backgroundColor} ${style.width}x${style.height}`;
-        });
-      await expect.poll(async () => {
-        const [bar, panel] = [await trackOf('select-bar-mode'), await trackOf('highlight-select-mode')];
-        return bar === panel ? panel : `${bar} vs ${panel}`;
-      }).toBe(`${on.track} ${on.width}x20px`);
+  test('the bar switch shows its state as clearly as the panel switch', async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('cellucid_theme', 'light');
     });
+    await openDataset(page);
+    for (const theme of ['light', 'dark']) {
+      await test.step(`in ${theme} theme the bar switch shows its state as clearly as the panel switch`, async () => {
+        // The panel is open: the theme is chosen there, and Select mode is off.
+        await page.locator('#theme-select').selectOption(theme);
+        await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+        if (await page.locator('#highlight-select-mode').getAttribute('aria-checked') === 'true') {
+          await page.locator('#highlight-select-mode').tap();
+        }
+        await expect(page.locator('#highlight-select-mode')).toHaveAttribute('aria-checked', 'false');
+        await closeSidebar(page);
+        const toggle = page.locator('#select-bar-mode');
+        const look = () => toggle.evaluate(element => {
+          const track = element.querySelector('.switch-track');
+          const trackStyle = getComputedStyle(track);
+          const knobStyle = getComputedStyle(track, '::after');
+          return {
+            track: trackStyle.backgroundColor,
+            knob: knobStyle.backgroundColor,
+            knobAt: knobStyle.transform,
+            width: trackStyle.width,
+          };
+        });
+        // A color sampled mid-transition is neither state, so every sample
+        // waits until the switch's own transitions (track and knob) have ended.
+        const settled = () => expect.poll(() => toggle.evaluate(element =>
+          element.getAnimations({ subtree: true }).length)).toBe(0);
+        await settled();
+        const off = await look();
+        await toggle.tap();
+        await expect(toggle).toHaveAttribute('aria-checked', 'true');
+        await expect.poll(async () => (await look()).knobAt).not.toBe(off.knobAt);
+        await settled();
+        const on = await look();
+        expect(on.track).not.toBe(off.track);
+        expect(on.knob).not.toBe(on.track);
+        expect(off.knob).not.toBe(off.track);
+        // The panel's switch is the same component, drawn the same way.
+        await openSidebar(page);
+        const trackOf = id => page.locator(`#${id} .switch-track`)
+          .evaluate(element => {
+            const style = getComputedStyle(element);
+            return `${style.backgroundColor} ${style.width}x${style.height}`;
+          });
+        await expect.poll(async () => {
+          const [bar, panel] = [await trackOf('select-bar-mode'), await trackOf('highlight-select-mode')];
+          return bar === panel ? panel : `${bar} vs ${panel}`;
+        }).toBe(`${on.track} ${on.width}x20px`);
+      });
+    }
   });
-}
+});

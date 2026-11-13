@@ -120,9 +120,8 @@ export function createGeneExpressionSelector(options = {}) {
   wrapper.className = 'searchable-dropdown';
 
   // Search input - styled like obs-select.
-  // The list used to be driven by `mousedown` alone: no Enter, no Escape, no
-  // arrow keys and no combobox semantics, so picking a gene for an analysis was
-  // impossible without a pointer.
+  // The list takes Enter, Escape and the arrow keys and carries combobox
+  // semantics, so a gene is picked without a pointer.
   const input = document.createElement('input');
   input.type = 'text';
   input.id = `${id}-search`;
@@ -205,8 +204,8 @@ export function createGeneExpressionSelector(options = {}) {
    * is empty or shows the chosen one), best match first
    * (`utils/gene-lookup.js`). What Enter would choose is active: the best
    * match of what is typed, else the chosen gene wherever it is listed, else
-   * None. (Typing a gene used to leave None active, so Enter cleared the
-   * choice instead of taking the gene typed.)
+   * None. (A gene typed is active over None, so Enter takes it and does not
+   * clear the choice.)
    */
   const openDropdown = () => {
     dropdown.hidden = false;
@@ -318,17 +317,6 @@ export function createGeneExpressionSelector(options = {}) {
     currentSelectedGene = selectedValue;
     updateSelectedDisplay();
   }
-
-  // Store reference for external control
-  container._clearSelection = () => {
-    currentSelectedGene = '';
-    updateSelectedDisplay();
-  };
-
-  container._setSelection = (gene) => {
-    currentSelectedGene = gene;
-    updateSelectedDisplay();
-  };
 
   return container;
 }

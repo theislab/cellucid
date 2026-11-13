@@ -40,6 +40,9 @@ import { analysisWorkerCount } from '../shared/performance-config.js';
 import { throwIfAborted } from '../../../utils/abort.js';
 import { DEFAULTS, ANALYSIS_PHASES } from './constants.js';
 
+/** @typedef {import('./constants.js').ExpressionMatrix} ExpressionMatrix */
+/** @typedef {import('./constants.js').ClusteringResult} ClusteringResult */
+
 /**
  * Why clustering an axis was refused, in the words a user reads.
  *

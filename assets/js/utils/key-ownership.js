@@ -15,8 +15,8 @@
  *
  * Every other control leaves the letters to the page: a slider takes the
  * arrow, Home, End and Page keys, a checkbox or a radio Space, a button
- * Enter and Space. Treating every `<input>` as a text field left the keys
- * dead after a slider or a checkbox was used (round 9, R9K-1).
+ * Enter and Space. Treating every `<input>` as a text field would leave the
+ * keys dead after a slider or a checkbox was used.
  *
  * One rule for every page-wide key listener (`app/ui/onboarding/keyboard-shortcuts.js`,
  * `rendering/viewer.js`, `app/ui/modules/highlight/mode-ui.js`,

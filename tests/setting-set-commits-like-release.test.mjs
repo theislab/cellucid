@@ -1,15 +1,14 @@
 /**
- * L18-2 (live pass 5): an agent's `setting.set` of the vector field's
- * sliders read back the value before ("Intensity: set to 0.25" for 0.9, the
- * step named so and the agent told so), and Particle density never reached
- * the viewer: the readout said 60K while 15K particles were drawn.
- *
- * Cause: the restore path `setting.set`, a session restore and a history
- * jump share (`state-serializer/ui-controls.js` `restoreValidatedControl`)
- * dispatched `input` alone for a slider. The vector field's owner follows
- * `input` on the next frame (readout and value) and applies density only on
- * `change`, the release a person's drag ends with. The restore now ends as a
- * person's change ends: `input`, then `change`.
+ * An agent's `setting.set` of the vector field's sliders reads back the value
+ * set, and Particle density reaches the viewer. The restore path
+ * `setting.set`, a session restore and a history jump share
+ * (`state-serializer/ui-controls.js` `restoreValidatedControl`) ends as a
+ * person's change ends: `input`, then `change`. The vector field's owner
+ * follows `input` on the next frame (readout and value) and applies density
+ * only on `change`, the release a person's drag ends with; `input` alone
+ * would read back the value before ("Intensity: set to 0.25" for 0.9, the
+ * step named so and the agent told so) and leave the viewer drawing 15K
+ * particles under a readout of 60K.
  *
  * The real owner (`ui/modules/velocity-overlay-controls.js`) and the real
  * serializer share the same fake elements; no frame is ever drawn here

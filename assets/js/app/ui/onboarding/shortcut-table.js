@@ -4,9 +4,7 @@
  * listener answers the presses it binds (`keyboard-shortcuts.js`), and the
  * camera keys it lists are the ones the viewer moves by
  * (`rendering/navigation-keys.js`). A key cannot be answered without being
- * listed, nor listed without being answered (round 9, R9K-4: the panel was
- * hand-written HTML beside five separate key listeners, held together by a
- * test reading both).
+ * listed, nor listed without being answered.
  *
  * A row is one line of the panel: its words, the keys it shows, and what
  * serves them:
@@ -134,7 +132,7 @@ export const SHORTCUT_GROUPS = Object.freeze([
     ],
   },
   {
-    // A focused row of the history (`state/graph.js`, History v2 §3.9, §3.13).
+    // A focused row of the history (`state/graph.js`).
     id: 'history',
     title: 'History list',
     rows: [

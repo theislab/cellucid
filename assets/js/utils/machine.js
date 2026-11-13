@@ -12,18 +12,17 @@
  * again from how fast kept copies were read; which pass indexes a share from
  * what a pass's work cost. A measurement follows how busy the machine is,
  * so the same file on the same link is planned otherwise on a loaded
- * machine: a request a busy machine answers itself 370 ms late is a slow
- * link to the reader, which then read genes for a sample of a 238 KB file's
- * 1,500 open cells, in another order, so a larger share was read anew where
- * it is shown in place at rest (`tests/browser/held-machine.spec.mjs`; what
- * failed `open-cells-in-place.spec.mjs` beside other runs, 2026-11-06).
+ * machine: a request a busy machine answers itself late is a slow link to the
+ * reader, which then reads genes for a sample in another order, so a larger
+ * share is read anew where it is shown in place at rest
+ * (`tests/browser/held-machine.spec.mjs`; measured:
+ * 38_decisions_testing_and_hosted_runners.md).
  * Nothing can be asserted of a plan whose inputs the runner chooses. Held,
  * each input is a number a test or a benchmark names:
  * `holdMachine({decodeBytesPerMs: 1e6})`.
  *
  * Nothing is held unless `holdMachine` is called, and nothing in the app
- * calls it: every measure is then what its module measures, exactly as
- * before this module existed. The callers are the tests
+ * calls it: every measure is then what its module measures. The callers are the tests
  * (`tests/helpers/machine-at-rest.mjs`; the browser specs' device,
  * `tests/browser/helpers/device.mjs`) and the benchmarks.
  *

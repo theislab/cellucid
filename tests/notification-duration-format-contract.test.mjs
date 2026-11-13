@@ -1,12 +1,12 @@
 /**
- * Every user-facing duration and size is written one way. Analysis
- * notifications used their own `(ms / 1000).toFixed(1)` and printed
- * "Loaded 2 fields (0.0s)" next to "Export complete (298ms)"; the read log,
- * the opening progress and the notification center each carried their own
- * duration format ("850ms" beside "850 ms"), and two byte formatters rounded
- * differently ("2 MB" beside "2.0 MB"). They all use `utils/format-units.js`
- * now, and no unit rounds into the next one's ceiling ("1000 ms", "60.0 s",
- * "1 min 60 s", "1024 KB").
+ * Every user-facing duration and size is written one way, through
+ * `utils/format-units.js`: not an analysis notification's own
+ * `(ms / 1000).toFixed(1)` printing "Loaded 2 fields (0.0s)" next to "Export
+ * complete (298ms)", nor a duration format of its own in each of the read log,
+ * the opening progress and the notification center ("850ms" beside "850 ms"),
+ * nor two byte formatters rounding differently ("2 MB" beside "2.0 MB"). No
+ * unit rounds into the next one's ceiling ("1000 ms", "60.0 s", "1 min 60 s",
+ * "1024 KB").
  */
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';

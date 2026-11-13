@@ -33,7 +33,7 @@ import { medianInPlace } from '../compute/math-utils.js';
  * @param {unknown} column
  * @returns {column is SparseGeneColumn}
  */
-export function isSparseGeneColumn(column) {
+function isSparseGeneColumn(column) {
   return (
     column !== null &&
     typeof column === 'object' &&

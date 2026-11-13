@@ -13,13 +13,13 @@ const fixturePath = path.join(
   'current-ui-smoke.h5ad',
 );
 
-// Past the former 512 MiB direct-file ceiling. The tail is a sparse hole
+// Past 512 MiB, a size no direct-file read is limited by. The tail is a sparse hole
 // after HDF5's end of allocation (legal: HDF5 reads only what it addresses),
 // so the file costs no disk and the test proves the reader never touches
 // bytes it does not need.
 const OVERSIZED_BYTES = 600 * 1024 * 1024;
 
-test('an H5AD file far above the former 512 MiB ceiling opens from the file picker', async ({ page }, testInfo) => {
+test('an H5AD file far above 512 MiB opens from the file picker', async ({ page }, testInfo) => {
   const oversizedPath = testInfo.outputPath('oversized.h5ad');
   await copyFile(fixturePath, oversizedPath);
   await truncate(oversizedPath, OVERSIZED_BYTES);

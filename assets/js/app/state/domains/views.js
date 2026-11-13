@@ -116,7 +116,7 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
   }
 
   // `signal`: the history move's (its Stop): a view's embedding stops waiting for its
-  // coordinates, and the history puts back what was shown (F147).
+  // coordinates, and the history puts back what was shown.
   async function restore(value, { signal = null } = {}) {
     if (value === null || typeof value !== 'object' || !Array.isArray(value.views) || value.views.length === 0) {
       throw new TypeError('The views to restore must list the live view and each kept view.');
@@ -207,7 +207,7 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
   }
 
   return {
-    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    // A step read the view it acted in: staleness compares that view's part alone.
     readPart: viewReadPart,
     capture,
     restore,

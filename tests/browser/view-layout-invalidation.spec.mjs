@@ -5,9 +5,9 @@
  * programmatically (the synthetic dataset has one) and switches a kept view
  * and the live view between the two. A same-dimension switch must
  * publish the other layout's positions and drop every per-view cache derived
- * from the previous geometry: keyed by dimension, the switch was a no-op and a
- * view kept LOD, frustum and spawn state describing the embedding it no
- * longer showed.
+ * from the previous geometry: keyed by dimension, the switch would be a no-op
+ * and a view would keep LOD, frustum and spawn state describing the embedding
+ * it no longer shows.
  */
 
 import { expect, test } from './helpers/test.mjs';
@@ -150,7 +150,7 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
     liveLayoutKey: proof.slot,
     liveX: proof.slotX,
   });
-  // The same-dimension switch dropped the kept view's frustum and LOD caches.
+  // The same-dimension switch drops the kept view's frustum and LOD caches.
   expect(proof.afterSwitch).toEqual({ culled: false, lodLevel: -1 });
   expect(proof.rebuilt.culled).toBe(true);
   expect(proof.afterReturn).toEqual({ culled: false, lodLevel: -1 });

@@ -512,7 +512,7 @@ export function chooseOpenableFile(names, requested, where, locatorFor) {
  * byte it stopped at (`Range: bytes=<received>-`, asked again as any
  * request is, counted afresh once bytes arrive again), under the version it
  * started with: a compressed copy on a host that serves ranges (GEO's
- * `.h5ad.gz`, 616 MB at 1.5-8 MB/s) never starts over on an unsteady link.
+ * `.h5ad.gz`, hundreds of MB) never starts over on an unsteady link.
  * Only a host that ignores ranges (`rangesIgnored`, or one that answers the
  * resumption whole) or content-codes the file has it downloaded again from
  * its start, as a failed request is asked again, for as long as one would be.

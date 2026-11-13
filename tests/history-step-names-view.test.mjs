@@ -1,9 +1,8 @@
 /**
- * With several views, a step that changed one of them says which (F157,
- * live pass 6 L24-13): "Colored by gene Sox9" and "Colored Beta of
- * cell_type #1f4e9e" went to the view in focus and named none, in the
- * history and in the methods text, so a reader could not tell which panel a
- * step changed. The history names the views a step changed, found from what
+ * With several views, a step that changed one of them says which: "Colored by
+ * gene Sox9" and "Colored Beta of cell_type #1f4e9e" name the view, in the
+ * history and in the methods text, so a reader can tell which panel a step
+ * changed. The history names the views a step changed, found from what
  * changed in each per-view domain, as the Compare views list names them
  * (`viewNameInValue`, with a view's label); one view, every view, a label
  * that names a view already, and keeping or removing a view are left as

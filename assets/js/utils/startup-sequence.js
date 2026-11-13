@@ -1,6 +1,6 @@
 /**
- * The one order of what a start puts in front of the person (R9U-14, owner
- * direction): the welcome dialog first, as on every ordinary start (F22),
+ * The one order of what a start puts in front of the person: the welcome
+ * dialog first, as on every ordinary start,
  * then, once it is closed, whatever else the start asks or tells — the
  * dataset's "Continue where you left off?", a sample view's notices, the
  * question an opening of the link asks (which object of an R file to open).

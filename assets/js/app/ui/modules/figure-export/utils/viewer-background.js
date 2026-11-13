@@ -156,7 +156,7 @@ export function readActiveViewerBackground(documentRef) {
  * background draws none (`White` and `Black`).
  *
  * @param {string|null} mode
- * @returns {ReturnType<typeof readReferenceGridAppearance>}
+ * @returns {(typeof REFERENCE_GRID_APPEARANCE_BY_MODE)[string]|null}
  */
 function readReferenceGridAppearance(mode) {
   if (mode === null) return null;

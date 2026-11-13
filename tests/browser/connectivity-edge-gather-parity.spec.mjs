@@ -7,8 +7,8 @@ import { pixelParityVerdict } from './helpers/pixel-parity.mjs';
  * (rendering/connectivity-edge-layer.js), copying bits from a position
  * texture into the instance records the draw shader reads as attributes.
  * A frame must be the frame a CPU copy of the positions draws: on Metal, the
- * same vertex arithmetic on texture-fetched positions rasterized some 3D
- * lines differently (measured 2026-10-23), which is why the draw keeps
+ * same vertex arithmetic on texture-fetched positions can rasterize some 3D
+ * lines differently, which is why the draw keeps
  * attribute inputs. This draws one 3D graph both ways, through the same
  * shader program sources, with equal cameras and frame uniforms.
  */

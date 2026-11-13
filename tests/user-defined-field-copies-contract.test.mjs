@@ -4,16 +4,17 @@
  * A kept view holds its own copy of each field object, and a user-defined
  * categorical's definition (categories, codes, centroid tables) belongs to
  * the field: the registry holds one, a session saves one. An edit in place
- * (deleting or merging a category, a rebuilt consensus column) replaced the
- * definition of the edited view's copy and of the registry's only. The other
- * views kept the previous one, so a kept view computing a new layout's
- * centroids wrote them into the registry's table and found none in its own
- * ("Normalized user-defined centroids of layout ... were not published"),
- * and an edit made in a kept view left the live copy (the registry's object)
- * with the new categories under colors indexed for the old ones. A field
- * deleted, restored or purged in one view stayed as it was in the others.
+ * (deleting or merging a category, a rebuilt consensus column) must not
+ * replace the definition of the edited view's copy and of the registry's
+ * only: the other views would keep the previous one, so a kept view
+ * computing a new layout's centroids would write them into the registry's
+ * table and find none in its own ("Normalized user-defined centroids of
+ * layout ... were not published"), and an edit made in a kept view would
+ * leave the live copy (the registry's object) with the new categories under
+ * colors indexed for the old ones. A field deleted, restored or purged in
+ * one view must not stay as it was in the others.
  *
- * Each copy now takes the new definition at once, keeping its own colors
+ * Each copy takes the new definition at once, keeping its own colors
  * and hidden categories by category, and follows the field's deletion when
  * its view is shown, as a dataset field's copy follows the delete registry.
  */
@@ -275,7 +276,7 @@ test('a field deleted, restored or purged in one view is so in every view once s
   }
 });
 
-test('two deleted fields of one name: Restore and Delete for good each act on the one named by its place (R9F-4)', async t => {
+test('two deleted fields of one name: Restore and Delete for good each act on the one named by its place', async t => {
   const { getActions } = await import('../assets/js/app/actions/index.js');
   const { ActionRefused } = await import('../assets/js/app/actions/dispatcher.js');
   const { installFieldActions } = await import('../assets/js/app/state/actions/field-actions.js');

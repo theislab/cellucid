@@ -10,8 +10,8 @@
  * fails the sync (the connection lost). Every step of the sync throws that
  * reason (`throwIfAborted(controller.signal)`), and its catch reads it back
  * (`syncFailureOf`): a cancellation is said as one (`stoppedSyncOutcome`),
- * never as a failure, wherever the stop caught the sync (round 9: a stop
- * was a plain `Error`, so the person's Cancel read as "Pull failed").
+ * never as a failure, wherever the stop caught the sync (a plain `Error`
+ * would read the person's Cancel as "Pull failed").
  *
  * @module ui/modules/community-annotation/sync-stop
  */

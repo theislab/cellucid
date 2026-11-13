@@ -94,3 +94,27 @@ export function clearElement(el) {
     el.removeChild(el.firstChild);
   }
 }
+
+/**
+ * Hold `element`'s place in its parent while it is shown elsewhere (above the
+ * page, inside a dialog): an empty comment stands in it. A remembered next
+ * sibling is not a place: the last child would go back after everything its
+ * parent gained meanwhile, and one before a sibling that left, or that is
+ * itself away, would have nowhere to go.
+ *
+ * @param {Element} element
+ * @returns {() => boolean} Put the element back in its place, exactly; false,
+ *   the element untouched, when there is none (it had no parent, or the
+ *   placeholder left with what the parent dropped).
+ */
+export function holdPlace(element) {
+  const parent = element.parentNode;
+  if (parent === null) return () => false;
+  const placeholder = element.ownerDocument.createComment('');
+  parent.insertBefore(placeholder, element);
+  return () => {
+    if (placeholder.parentNode === null) return false;
+    placeholder.replaceWith(element);
+    return true;
+  };
+}

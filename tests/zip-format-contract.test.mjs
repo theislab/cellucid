@@ -249,8 +249,8 @@ test('each entry is one range (header and data together); entries read together 
   const source = recorded(bytes, { mergeGapBytes: 64 * 1024, maxRequestBytes: 8 * 1024 * 1024 });
   // On a clock that stands still the link is never measured: the reads are
   // shaped by the source's prior, not by how long this machine took to read
-  // the archive's end (measured on the real clock, a slow runner priced the
-  // gaps between far-apart entries as worth fetching).
+  // the archive's end (on the real clock a slow runner would price the gaps
+  // between far-apart entries as worth fetching).
   const archive = await openZipArchive(createByteReader(source, { clock: virtualTime().now }));
   source.calls.length = 0;
   const one = await archive.entry('c/5').read();

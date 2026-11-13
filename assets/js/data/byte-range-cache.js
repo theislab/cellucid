@@ -50,9 +50,8 @@ export function createByteRangeCache({ budgetBytes: budget }) {
    * The index of the first range of `ranges` that starts at or after
    * `start`. No range holds another (`keep`), so ranges sorted by start are
    * sorted by end too, and a binary search finds where any range lies: an
-   * export of tens of thousands of scattered chunks kept each in a scan of
-   * every range kept (2.8 s of the page's main thread on a 21,285-cell
-   * export of HLCA core).
+   * export of tens of thousands of scattered chunks would keep each in a scan of
+   * every range kept (measured: 25_decisions_exports.md).
    */
   function firstFrom(ranges, start) {
     let low = 0;

@@ -3,11 +3,11 @@
  *
  * Positions are normalized in place as they load, so the raw coordinates of a
  * layout are gone by the time anyone can create a field. User-defined
- * centroids used to be computed only from those raw coordinates: a new field
- * had no centroids and therefore no labels, and switching a view's dimension
- * while one was active threw "Raw 2D positions are unavailable for centroid
- * computation". They are now computed from each layout's normalized positions,
- * recorded as normalized, and recomputed after every category edit. The
+ * centroids are computed from each layout's normalized positions, recorded as
+ * normalized, and recomputed after every category edit; computed only from the
+ * raw coordinates, a new field would have no centroids and therefore no
+ * labels, and switching a view's dimension while one was active would throw
+ * "Raw 2D positions are unavailable for centroid computation". The
  * `field-overlays` state domain (`app/state/domains/field-overlays.js`), which
  * the history and a session file keep, holds only the codes: restoring them
  * computes the centroids again from the positions of each resident layout.

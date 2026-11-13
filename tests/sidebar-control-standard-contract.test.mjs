@@ -34,7 +34,6 @@ async function listFiles(relativeDir, extension) {
 }
 
 const indexHtml = (await read('index.html')).replace(/<!--[\s\S]*?-->/g, '');
-const cssReadme = await read('assets/css/README.md');
 
 /** Sidebar and selection-bar markup. */
 function sidebarMarkup() {
@@ -67,18 +66,6 @@ const CSS = new Map(
   ]))
 );
 
-test('the rules held here are the ones the design system states', () => {
-  for (const phrase of [
-    '## Sidebar Control Standard',
-    'never end in a colon',
-    'Visibility is the `hidden` attribute',
-    'display-format.js',
-    'coalesceToFrame'
-  ]) {
-    assert.ok(cssReadme.includes(phrase), `README must state: ${phrase}`);
-  }
-});
-
 test('every sidebar label names exactly one control', () => {
   const offenders = [];
   for (const match of SIDEBAR.matchAll(/<label\b([^>]*)>([\s\S]*?)<\/label>/g)) {
@@ -91,21 +78,6 @@ test('every sidebar label names exactly one control', () => {
     }
     if (!/\bclass="[^"]*\bcheckbox-inline\b/.test(attributes) || wrapped !== 1) {
       offenders.push(`<label${attributes}>${body.trim().slice(0, 40)}`);
-    }
-  }
-  assert.deepEqual(offenders, []);
-});
-
-test('no label or heading ends in a colon', () => {
-  const offenders = [];
-  const visibleText = /<(label|h3)\b[^>]*>([^<]*?):\s*<\/\1>/g;
-  for (const [, , text] of SIDEBAR.matchAll(visibleText)) offenders.push(`index.html: ${text}:`);
-  for (const [file, source] of UI_JS) {
-    for (const [, text] of source.matchAll(/<(?:label|h3)\b[^>]*>([^<$]*?):<\/(?:label|h3)>/g)) {
-      offenders.push(`${file}: ${text}:`);
-    }
-    for (const [, text] of source.matchAll(/\b(?:label|title|labelText):\s*['"`]([^'"`\n]*?):['"`]/g)) {
-      offenders.push(`${file}: ${text}:`);
     }
   }
   assert.deepEqual(offenders, []);

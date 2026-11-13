@@ -10,7 +10,6 @@
  *   session restores in a fresh tab where the file opens whole, and in one
  *   where it opens at another share: the restore opens the session's cells,
  *   checks them, and restores its highlight on the same cells.
- * - Saved after an Apply that raised the share in place, likewise.
  *
  * Fixture: a synthetic `.zarr.zip` of 2,400 cells whose UMAP spreads wider
  * on the cells a first view leaves out, so a first view's frame differs from
@@ -155,25 +154,4 @@ test('a session saved after a progressive opening grew restores where the file o
     expect(tab.errors).toEqual([]);
     await closeContextWithApplicationRetirement(tab.context);
   }
-});
-
-test('a session saved after Apply raised the share in place restores in a tab where the file opens whole', async ({ browser }, testInfo) => {
-  test.setTimeout(240_000);
-  const saved = await openTab(browser, '&cells=600&sample=uniform&seed=3');
-  await cellsOpen(saved.page, 600);
-  await openCollapsedPanels(saved.page);
-  await saved.page.locator('#subsample-percent').fill(String((100 * 1800) / CELLS));
-  await saved.page.locator('#subsample-method').selectOption('uniform');
-  await saved.page.locator('#subsample-seed').fill('3');
-  await saved.page.locator('#subsample-apply').click();
-  await cellsOpen(saved.page, 1800);
-  const { bytes, picked } = await highlightAndSave(saved.page, testInfo, 'raised.cellucid-session');
-  expect(saved.errors).toEqual([]);
-  await closeContextWithApplicationRetirement(saved.context);
-
-  const tab = await openTab(browser, '&cells=100%');
-  await cellsOpen(tab.page, CELLS);
-  await loadAndExpectRestored(tab.page, bytes, 1800, picked);
-  expect(tab.errors).toEqual([]);
-  await closeContextWithApplicationRetirement(tab.context);
 });

@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { CommunityAnnotationGitHubSync } from '../assets/js/app/community-annotations/github-sync.js';
 import {
+  ANNOTATION_FILE_MAX_UTF8_BYTES,
   composeMergesFile,
   composeUserFile,
   parseExactJson,
@@ -1656,6 +1657,153 @@ test(
     assert.equal(
       worker.requests.some(request => request.method === 'PUT'),
       false,
+    );
+  },
+);
+
+/**
+ * A config document whose canonical published form is exactly `targetBytes`: the dataset "synthetic"
+ * first (threshold 0), then fillers whose field names are grown to take up the rest.
+ */
+function configDocumentAtCanonicalBytes(targetBytes) {
+  const supportedDatasets = [{
+    datasetId: 'synthetic',
+    name: 'Synthetic',
+    fieldsToAnnotate: ['cell_type'],
+    annotatableSettings: { cell_type: { minAnnotators: 1, threshold: 0 } },
+    closedFields: [],
+  }];
+  for (let datasetIndex = 0; datasetIndex < 50; datasetIndex += 1) {
+    const fieldsToAnnotate = Array.from(
+      { length: 80 },
+      (_, fieldIndex) => `f${datasetIndex}_${fieldIndex}_${'x'.repeat(70)}`
+    );
+    supportedDatasets.push({
+      datasetId: `filler-${datasetIndex}`,
+      name: `Filler ${datasetIndex}`,
+      fieldsToAnnotate,
+      annotatableSettings: Object.fromEntries(
+        fieldsToAnnotate.map(field => [field, { minAnnotators: 1, threshold: 0.5 }])
+      ),
+      closedFields: [],
+    });
+  }
+  const document = { version: 1, supportedDatasets };
+  const canonicalBytes = () => Buffer.byteLength(exactPublishedJson(document), 'utf8');
+  let remaining = targetBytes - canonicalBytes();
+  assert.ok(remaining >= 0, 'the config target is above its base fixture');
+  // Each grown field name adds its characters twice (the name and its settings key).
+  if (remaining % 2 === 1) {
+    supportedDatasets[1].name += 'n';
+    remaining -= 1;
+  }
+  for (let datasetIndex = 1; datasetIndex < supportedDatasets.length && remaining > 0; datasetIndex += 1) {
+    const entry = supportedDatasets[datasetIndex];
+    for (let fieldIndex = 0; fieldIndex < entry.fieldsToAnnotate.length && remaining > 0; fieldIndex += 1) {
+      const current = entry.fieldsToAnnotate[fieldIndex];
+      const addedCharacters = Math.min(256 - current.length, remaining / 2);
+      if (addedCharacters < 1) continue;
+      const next = `${current}${'y'.repeat(addedCharacters)}`;
+      const setting = entry.annotatableSettings[current];
+      delete entry.annotatableSettings[current];
+      entry.annotatableSettings[next] = setting;
+      entry.fieldsToAnnotate[fieldIndex] = next;
+      remaining -= addedCharacters * 2;
+    }
+  }
+  assert.equal(remaining, 0);
+  assert.equal(canonicalBytes(), targetBytes);
+  return document;
+}
+
+test(
+  'a config change merged onto a remote file at the byte limit is refused before any write',
+  { concurrency: false },
+  async () => {
+    // The remote file is exactly at the limit; the local settings (threshold 0 to 0.5) add two bytes.
+    const remote = configDocumentAtCanonicalBytes(ANNOTATION_FILE_MAX_UTF8_BYTES);
+    assert.equal(Buffer.byteLength(exactPublishedJson(remote), 'utf8'), ANNOTATION_FILE_MAX_UTF8_BYTES);
+    const worker = createConfigNoOpWorker(exactPublishedJson(remote));
+    await withDeterministicOperationIds(() =>
+      withWorkerFetch(
+        worker.fetch,
+        () => assert.rejects(
+          createSync().updateDatasetFieldsToAnnotate({
+            datasetId: 'synthetic',
+            datasetName: 'Synthetic',
+            fieldsToAnnotate: ['cell_type'],
+            annotatableSettings: {
+              cell_type: { minAnnotators: 1, threshold: 0.5 },
+            },
+            closedFields: [],
+            conflictIfRemoteShaNotEqual: SHA_D,
+            publicationMode: 'direct',
+          }),
+          error => {
+            assert.equal(error?.code, 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE');
+            assert.equal(error?.path, 'annotations/config.json');
+            assert.equal(error?.phase, 'publication-preflight');
+            assert.equal(error?.actualBytes, ANNOTATION_FILE_MAX_UTF8_BYTES + 2);
+            assert.match(error.message, /annotations\/config\.json is 1000002 UTF-8 bytes/);
+            assert.match(error.message, /GitHub Contents supports at most 1000000 bytes/);
+            return true;
+          },
+        ),
+      ));
+    assert.equal(
+      worker.requests.some(request => request.method !== 'GET' && request.method !== 'POST'),
+      false,
+      'no write was attempted',
+    );
+  },
+);
+
+test(
+  'a merges file over the byte limit is refused before any write',
+  { concurrency: false },
+  async () => {
+    const oversized = {
+      version: 1,
+      updatedAt: '2026-07-29T00:00:00.000Z',
+      merges: Array.from({ length: 1000 }, (_, index) => ({
+        bucket: `cell_type:${'x'.repeat(985)}${index}`,
+        fromSuggestionId: `ghid_7_from-${index}`,
+        intoSuggestionId: `ghid_8_into-${index}`,
+        by: 'ghid_4242',
+        at: '2026-07-29T00:00:00.000Z',
+        note: 'n'.repeat(512),
+      })),
+    };
+    const publishedBytes = Buffer.byteLength(
+      exactPublishedJson(composeMergesFile(null, 'synthetic', oversized)),
+      'utf8',
+    );
+    assert.ok(publishedBytes > ANNOTATION_FILE_MAX_UTF8_BYTES, 'the fixture is over the limit');
+    const worker = createMergesNoOpWorker(exactPublishedJson(validMergesFile()));
+    await withDeterministicOperationIds(() =>
+      withWorkerFetch(
+        worker.fetch,
+        () => assert.rejects(
+          createSync().pushModerationMerges({
+            mergesDoc: oversized,
+            conflictIfRemoteShaNotEqual: SHA_B,
+            publicationMode: 'direct',
+          }),
+          error => {
+            assert.equal(error?.code, 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE');
+            assert.equal(error?.path, MERGES_PATH);
+            assert.equal(error?.phase, 'publication-preflight');
+            assert.equal(error?.actualBytes, publishedBytes);
+            assert.match(error.message, /annotations\/moderation\/merges\.json is \d+ UTF-8 bytes/);
+            assert.match(error.message, /GitHub Contents supports at most 1000000 bytes/);
+            return true;
+          },
+        ),
+      ));
+    assert.equal(
+      worker.requests.some(request => request.method !== 'GET' && request.method !== 'POST'),
+      false,
+      'no write was attempted',
     );
   },
 );

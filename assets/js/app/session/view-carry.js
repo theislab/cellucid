@@ -17,7 +17,7 @@
 import { DOMAIN_IDS, PER_VIEW_DOMAINS, domainName } from '../actions/domains.js';
 
 /** The domains a reading of other cells keeps here (the cells are what changes; highlights and labels go by `cell-subset-carry.js`). */
-export const CARRIED_DOMAINS = Object.freeze(DOMAIN_IDS.filter(id => !['cells', 'field-overlays', 'highlights'].includes(id)));
+const CARRIED_DOMAINS = Object.freeze(DOMAIN_IDS.filter(id => !['cells', 'field-overlays', 'highlights'].includes(id)));
 
 /**
  * The domains a kept view's own state is held in (its coloring, filters,
@@ -26,7 +26,7 @@ export const CARRIED_DOMAINS = Object.freeze(DOMAIN_IDS.filter(id => !['cells', 
  * (`app/open-cells-resize.js`). Their owners capture at once, so they are
  * taken inside the one synchronous step that replaces the cells.
  */
-export const KEPT_VIEW_DOMAINS = Object.freeze(['views', ...PER_VIEW_DOMAINS]);
+const KEPT_VIEW_DOMAINS = Object.freeze(['views', ...PER_VIEW_DOMAINS]);
 
 /**
  * @param {{domains: ReturnType<typeof import('../actions/domains.js').createDomainRegistry>}} options -

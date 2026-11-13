@@ -4,7 +4,7 @@
  * A modality that did not measure every cell (MuData), or any embedding with
  * non-finite rows, gives those cells NaN positions in every axis: the one mark
  * of an unplaced cell, which survives growth, cuts, reorders, caches and
- * sessions with nothing beside it (the readers' contract, K-03). They are
+ * sessions with nothing beside it (the readers' contract). They are
  * still cells: filters count them, analyses and other embeddings keep them.
  * In a view of that embedding they are not drawn, picked, selected or joined
  * by an edge, and NaN never reaches the GPU:

@@ -10,7 +10,7 @@
  * - `tests/fixtures/category_default_colors.json` in cellucid-python;
  * - `tests/testthat/fixtures/category_default_colors.json` in cellucid-r;
  *
- * byte for byte the same, each pinned by SHA-256 in its repository's tests.
+ * byte for byte the same (`scripts/shared-files.mjs` lists the copies).
  *
  *   node scripts/generate-category-default-colors.mjs           # write
  *   node scripts/generate-category-default-colors.mjs --check   # exit 1 when one differs
@@ -19,22 +19,17 @@
  * and CELLUCID_R_ROOT.
  */
 
-import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getCategoryColor, getCategoryColorSeedCount } from '../assets/js/data/palettes.js';
 import { hexOfRgb01 } from '../assets/js/utils/hex-color.js';
+import { copyPaths, sharedFile } from './shared-files.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const CATEGORY_DEFAULT_COLORS_PATH = path.join(ROOT, 'tests', 'fixtures', 'category-default-colors.json');
 const COUNT = 1024;
-
-const MIRRORS = [
-  { repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', file: 'tests/fixtures/category_default_colors.json' },
-  { repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', file: 'tests/testthat/fixtures/category_default_colors.json' },
-];
 
 /** The fixture's text. */
 export function categoryDefaultColorsText() {
@@ -61,13 +56,16 @@ async function main() {
   const unknown = process.argv.slice(2).filter(argument => argument !== '--check');
   if (unknown.length > 0) throw new Error(`Unknown argument ${unknown[0]}; the only one is --check`);
   const text = categoryDefaultColorsText();
-  const targets = [{ repository: 'cellucid', file: CATEGORY_DEFAULT_COLORS_PATH }];
-  for (const mirror of MIRRORS) {
-    const root = process.env[mirror.env] ?? path.join(ROOT, '..', mirror.repository);
-    targets.push({ repository: mirror.repository, file: path.join(root, mirror.file) });
-  }
+  const targets = [
+    { repository: 'cellucid', file: CATEGORY_DEFAULT_COLORS_PATH },
+    ...copyPaths(sharedFile('tests/fixtures/category-default-colors.json')).map(copy => ({ repository: copy.repository, env: copy.env, file: copy.path })),
+  ];
   let stale = 0;
   for (const target of targets) {
+    if (target.file === null) {
+      console.log(`skipped ${target.repository}: not found (set ${target.env})`);
+      continue;
+    }
     if (check) {
       const same = (await readOrNull(target.file)) === text;
       console.log(`${same ? 'current' : 'stale  '} ${target.repository}`);
@@ -77,9 +75,8 @@ async function main() {
     await writeFile(target.file, text);
     console.log(`wrote   ${target.repository}`);
   }
-  if (!check) console.log(`sha256  ${createHash('sha256').update(text).digest('hex')}`);
   if (stale > 0) {
-    console.log('Run node scripts/generate-category-default-colors.mjs and pin the printed digest in the three repositories.');
+    console.log('Run node scripts/generate-category-default-colors.mjs.');
     process.exitCode = 1;
   }
 }

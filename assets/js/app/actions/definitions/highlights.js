@@ -135,8 +135,8 @@ export const highlightActions = Object.freeze([
     title: 'Delete highlight pages',
     summary: 'Delete one or several highlight pages and their groups, as one step; at least one page stays.',
     group: GROUP,
-    // Version 2 deletes several pages at once (bug hunt L25-3: 56 calls to clear the pages an
-    // agent had made); a version-1 step named one page.
+    // Version 2 deletes several pages at once, so clearing the pages an agent made is one call,
+    // not one per page; a version-1 step named one page.
     version: 2,
     upgrade: { 1: ({ page }) => ({ pages: [page] }) },
     params: {
@@ -258,9 +258,8 @@ export const highlightActions = Object.freeze([
     group: GROUP,
     // Version 2 names several categories (`categories`) where version 1 named
     // one (`category`): one act, one step, one undo for a page of ten donors.
-    // Version 1 took a number or a boolean too (the legend sent a category's
-    // raw value, and a boolean or numeric field's was refused: L14-6); a label
-    // is the text the legend shows.
+    // A label is the text the legend shows: a version-1 step named a category by its raw
+    // value (a number or a boolean), which version 2 turns into that text.
     version: 2,
     upgrade: { 1: ({ category, ...rest }) => ({ ...rest, categories: [categoryLabel(category)] }) },
     params: {

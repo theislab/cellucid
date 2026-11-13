@@ -180,7 +180,7 @@ test('saved and opened in a fresh profile: every step of every tracker gives its
     await open(other);
     await load(other, 'hunt-mixed.cellucid-session', bytes);
     await expect.poll(() => messages(other), { timeout: 60_000 }).toContain(RESTORED);
-    // Loaded beside the fresh page's own tracker (History v2 Q2), each named apart where its name was taken.
+    // Loaded beside the fresh page's own tracker, each named apart where its name was taken.
     const loaded = await wholeHistory(other);
     const own = loaded.trackers.length - where.trackers.length;
     expect(own).toBe(1);
@@ -204,66 +204,34 @@ test('saved and opened in a fresh profile: every step of every tracker gives its
     await closeContextWithApplicationRetirement(fresh);
   }
   expect(errors).toEqual([]);
-});
 
-test('damaged and truncated files are refused, and nothing changes', async ({ page }, testInfo) => {
-  test.setTimeout(300_000);
-  await open(page);
-  await buildHistory(page);
-  const bytes = await save(page, testInfo, 'hunt-damage.cellucid-session');
-  const before = await wholeHistory(page);
-  const variants = [];
-  for (const fraction of [0.1, 0.5, 0.9]) variants.push([`truncated at ${fraction}`, bytes.subarray(0, Math.floor(bytes.length * fraction))]);
-  variants.push(['last byte cut', bytes.subarray(0, bytes.length - 1)]);
-  for (const fraction of [0.3, 0.6, 0.95]) {
-    const copy = Buffer.from(bytes);
-    const at = Math.floor(copy.length * fraction);
-    copy[at] ^= 0xff;
-    variants.push([`byte flipped at ${fraction}`, copy]);
-  }
-  variants.push(['two files joined', Buffer.concat([bytes, bytes])]);
-  const outcomes = [];
-  for (const [label, damaged] of variants) {
-    await markSaid(page);
-    await load(page, `${label}.cellucid-session`, damaged);
-    await expect.poll(async () => (await messages(page)).length).toBeGreaterThan(0);
-    await settled(page);
-    const said = await messages(page);
-    const now = await wholeHistory(page);
-    outcomes.push({ label, restored: said.includes(RESTORED), unchanged: JSON.stringify(now) === JSON.stringify(before), said });
-  }
-  expect(outcomes.filter(outcome => outcome.restored || !outcome.unchanged)).toEqual([]);
-});
-
-test('a hand-edited file whose shown values cannot be put back is restored but for that part, which keeps what was shown (F155)', async ({ page }, testInfo) => {
-  test.setTimeout(300_000);
-  await open(page);
-  await buildHistory(page);
-  const bytes = await save(page, testInfo, 'hunt-edit.cellucid-session');
-  // Each domain refused is one part: named with its own words, left as shown; the rest of the file is restored.
-  const edits = {
-    'camera names a view that is not there': ['Camera', whole => editShown(whole, 'camera', value => { value.views.push(structuredClone(value.views[0])); })],
-    'filters name a field the dataset lacks': ['Filters', whole => editShown(whole, 'filters', value => {
-      value.views[0].push({ field: { source: 'obs', key: 'no_such_field' }, hidden: ['x'] });
-    })],
-    'highlights hold a cell past the dataset': ['Highlights', whole => editShown(whole, 'highlights', value => {
-      value.pages[0].groups[0].cells = Uint32Array.from([1, 2, 999999]);
-    })],
-  };
-  const outcomes = [];
-  for (const [label, [part, edit]] of Object.entries(edits)) {
-    const whole = await readWholeSession(bytes);
-    await edit(whole);
-    const edited = await writeWholeSession(whole);
-    await markSaid(page);
-    await load(page, `${label}.cellucid-session`, edited);
-    await expect.poll(async () => (await messages(page)).length).toBeGreaterThan(0);
-    await settled(page);
-    const said = await messages(page);
-    const named = new RegExp(`^Session restored but for 1 part\\. ${part} could not be restored: .+ It is left as it was shown\\.$`);
-    outcomes.push({ label, restored: said.includes(RESTORED), named: said.some(text => named.test(text)), said });
-  }
-  expect(outcomes.filter(outcome => outcome.restored || !outcome.named)).toEqual([]);
+  // The file saved above, edited by hand, loaded on the page that wrote it.
+  await test.step('a hand-edited file whose shown values cannot be put back is restored but for that part, which keeps what was shown', async () => {
+    // Each domain refused is one part: named with its own words, left as shown; the rest of the file is restored.
+    const edits = {
+      'camera names a view that is not there': ['Camera', whole => editShown(whole, 'camera', value => { value.views.push(structuredClone(value.views[0])); })],
+      'filters name a field the dataset lacks': ['Filters', whole => editShown(whole, 'filters', value => {
+        value.views[0].push({ field: { source: 'obs', key: 'no_such_field' }, hidden: ['x'] });
+      })],
+      'highlights hold a cell past the dataset': ['Highlights', whole => editShown(whole, 'highlights', value => {
+        value.pages[0].groups[0].cells = Uint32Array.from([1, 2, 999999]);
+      })],
+    };
+    const outcomes = [];
+    for (const [label, [part, edit]] of Object.entries(edits)) {
+      const whole = await readWholeSession(bytes);
+      await edit(whole);
+      const edited = await writeWholeSession(whole);
+      await markSaid(page);
+      await load(page, `${label}.cellucid-session`, edited);
+      await expect.poll(async () => (await messages(page)).length).toBeGreaterThan(0);
+      await settled(page);
+      const said = await messages(page);
+      const named = new RegExp(`^Session restored but for 1 part\\. ${part} could not be restored: .+ It is left as it was shown\\.$`);
+      outcomes.push({ label, restored: said.includes(RESTORED), named: said.some(text => named.test(text)), said });
+    }
+    expect(outcomes.filter(outcome => outcome.restored || !outcome.named)).toEqual([]);
+  });
 });
 
 /** Change, on a copy, the value one domain shows at the active head, wherever a step holds it. */

@@ -48,6 +48,9 @@ import { isLeftOutResult } from './shared/analysis-result-session.js';
 import { failureDetails, sayFailure } from '../../utils/errors.js';
 import { isCancellation } from '../../utils/abort.js';
 import { GeneUnavailableError, describeUnavailableGene } from '../utils/gene-lookup.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
+
+/** @typedef {import('./ui/analysis-ui-manager.js').AnalysisUIManager} AnalysisUIManager */
 
 /**
  * Comparison Module class
@@ -91,7 +94,7 @@ export class ComparisonModule {
     }
     this._colorByGene = options.colorByGene;
 
-    // Initialize components - DataLayer now includes all enhanced features by default
+    // Initialize components - DataLayer includes all enhanced features by default
     this.dataLayer = createDataLayer(this.state);
 
     // Advanced analysis modules (lazy initialized)
@@ -270,11 +273,9 @@ export class ComparisonModule {
     this._lastKnownPageIds = pages.map(p => p.id);
     this._lastKnownSelectablePageIds = [...selectablePageIds];
 
-    // Set default active mode (simple/quick) without auto-opening the accordion item.
-    // Users can open the desired section explicitly.
-    this._analysisMode = 'simple';
-    this._uiManager.switchToMode('simple');
-
+    // No mode is made until it is first opened or used (`getPanelUI`), so the
+    // panel as it starts exports nothing opened (`exportSessionState`): the
+    // value the `analysis` state domain holds before this code arrived.
     this._subscribeToStateChanges();
   }
 
@@ -722,8 +723,7 @@ export class ComparisonModule {
   /**
    * A field was created, renamed, deleted or had its categories edited: every
    * analysis offers the fields there are now, with their categories read
-   * again, in the panel and in every window (an agent's new field was "no
-   * choice" of Differential expression until another change, L25-6).
+   * again, in the panel and in every window.
    */
   onFieldsChanged() {
     this._uiManager.onFieldsChanged();
@@ -1123,12 +1123,7 @@ export class ComparisonModule {
     // Publish the reset owner before touching any child or DOM surface.
     // closeAll(), reset(), and even a classList implementation can reenter
     // destroy(); that destruction must capture and drain this exact task.
-    let resolveOwnedReset;
-    let rejectOwnedReset;
-    const task = new Promise((resolve, reject) => {
-      resolveOwnedReset = resolve;
-      rejectOwnedReset = reject;
-    });
+    const { promise: task, resolve: resolveOwnedReset, reject: rejectOwnedReset } = promiseWithResolvers();
     this._datasetResetPromise = task;
     const releaseTask = () => {
       if (this._datasetResetPromise === task) {

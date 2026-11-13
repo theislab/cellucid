@@ -408,7 +408,7 @@ test('each control makes exactly one step with exact parameters, dispatched or r
     assert.equal(dom.clearBtn.disabled, false, 'Clear all is on with keyframes to clear');
     const clearEvents = await dispatchedDuring(() => dom.clearBtn.listeners('click')[0]());
     assert.deepEqual(clearEvents, [{ type: 'camera-path.clear', params: {} }]);
-    // R9E-9: with nothing to clear, Clear all is dimmed (a click did nothing).
+    // With nothing to clear, Clear all is dimmed.
     assert.equal(dom.clearBtn.disabled, true, 'Clear all is off with no keyframe');
 
     // A restore (a session load, the history putting a path back) is not a step.
@@ -505,7 +505,7 @@ test('camera-path.play plays the path to its end as one step, camera-path.stop e
 
       // A stop sent while the play still waits for the path's end runs at
       // once, beside it (a stepless control, never queued behind it on the
-      // camera; F96): the play answers ended "stopped", its one step holding
+      // camera): the play answers ended "stopped", its one step holding
       // the camera where the path stopped.
       await dispatch('camera-path.playback.set', { loop: false });
       const interrupted = dispatch('camera-path.play', {});
@@ -532,7 +532,7 @@ test('camera-path.play plays the path to its end as one step, camera-path.stop e
   }
 });
 
-test('the person\'s Stop of an agent\'s turn stops a playing path where the film is: the step keeps that camera, nothing is put back (F104)', async () => {
+test('the person\'s Stop of an agent\'s turn stops a playing path where the film is: the step keeps that camera, nothing is put back', async () => {
   const originalNow = performance.now;
   let clock = 1000;
   performance.now = () => clock;
@@ -577,7 +577,7 @@ test('the person\'s Stop of an agent\'s turn stops a playing path where the film
   }
 });
 
-test('a looping path an agent started belongs to its turn: the turn\'s Stop stops it where it is (R9R-8)', async () => {
+test('a looping path an agent started belongs to its turn: the turn\'s Stop stops it where it is', async () => {
   const originalNow = performance.now;
   let clock = 1000;
   performance.now = () => clock;
@@ -624,7 +624,7 @@ test('an optional parameter sent as null, "null" or {} is refused with how to fi
       return error.message;
     }
   };
-  // Seen live (2026-11-11): Haiku 5.5 sent camera "null", Opus 5.5 sent camera {}.
+  // Agents send camera "null" and camera {} for "no camera".
   assert.equal(
     problem('camera-path.keyframe.add', { camera: 'null' }),
     'camera-path.keyframe.add.camera must be object, not "null"; camera is optional: leave it out (send no value at all, not null, "null" or {}) for the selected view\'s camera now'
@@ -657,7 +657,7 @@ test('a keyframe composed by hand keeps the pose its mode drives; its free-fly p
     const guessed = {
       navigationMode: 'orbit',
       orbit: { radius: 2, targetRadius: 2, theta: 0.5, phi: 1.2, target: [0.1, -0.2, 0.3] },
-      // What agents sent live (2026-11-11): a guessed eye, yaw and pitch 0.
+      // A guessed eye, yaw and pitch 0, as an agent sends them.
       freefly: { position: [1, 1, 1], yaw: 0, pitch: 0 },
     };
     await dispatch('camera-path.keyframe.add', { camera: guessed, label: 'Hand-made' });
@@ -674,7 +674,7 @@ test('a keyframe composed by hand keeps the pose its mode drives; its free-fly p
   });
 });
 
-test('a field given as {source, key} where its name is asked for is shown as sent, with the name to give (L25-15)', () => {
+test('a field given as {source, key} where its name is asked for is shown as sent, with the name to give', () => {
   const catalog = getActions().catalog;
   const problem = (type, params) => {
     try {
@@ -684,7 +684,7 @@ test('a field given as {source, key} where its name is asked for is shown as sen
       return error.message;
     }
   };
-  // Seen live (2026-11-11, Haiku 5.5): "…field must be string, not [object Object]; field is optional: leave it out".
+  // The refusal names the form given and the name to give, not "[object Object]".
   assert.equal(
     problem('analysis.differential.set', { options: { field: { source: 'obs', key: 'cell_type' } } }),
     'analysis.differential.set.options.field must be string, not the object {"source":"obs","key":"cell_type"}: give the name itself, "cell_type"',

@@ -1,7 +1,7 @@
 /**
  * h5Seurat (SeuratDisk's own HDF5 layout of a Seurat object): recognized and
- * refused with what to do (design decision D11: SeuratDisk is unmaintained
- * since 2023, and an `.rds` of the same object opens directly).
+ * refused with what to do (SeuratDisk is unmaintained since 2023, and an
+ * `.rds` of the same object opens directly).
  *
  * An h5Seurat root holds `assays`, `cell.names`, `meta.data` and
  * `reductions` groups, with `active.assay`, `project` and `version`

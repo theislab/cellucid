@@ -19,7 +19,8 @@ import { armSelection } from './helpers/selection-gesture.mjs';
 
 // Every test here draws a multiview grid frame by frame, some at pixel ratio
 // 2 (four times the pixels). The macOS Firefox runners render in software,
-// where these take 70-95 s against the 90 s default, so the file carries its
+// where these can outlast the 90 s default (measured:
+// 38_decisions_testing_and_hosted_runners.md), so the file carries its
 // own budget, as the other frame-driven WebGL specs do.
 test.describe.configure({ timeout: 240_000 });
 
@@ -73,6 +74,19 @@ async function openGrid(page, viewCount) {
   // recorder was installed: an idle viewer draws nothing more. Re-applying the
   // same layout is a public mutation that changes nothing on screen but draws
   // a frame, so every pane's scissor is recorded.
+  await page.evaluate(() => {
+    window._cellucidViewer.setViewLayout('grid', 'live');
+  });
+  await waitForFrames(page, 3);
+}
+
+/** Keep views until the grid open on the page has `viewCount`, and draw it once so every pane's scissor is recorded. */
+async function growGrid(page, viewCount) {
+  for (let count = (await page.locator('.split-badge').count()) + 1; count <= viewCount; count++) {
+    await page.locator('#split-keep-view-btn').click();
+    await expect(page.locator('.split-badge')).toHaveCount(count);
+  }
+  await expect(page.locator('.view-title-chip')).toHaveCount(viewCount);
   await page.evaluate(() => {
     window._cellucidViewer.setViewLayout('grid', 'live');
   });
@@ -232,19 +246,19 @@ async function toggleSidebar(page, hidden) {
  * to each point, and one frame drawn there before it is sampled, then taken
  * to its end and sampled settled.
  *
- * Sampling the frames the browser happened to draw saw nothing of the slide
- * wherever a frame outlasted it: the slide is 300 ms, and on a slow hosted
- * runner it had already ended by the first frame after the click, so the only
- * samples were that frame and the settled one. A
+ * Sampling the frames the browser happens to draw sees nothing of the slide
+ * wherever a frame outlasts it: the slide is 300 ms, and on a slow hosted
+ * runner it has already ended by the first frame after the click, so the only
+ * samples would be that frame and the settled one. A
  * paused slide keeps the sidebar's transition running, which is all the
  * product watches while it slides (`sidebar-controls.js`), so a stepped
  * point is a real frame of the slide on any runner.
  *
- * Finding the slide to pause it had the same flaw one step earlier: where
- * two frames were more than its 300 ms apart it had started and ended
- * between two looks, and the sampler waited for a slide that was over
- * ("the sidebar toggle started no slide", Linux WebKit, push run of
- * 2026-11-05). The slide sampled is therefore one that does not end by
+ * Finding the slide to pause it has the same flaw one step earlier: where
+ * two frames are more than its 300 ms apart it starts and ends
+ * between two looks, and the sampler waits for a slide that is over
+ * ("the sidebar toggle started no slide", Linux WebKit). The slide sampled is
+ * therefore one that does not end by
  * itself: its duration is set far past any wait, it is stepped by share of
  * its run as before, and finished by the sampler.
  */
@@ -289,119 +303,136 @@ function expectSlideSampled(samples, label) {
   expect(edges.size, `${label}: ${[...edges]}`).toBeGreaterThan(2);
 }
 
-for (const viewCount of [2, 4]) {
-  test(`${viewCount}-view grid cells stay equal and uncovered through every sidebar and window change`, async ({
-    page,
-  }) => {
-    const productErrors = observeProductErrors(page);
-    await page.setViewportSize({ width: 1440, height: 900 });
-    await openGrid(page, viewCount);
+test('grid cells stay equal and uncovered through every sidebar and window change, with two views and with four', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openGrid(page, 2);
 
-    const open = await waitForSettledLayout(page);
-    expect(open.sidebarHidden).toBe(false);
-    expect(open.coveredRight).toBeGreaterThan(open.canvas.left + 200);
-    expectEqualUncoveredCells(open, 'sidebar open');
-    expectGridFillsUncoveredWidth(open, 'sidebar open');
+  for (const viewCount of [2, 4]) {
+    await test.step(`${viewCount}-view grid cells stay equal and uncovered through every sidebar and window change`, async () => {
+      await growGrid(page, viewCount);
+      const open = await waitForSettledLayout(page);
+      expect(open.sidebarHidden).toBe(false);
+      expect(open.coveredRight).toBeGreaterThan(open.canvas.left + 200);
+      expectEqualUncoveredCells(open, 'sidebar open');
+      expectGridFillsUncoveredWidth(open, 'sidebar open');
 
-    // Live resize drag: every intermediate width re-lays the grid out.
-    const handle = page.locator('#sidebar-resize-handle');
-    const box = await handle.boundingBox();
-    expect(box).not.toBeNull();
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(box.x + box.width / 2 + 70, box.y + 40, { steps: 4 });
-    const midDrag = await waitForSettledLayout(page);
-    expect(midDrag.coveredRight).toBeGreaterThan(open.coveredRight + 50);
-    expectEqualUncoveredCells(midDrag, 'mid resize drag');
-    expectGridFillsUncoveredWidth(midDrag, 'mid resize drag');
-    await page.mouse.move(box.x + box.width / 2 + 140, box.y + 40, { steps: 4 });
-    await page.mouse.up();
-    const dragged = await waitForSettledLayout(page);
-    expect(dragged.coveredRight).toBeGreaterThan(midDrag.coveredRight + 50);
-    expectEqualUncoveredCells(dragged, 'after resize drag');
-    expectGridFillsUncoveredWidth(dragged, 'after resize drag');
+      // Live resize drag: every intermediate width re-lays the grid out.
+      const handle = page.locator('#sidebar-resize-handle');
+      const box = await handle.boundingBox();
+      expect(box).not.toBeNull();
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width / 2 + 70, box.y + 40, { steps: 4 });
+      const midDrag = await waitForSettledLayout(page);
+      expect(midDrag.coveredRight).toBeGreaterThan(open.coveredRight + 50);
+      expectEqualUncoveredCells(midDrag, 'mid resize drag');
+      expectGridFillsUncoveredWidth(midDrag, 'mid resize drag');
+      await page.mouse.move(box.x + box.width / 2 + 140, box.y + 40, { steps: 4 });
+      await page.mouse.up();
+      const dragged = await waitForSettledLayout(page);
+      expect(dragged.coveredRight).toBeGreaterThan(midDrag.coveredRight + 50);
+      expectEqualUncoveredCells(dragged, 'after resize drag');
+      expectGridFillsUncoveredWidth(dragged, 'after resize drag');
 
-    // The close slide: equal, uncovered cells at every point of it.
-    const closing = await sampleToggleAnimation(page);
-    expectSlideSampled(closing, 'closing');
-    for (const [index, frame] of closing.entries()) {
-      expectEqualUncoveredCells(frame, `closing frame ${index}`, {
-        drawnMatchesLayout: false,
-      });
-    }
-    const closed = await waitForSettledLayout(page);
-    expect(closed.sidebarHidden).toBe(true);
-    expect(closed.coveredRight).toBe(closed.canvas.left);
-    expectEqualUncoveredCells(closed, 'sidebar closed');
-    expectGridFillsUncoveredWidth(closed, 'sidebar closed');
-    expect(closed.panes[0].drawn.left).toBeLessThanOrEqual(closed.canvas.left + 1);
+      // The close slide: equal, uncovered cells at every point of it.
+      const closing = await sampleToggleAnimation(page);
+      expectSlideSampled(closing, 'closing');
+      for (const [index, frame] of closing.entries()) {
+        expectEqualUncoveredCells(frame, `closing frame ${index}`, {
+          drawnMatchesLayout: false,
+        });
+      }
+      const closed = await waitForSettledLayout(page);
+      expect(closed.sidebarHidden).toBe(true);
+      expect(closed.coveredRight).toBe(closed.canvas.left);
+      expectEqualUncoveredCells(closed, 'sidebar closed');
+      expectGridFillsUncoveredWidth(closed, 'sidebar closed');
+      expect(closed.panes[0].drawn.left).toBeLessThanOrEqual(closed.canvas.left + 1);
 
-    // Window resize while closed, then the open slide.
-    await page.setViewportSize({ width: 1280, height: 720 });
-    const resizedClosed = await waitForSettledLayout(page);
-    expect(resizedClosed.canvas.right).toBe(1280);
-    expectEqualUncoveredCells(resizedClosed, 'window resized, closed');
-    expectGridFillsUncoveredWidth(resizedClosed, 'window resized, closed');
+      // Window resize while closed, then the open slide.
+      await page.setViewportSize({ width: 1280, height: 720 });
+      const resizedClosed = await waitForSettledLayout(page);
+      expect(resizedClosed.canvas.right).toBe(1280);
+      expectEqualUncoveredCells(resizedClosed, 'window resized, closed');
+      expectGridFillsUncoveredWidth(resizedClosed, 'window resized, closed');
 
-    const opening = await sampleToggleAnimation(page);
-    expectSlideSampled(opening, 'opening');
-    for (const [index, frame] of opening.entries()) {
-      expectEqualUncoveredCells(frame, `opening frame ${index}`, {
-        drawnMatchesLayout: false,
-      });
-    }
-    const reopened = await waitForSettledLayout(page);
-    expect(reopened.sidebarHidden).toBe(false);
-    expectEqualUncoveredCells(reopened, 'reopened');
-    expectGridFillsUncoveredWidth(reopened, 'reopened');
+      const opening = await sampleToggleAnimation(page);
+      expectSlideSampled(opening, 'opening');
+      for (const [index, frame] of opening.entries()) {
+        expectEqualUncoveredCells(frame, `opening frame ${index}`, {
+          drawnMatchesLayout: false,
+        });
+      }
+      const reopened = await waitForSettledLayout(page);
+      expect(reopened.sidebarHidden).toBe(false);
+      expectEqualUncoveredCells(reopened, 'reopened');
+      expectGridFillsUncoveredWidth(reopened, 'reopened');
 
-    await page.setViewportSize({ width: 1440, height: 900 });
-    const resizedOpen = await waitForSettledLayout(page);
-    expectEqualUncoveredCells(resizedOpen, 'window resized, open');
-    expectGridFillsUncoveredWidth(resizedOpen, 'window resized, open');
+      await page.setViewportSize({ width: 1440, height: 900 });
+      const resizedOpen = await waitForSettledLayout(page);
+      expectEqualUncoveredCells(resizedOpen, 'window resized, open');
+      expectGridFillsUncoveredWidth(resizedOpen, 'window resized, open');
 
-    // Title chips sit over their own cells.
-    for (const pane of resizedOpen.panes) {
-      expect(pane.chip).not.toBeNull();
-      expect(pane.chip.left).toBeGreaterThanOrEqual(pane.drawn.left - 1);
-      expect(pane.chip.right).toBeLessThanOrEqual(
-        pane.drawn.left + pane.drawn.width + 1,
+      // Title chips sit over their own cells.
+      for (const pane of resizedOpen.panes) {
+        expect(pane.chip).not.toBeNull();
+        expect(pane.chip.left).toBeGreaterThanOrEqual(pane.drawn.left - 1);
+        expect(pane.chip.right).toBeLessThanOrEqual(
+          pane.drawn.left + pane.drawn.width + 1,
+        );
+        expect(pane.chip.top).toBeGreaterThanOrEqual(pane.drawn.top - 1);
+        expect(pane.chip.bottom).toBeLessThanOrEqual(
+          pane.drawn.top + pane.drawn.height / 2,
+        );
+      }
+
+      const webglError = await page.evaluate(
+        () => window._cellucidViewer.getGLContext().getError(),
       );
-      expect(pane.chip.top).toBeGreaterThanOrEqual(pane.drawn.top - 1);
-      expect(pane.chip.bottom).toBeLessThanOrEqual(
-        pane.drawn.top + pane.drawn.height / 2,
-      );
-    }
+      expect(webglError).toBe(0);
 
-    const webglError = await page.evaluate(
-      () => window._cellucidViewer.getGLContext().getError(),
-    );
-    expect(webglError).toBe(0);
-    expect(productErrors).toEqual([]);
-  });
-}
+      // The sidebar is dragged back to the width it had, as the next pass finds it.
+      const widened = await handle.boundingBox();
+      await page.mouse.move(widened.x + widened.width / 2, widened.y + widened.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(widened.x + widened.width / 2 - 140, widened.y + 40, { steps: 4 });
+      await page.mouse.up();
+      const narrowed = await waitForSettledLayout(page);
+      expect(Math.abs(narrowed.coveredRight - open.coveredRight)).toBeLessThanOrEqual(1);
+    });
+  }
+  expect(productErrors).toEqual([]);
+});
 
 test.describe('at device pixel ratio 2', () => {
   test.use({ deviceScaleFactor: 2 });
 
-  for (const viewCount of [2, 4]) {
-    test(`${viewCount}-view grid cells are equal and uncovered in backing-store pixels`, async ({
-      page,
-    }) => {
-      const productErrors = observeProductErrors(page);
-      await page.setViewportSize({ width: 1280, height: 720 });
-      await openGrid(page, viewCount);
-      const open = await waitForSettledLayout(page);
-      expect(open.dpr).toBe(2);
-      expectEqualUncoveredCells(open, 'dpr 2 open');
-      expectGridFillsUncoveredWidth(open, 'dpr 2 open');
-      await toggleSidebar(page, true);
-      const closed = await waitForSettledLayout(page);
-      expectEqualUncoveredCells(closed, 'dpr 2 closed');
-      expectGridFillsUncoveredWidth(closed, 'dpr 2 closed');
-      expect(productErrors).toEqual([]);
-    });
-  }
+  test('grid cells are equal and uncovered in backing-store pixels, with two views and with four', async ({
+    page,
+  }) => {
+    const productErrors = observeProductErrors(page);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await openGrid(page, 2);
+    for (const viewCount of [2, 4]) {
+      await test.step(`${viewCount}-view grid cells are equal and uncovered in backing-store pixels`, async () => {
+        await growGrid(page, viewCount);
+        const open = await waitForSettledLayout(page);
+        expect(open.dpr).toBe(2);
+        expectEqualUncoveredCells(open, 'dpr 2 open');
+        expectGridFillsUncoveredWidth(open, 'dpr 2 open');
+        await toggleSidebar(page, true);
+        const closed = await waitForSettledLayout(page);
+        expectEqualUncoveredCells(closed, 'dpr 2 closed');
+        expectGridFillsUncoveredWidth(closed, 'dpr 2 closed');
+        // The sidebar is shown again, as the next pass finds it.
+        await toggleSidebar(page, false);
+      });
+    }
+    expect(productErrors).toEqual([]);
+  });
 });
 
 /**
@@ -471,20 +502,6 @@ test('a live device-pixel-ratio change re-lays the grid out', async ({ page }) =
   expect(productErrors).toEqual([]);
 });
 
-test('with the sidebar hidden the grid uses the full canvas', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openGrid(page, 2);
-  await toggleSidebar(page, true);
-  const closed = await waitForSettledLayout(page);
-  expect(closed.presentedLeft).toBe(closed.canvas.left);
-  expect(closed.panes[0].drawn.left).toBe(closed.canvas.left);
-  expect(closed.panes[1].drawn.left + closed.panes[1].drawn.width)
-    .toBeGreaterThan(closed.canvas.right - 2);
-  expectEqualUncoveredCells(closed, 'hidden');
-  expect(productErrors).toEqual([]);
-});
-
 /** Pane centres in client pixels, from the presented layout. */
 function paneCentres(page) {
   return page.evaluate(() => {
@@ -503,11 +520,78 @@ function paneCentres(page) {
   });
 }
 
-for (const viewCount of [2, 4]) {
-  test(`a click at each ${viewCount}-view cell centre focuses that cell`, async ({ page }) => {
+test.describe('on a touch screen', () => {
+  test.use({ viewport: { width: 1180, height: 820 }, hasTouch: true });
+
+  test('on a touch screen the selection bar is centred in the presented area of the grid, and a tap at each cell centre focuses that cell', async ({ page }) => {
     const productErrors = observeProductErrors(page);
-    await page.setViewportSize({ width: 1440, height: 900 });
-    await openGrid(page, viewCount);
+    await openGrid(page, 2);
+
+    await test.step('the selection bar is centred in the same presented area as the grid', async () => {
+      await expect(page.locator('#select-bar')).toBeVisible();
+      const placement = () => page.evaluate(() => {
+        const layout = window._cellucidViewer.getPresentedLayout();
+        const canvasRect = document.getElementById('glcanvas').getBoundingClientRect();
+        const bar = document.getElementById('select-bar').getBoundingClientRect();
+        const card = document.querySelector('.select-bar-card').getBoundingClientRect();
+        const left = canvasRect.left + layout.presentedArea.cssLeft;
+        const grid = layout.panes.map(pane => canvasRect.left + pane.cssLeft);
+        return {
+          barLeft: Math.abs(bar.left - left) < 1,
+          barRight: Math.abs(bar.right - (left + layout.presentedArea.cssWidth)) < 1,
+          cardCentred: Math.abs(
+            card.left + card.width / 2 - (left + layout.presentedArea.cssWidth / 2),
+          ) < 1,
+          gridStartsWithBar: Math.abs(Math.min(...grid) - bar.left) < 1,
+          sidebarHidden: document.getElementById('sidebar').classList.contains('hidden'),
+          ...(document.getElementById('sidebar').classList.contains('hidden')
+            ? { presentedLeft: layout.presentedArea.cssLeft }
+            : {}),
+        };
+      });
+      const aligned = {
+        barLeft: true,
+        barRight: true,
+        cardCentred: true,
+        gridStartsWithBar: true,
+      };
+      await expect.poll(placement).toEqual({ ...aligned, sidebarHidden: false });
+      await page.locator('#sidebar-toggle').tap();
+      await expect.poll(placement).toEqual({
+        ...aligned,
+        presentedLeft: 0,
+        sidebarHidden: true,
+      });
+      await page.locator('#sidebar-toggle').tap();
+      await expect.poll(placement).toEqual({ ...aligned, sidebarHidden: false });
+    });
+
+    await test.step('a tap at each 4-view cell centre focuses that cell', async () => {
+      await growGrid(page, 4);
+      const centres = await paneCentres(page);
+      const sidebarRight = await page.evaluate(
+        () => document.getElementById('sidebar').getBoundingClientRect().right,
+      );
+      expect(centres[0].rect.left).toBeGreaterThanOrEqual(sidebarRight - 1);
+      for (const centre of [...centres].reverse()) {
+        await page.touchscreen.tap(centre.x, centre.y);
+        await expect.poll(
+          () => page.evaluate(() => window._cellucidViewer.getViewLayout().activeId),
+        ).toBe(centre.viewId);
+      }
+      expect(productErrors).toEqual([]);
+    });
+  });
+});
+
+test('the left cell of a grid, beside the sidebar: clicks focus, the hidden sidebar is inert, picking, a lasso, proximity and KNN drags and a projectile stay in it', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openGrid(page, 2);
+
+  await test.step('a click at each 2-view cell centre focuses that cell', async () => {
     const centres = await paneCentres(page);
     for (const centre of [...centres].reverse()) {
       await page.mouse.click(centre.x, centre.y);
@@ -519,107 +603,228 @@ for (const viewCount of [2, 4]) {
         centre.viewId,
       );
     }
-    expect(productErrors).toEqual([]);
   });
-}
 
-test.describe('on a touch screen', () => {
-  test.use({ viewport: { width: 1180, height: 820 }, hasTouch: true });
+  await test.step('the hidden sidebar is inert: nothing in it takes focus or a Tab stop', async () => {
+    const sidebarFocusState = () => page.evaluate(() => {
+      const sidebar = document.getElementById('sidebar');
+      const control = document.getElementById('navigation-mode');
+      control.focus();
+      return {
+        inert: sidebar.inert,
+        controlFocusable: document.activeElement === control,
+      };
+    });
+    expect(await sidebarFocusState()).toEqual({ inert: false, controlFocusable: true });
 
-  test('a tap at each 4-view cell centre focuses that cell', async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await openGrid(page, 4);
-    const centres = await paneCentres(page);
-    const sidebarRight = await page.evaluate(
-      () => document.getElementById('sidebar').getBoundingClientRect().right,
+    await toggleSidebar(page, true);
+    expect(await sidebarFocusState()).toEqual({ inert: true, controlFocusable: false });
+    // Tabbing round the whole page never stops inside the hidden sidebar.
+    await page.locator('#sidebar-toggle').focus();
+    const stops = [];
+    for (let press = 0; press < 40; press++) {
+      await page.keyboard.press('Tab');
+      stops.push(await page.evaluate(() => (
+        document.getElementById('sidebar').contains(document.activeElement)
+      )));
+    }
+    expect(stops.every(inside => inside === false)).toBe(true);
+
+    await toggleSidebar(page, false);
+    expect(await sidebarFocusState()).toEqual({ inert: false, controlFocusable: true });
+  });
+
+  await test.step('picking in the left cell returns the cell drawn under the pointer', async () => {
+    const projected = await projectViewCells(page, 'live');
+    const target = isolatedCell(projected);
+    const record = await page.evaluate(
+      ({ x, y }) => window._cellucidViewer.pickCellRecordAtScreen(x, y),
+      target,
     );
-    expect(centres[0].rect.left).toBeGreaterThanOrEqual(sidebarRight - 1);
+    expect(record?.viewId).toBe('live');
+    expect(record?.cellIndex).toBe(target.cellIndex);
+    // Nothing under the sidebar can be picked.
+    const underSidebar = await page.evaluate(() => {
+      const sidebarRect = document.getElementById('sidebar').getBoundingClientRect();
+      return window._cellucidViewer.pickCellRecordAtScreen(
+        sidebarRect.right - 20,
+        sidebarRect.top + sidebarRect.height / 2,
+      );
+    });
+    expect(underSidebar).toBeNull();
+  });
+
+  await test.step('a lasso drawn in the left cell selects exactly the cells drawn inside it', async () => {
+    await colorByCellType(page);
+    const projected = await projectViewCells(page, 'live');
+    const { pane } = projected;
+    const rect = {
+      left: pane.left + 30,
+      right: pane.left + (pane.right - pane.left) * 0.6,
+      top: pane.top + 120,
+      bottom: pane.bottom - 120,
+    };
+    await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
+    await armSelection(page, 'lasso', () => altPath(page, [
+      { x: rect.left, y: rect.top },
+      { x: rect.right, y: rect.top },
+      { x: rect.right, y: rect.bottom },
+      { x: rect.left, y: rect.bottom },
+      { x: rect.left, y: rect.top },
+    ]));
+    const selected = new Set((await unifiedState(page)).candidates);
+    const margin = 3;
+    let inside = 0;
+    for (const cell of projected.cells) {
+      const clearlyInside = cell.x > rect.left + margin && cell.x < rect.right - margin
+        && cell.y > rect.top + margin && cell.y < rect.bottom - margin;
+      const clearlyOutside = cell.x < rect.left - margin || cell.x > rect.right + margin
+        || cell.y < rect.top - margin || cell.y > rect.bottom + margin;
+      if (clearlyInside) {
+        inside += 1;
+        expect(selected.has(cell.cellIndex), JSON.stringify(cell)).toBe(true);
+      }
+      if (clearlyOutside) {
+        expect(selected.has(cell.cellIndex), JSON.stringify(cell)).toBe(false);
+      }
+    }
+    expect(inside).toBeGreaterThan(5);
+    // The selection is cancelled: the next step arms its own.
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#lasso-step-controls')).toHaveCount(0);
+  });
+
+  await test.step('proximity and KNN drags in the left cell grow from the cell under the pointer', async () => {
+    await colorByCellType(page);
+    const projected = await projectViewCells(page, 'live');
+    const seed = isolatedCell(projected);
+
+    await page.locator('.highlight-mode-btn[data-mode="proximity"]').click();
+    await armSelection(page, 'proximity', () => altPath(page, [
+      seed,
+      { x: seed.x + 40, y: seed.y + 30 },
+    ]));
+    const proximity = await unifiedState(page);
+    expect(proximity.candidates).toContain(seed.cellIndex);
+    // A proximity sphere grown from a left-cell press stays a left-cell
+    // selection: no cell is chosen that the left pane draws far away.
+    const near = new Set(projected.cells
+      .filter(cell => Math.hypot(cell.x - seed.x, cell.y - seed.y) < 400)
+      .map(cell => cell.cellIndex));
+    for (const cellIndex of proximity.candidates) {
+      expect(near.has(cellIndex)).toBe(true);
+    }
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
+
+    // A chain graph (each cell's neighbors are the previous and next index),
+    // handed over as the k-NN tool's row source (rows read by cell, as the
+    // reader worker reads them from the file).
+    await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const count = viewer.getPointCount();
+      viewer.loadKnnEdges({
+        nCells: count,
+        async readRows(cells) {
+          const offsets = new Uint32Array(cells.length + 1);
+          const neighbors = [];
+          cells.forEach((cell, i) => {
+            if (cell > 0) neighbors.push(cell - 1);
+            if (cell + 1 < count) neighbors.push(cell + 1);
+            offsets[i + 1] = neighbors.length;
+          });
+          return { offsets, neighbors: Uint32Array.from(neighbors) };
+        },
+      });
+    });
+    await page.locator('.highlight-mode-btn[data-mode="knn"]').click();
+    await armSelection(page, 'knn', () => altPath(page, [
+      seed,
+      { x: seed.x, y: seed.y + 60 },
+    ]));
+    const knn = await unifiedState(page);
+    expect(knn.candidates).toContain(seed.cellIndex);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#knn-step-controls')).toHaveCount(0);
+  });
+
+  await test.step('a projectile launched in the left cell flies in that cell', async () => {
+    const openedNavigation = await page.locator('#navigation-mode').inputValue();
+    await page.locator('#navigation-mode').selectOption('free');
+    await expect(page.locator('#navigation-mode')).toHaveValue('free');
+    await page.locator('#projectiles-enabled').check();
+    await page.waitForFunction(
+      () => window._cellucidViewer.isProjectileSpatialIndexReady(),
+    );
+    const [left] = await paneCentres(page);
+    const aim = { x: left.rect.left + 120, y: left.y - 80 };
+    await page.mouse.move(aim.x, aim.y);
+    // Press and release in the same task that reads the shot. Read at launch,
+    // gravity has not yet bent it by however long a frame took. Released at
+    // once, the shot is uncharged: a held press charges it, and a charged shot
+    // leaves with more upward loft (`spawnProjectile`), so a hold whose length
+    // was the runner's latency (150 ms meant) puts the launch point 28 px above
+    // the aim, and a full charge puts it 38 px
+    // above.
+    const flight = await page.evaluate(async ({ x, y }) => {
+      const viewer = window._cellucidViewer;
+      const press = { bubbles: true, cancelable: true, button: 0, clientX: x, clientY: y };
+      document.getElementById('glcanvas').dispatchEvent(new MouseEvent('mousedown', {
+        ...press,
+        buttons: 1,
+      }));
+      window.dispatchEvent(new MouseEvent('mouseup', { ...press, buttons: 0 }));
+      const canvasRect = document.getElementById('glcanvas').getBoundingClientRect();
+      const project = () => {
+        const { renderState } = viewer.getPresentedViewState('live');
+        const { mvpMatrix: m, pane } = renderState;
+        return viewer.getProjectilePositions().map(([x, y, z]) => {
+          const cx = m[0] * x + m[4] * y + m[8] * z + m[12];
+          const cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+          const cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+          return {
+            x: canvasRect.left + pane.cssLeft + ((cx / cw + 1) / 2) * pane.cssWidth,
+            y: canvasRect.top + pane.cssTop + ((1 - cy / cw) / 2) * pane.cssHeight,
+            inFront: cw > 0,
+          };
+        });
+      };
+      const first = project();
+      await new Promise(resolve => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+      return { first, later: project() };
+    }, aim);
+    const [shot] = flight.first;
+    expect(shot.inFront).toBe(true);
+    // The shot leaves from the camera straight through the aim point...
+    expect(Math.abs(shot.x - aim.x)).toBeLessThan(25);
+    expect(Math.abs(shot.y - aim.y)).toBeLessThan(25);
+    // ...and keeps flying inside the left cell.
+    for (const point of [...flight.first, ...flight.later]) {
+      expect(point.x).toBeGreaterThan(left.rect.left);
+      expect(point.x).toBeLessThan(left.rect.right);
+    }
+    // Projectiles off and the navigation the page opened with: a click is a click again.
+    await page.locator('#projectiles-enabled').uncheck();
+    await page.locator('#navigation-mode').selectOption(openedNavigation);
+    await expect(page.locator('#navigation-mode')).toHaveValue(openedNavigation);
+  });
+
+  await test.step('a click at each 4-view cell centre focuses that cell', async () => {
+    await growGrid(page, 4);
+    const centres = await paneCentres(page);
     for (const centre of [...centres].reverse()) {
-      await page.touchscreen.tap(centre.x, centre.y);
+      await page.mouse.click(centre.x, centre.y);
       await expect.poll(
         () => page.evaluate(() => window._cellucidViewer.getViewLayout().activeId),
       ).toBe(centre.viewId);
+      await expect(page.locator('.view-title-chip.active')).toHaveAttribute(
+        'data-view-id',
+        centre.viewId,
+      );
     }
-    expect(productErrors).toEqual([]);
   });
-
-  test('the selection bar is centred in the same presented area as the grid', async ({
-    page,
-  }) => {
-    const productErrors = observeProductErrors(page);
-    await openGrid(page, 2);
-    await expect(page.locator('#select-bar')).toBeVisible();
-    const placement = () => page.evaluate(() => {
-      const layout = window._cellucidViewer.getPresentedLayout();
-      const canvasRect = document.getElementById('glcanvas').getBoundingClientRect();
-      const bar = document.getElementById('select-bar').getBoundingClientRect();
-      const card = document.querySelector('.select-bar-card').getBoundingClientRect();
-      const left = canvasRect.left + layout.presentedArea.cssLeft;
-      const grid = layout.panes.map(pane => canvasRect.left + pane.cssLeft);
-      return {
-        barLeft: Math.abs(bar.left - left) < 1,
-        barRight: Math.abs(bar.right - (left + layout.presentedArea.cssWidth)) < 1,
-        cardCentred: Math.abs(
-          card.left + card.width / 2 - (left + layout.presentedArea.cssWidth / 2),
-        ) < 1,
-        gridStartsWithBar: Math.abs(Math.min(...grid) - bar.left) < 1,
-        sidebarHidden: document.getElementById('sidebar').classList.contains('hidden'),
-        ...(document.getElementById('sidebar').classList.contains('hidden')
-          ? { presentedLeft: layout.presentedArea.cssLeft }
-          : {}),
-      };
-    });
-    const aligned = {
-      barLeft: true,
-      barRight: true,
-      cardCentred: true,
-      gridStartsWithBar: true,
-    };
-    await expect.poll(placement).toEqual({ ...aligned, sidebarHidden: false });
-    await page.locator('#sidebar-toggle').tap();
-    await expect.poll(placement).toEqual({
-      ...aligned,
-      presentedLeft: 0,
-      sidebarHidden: true,
-    });
-    await page.locator('#sidebar-toggle').tap();
-    await expect.poll(placement).toEqual({ ...aligned, sidebarHidden: false });
-    expect(productErrors).toEqual([]);
-  });
-});
-
-test('the hidden sidebar is inert: nothing in it takes focus or a Tab stop', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openGrid(page, 2);
-  const sidebarFocusState = () => page.evaluate(() => {
-    const sidebar = document.getElementById('sidebar');
-    const control = document.getElementById('navigation-mode');
-    control.focus();
-    return {
-      inert: sidebar.inert,
-      controlFocusable: document.activeElement === control,
-    };
-  });
-  expect(await sidebarFocusState()).toEqual({ inert: false, controlFocusable: true });
-
-  await toggleSidebar(page, true);
-  expect(await sidebarFocusState()).toEqual({ inert: true, controlFocusable: false });
-  // Tabbing round the whole page never stops inside the hidden sidebar.
-  await page.locator('#sidebar-toggle').focus();
-  const stops = [];
-  for (let press = 0; press < 40; press++) {
-    await page.keyboard.press('Tab');
-    stops.push(await page.evaluate(() => (
-      document.getElementById('sidebar').contains(document.activeElement)
-    )));
-  }
-  expect(stops.every(inside => inside === false)).toBe(true);
-
-  await toggleSidebar(page, false);
-  expect(await sidebarFocusState()).toEqual({ inert: false, controlFocusable: true });
   expect(productErrors).toEqual([]);
 });
 
@@ -670,30 +875,6 @@ function isolatedCell({ cells, pane }, gap = 12) {
   return isolated;
 }
 
-test('picking in the left cell returns the cell drawn under the pointer', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openGrid(page, 2);
-  const projected = await projectViewCells(page, 'live');
-  const target = isolatedCell(projected);
-  const record = await page.evaluate(
-    ({ x, y }) => window._cellucidViewer.pickCellRecordAtScreen(x, y),
-    target,
-  );
-  expect(record?.viewId).toBe('live');
-  expect(record?.cellIndex).toBe(target.cellIndex);
-  // Nothing under the sidebar can be picked.
-  const underSidebar = await page.evaluate(() => {
-    const sidebarRect = document.getElementById('sidebar').getBoundingClientRect();
-    return window._cellucidViewer.pickCellRecordAtScreen(
-      sidebarRect.right - 20,
-      sidebarRect.top + sidebarRect.height / 2,
-    );
-  });
-  expect(underSidebar).toBeNull();
-  expect(productErrors).toEqual([]);
-});
-
 async function colorByCellType(page) {
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
@@ -722,162 +903,3 @@ async function altPath(page, points) {
   await page.mouse.up();
   await page.keyboard.up('Alt');
 }
-
-test('a lasso drawn in the left cell selects exactly the cells drawn inside it', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openGrid(page, 2);
-  await colorByCellType(page);
-  const projected = await projectViewCells(page, 'live');
-  const { pane } = projected;
-  const rect = {
-    left: pane.left + 30,
-    right: pane.left + (pane.right - pane.left) * 0.6,
-    top: pane.top + 120,
-    bottom: pane.bottom - 120,
-  };
-  await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
-  await armSelection(page, 'lasso', () => altPath(page, [
-    { x: rect.left, y: rect.top },
-    { x: rect.right, y: rect.top },
-    { x: rect.right, y: rect.bottom },
-    { x: rect.left, y: rect.bottom },
-    { x: rect.left, y: rect.top },
-  ]));
-  const selected = new Set((await unifiedState(page)).candidates);
-  const margin = 3;
-  let inside = 0;
-  for (const cell of projected.cells) {
-    const clearlyInside = cell.x > rect.left + margin && cell.x < rect.right - margin
-      && cell.y > rect.top + margin && cell.y < rect.bottom - margin;
-    const clearlyOutside = cell.x < rect.left - margin || cell.x > rect.right + margin
-      || cell.y < rect.top - margin || cell.y > rect.bottom + margin;
-    if (clearlyInside) {
-      inside += 1;
-      expect(selected.has(cell.cellIndex), JSON.stringify(cell)).toBe(true);
-    }
-    if (clearlyOutside) {
-      expect(selected.has(cell.cellIndex), JSON.stringify(cell)).toBe(false);
-    }
-  }
-  expect(inside).toBeGreaterThan(5);
-  expect(productErrors).toEqual([]);
-});
-
-test('proximity and KNN drags in the left cell grow from the cell under the pointer', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openGrid(page, 2);
-  await colorByCellType(page);
-  const projected = await projectViewCells(page, 'live');
-  const seed = isolatedCell(projected);
-
-  await page.locator('.highlight-mode-btn[data-mode="proximity"]').click();
-  await armSelection(page, 'proximity', () => altPath(page, [
-    seed,
-    { x: seed.x + 40, y: seed.y + 30 },
-  ]));
-  const proximity = await unifiedState(page);
-  expect(proximity.candidates).toContain(seed.cellIndex);
-  // A proximity sphere grown from a left-cell press stays a left-cell
-  // selection: no cell is chosen that the left pane draws far away.
-  const near = new Set(projected.cells
-    .filter(cell => Math.hypot(cell.x - seed.x, cell.y - seed.y) < 400)
-    .map(cell => cell.cellIndex));
-  for (const cellIndex of proximity.candidates) {
-    expect(near.has(cellIndex)).toBe(true);
-  }
-  await page.keyboard.press('Escape');
-  await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
-
-  // A chain graph (each cell's neighbors are the previous and next index),
-  // handed over as the k-NN tool's row source (rows read by cell, as the
-  // reader worker reads them from the file).
-  await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const count = viewer.getPointCount();
-    viewer.loadKnnEdges({
-      nCells: count,
-      async readRows(cells) {
-        const offsets = new Uint32Array(cells.length + 1);
-        const neighbors = [];
-        cells.forEach((cell, i) => {
-          if (cell > 0) neighbors.push(cell - 1);
-          if (cell + 1 < count) neighbors.push(cell + 1);
-          offsets[i + 1] = neighbors.length;
-        });
-        return { offsets, neighbors: Uint32Array.from(neighbors) };
-      },
-    });
-  });
-  await page.locator('.highlight-mode-btn[data-mode="knn"]').click();
-  await armSelection(page, 'knn', () => altPath(page, [
-    seed,
-    { x: seed.x, y: seed.y + 60 },
-  ]));
-  const knn = await unifiedState(page);
-  expect(knn.candidates).toContain(seed.cellIndex);
-  expect(productErrors).toEqual([]);
-});
-
-test('a projectile launched in the left cell flies in that cell', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openGrid(page, 2);
-  await page.locator('#navigation-mode').selectOption('free');
-  await expect(page.locator('#navigation-mode')).toHaveValue('free');
-  await page.locator('#projectiles-enabled').check();
-  await page.waitForFunction(
-    () => window._cellucidViewer.isProjectileSpatialIndexReady(),
-  );
-  const [left] = await paneCentres(page);
-  const aim = { x: left.rect.left + 120, y: left.y - 80 };
-  await page.mouse.move(aim.x, aim.y);
-  // Press and release in the same task that reads the shot. Read at launch,
-  // gravity has not yet bent it by however long a frame took. Released at
-  // once, the shot is uncharged: a held press charges it, and a charged shot
-  // leaves with more upward loft (`spawnProjectile`), so a hold whose length
-  // was the runner's latency (150 ms meant, over 330 ms on a Windows runner)
-  // put the launch point 28 px above the aim, and a full charge puts it 38 px
-  // above.
-  const flight = await page.evaluate(async ({ x, y }) => {
-    const viewer = window._cellucidViewer;
-    const press = { bubbles: true, cancelable: true, button: 0, clientX: x, clientY: y };
-    document.getElementById('glcanvas').dispatchEvent(new MouseEvent('mousedown', {
-      ...press,
-      buttons: 1,
-    }));
-    window.dispatchEvent(new MouseEvent('mouseup', { ...press, buttons: 0 }));
-    const canvasRect = document.getElementById('glcanvas').getBoundingClientRect();
-    const project = () => {
-      const { renderState } = viewer.getPresentedViewState('live');
-      const { mvpMatrix: m, pane } = renderState;
-      return viewer.getProjectilePositions().map(([x, y, z]) => {
-        const cx = m[0] * x + m[4] * y + m[8] * z + m[12];
-        const cy = m[1] * x + m[5] * y + m[9] * z + m[13];
-        const cw = m[3] * x + m[7] * y + m[11] * z + m[15];
-        return {
-          x: canvasRect.left + pane.cssLeft + ((cx / cw + 1) / 2) * pane.cssWidth,
-          y: canvasRect.top + pane.cssTop + ((1 - cy / cw) / 2) * pane.cssHeight,
-          inFront: cw > 0,
-        };
-      });
-    };
-    const first = project();
-    await new Promise(resolve => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    });
-    return { first, later: project() };
-  }, aim);
-  const [shot] = flight.first;
-  expect(shot.inFront).toBe(true);
-  // The shot leaves from the camera straight through the aim point...
-  expect(Math.abs(shot.x - aim.x)).toBeLessThan(25);
-  expect(Math.abs(shot.y - aim.y)).toBeLessThan(25);
-  // ...and keeps flying inside the left cell.
-  for (const point of [...flight.first, ...flight.later]) {
-    expect(point.x).toBeGreaterThan(left.rect.left);
-    expect(point.x).toBeLessThan(left.rect.right);
-  }
-  expect(productErrors).toEqual([]);
-});

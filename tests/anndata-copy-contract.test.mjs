@@ -632,7 +632,7 @@ test('changes are written where they belong: obs columns by original position, u
       cellucid: {
         history_applied: '[{"tracker":"t"}]',
         gene_sets: { first: { genes: ['a', 'b'], description: '', origin: 'session' } },
-        // Descriptive text is written trimmed (R9U-9).
+        // Descriptive text is written trimmed.
         description: 'Typed by hand. ',
       },
     },
@@ -682,7 +682,7 @@ test('an obs column renamed in place keeps its place and values; its old name is
   await root.load();
   // What the plan reads of a store: its columns, the asked ones whole, as a copy writes columns.
   const before = await readCopyTarget(root, ['cluster', 'label', 'score', 'flag', 'absent'], {}, { colors: ['cluster', 'label', 'absent'] });
-  // Its uns keys, and the colors asked for: text as stored, null for another form or none (F139).
+  // Its uns keys, and the colors asked for: text as stored, null for another form or none.
   assert.deepEqual(before.unsKeys.sort(), ['cluster_colors', 'label_colors']);
   assert.deepEqual(before.colors, { cluster: ['#111111', '#222222', '#333333'], label: null, absent: null });
   assert.deepEqual(before.obsColumns, ['cluster', 'label', 'score', 'flag']);
@@ -776,7 +776,7 @@ test('a change a copy cannot make as asked is refused, in one sentence, before a
   // What a copy changes.
   await refused({ colour: [] }, /'colour' is not a change/);
   await refused({ obs: {} }, /changes are a list of columns/);
-  // Names that become paths (specification §1), and none in another case or Unicode form.
+  // Names that become paths (the specification's naming rules), and none in another case or Unicode form.
   for (const name of ['a/b', 'a\\b', 'a:b', 'tab\there', '.zattrs', 'zarr.json', '..', 'trailing ', 'trailing.', 'CON', 'lpt1.txt', '']) {
     await refused({ obs: [{ name, column: numbers() }] }, /The obs column|names must be non-empty/);
   }

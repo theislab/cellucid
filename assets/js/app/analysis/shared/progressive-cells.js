@@ -42,9 +42,9 @@ const STORAGE_KEY = 'cellucid:analysis-cost:v3';
  * (`units`): a cost is known only for the genes it was measured with. Per gene
  * the time of a run falls the more genes it reads (a run's start, its workers
  * and its first reads are paid once), so the time a run of 6 genes took says
- * nothing of a run of 3,691: scaled per gene it once told an agent's
- * permission card that a 1-second marker run would take 88 hours (live-7
- * L25-1). A kind is named with its source (`analysisCostKind`): a local file
+ * nothing of a run of 3,691: scaled per gene, it would claim hours for a
+ * marker run that takes a second (measured: 37_decisions_analysis.md). A
+ * kind is named with its source (`analysisCostKind`): a local file
  * and a link cost differently. Kept in memory and, as a convenience across
  * visits, in this browser's storage (never required).
  */

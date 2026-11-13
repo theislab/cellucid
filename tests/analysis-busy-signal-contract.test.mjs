@@ -1,10 +1,9 @@
 /**
  * Asynchronous analysis content publishes one counted `aria-busy` signal.
  *
- * Quick Insights was the first region to say when it was still changing; the
- * expanded view, the Detailed preview and the Correlation and Gene Signature
- * runs grew after they appeared with no signal at all. The signal now
- * lives once in BaseAnalysisUI and every asynchronous region uses it.
+ * The signal lives once in BaseAnalysisUI and every asynchronous region
+ * (Quick Insights, the expanded view, the Detailed preview, the Correlation
+ * and Gene Signature runs) uses it to say when it is still changing.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -68,7 +67,6 @@ test('busy claims are counted so a late release cannot clear a newer owner', () 
 test('Quick Insights uses the shared busy signal instead of its own', () => {
   assert.equal(Object.hasOwn(QuickInsights.prototype, '_setBusy'), false);
   assert.equal(QuickInsights.prototype._setBusy, BaseAnalysisUI.prototype._setBusy);
-  assert.equal(Object.hasOwn(BaseAnalysisUI.prototype, '_showLoading'), false);
 });
 
 test('the expanded view body is busy for its whole render', async () => {
@@ -120,7 +118,7 @@ for (const [label, UIClass] of [
     ui._startAnalysisJob = () => ({ cancel() {}, succeed() {}, step() {}, subscribe: () => () => {}, running: true });
     const computation = deferred();
     ui._runAnalysisImpl = () => computation.promise;
-    const running = ui._runAnalysis();
+    const running = ui._runForm();
     await nextTurn();
     assert.equal(container.busy, 'true');
     computation.resolve(null);

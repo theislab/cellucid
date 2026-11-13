@@ -6,8 +6,8 @@
  * parameters that only name a file), and what a link *is* (its identity)
  * holds no credential either.
  *
- * Covered here: the two forms and the identity over every credential scheme
- * the privacy audit listed; every provider whose values can carry a key
+ * Covered here: the two forms and the identity over every credential scheme;
+ * every provider whose values can carry a key
  * (web addresses, Dropbox, Google Drive); and the sinks: the connection's
  * locator (sessions, the connection list), the page address, Share links,
  * badges and the subsample link, the debug snapshot's address, the opening
@@ -25,7 +25,8 @@ import { DataSourceError } from '../assets/js/data/data-source.js';
 import { LinkDataSource } from '../assets/js/data/link-source.js';
 import { OpeningProgress, openingCancelledError } from '../assets/js/data/opening-progress.js';
 import { TransferLog } from '../assets/js/data/transfer-log.js';
-import { linkIdentity, linkLeavesOutParts, publicLink, textWithPublicLinks } from '../assets/js/data/sources/link-credentials.js';
+import { linkIdentity, publicLink } from '../assets/js/data/sources/link-credentials.js';
+import { linkLeavesOutParts, textWithPublicLinks } from '../assets/js/data/sources/link-text.js';
 import { getProviderRegistry, publicPageAddress } from '../assets/js/data/sources/registry.js';
 import { BYTE_SOURCE_FAILURES, ByteSourceError } from '../assets/js/formats/io/byte-source.js';
 import { serveFixtureHost } from './helpers/fixture-web-host.mjs';
@@ -33,7 +34,7 @@ import { serveFixtureHost } from './helpers/fixture-web-host.mjs';
 const FIXTURES = new URL('./fixtures/cellucid-ready/', import.meta.url);
 const WEB = 'https://data.example.org/anndata/';
 
-/** One link per credential scheme the audit found surviving a deny-list. */
+/** One link per credential scheme a deny-list would let through. */
 const SIGNED = Object.freeze({
   'AWS SigV4': 'X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIASECRET&X-Amz-Signature=SECRET&X-Amz-Expires=60',
   'AWS SigV2': 'AWSAccessKeyId=AKIASECRET&Signature=SECRET&Expires=1700000000',

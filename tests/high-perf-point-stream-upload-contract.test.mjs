@@ -9,7 +9,7 @@
  * through the order's permutation texture (`GpuPermuter`; a CPU stand-in
  * writes the same bytes here), in one pass a store and with no CPU staging;
  * the bytes must be identical to a whole-buffer gather at counts around the
- * old 65,536-point chunk edge too.
+ * 65,536-point chunk edge too.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

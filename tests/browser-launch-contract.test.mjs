@@ -2,10 +2,9 @@
  * Every measuring script launches its browser one way
  * (`scripts/lib/browser-launch.mjs`): on the machine's GPU, recording the
  * renderer it drew with and refusing a software rasterizer unless the run
- * asked for one (`--software-gl`). `app-run.mjs` and `scale-browser.mjs`
- * once launched Chromium on SwiftShader, and the app timings taken with them
- * measured the CPU rasterizer (frames of millions of points, and the main
- * thread held by synchronous GL calls), not the app.
+ * asked for one (`--software-gl`). A launch on SwiftShader would make the app
+ * timings measure the CPU rasterizer (frames of millions of points, and the
+ * main thread held by synchronous GL calls), not the app.
  */
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync, statSync } from 'node:fs';

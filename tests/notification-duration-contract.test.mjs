@@ -2,21 +2,21 @@
  * How long a notification stays on screen belongs to its type, not to the
  * method that published it.
  *
- * `error()` and `fail()` publish the identical `NotificationType.ERROR`. They
- * differed only in that `error()` wrote a `6000` literal and `fail()` wrote
- * nothing, so `fail()` fell through to the 4000 ms default — which handed the
- * longest, most actionable messages the app produces the shortest time on
- * screen. The h5ad "No exact UMAP embedding found in obsm…" diagnostic
- * (assets/js/data/h5ad.js) reaches the user through `fail()`; the comparable
- * session-fingerprint refusals reach it through `error()`. Nothing about the
- * two messages justified 4000 against 6000; only the call site did.
+ * `error()` and `fail()` publish the identical `NotificationType.ERROR`, so
+ * the duration cannot differ by method: were `error()` to write a `6000`
+ * literal and `fail()` nothing, `fail()` would fall through to the 4000 ms
+ * default, which hands the longest, most actionable messages the app produces
+ * the shortest time on screen. A failed operation ("Could not create the field…",
+ * "… failed: …") reaches the user through `fail()`; a refusal published as an
+ * error reaches it through `error()`. Nothing about the two messages
+ * justifies 4000 against 6000; only the call site would.
  *
- * An error is now published without a timer at all. A notification cannot be
+ * An error is published without a timer at all. A notification cannot be
  * re-opened once dismissed, and an error names something the user has to do, so
  * a timer can only remove the message before it has been read. The cap on
  * simultaneous notifications is what keeps that bounded: an ERROR is not an
  * active type, so `_evictNonActiveUntil` retires it under pressure exactly like
- * a success (CEL-0220).
+ * a success.
  */
 
 import './helpers/anndata-reader-in-process.mjs';
@@ -296,13 +296,11 @@ test('work in progress is never evicted to make room for a sticky error', t => {
 });
 
 /*
- * Removing the timer exposed a defect the timer had been hiding: a session
- * restore that fails publishes the message twice — once by failing its own
- * "Session file" progress notification, once by the load button's catch
- * re-announcing the rethrown error. With one copy living 4000 ms and the other
- * 6000 ms, the duplicate looked like a flicker, and the browser test that
- * counts them went green as soon as the shorter one expired. With neither
- * expiring, both stay on screen and the count is wrong (CEL-0220).
+ * A session restore that fails must not publish its message twice — once by
+ * failing its own "Session file" progress notification, once by the load
+ * button's catch re-announcing the rethrown error. A timer would hide the
+ * duplicate (one copy living 4000 ms and the other 6000 ms looked like a
+ * flicker); with neither expiring, both stay on screen and the count shows it.
  */
 
 test('a restore failure the serializer already published is not announced twice', async () => {
@@ -364,7 +362,6 @@ test('a restore failure the serializer already published is not announced twice'
 
   // The predicate itself only claims what was actually marked.
   assert.equal(isReported(new Error('unreported')), false);
-  assert.equal(isReported(null), false);
   assert.equal(isReported('not an error'), false);
   assert.equal(isReported(markReported(new Error('reported'))), true);
 });

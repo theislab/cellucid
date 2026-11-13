@@ -16,7 +16,7 @@
  * The refusal is owned by `readBoundedBody()` and `allocatePayloadBytes()`, so
  * that is where the cause is named. Everything downstream — `fetchJson()`, the
  * remote transport, the failure sentence — reads the published code rather than
- * re-deriving it (CEL-0219).
+ * re-deriving it.
  */
 
 import './helpers/anndata-reader-in-process.mjs';

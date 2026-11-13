@@ -1,8 +1,8 @@
 /**
  * A Cell Ranger `outs/` folder: its count matrix (`filtered_feature_bc_matrix.h5`)
  * read in place through the 10x view (`tenx-h5.js`), with Cell Ranger's own
- * analysis beside it as embeddings and clusterings (design decision D4: the
- * matrix alone has no embedding).
+ * analysis beside it as embeddings and clusterings (the matrix alone has no
+ * embedding).
  *
  * | Path (any depth below the folder) | Header | Becomes |
  * | --- | --- | --- |
@@ -55,7 +55,7 @@ const CLUSTERS = /(?:^|\/)analysis\/clustering\/([^/]+)\/clusters\.csv$/;
  * @param {Map<string, File>} files - Every file by its path below the folder
  * @returns {{path: string, file: File, base: string}|null}
  */
-export function outsMatrixFile(files) {
+function outsMatrixFile(files) {
   for (const wanted of OUTS_MATRIX_FILES) {
     const found = [...files.keys()]
       .filter(path => path === wanted || path.endsWith(`/${wanted}`))
@@ -199,7 +199,7 @@ function barcodesOf(root) {
  *   `readerOf`: a byte reader of one file of the folder (picked or served)
  * @returns {Promise<Object>}
  */
-export async function tenxOutsView(root, { name, files, base, signal = null, activity = null, readerOf, fromLink = false }) {
+async function tenxOutsView(root, { name, files, base, signal = null, activity = null, readerOf, fromLink = false }) {
   await root.load(TENX_OPENING_PATHS, { signal, activity });
   const barcodes = Array.from(await barcodesOf(root).read(undefined, { signal }), String);
   const analysis = await readAnalysis(files, base, barcodes, readerOf, { signal, activity });

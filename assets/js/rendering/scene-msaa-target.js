@@ -49,10 +49,8 @@
  * Samples to ask for.
  *
  * Four is what browsers grant for a multisampled default drawing buffer, so
- * asking for four reproduces what `antialias: true` used to give rather than
- * quietly changing the image while claiming to preserve it. A device whose
- * maximum is lower gets its maximum, which is also what the attribute would
- * have done.
+ * asking for four gives the image the `antialias: true` attribute gives. A
+ * device whose maximum is lower gets its maximum, as the attribute would.
  */
 export const SCENE_MSAA_TARGET_SAMPLES = 4;
 

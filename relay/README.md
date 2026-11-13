@@ -163,7 +163,7 @@ Apps reads the tool's text and image content alone.
   done is not known, read the history before repeating a change. When the last tab of the
   pairing closed less than `TAB_RECONNECT_WAIT_MS` (20 s) ago, a call, a tool list or a status
   waits for a tab to be back and say which dataset it shows (`pairing.js` `targetSoon`): a
-  reloaded page reaches the relay again in about 2 s (measured), so the agent's next call runs
+  reloaded page reaches the relay again within a few seconds (measured: `34_decisions_agents.md`), so the agent's next call runs
   in it instead of being told no tab is there.
 - **What passes through.** Tool calls and results exist only in memory while in flight;
   nothing of them is stored or logged (errors log a name and a message only). Stored: per

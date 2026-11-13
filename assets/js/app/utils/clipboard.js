@@ -1,8 +1,7 @@
 /**
  * @fileoverview Copying text for the person: the one way the page writes the
  * clipboard, and it always says how it went — copied, or why not and what to
- * do (round 9: five callers wrote the clipboard themselves, one swallowed a
- * refusal in silence). Contract: `tests/one-implementation-contract.test.mjs`
+ * do. Contract: `tests/one-implementation-contract.test.mjs`
  * (no other module calls `clipboard.writeText`).
  *
  * @module app/utils/clipboard

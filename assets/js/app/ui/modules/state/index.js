@@ -1,5 +1,5 @@
 /**
- * @fileoverview The State panel (History v2 §3.10): the session's Share and
+ * @fileoverview The State panel: the session's Share and
  * Load, and the history of the dataset shown as a branch graph.
  *
  * - **Header:** `History (i)  🔍 ↶ ↷ ⚙ ⋯`: search, undo and redo (and the
@@ -18,7 +18,7 @@
  * runs at a time from here (`run`): while it runs the panel is busy, and a
  * failure is told once. While recording is paused, going back (undo, redo, a
  * jump, a branch or tracker switch) first asks whether to keep what changed
- * as one step (§3.15.1).
+ * as one step.
  *
  * The panel draws the page's current history (`app/history/current.js`) and
  * redraws when it tells of a change, at most once a frame and only while the
@@ -85,7 +85,7 @@ const REQUIRED = [
 ];
 
 /**
- * The rows of History settings, in order (§3.15.5): each a setting of
+ * The rows of History settings, in order: each a setting of
  * `HISTORY_SETTINGS` (its label and kind from there) with its info tip, or
  * the rule between what is recorded and the rest. A setting this browser's
  * history does not have is not drawn.
@@ -294,7 +294,7 @@ export function initStateSection({
     dom.settingsButton.click();
   }
 
-  // The History (i) tip links to History settings (§3.15.6), first under its
+  // The History (i) tip links to History settings, first under its
   // title (`data-info-tip-live`), so a person who never looks at ⚙ finds it.
   const historyTip = ownerDocument.getElementById('history-info-tooltip');
   if (historyTip !== null) {
@@ -323,7 +323,7 @@ export function initStateSection({
 
   /**
    * Before the history moves while recording is paused with changes: keep
-   * them as one step first, discard them, or stay (§3.15.1). The answer is
+   * them as one step first, discard them, or stay. The answer is
    * the core's for the next move (`setPausedChoice`), for the rest of the
    * paused period with "Don't ask again". Resolves whether to go on.
    */
@@ -1365,7 +1365,8 @@ export function initStateSection({
     historyVersion += 1;
     // What the panel acts on is the history now. Drawing waits for the next frame and for the panel
     // being in sight; a tour stopped before that frame must see where the history is, not where
-    // it was drawn (it found itself still at the step to return to, and stayed at the opening).
+    // it was drawn (otherwise it would find itself still at the step to return
+    // to, and stay at the opening).
     view = trackerView(history);
     render();
   }

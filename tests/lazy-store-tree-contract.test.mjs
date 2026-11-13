@@ -320,3 +320,53 @@ test('a MuData .h5mu opens as a uniform subsample through its view, each modalit
   lazy.reader.close();
   whole.reader.close();
 });
+
+test('a MuData .h5mu asks for every var frame\'s structure at once as it opens: each modality\'s beside obs and var', async () => {
+  const { MUDATA_OPENING_PATHS, H5MU_FORMAT } = await import('../assets/js/data/anndata/views/mudata.js');
+  const encodingAttrsOf = (type, version) => ({ 'encoding-type': type, 'encoding-version': version });
+  const cells = 10;
+  const names = Array.from({ length: cells }, (_, i) => `cell${i}`);
+  const frame = (rows, columns = [], order = columns.map(([name]) => name)) => group({ ...encodingAttrsOf('dataframe', '0.2.0'), _index: '_index', 'column-order': order }, [
+    ['_index', stringDataset(rows, encodingAttrsOf('string-array', '0.2.0'))], ...columns,
+  ]);
+  const dense = (rows, cols) => numericDataset('float32', [rows, cols], new Float32Array(rows * cols), encodingAttrsOf('array', '0.2.0'));
+  // Each modality's var has a column below a group, which its structure loads.
+  const modality = (vars, c) => group(encodingAttrsOf('anndata', '0.1.0'), [
+    ['obs', frame(names)],
+    ['var', frame(Array.from({ length: vars }, (_, g) => `g${c}_${g}`), [['nested', group({}, [
+      ['score', numericDataset('float32', [vars], new Float32Array(vars), encodingAttrsOf('array', '0.2.0'))],
+    ])]], ['nested/score'])],
+    ['X', dense(cells, vars)],
+    ['obsm', group(encodingAttrsOf('dict', '0.1.0'), [['X_umap', dense(cells, 2)]])],
+  ]);
+  const root = group({ ...encodingAttrsOf('MuData', '0.1.0'), axis: BigInt64Array.of(0n) }, [
+    ['obs', frame(names)],
+    ['obsm', group(encodingAttrsOf('dict', '0.1.0'), [['X_umap', dense(cells, 2)]])],
+    ['mod', group({ 'mod-order': ['rna', 'prot'] }, [['rna', modality(6, 0)], ['prot', modality(3, 1)]])],
+  ]);
+  const bytes = new Uint8Array(await writeHdf5(root).arrayBuffer());
+  const real = await openHdf5(createByteReader(bytesByteSource(bytes, { name: 'm.h5mu' })), { load: MUDATA_OPENING_PATHS });
+  const { root: view } = await presentStore(real, { container: 'hdf5', layout: 'file', name: 'm.h5mu' });
+  // When each frame's load is asked for and when it is answered.
+  const events = [];
+  for (const path of ['obs', 'mod/rna/var', 'mod/prot/var']) {
+    const node = real.get(path);
+    const load = node.load;
+    node.load = function (paths, options) {
+      events.push(`ask ${path}`);
+      return load.call(this, paths, options).then(result => {
+        events.push(`answered ${path}`);
+        return result;
+      });
+    };
+  }
+  const reader = new AnnDataReader();
+  await reader.open(view, { format: H5MU_FORMAT, name: 'm.h5mu' });
+  // The structure's round is the last that asks for obs: the other
+  // modality's var is asked for in it, before any of its loads is answered.
+  const round = events.slice(events.lastIndexOf('ask obs'));
+  const other = round.indexOf('ask mod/prot/var');
+  assert.ok(other > 0, events.join(', '));
+  assert.ok(round.slice(0, other).every(event => event.startsWith('ask ')), events.join(', '));
+  reader.close();
+});

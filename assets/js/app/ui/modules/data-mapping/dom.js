@@ -126,11 +126,6 @@ export function setText(node, text) {
   if (node.textContent !== text) node.textContent = text;
 }
 
-function setTitle(node, title) {
-  if (title === null || title === '') node.removeAttribute('title');
-  else node.title = title;
-}
-
 function fillColumnOptions(ownerDocument, select, width) {
   if (select.options?.length === width) return;
   const options = [];

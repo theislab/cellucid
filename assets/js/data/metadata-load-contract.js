@@ -1,5 +1,5 @@
 import { abortReason, onAbort, requireSignalOrNull, throwIfAborted } from '../utils/abort.js';
-import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
+import { requireKeys } from '../utils/exact-record.js';
 
 /**
  * Validate the one exact options seam shared by public metadata loaders.

@@ -31,15 +31,15 @@ const SERIALIZABLE_INPUT_TYPES = new Set([
  * lists different fields, or none, per view layout). Its record is checked
  * for shape with every other control up front, but its value is checked and
  * applied only once the restore has put the embeddings and the active view
- * back: checked earlier, a session saved on one embedding was refused on a
- * page showing another ("option is not available"), and applied earlier its
- * value was overwritten when the embedding changed under it.
+ * back: checked earlier, a session saved on one embedding would be refused on
+ * a page showing another ("option is not available"), and applied earlier its
+ * value would be overwritten when the embedding changed under it.
  */
 const AFTER_EMBEDDING_SELECTOR = '[data-state-serializer-after-embedding]';
 
 // Not in the inventory: another domain's owner reads their state from the
 // state it shows, or they are not a preference (README.md lists each with why).
-const DOMAIN_OWNED_IDS = new Set([
+export const DOMAIN_OWNED_IDS = new Set([
   'navigation-mode',
   'categorical-field',
   'continuous-field',
@@ -134,8 +134,8 @@ function afterEmbeddingControlIds(inventory) {
 }
 
 /**
- * Page chrome kept in sessions and saved states but outside the history
- * (CEL-0249, History v2 §3.3.8): a toolbelt, several buttons of which
+ * Page chrome kept in sessions and saved states but outside the history:
+ * a toolbelt, several buttons of which
  * exactly one is pressed at a time, marked with this attribute. Its value
  * is the id of its `aria-pressed="true"` button. The selection tool
  * (`#highlight-mode`: Annotation, KNN drag, Proximity drag, Lasso) is one: it
@@ -278,8 +278,9 @@ export function applyPageChrome(chrome, root = globalThis.document) {
  *
  * `#hp-antialias` is a device capability its owner keeps in `localStorage` and
  * persists on every `change` event — including one a restore dispatches. A
- * session that carried it was the last writer of a device preference: a
- * sample's published view turned antialiasing back on after you turned it off.
+ * session that carried it would be the last writer of a device preference: a
+ * sample's published view would turn antialiasing back on after the person
+ * turned it off.
  * The stored preference also has a third state, `auto`, that a checkbox cannot
  * express.
  *
@@ -608,8 +609,8 @@ function restoreValidatedControl(id, entry, data) {
     // As a person's change ends: the thumb let go, the field committed. An
     // owner may follow `input` on the next frame and apply only on `change`
     // (the vector field's sliders: Particle density restarts the particles
-    // on release only), so `input` alone left its readout one frame behind
-    // what `setting.set` read back and the value never applied.
+    // on release only), so `input` alone leaves its readout one frame behind
+    // what `setting.set` reads back and the value never applies.
     dispatchControlEvent(id, element, 'input');
     dispatchControlEvent(id, element, 'change');
   }
@@ -667,7 +668,7 @@ const RESTORE_ORDER = Object.freeze([
  * (`AFTER_EMBEDDING_SELECTOR`): the choice (a select: which vector field)
  * before the switch that shows it (`Show overlay`), so the switch shows the
  * restored choice at once. Switched on first, it began showing the choice
- * the page had, and the restored choice had to supersede it (R9V-1).
+ * the page had, and the restored choice had to supersede it.
  */
 const AFTER_EMBEDDING_RESTORE_ORDER = Object.freeze([
   'details', 'select', 'checkbox', 'range', 'number', 'color', 'text',
@@ -808,9 +809,7 @@ export function createUiControlSerializer({ sidebar, domains = null }) {
    * refuses keep their value now; one the interface no longer has is left
    * out. `unread` names each refused or left-out value, so the restore says
    * it, and the record returned is complete and valid for
-   * `restoreUIControls`. One control never fails the others (found
-   * 2026-11-11: a value one version of Cellucid could not read failed every
-   * setting of a session).
+   * `restoreUIControls`. One control never fails the others.
    *
    * @param {unknown} saved
    * @returns {{controls: object, unread: Array<{id: string, label: string, reason: string}>}}

@@ -414,14 +414,11 @@ function describeInvalidString(text, start) {
  * duplicates). It accepts exactly the JSON that JSON.parse accepts (nested at
  * most `ANNOTATION_JSON_MAX_DEPTH` levels) and returns the same value.
  *
- * One pass, not a duplicate-key scan followed by JSON.parse: measured on
- * 1 MB annotation files (median of 60 runs, Node 26, Apple M-series), this
- * pass takes 5.4 ms where the scan plus JSON.parse took 8.9 ms (many short
- * tokens), 1.1 ms where it took 5.1 ms (long texts) and 3.5 ms where it took
- * 8.9 ms (escaped texts). Each string is matched by one sticky regular
- * expression and handed to JSON.parse only when it holds an escape, so a long
- * text is one native scan; a megabyte that never closes its string is refused
- * in about 9 ms.
+ * One pass, not a duplicate-key scan followed by JSON.parse, which costs
+ * more on every shape of file (measured: 35_decisions_interface.md). Each
+ * string is matched by one sticky regular expression and handed to
+ * JSON.parse only when it holds an escape, so a long text is one native
+ * scan; a megabyte that never closes its string is refused in one pass.
  */
 export function parseExactJson(text, { path = '$' } = {}) {
   if (typeof text !== 'string') reject(path, 'JSON input must be a string');

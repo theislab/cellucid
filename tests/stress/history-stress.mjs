@@ -1,6 +1,5 @@
 /**
- * The history stress suite (`cellucid-private/plans/history-v2.md` §3.15.4,
- * workstream HS): it drives the real history (`app/history/history.js`,
+ * The history stress suite: it drives the real history (`app/history/history.js`,
  * `tree.js`, `value-pool.js`), the real dispatcher and catalog, the real
  * session file (`app/session/history-file.js`) and the real autosave
  * (`app/history/autosave.js` over `autosave-store.js`) on the synthetic page
@@ -38,7 +37,7 @@ import { setWorkingSet } from '../../assets/js/data/memory-budget.js';
 import { memoryDatabase } from './memory-database.mjs';
 import { syntheticDataset, syntheticPage } from './synthetic-page.mjs';
 
-/** The connector's result limit, in characters (`plans/history-v2.md` §2.4 X3). */
+/** The result limit, in characters, of the connectors an agent calls the tools through. */
 export const CONNECTOR_RESULT_CHARACTERS = 150_000;
 
 /**

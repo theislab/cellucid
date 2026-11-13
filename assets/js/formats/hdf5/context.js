@@ -31,8 +31,8 @@ const MiB = 1024 * 1024;
 
 /**
  * Chunks decompressed at once per file: enough to keep every core busy,
- * few enough that their native buffers stay small (measured: 16 decodes as
- * fast as 64 and holds about 40 MiB less).
+ * few enough that their native buffers stay small (measured:
+ * 21_decisions_decoders_and_codecs.md).
  */
 const DECOMPRESSIONS_AT_ONCE = 16;
 
@@ -82,9 +82,8 @@ export class FileContext {
      * measured (`formats/io/link.js`), and at least a 4 MiB group per
      * connection of the source's prior -- and twice what keeps the decoders
      * busy: every decompression slot with a chunk, and the next group
-     * fetched while one decodes (Suo's 1,580 expression chunks, Chromium:
-     * read in 210 ms at the link's budget alone, 175 ms at this one, against
-     * 121 ms of decoding them all at once). A remote link stays full and every decoder works,
+     * fetched while one decodes (measured: 21_decisions_decoders_and_codecs.md). A remote
+     * link stays full and every decoder works,
      * while memory stays bounded however many reads run.
      */
     const policy = reader.source?.policy ?? { concurrency: 4 };

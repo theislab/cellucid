@@ -260,7 +260,7 @@ export function createIdentityProfileModal({
             // The ORCID search runs once typing pauses; the suggestions hide a
             // moment after focus leaves (a pointerdown on one cancels it); the
             // popup is placed again once its layout settled.
-            const searchSoon = debounce(search => void search(), ORCID_SEARCH_DEBOUNCE_MS);
+            const searchSoon = debounce(/** @param {() => unknown} search */ search => void search(), ORCID_SEARCH_DEBOUNCE_MS);
             const hideSoon = debounce(() => hideSuggestions(), ORCID_SUGGESTION_HIDE_DELAY_MS);
             const positionSoon = debounce(() => positionSuggest(), 60);
             let activeSearch = null;

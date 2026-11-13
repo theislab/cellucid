@@ -291,7 +291,7 @@ test('damaged, foreign and truncated files are refused before anything is added'
     assert.deepEqual(await listSavedStates(to.store), []);
   };
   const tryImport = async file => (await refusal(importLibrary(file, { library: to.library, store: to.store }))).message;
-  // A damaged file is said so, its technical words under Details (F141); a foreign one says what it is.
+  // A damaged file is said so, its technical words under Details; a foreign one says what it is.
   const said = async file => {
     const error = await refusal(importLibrary(file, { library: to.library, store: to.store }));
     return { sentence: sayFailure(error), details: failureDetails(error).details ?? null };

@@ -152,8 +152,8 @@ const SMALLEST_NAME_SIZE = 7;
  * The room one name takes beside the next (a row's, or a column's turned to
  * run down): the box this engine draws its label in, to a whole pixel, and
  * one more. Plotly puts each name on a pixel, so names 10.8 px apart are 10
- * px apart one row and 11 the next: a box of 10.8 overlapped its neighbor
- * in Firefox (found 2026-11-10).
+ * px apart one row and 11 the next, so a box of 10.8 would overlap its
+ * neighbor.
  */
 function nameSlot(font) {
   return Math.ceil(lineBoxHeight(font)) + 1;
@@ -184,7 +184,7 @@ function namesFor(data, viewport, rightMargin, top) {
     const left = Math.ceil(widestOf(down, tickfont)) + 14;
     const columns = (viewport.width - left - rightMargin) / Math.max(1, across.length);
     const line = nameSlot(tickfont);
-    // As before, many or long gene names run down; any that do not fit across do too.
+    // Many or long gene names run down; any that do not fit across do too.
     const upright = across.length <= 6 && longest <= 8 && widestOf(across, tickfont) + 4 <= columns;
     const bottom = Math.ceil(upright ? line : widestOf(across, tickfont)) + 10;
     const rows = (viewport.height - top - bottom) / Math.max(1, down.length);

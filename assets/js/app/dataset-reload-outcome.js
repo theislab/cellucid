@@ -1,6 +1,7 @@
 import { requireExactObjectKeys } from '../utils/exact-record.js';
 import { cancelled, isCancellation, cancel, onAbort, requireSignal } from '../utils/abort.js';
 import { InternalError } from '../utils/errors.js';
+import { promiseWithResolvers } from '../utils/promise-resolvers.js';
 
 function attachSecondaryFailure(primaryError, secondaryError) {
   if (
@@ -323,9 +324,9 @@ function reloadIdentitiesMatch(left, right) {
  * dataset startup opens: the default sample, or the one its address names).
  * It supersedes like any change but is no action of the person's: a
  * connection the person asked for before it began still replaces it when
- * its server answers (bug hunt R9V-2: a link typed while the default sample
- * was still being chosen lost to it, because the sample's own beginning
- * counted as a newer choice).
+ * its server answers (a link typed while the default sample was still being
+ * chosen would otherwise lose to it, the sample's own beginning counting as
+ * a newer choice).
  *
  * When the application is torn down, `retire()` stops the change in flight
  * as a newer choice would (its reads end, its opening lets go) and refuses
@@ -393,10 +394,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
     const controller = new AbortController();
     const generation = ++latestGeneration;
     if (choice) advanceActionSequence();
-    let resolveSettled;
-    const settled = new Promise(resolve => {
-      resolveSettled = resolve;
-    });
+    const { promise: settled, resolve: resolveSettled } = promiseWithResolvers();
     const record = {
       controller,
       generation,
@@ -524,9 +522,8 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
  * a newer one would: its signal aborts, so work waiting on it (a first
  * frame to record, a read for its cells) stops instead of reaching a
  * disposed viewer, and no publication follows. A first frame queued at the
- * opening that the page closed before ran after dispose() and asked the
- * disposed viewer for its statistics (Web contracts run 41269083996, Linux
- * WebKit, `open-cells-in-place.spec.mjs`).
+ * opening that the page closed before would run after dispose() and ask the
+ * disposed viewer for its statistics (`open-cells-in-place.spec.mjs`).
  *
  * @returns {Readonly<{
  *   readonly generation: number,

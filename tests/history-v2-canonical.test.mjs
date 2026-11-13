@@ -1,5 +1,5 @@
 /**
- * History v2 §3.13 and §3.3.4 with generated ids: a domain whose values carry
+ * Generated ids: a domain whose values carry
  * ids from a counter that is never lowered (highlight pages and groups, user
  * fields) or creation times gives a canonical form. Verify compares canonical
  * forms, so the same steps applied again reproduce; a delete applies again a

@@ -86,8 +86,8 @@ test('a snapshot draws a reduced LOD level with the live view pixels and no elem
     // The snapshot takes the live camera only once the live camera is final:
     // publishing the synthetic dataset starts a zoom that eases toward its
     // target over frames, and a copy taken mid-ease (seconds of frames on a
-    // slow renderer, microseconds on hardware) gave the two views cameras
-    // that differed in the last digits and a handful of edge pixels.
+    // slow renderer, microseconds on hardware) gives the two views cameras
+    // that differ in the last digits and a handful of edge pixels.
     await settled();
     viewer.setViewCameraState(snapshotId, viewer.getViewCameraState('live'));
     const cameraOf = viewId => JSON.stringify(viewer.getViewCameraState(viewId));
@@ -100,8 +100,8 @@ test('a snapshot draws a reduced LOD level with the live view pixels and no elem
       await frames(4);
       // The LOD levels are built off the main thread; until they land a view
       // draws full detail (level -1) and has nothing left to animate, so a
-      // settled scene is no sign the forced level is drawn. On a macOS WebKit
-      // runner the live capture came before the levels did.
+      // settled scene is no sign the forced level is drawn: a capture taken before
+      // the levels land is of full detail.
       while (viewer.getRendererStats(viewId).lodLevel !== level) await frames(1);
       await settled();
       draws.arrays = 0;
@@ -126,8 +126,8 @@ test('a snapshot draws a reduced LOD level with the live view pixels and no elem
       };
     };
     // Every mismatch, with where it is and by how much, so a failure says
-    // whether a point moved (a camera or order difference: whole points,
-    // large deltas) or the rasterizer rounded an edge differently.
+    // whether whole points moved (a camera or order difference) or only
+    // edges of points changed.
     const compare = (left, right, width) => {
       let mismatched = 0;
       let lit = 0;
@@ -179,8 +179,7 @@ test('a snapshot draws a reduced LOD level with the live view pixels and no elem
     expect(outcome.lit).toBeGreaterThan(1_000);
     // The two views were drawn with the same camera, to the digit.
     expect(outcome.camerasMatch, `${mode}: ${JSON.stringify(outcome.cameras)}`).toBe(true);
-    // Same data, same camera, same order: the picture may differ only by the
-    // rasterizer's last bit (helpers/pixel-parity.mjs).
+    // Same data, same camera, same order: the same pixels.
     expect(pixelParityVerdict(outcome, mode)).toBeNull();
   }
   // Without culling a reduced level is one sequential draw of the stored

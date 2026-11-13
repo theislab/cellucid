@@ -206,18 +206,18 @@ profile once and everything else per dataset:
   "version": 3,
   "username": "ghid_42",
   "githubUserId": 42,
-  "updatedAt": "2026-10-22T10:00:00.000Z",
+  "updatedAt": "2025-01-15T10:00:00.000Z",
   "datasets": {
     "my_atlas_v1": {
       "fieldsToAnnotate": ["cell_type"],
-      "lastAccessedAt": "2026-10-22T10:00:00.000Z",
+      "lastAccessedAt": "2025-01-15T10:00:00.000Z",
       "suggestions": {
         "cell_type:T": [
           {
             "id": "ghid_42_3f2c9a4e-8b1d-4c7a-9e5f-0a6b2d1c4e8f",
             "label": "T cell",
             "proposedBy": "ghid_42",
-            "proposedAt": "2026-10-22T10:00:00.000Z"
+            "proposedAt": "2025-01-15T10:00:00.000Z"
           }
         ]
       },
@@ -316,8 +316,8 @@ invalid filenames or ownership, malformed timestamps, missing settings,
 duplicate mappings and cycles fail the workflow. Nothing is truncated, coerced,
 migrated, skipped, or repaired. One shared accept/reject corpus
 (`tests/fixtures/community-annotation-contract-corpus.json`, byte for byte the
-template's `tests/fixtures/contract-corpus.json`, pinned by SHA-256 in both
-suites) holds the validator and `wire-contract.js` to the same verdict.
+template's `tests/fixtures/contract-corpus.json`, which the web app's tests
+compare it with) holds the validator and `wire-contract.js` to the same verdict.
 
 CI is a gate for pull requests and a report for everything else: a direct
 publish lands before CI runs. The browser therefore never trusts the

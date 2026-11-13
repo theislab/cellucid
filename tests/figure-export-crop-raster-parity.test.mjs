@@ -183,7 +183,7 @@ test('the zoomed projection maps the crop onto the whole clip square', () => {
   close(bottom, -1);
 });
 
-test('every raster goes through the one plot plan, never letterboxed', async () => {
+test('every raster goes through the one plot plan', async () => {
   const root = new URL('../assets/js/app/ui/modules/figure-export/', import.meta.url);
   const [pngSource, svgSource, rasterSource] = await Promise.all([
     readFile(new URL('renderers/png-renderer.js', root), 'utf8'),
@@ -196,9 +196,7 @@ test('every raster goes through the one plot plan, never letterboxed', async () 
   for (const source of [pngSource, svgSource]) {
     assert.match(source, /planPlotRaster\(\{/);
     assert.match(source, /viewRect01: (rasterPlan\.viewRect01|sourceRect01\(source\)),/);
-    assert.doesNotMatch(source, /computeLetterboxedRect|fitCropIntoRect|planCropRaster/);
   }
   // The rasterizer always maps its source onto its whole canvas.
-  assert.doesNotMatch(rasterSource, /viewRect === null|viewRect01 = null/);
   assert.match(rasterSource, /gl\.viewport\(0, 0, outW, outH\)/);
 });

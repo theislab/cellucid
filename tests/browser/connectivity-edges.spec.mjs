@@ -10,10 +10,10 @@ const DATASET_URL =
  * Connectivity edges in the real viewer (rendering/connectivity-edge-layer.js):
  * every pane draws the first K of its own visible edges, from instance
  * records that exist only for those K edges (gathered on the GPU from
- * one position texture a geometry); a pane's filters, a kept view, a geometry change
- * and a dataset replacement each keep that exact.
+ * one position texture a geometry); a pane's filters, a kept view and a geometry
+ * change each keep that exact, and clearing the graph leaves nothing held.
  */
-test('every pane draws exactly the first K of its own visible edges from K records', async ({ page }) => {
+test('every pane draws exactly the first K of its own visible edges from K records, and a cleared graph holds nothing', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
@@ -156,23 +156,37 @@ test('every pane draws exactly the first K of its own visible edges from K recor
     viewer.updatePositions(positions, viewer.getViewDimension('live'));
     const afterMove = await capture();
 
-    // A new dataset publication drops the graph and every pane's records.
     const error = gl.getError();
+
+    // Clearing the graph drops it and every pane's records.
+    const liveStats = viewer.getEdgeSelectionStatsForView('live');
+    const snapshotStats = viewer.getEdgeSelectionStatsForView(snapshot.id);
+    const before = viewer.getConnectivityMemoryStats();
+    viewer.clearEdgesV2();
+    const after = viewer.getConnectivityMemoryStats();
     return {
       afterMove,
+      cleared: {
+        beforeGpu: before.gpuBytes,
+        beforePanesGpu: before.panes.reduce((sum, pane) => sum + pane.gpuBytes, 0),
+        beforePositionTextureGpu: before.positionTextureBytes,
+        afterGpu: after.gpuBytes,
+        afterGraph: after.graphBytes,
+        hasData: viewer.hasConnectivityData(),
+      },
       counts,
       edgeCount,
       error,
       frames,
       kept,
       live,
-      liveStats: viewer.getEdgeSelectionStatsForView('live'),
+      liveStats,
       memory: {
         gpuBytes: memory.gpuBytes,
         panes: memory.panes.map(pane => [pane.viewId, pane.gpuBytes, pane.shownCount]),
       },
       snapshotId: snapshot.id,
-      snapshotStats: viewer.getEdgeSelectionStatsForView(snapshot.id),
+      snapshotStats,
       target,
     };
   });
@@ -200,64 +214,12 @@ test('every pane draws exactly the first K of its own visible edges from K recor
   expect(proof.afterMove.slice(-2).sort((a, b) => a - b)).toEqual(
     proof.frames.slice(-2).sort((a, b) => a - b),
   );
-});
-
-test('a dataset replacement drops the connectivity graph and every pane\'s records', async ({ page }) => {
-  const pageErrors = [];
-  page.on('pageerror', error => pageErrors.push(error.message));
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-
-  const proof = await page.evaluate(async () => {
-    // An edge payload as the reader worker builds it: the symmetric CSR of
-    // the pairs (weights as given, largest 1) through its own extraction.
-    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
-    const edgePayloadOf = (sources, destinations, weights, nCells) => {
-      const indptr = new Int32Array(nCells + 1);
-      for (let edge = 0; edge < sources.length; edge++) {
-        indptr[sources[edge] + 1]++;
-        indptr[destinations[edge] + 1]++;
-      }
-      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
-      const fill = indptr.slice(0, nCells);
-      const indices = new Int32Array(indptr[nCells]);
-      const data = new Float32Array(indptr[nCells]);
-      // Edges come ordered by source, so every row is written ascending.
-      for (let edge = 0; edge < sources.length; edge++) {
-        const s = sources[edge];
-        const d = destinations[edge];
-        indices[fill[d]] = s;
-        data[fill[d]++] = weights[edge];
-        indices[fill[s]] = d;
-        data[fill[s]++] = weights[edge];
-      }
-      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
-    };
-    const viewer = window._cellucidViewer;
-    const nCells = viewer.getPointCount();
-    viewer.setupEdgesV2(edgePayloadOf(Uint32Array.from([0, 1]), Uint32Array.from([1, 2]), Float32Array.from([0.5, 1]), nCells));
-    viewer.setEdgeVisibleTarget(2);
-    viewer.refreshEdgeSelectionForView('live');
-    viewer.setShowConnectivity(true);
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    const before = viewer.getConnectivityMemoryStats();
-    viewer.clearEdgesV2();
-    const after = viewer.getConnectivityMemoryStats();
-    return {
-      beforeGpu: before.gpuBytes,
-      beforePaneGpu: before.panes[0].gpuBytes,
-      beforePositionTextureGpu: before.positionTextureBytes,
-      afterGpu: after.gpuBytes,
-      afterGraph: after.graphBytes,
-      hasData: viewer.hasConnectivityData(),
-    };
-  });
-  expect(pageErrors).toEqual([]);
-  expect(proof.beforePaneGpu).toBe(2 * 40);
-  expect(proof.beforePositionTextureGpu).toBeGreaterThan(0);
-  expect(proof.beforeGpu).toBe(proof.beforePaneGpu + proof.beforePositionTextureGpu);
-  expect(proof.afterGpu).toBe(0);
-  expect(proof.afterGraph).toBe(0);
-  expect(proof.hasData).toBe(false);
+  // What was held before the graph was cleared is the panes' records and the
+  // position texture; after it, nothing.
+  expect(proof.cleared.beforePanesGpu).toBe(2 * Math.min(proof.target, proof.edgeCount) * 40);
+  expect(proof.cleared.beforePositionTextureGpu).toBeGreaterThan(0);
+  expect(proof.cleared.beforeGpu).toBe(proof.cleared.beforePanesGpu + proof.cleared.beforePositionTextureGpu);
+  expect(proof.cleared.afterGpu).toBe(0);
+  expect(proof.cleared.afterGraph).toBe(0);
+  expect(proof.cleared.hasData).toBe(false);
 });

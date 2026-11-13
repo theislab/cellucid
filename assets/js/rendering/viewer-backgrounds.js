@@ -45,7 +45,7 @@ export const VIEWER_BACKGROUND_GROUPS = Object.freeze([
  * A background's twin for a theme: the background in that theme's group at the
  * same place (Studio (light) ↔ Studio (dark), Atelier ↔ Nebula, White ↔
  * Black); itself when it is already in that group. A background the person
- * never chose follows the theme by it (owner, 2026-11-10); one they chose stays.
+ * never chose follows the theme by it; one they chose stays.
  *
  * @param {string} background
  * @param {'light'|'dark'} theme

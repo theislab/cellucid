@@ -1,6 +1,6 @@
 /**
- * @fileoverview The branch picker, opened from the status line's "Main ▾"
- * (History v2 §3.10): the tracker in use (its menu switches tracker, starts
+ * @fileoverview The branch picker, opened from the status line's "Main ▾":
+ * the tracker in use (its menu switches tracker, starts
  * another, renames or removes it), every branch that is not archived with
  * where it starts, its steps and its last change, main ★ and locked 🔒
  * marked, the one shown current; a ⋯ menu per branch; "N archived" to list

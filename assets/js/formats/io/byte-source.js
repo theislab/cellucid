@@ -25,7 +25,8 @@ import { MAX_QUIET_MS, budgetOf, HostNotAnswering, realmHosts, retryAfterMillise
 import { formatDuration, formatCountOf } from '../../utils/format-units.js';
 import { createMirrorSet } from './mirrors.js';
 import { KeptCopyDamage, checkedRead } from './page-checks.js';
-import { publicLink, textWithPublicLinks } from '../../data/sources/link-credentials.js';
+import { publicLink } from '../../data/sources/link-credentials.js';
+import { textWithPublicLinks } from '../../data/sources/link-text.js';
 import { fnv1a32 } from '../../utils/fnv1a.js';
 
 /**
@@ -85,7 +86,7 @@ export const BYTE_SOURCE_FAILURES = Object.freeze({
  * A read that could not be served, with a `code` from `BYTE_SOURCE_FAILURES`.
  *
  * A failure names the file it could not read by its link's public form
- * (`textWithPublicLinks`, `data/sources/link-credentials.js`): the request
+ * (`textWithPublicLinks`, `data/sources/link-text.js`): the request
  * went to the read URL, with whatever signature or key it carries, but the
  * message and `details.url` (shown in notifications, logged to the console)
  * never hold it, whichever site raised the error.
@@ -115,18 +116,15 @@ const MiB = 1024 * KiB;
  * are split to run in parallel. Six requests in flight is what a browser
  * keeps open per HTTP/1.1 host; over HTTP/2 or HTTP/3 a host answers as many
  * at once as its `SETTINGS_MAX_CONCURRENT_STREAMS`, which RFC 9113 (6.5.2)
- * asks to be no smaller than 100 and GitHub sets to 100 (measured): reads
- * start there until the protocol is known (`link.js`).
+ * asks to be no smaller than 100 and GitHub sets to 100: reads start there
+ * until the protocol is known (`link.js`).
  *
  * Metadata blocks are 16 KiB: an `.h5ad` written by anndata keeps each
  * element's object header, B-tree node and heap together within a few KiB,
  * spread over the whole file (one cluster per element, beside its data), so
- * a larger block fetches mostly data. Measured opening a 1M-cell `.h5ad`
- * (23 clusters), a gzip `.h5ad` and a `cellucid.prepare()` one over links
- * of 30 ms/5 MB/s, 80 ms/2 MB/s and 20 ms/50 MB/s: 16 KiB opened each in
- * 0.3–0.4× the time of 256 KiB on the slow links (4.2 s → 1.4 s; 7.5 MB →
- * 1.8 MB) and no slower on the fast one; 8 KiB was no quicker, with more
- * requests. A read's shape, not a limit.
+ * a larger block fetches mostly data, and a smaller one is no quicker with
+ * more requests (measured: 22_decisions_link_model_and_request_planning.md).
+ * A read's shape, not a limit.
  */
 export const REMOTE_POLICY = Object.freeze({
   blockBytes: 16 * KiB,
@@ -156,10 +154,10 @@ export const LOCAL_POLICY = Object.freeze({
  * there -- every Cellucid-ready `.h5ad` (`cellucid.prepare()`: a 256 KiB
  * metadata block, the attributes' strings, then `uns`, the gene names and the
  * pointers of `X`) -- everything opening reads, so it opens with this one
- * read. Suo's (5,103 genes) is 416 KB. Asked for whole whatever the link:
- * 512 KiB transfer in less than the round trip another read would cost on
- * every link measured (the slowest, 150 ms at 5 MB/s, carries 750 KB per
- * round trip). A read's shape, not a limit: a larger head is read on.
+ * read. Asked for whole whatever the link: 512 KiB transfer in less than the
+ * round trip another read would cost on every link measured (measured:
+ * 22_decisions_link_model_and_request_planning.md). A read's shape, not a
+ * limit: a larger head is read on.
  */
 export const HEAD_BYTES = 512 * KiB;
 
@@ -308,8 +306,8 @@ const ONLINE_POLL_MS = 500;
 /**
  * Waits until this computer says it is online again (`online()`), looked at
  * every `ONLINE_POLL_MS` on the timers `after`: a dedicated worker is not
- * reliably told by an `online` event (Chromium, measured 2026-11-11), so it
- * looks. `signal` ends the wait.
+ * reliably told by an `online` event (Chromium), so it looks. `signal` ends
+ * the wait.
  */
 async function untilOnline(online, signal, after) {
   while (!online()) await sleep(ONLINE_POLL_MS, signal, after);
@@ -450,7 +448,7 @@ export function hostFaultOfStatus(status) {
  * (`withRetries`): the host, what it answered, and when it is asked again.
  * The one sentence every retrying transport reports through its `onWait`
  * (a reader's activity line, an opening, a community annotation Pull), so a
- * long wait that is really retrying never reads as plain progress (R9A-4).
+ * long wait that is really retrying never reads as plain progress.
  *
  * @param {{host: string|null, status?: number|null, service?: string|null,
  *   stalled?: boolean, waitMs?: number|null, attempt: number}} retry -
@@ -530,8 +528,7 @@ export function hostFaultSentence({ kind, host, status = null, what, service = n
  * (`silent`: it refuses this network for now, fails, or the connection
  * dropped; its own sentence says all three). A host never
  * answered may be a typo or a site that does not let others read it: said as
- * it was. (Found 2026-11-10: a sample that stopped answering was said with the
- * generic "Try again", its URL-led sentence being unshowable.)
+ * it was.
  *
  * @param {ByteSourceError} error
  * @param {{connectionDown: (url: string) => boolean}} hosts
@@ -712,6 +709,28 @@ export function transientStatusError(response, what, said = null) {
       // What a repeat of the same failure looks like (`withRetries`).
       signature: `${status}:${response.headers.get('Content-Length') ?? ''}`,
     }
+  );
+}
+
+/**
+ * The error of an answer that is neither the bytes asked for nor transient
+ * (a 404, a 416), naming what was asked. `said`: its body, when read: an
+ * API's error reason, and the host's words (`text/plain`: a served store
+ * says what it could not find), kept as `details.words`.
+ *
+ * @param {Response} response
+ * @param {string} what - How the failure names the request
+ * @param {string|null} [said]
+ * @returns {ByteSourceError}
+ */
+export function refusedStatusError(response, what, said = null) {
+  const status = response.status;
+  const reason = errorReasonOf(said);
+  const words = wordsOf(response, said);
+  return new ByteSourceError(
+    BYTE_SOURCE_FAILURES.HTTP,
+    `${what}: the host answered HTTP ${status}${reason === null ? '' : ` (${reason})`}.`,
+    { status, ...(reason === null ? {} : { reason }), ...(words === null ? {} : { words }) }
   );
 }
 
@@ -1180,9 +1199,8 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
       }
       if (refusesForNow(error) && delivered(error) && !online()) {
         // This computer is offline: no host refuses anything. The read waits
-        // for the connection, not a back-off, and is asked again the moment
-        // it is back (round 9, R9P-7: a read waited up to 20 s more after an
-        // 18 s outage ended).
+        // for the connection, not a back-off (which would outlast the outage),
+        // and is asked again the moment it is back.
         const host = error.details?.host ?? hostOf(error.details?.url ?? '') ?? null;
         tell({
           host,
@@ -1258,7 +1276,7 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
       // A `Retry-After` under a second asks again no sooner than the link's own wait would.
       const wait = stalled ? null : Math.max(retryAfterMilliseconds(error.details?.retryAfter) ?? 0, retryWaitMs(repeats - 1, clock.timeoutMs, random));
       // Said on whatever progress line owns the request: a wait that is
-      // really asking again never reads as plain progress (R9A-4).
+      // really asking again never reads as plain progress.
       const host = error.details?.host ?? hostOf(error.details?.url ?? '') ?? null;
       tell({
         host,
@@ -1284,11 +1302,10 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
  * refuse. Each bypasses the browser's HTTP cache (`cache: 'no-store'`, which
  * is not a header and needs no preflight either): Chromium lets one request
  * of a URL through its cache at a time, so the ranges of one file asked for
- * together went out one round trip after another (measured: five 100-byte
- * ranges of one URL took five round trips in Chromium, one in Firefox and
- * WebKit; one in all three with `no-store`). The size comes from the caller
- * (provider metadata or a probe),
- * because many hosts do not expose `Content-Range` to scripts. After a
+ * together went out one round trip after another (Firefox and WebKit do not
+ * do this, and with `no-store` neither does Chromium). The size comes from
+ * the caller (provider metadata or a probe), because many hosts do not expose
+ * `Content-Range` to scripts. After a
  * redirect, the final URL is reused until it fails once (signed CDN URLs
  * expire), then the original URL is asked again; a final URL that states its
  * own lifetime (an AWS SigV4 `X-Amz-Expires`, as Figshare's ten-second S3
@@ -1302,9 +1319,9 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
  * A request that carries a header beyond `Range` (a sign-in's
  * `Authorization`) is not CORS-safelisted: the browser asks the host first
  * (a preflight), and keeps the host's answer for later requests of the same
- * URL only when the request may use its HTTP cache (measured: Chromium only
- * under `cache: 'default'`, Firefox under `'default'` and `'no-cache'`,
- * WebKit under every mode). Chromium's HTTP cache then lets one request of a
+ * URL only when the request may use its HTTP cache (Chromium only under
+ * `cache: 'default'`, Firefox under `'default'` and `'no-cache'`, WebKit under
+ * every mode). Chromium's HTTP cache then lets one request of a
  * URL through at a time, so the ranges of one URL would go out one after
  * another. A target that names a lane parameter (`lane`, the name of a query
  * parameter the host ignores) gives each request in flight its own stable
@@ -1313,9 +1330,7 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
  * once and kept, and no two requests in flight share a URL. Only a host whose
  * answers no cache may reuse (Google Drive's: `private, max-age=0,
  * must-revalidate`, no validators) names a lane, so nothing is ever answered
- * from the cache. Measured on a Drive-shaped host (650 ms a request, 200 ms a
- * preflight), a signed first gene took 7.0 s in Chromium with a preflight per
- * request and 5.3 s with lanes, as a request needing no preflight does.
+ * from the cache (measured: 22_decisions_link_model_and_request_planning.md).
  *
  * A file behind a sign-in or an expiring link is read through `access`:
  * `target({refresh})` answers the URL and headers the next request goes to
@@ -1705,14 +1720,7 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
       throw failure;
     }
     if (status === 409) throw changedWhereServed(fileName, said, { url: originalUrl });
-    if (status !== 206 && status !== 200) {
-      const reason = errorReasonOf(said);
-      throw new ByteSourceError(
-        BYTE_SOURCE_FAILURES.HTTP,
-        `${originalUrl}: the host answered HTTP ${status}${reason === null ? '' : ` (${reason})`}.`,
-        { status, ...(reason === null ? {} : { reason }) }
-      );
-    }
+    if (status !== 206 && status !== 200) throw refusedStatusError(response, originalUrl, said);
     if (status === 206) requireAnsweredRange(response, offset, length, size, fileName);
     // Without an ETag, its modification time tells a new version.
     const responseTag = response.headers.get('ETag');
@@ -2145,8 +2153,8 @@ async function probeOnce(url, { signal = null, fetchImpl = routedFetch, headByte
     const asked = Math.min(size, Math.max(1, headBytes));
     // A head whose body stopped coming (the host stalled, asked again until
     // the read's patience ran out) says nothing of how the host codes the
-    // file: that host stalls, and is said to (it was read as content-coded
-    // and downloaded whole, which stalled again).
+    // file: that host stalls, and is said to (read as content-coded, it
+    // would be downloaded whole, which stalls again).
     if (failure?.code === BYTE_SOURCE_FAILURES.STALLED) throw failure;
     if (failure !== null || headOf.response.status !== 206 || headOf.bytes?.length !== asked) {
       if ((await wholeIsReadable(finalUrl, signal, fetchImpl)) !== null) {

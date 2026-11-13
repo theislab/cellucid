@@ -13,9 +13,7 @@
  *   while it answers them with an HTML "unusual traffic" page (HTTP 403)
  *   without CORS headers, which the page sees only as a failed request,
  *   while the file's details still answer and a request that carries a
- *   sign-in still reaches the API (seen three times on 2026-10-25, each
- *   after some 200-400 MB from one address within minutes, for about 50
- *   minutes). A file whose first bytes are
+ *   sign-in still reaches the API. A file whose first bytes are
  *   held back so opens after "[Sign in to Google]" and the file picker, as
  *   a private one. A read held back after the file opened says so as soon
  *   as Google's answers show it (`heldBackNow`: the details answer, one byte
@@ -67,7 +65,7 @@ const RESOURCE_KEY = /^[A-Za-z0-9_-]+$/;
 const GOOGLE_APPS = 'application/vnd.google-apps.';
 
 /** `<id>[~<resource key>]`, `folder:<id>`, `document:<id>`, or null. */
-export function parseDrive(input, explicit = true) {
+function parseDrive(input, explicit = true) {
   if (typeof input !== 'string') return null;
   const text = input.trim();
   if (explicit) {
@@ -398,7 +396,7 @@ export function createDriveProvider({ google = null } = {}) {
 
   /**
    * The reads of a public file: the API key, no sign-in. The key may not
-   * read a revision (Drive answers 401, measured), and Drive's answers carry
+   * read a revision (Drive answers 401), and Drive's answers carry
    * no validator, so the version opened is confirmed by its item before
    * anything read of it is kept under it (`version`, `sources/access.js`).
    */
@@ -460,6 +458,10 @@ export function createDriveProvider({ google = null } = {}) {
    * Open a file signed in: granted already, or granted now in Google's file
    * picker.
    *
+   * @param {string} id - The file's id
+   * @param {string|null} resourceKey - Its resource key, when its link has one
+   * @param {AbortSignal|null} signal
+   * @param {((text: string) => void)|null} onStep - Told each wait by name
    * @param {{text: string, notGrantedTo?: string|null, readPublic?: (() => Promise<Object|null>)|null}} reasons
    *   `text`: why a sign-in is asked for, when nobody is signed in;
    *   `notGrantedTo`: the token Google just answered "not found" for this

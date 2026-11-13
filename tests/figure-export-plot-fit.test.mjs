@@ -1,13 +1,14 @@
 /**
- * F62: a figure shows exactly what its view frames on screen. The plot takes
+ * A figure shows exactly what its view frames on screen. The plot takes
  * the view's aspect (or the framing crop's) inside the requested size, the
  * view fills it with the screen's own projection (no letterbox, no blank
  * band), points keep their on-screen size, and the axes are the rulers of
  * exactly what is drawn.
  *
- * Before the fix a 16:10 view exported at 720 × 500 drew its cells in a
- * 720 × 450 band of a 720 × 500 plot while the axes spanned all 500 px, and a
- * narrow grid pane drew its cells in a middle band of a wide plot.
+ * A 16:10 view exported at 720 × 500 draws its cells over the whole plot, not
+ * in a 720 × 450 band of a 720 × 500 plot while the axes span all 500 px, and
+ * a narrow grid pane draws its cells over the whole plot, not in a middle band
+ * of a wide one.
  */
 
 import assert from 'node:assert/strict';
@@ -120,7 +121,7 @@ function drawnAt({ renderState, plotRect, crop = null, point }) {
 }
 
 test('the plot is the largest rectangle of the view\'s aspect inside the requested size', () => {
-  // The F62 case: a 1440 × 900 (16:10) screen exported at 720 × 500.
+  // A 1440 × 900 (16:10) screen exported at 720 × 500.
   const aspect = figureSourceAspect({ renderState: { viewportWidth: 1440, viewportHeight: 900 } });
   assert.deepEqual(fitPlotSize({ aspect, width: 720, height: 500 }), { width: 720, height: 450 });
   // A tall box keeps the width and gives up height.
@@ -248,9 +249,9 @@ test('the axes of a 2-D view frame exactly what is drawn', () => {
 });
 
 test('axes only where they are rulers: a 1-D or 2-D view seen planar', () => {
-  // Found 2026-11-11 (F86): a 3-D orbit view's figure carried X/Y ticks in
-  // camera units on the focal plane, exact at one depth only and read by
-  // everyone as UMAP coordinates. A perspective picture of cells at many
+  // A 3-D orbit view's figure carries no X/Y ticks: they would be in camera
+  // units on the focal plane, exact at one depth only and read by everyone as
+  // UMAP coordinates. A perspective picture of cells at many
   // depths has no single scale: no axes, and no margins for them.
   assert.equal(figureViewHasAxes({ dimension: 2, navigationMode: 'planar' }), true);
   assert.equal(figureViewHasAxes({ dimension: 1, navigationMode: 'planar' }), true);

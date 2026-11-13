@@ -13,7 +13,7 @@
  * | `heavy` | work estimated to take longer than `HEAVY_MS` on this device and link (`estimate.ms`, from what the page measured) |
  * | `writes-file`, `deletes-saved`, `large-download`, `publishes` | what the history cannot take back (the action's `confirm`) |
  * | `pauses-recording` | pausing the history, after which a change cannot be undone on its own (`history.recording.pause`) |
- * | `unseen-link` | fetching an address the person has not seen in this tab (an action with `opensLinks`: a dataset opened by a link): an agent misled by text it read could otherwise send what it read to any host (F121) |
+ * | `unseen-link` | fetching an address the person has not seen in this tab (an action with `opensLinks`: a dataset opened by a link): an agent misled by text it read could otherwise send what it read to any host |
  *
  * The dispatcher asks at the start of every change of an agent: of its
  * `confirm` kind when that is asked before it runs, else of `change`, and

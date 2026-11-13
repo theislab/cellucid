@@ -3,8 +3,8 @@
  * a loopback host a browser trusts over plain HTTP (where a secret may go:
  * `ALLOWED_ORIGINS`, a local relay) and this machine (served stores, the
  * address box, kept parts), which adds `0.0.0.0`. Exact tables per host
- * form; the origin allowlist answers by the first (round 9: it kept its own
- * copy, without lower-casing or a bare `::1`).
+ * form; the origin allowlist answers by the first (one table, not a second
+ * copy that lacks lower-casing or a bare `::1`).
  */
 
 import assert from 'node:assert/strict';

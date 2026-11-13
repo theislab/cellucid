@@ -44,7 +44,7 @@ test('every point pass publishes its uniforms through one shared helper', () => 
   const uniforms = Object.fromEntries(names.map(name => [name, name]));
   uniforms.u_lightingStrength = null;
   // A translation for the model and a scale for the view: their product is
-  // what the vertex shaders used to form per vertex.
+  // what the vertex shaders would otherwise form per vertex.
   const model = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 3, 4, 5, 1];
   const view = [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1];
   const fov = 1.2;

@@ -47,10 +47,11 @@ async function writeAndCompare(page, name, sourceBase64) {
     const { getDataSourceManager } = await import('/assets/js/data/data-source-manager.js');
     const { openDatasetStore } = await import('/assets/js/data/anndata/open.js');
     const { currentLayoutView, isOlderAnnDataLayout } = await import('/assets/js/data/anndata/older-layouts.js');
+    const { openFileWritable } = await import('/assets/js/utils/file-writable.js');
     const manager = getDataSourceManager();
     const adapter = manager.getSource(manager.getCurrentSourceType()).getAnnDataSource(manager.getCurrentDatasetId()).getAdapter();
 
-    // The copy, through the stream a saved file is written with.
+    // The copy, through the stream a saved file is written with (`utils/file-writable.js`).
     // A private file's stream where the engine gives a page one (WebKit's automation refuses private storage).
     let directory = null;
     let handle = null;
@@ -58,7 +59,7 @@ async function writeAndCompare(page, name, sourceBase64) {
     try {
       directory = await navigator.storage.getDirectory();
       handle = await directory.getFileHandle(`copy-of-${name}`, { create: true });
-      writable = typeof handle.createWritable === 'function' ? await handle.createWritable() : null;
+      writable = typeof handle.createWritable === 'function' ? await openFileWritable(handle) : null;
     } catch {
       writable = null;
     }

@@ -27,31 +27,27 @@
  * - Room: kept runs make room only from other kept runs (never a converted
  *   store), try again after a QuotaExceededError, and live work removes
  *   runs before converted stores.
- * - The revision of what a kept index holds is raised whenever the code
- *   that decides its bytes changes (comments aside).
+ * - Code: a run is stamped with the code fingerprint of gene indexes; one
+ *   stamped by other code is removed, never read, and the index is built
+ *   and kept again (which code that is:
+ *   `tests/kept-code-fingerprints-contract.test.mjs`).
  */
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 // The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
 import './helpers/machine-at-rest.mjs';
-import { fileURLToPath } from 'node:url';
 
 import { annData, countingStore, dataFrame, dense, mapping, sparse, strings } from './helpers/anndata-store.mjs';
 import { opfsOnDisk } from './helpers/opfs-on-disk.mjs';
-import { codeDigest, codeOf, sourceClosure } from './helpers/code-digest.mjs';
 import { openZarr } from '../assets/js/formats/zarr/index.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
 import { createMulberry32 } from '../assets/js/app/utils/random-utils.js';
 import {
-  KEPT_INDEX_REVISION,
   TRANSCODED_DIRECTORY,
-  cacheKey,
   holdTranscodedStore,
-  identityDigest,
   listKeptStores,
   forgetOtherVersions,
   onKeptStoresChange,
@@ -59,6 +55,8 @@ import {
   removeKeptStores,
   sweepAbandonedTranscodes,
 } from '../assets/js/data/anndata/transcode/space.js';
+import { KEPT_CODE_FINGERPRINTS } from '../assets/js/data/anndata/transcode/kept-code-fingerprints.js';
+import { cacheKey, identityDigest } from '../assets/js/data/anndata/transcode/kept-format.js';
 import { persistsAcrossVisits, writeVersion } from '../assets/js/data/sources/identity.js';
 import { diskFreeBytes } from '../assets/js/data/column-store-placement.js';
 import { initKeptStoresLine, summarizeKeptStores } from '../assets/js/app/ui/modules/kept-stores-line.js';
@@ -848,123 +846,35 @@ test('the Stored row lists one gene index per file and cell order, refreshes on 
   privateLine.destroy();
 });
 
-/**
- * The code that decides the bytes a kept index holds, and so what a kept
- * run means: followed from these modules through every relative import.
- *
- * - The index and its kept form: the column stores and their kept form,
- *   the index's build (`sparse-column-index.js`), the runs of rows
- *   (`prefix-column-index.js`), the kept format (`kept-column-index.js`).
- * - The values and entries it is built from: the matrix's reads
- *   (`matrix-access.js`: `readValues`, `readRows`, `writeFloat32`), their
- *   conversion (`values.js`: `readNumbers`, `readIntegers`), the subsample's
- *   view of the file's rows (`views/cell-subset.js`), the layouts a file is
- *   presented through (`views/index.js`, `older-layouts.js`), and the
- *   readers that decode the file's chunks (`formats/zarr`, `formats/hdf5`,
- *   `formats/zip`, and the decode worker that runs their codecs).
- *
- * The comments of these files do not count (`helpers/code-digest.mjs`
- * `codeOf`: each file printed by esbuild with comments and whitespace
- * removed, a semantics-preserving print), so a comment changes nothing;
- * any change to code does.
- */
-const ENTRIES = [
-  'assets/js/data/anndata/kept-column-index.js',
-  'assets/js/data/sparse-column-index.js',
-  'assets/js/data/anndata/prefix-column-index.js',
-  'assets/js/data/anndata/matrix-access.js',
-  'assets/js/data/anndata/values.js',
-  'assets/js/data/anndata/views/cell-subset.js',
-  'assets/js/data/anndata/views/index.js',
-  'assets/js/data/anndata/older-layouts.js',
-  'assets/js/formats/zarr/index.js',
-  'assets/js/formats/hdf5/index.js',
-  'assets/js/formats/zip/index.js',
-  'assets/js/formats/io/decode-worker.js',
-];
+test('a kept run stamped by other code is removed, never read: the index is built again, kept again, and exact', async t => {
+  for (const [layout, link] of [['csr', null], ['csr', SLOW_LINK], ['dense', null]]) {
+    const kind = `${layout}${link === null ? '' : ' over a slow link'}`;
+    const disk = opfsOnDisk();
+    t.after(() => disk.cleanup());
+    const { tree, values } = wideTree(layout, 13);
+    const first = await visit(tree, disk.environment, blocks(900), { link });
+    await first.reader.getMatrixColumn('X', 7);
+    await first.settled();
+    first.reader.close();
+    const runs = keptDirectories(disk);
+    assert.ok(runs.length > 0 && runs.every(({ manifest }) => manifest.kind === 'column-index' && manifest.codeFingerprint === KEPT_CODE_FINGERPRINTS.index),
+      `${kind}: each run is stamped with the code fingerprint of gene indexes`);
+    // The same runs, as other code would have left them.
+    for (const { folder, manifest } of runs) writeFileSync(path.join(folder, 'manifest.json'), JSON.stringify({ ...manifest, codeFingerprint: 'other code' }));
 
-/**
- * Modules reached from those that do not decide what a run holds, each
- * with why (and, followed no further, what only they import). A module
- * newly imported by a guarded one is guarded until it is listed here.
- */
-const LEFT_OUT = new Map([
-  // Holds the revision (guarding it would change the digest with every raise); writes no index content.
-  ['assets/js/data/anndata/transcode/space.js', 'keeps the runs; holds the revision'],
-  // Move bytes, schedule work or measure the link: what arrives is the same bytes.
-  ['assets/js/formats/io/byte-source.js', 'transport'],
-  ['assets/js/formats/io/byte-reader.js', 'transport'],
-  ['assets/js/formats/io/host-fetch.js', 'transport'],
-  ['assets/js/formats/io/hosts.js', 'transport: when a host is asked, and who is at fault when it does not answer'],
-  ['assets/js/formats/io/link.js', 'link measurement'],
-  ['assets/js/formats/io/mirrors.js', 'transport'],
-  ['assets/js/utils/abort.js', 'cancellation'],
-  // Which opening is planned (which cells, in which order, read when), from rates held or measured: never what an index of those cells holds.
-  ['assets/js/utils/machine.js', 'the rates a plan weighs'],
-  ['assets/js/formats/io/activity.js', 'progress reporting'],
-  ['assets/js/formats/io/decode-pool.js', 'runs the codecs (guarded through the decode worker) on worker threads'],
-  ['assets/js/data/memory-budget.js', 'residency policy'],
-  ['assets/js/utils/format-units.js', 'messages'],
-  ['assets/workers/scripts.js', 'generated names of the worker bundles'],
-  // Say what a file is or which modality is shown first; the matrix a run indexes is named in its group.
-  ['assets/js/data/input-formats.js', 'recognises formats'],
-  ['assets/js/data/data-mapping.js', 'names the default modality'],
-]);
-
-/** Every revision's digest of that code, oldest first: a row is added for every change, never edited. */
-const INDEX_REVISIONS = [
-  { revision: 1, digest: 'dda0ce2eaf4a5e4946fc24756d7f0e2ff1048fa879588997a68c1fbcf5704b41' },
-  { revision: 2, digest: '67d77d33da242f7875bee932ea9aa9e77949c9ebff832184aa72668e09276819' },
-  { revision: 3, digest: '7d85049a16f011129dc54e2fcca3740d65c227545a8bf2b3d52590ff9bcc0777' },
-  { revision: 4, digest: 'ec7d398d15e12de0e37b53ef532581e5e96f2a726d492005a818a0bace7cd80c' },
-  { revision: 5, digest: '60a10902a751aacecf49d4934ffbaba36b8aa90e69699de936e06fae3567ccff' },
-  { revision: 6, digest: '07c69ba853b46f61dac4cc636e9b8d26692dd255c1afe777bc33fd08a1c96b67' },
-  { revision: 7, digest: '6a7969a3f8993fa1d559e83a189234d1a11620bc026f2a84e646c7ecee15369d' },
-  { revision: 8, digest: '8560778575098ff604f63c6564bbfb1d23c5ccf4b32bd8605fb77ab0567ac4ab' },
-  // The rates a plan weighs are read through `utils/machine.js` (the kept-read rate, the index pass rates, the cores); nothing an index holds changed.
-  { revision: 9, digest: 'cec9f65e01ec9f5d74e721e8267e00b9c0ef60256190787e3592e0d99646b927' },
-  // A Zarr store on a web host remembers the objects its host answered as absent, in the store and in the page
-  // (`formats/zarr/stores/http.js`, `formats/io/range-cache.js`); nothing an index holds changed.
-  { revision: 10, digest: '216eae648134ad37c4e72c9b91590becca1e6d9e9271ca11c51df41b6c6058c5' },
-  // Round 8–9 (2026-11-11; one raise for the day): AnnData layout refusals (`AnnDataFormatError`), 64-bit integer obs
-  // columns past 2^53 read as their exact text, messages in US spelling, one formatter and one listener set per
-  // concept; what an index holds is unchanged.
-  { revision: 11, digest: 'aa1322276b1c712f5bd68c4dbee5228e25db1dc32493a8dd6d936eecf2093d60' },
-];
-
-test('the kept-index revision is raised whenever the code that decides what an index holds changes', () => {
-  const root = fileURLToPath(new URL('..', import.meta.url));
-  const { guarded, reached } = sourceClosure(root, ENTRIES, LEFT_OUT);
-  // Every left-out module is one the guarded code reaches (a stale entry is removed).
-  for (const file of LEFT_OUT.keys()) assert.ok(reached.has(file), `${file} is left out but no longer reached`);
-  // Every container reader the reader opens a file with is followed.
-  const opens = readFileSync(path.join(root, 'assets/js/data/anndata/open.js'), 'utf8');
-  for (const [, target] of opens.matchAll(/from '(\.\.\/\.\.\/formats\/[^/']+\/index\.js)'/g)) {
-    const file = path.posix.normalize(path.posix.join('assets/js/data/anndata', target));
-    assert.ok(reached.has(file), `${file}, which opens files, is followed`);
-  }
-  assert.ok(guarded.includes('assets/js/formats/zarr/codecs/blosc.js') && guarded.includes('assets/js/formats/hdf5/filters.js') && guarded.includes('assets/js/data/anndata/values.js'), 'the decoders and the conversion are guarded');
-  // A comment changes nothing; code does.
-  assert.equal(codeOf('const a = 1; // one\n/** two */\nexport { a };', 'x.js'), codeOf('const a = 1;\nexport { a };', 'x.js'));
-  assert.notEqual(codeOf('const a = 1;\nexport { a };', 'x.js'), codeOf('const a = 2;\nexport { a };', 'x.js'));
-  assert.notEqual(codeOf('const a = "x  y";', 'x.js'), codeOf('const a = "x y";', 'x.js'), 'the text of a string is code');
-  const digest = codeDigest(root, guarded);
-  INDEX_REVISIONS.forEach((row, index) => {
-    if (index > 0) assert.equal(row.revision, INDEX_REVISIONS[index - 1].revision + 1, 'one row per revision, in order');
-  });
-  assert.equal(new Set(INDEX_REVISIONS.map(row => row.digest)).size, INDEX_REVISIONS.length, 'every revision has its own code');
-  assert.deepEqual({ revision: KEPT_INDEX_REVISION, digest }, INDEX_REVISIONS.at(-1),
-    'The code that decides what a kept gene index holds changed: raise KEPT_INDEX_REVISION in assets/js/data/anndata/transcode/space.js ' +
-    '(indexes kept by the earlier revision are then removed, not read), and add a row with the new revision and digest here.');
-  // A row is never edited: against the committed test, a new digest comes with a new revision.
-  let committed = null;
-  try {
-    committed = execFileSync('git', ['show', 'HEAD:tests/kept-column-index-contract.test.mjs'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  } catch {
-    committed = null;
-  }
-  for (const [, revision, recorded] of committed?.matchAll(/\{ revision: (\d+), digest: '([0-9a-f]{64})' \}/g) ?? []) {
-    const row = INDEX_REVISIONS.find(item => item.revision === Number(revision));
-    assert.equal(row?.digest, recorded, `revision ${revision}'s committed digest is kept as it was: a change takes the next revision`);
+    const again = await visit(tree, disk.environment, blocks(900), { link });
+    assert.equal((await again.reader.geneReadPlan('X')).built, false, `${kind}: no run of other code is used`);
+    const order = again.reader.cellSubset.openOrder;
+    for (const gene of [7, 0, N_VARS - 1]) assertGene(await again.reader.getMatrixColumn('X', gene), values, order, gene, `${kind} gene ${gene}`);
+    assert.ok(again.matrixReads().length > 0, `${kind}: the index is built from the file again`);
+    await again.settled();
+    again.reader.close();
+    const left = keptDirectories(disk);
+    assert.ok(runs.every(({ name }) => !left.some(item => item.name === name)), `${kind}: the runs of other code are removed`);
+    assert.ok(left.length > 0 && left.every(({ manifest }) => manifest.codeFingerprint === KEPT_CODE_FINGERPRINTS.index), `${kind}: this code's runs are kept`);
+    const next = await visit(tree, disk.environment, blocks(900), { link });
+    assert.equal((await next.reader.geneReadPlan('X')).built, true, `${kind}: kept again`);
+    next.reader.close();
+    await assertNothingHeld(disk, `${kind} other code`);
   }
 });

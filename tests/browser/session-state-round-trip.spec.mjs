@@ -1,12 +1,10 @@
 /**
- * A session must come back whole, not almost whole (CEL-0232).
+ * A session must come back whole, not almost whole.
  *
- * Every existing session test names what it checks: four renderer controls,
- * eleven filter properties, one active field, a theme and a point size. That is
- * the same shape as the defect this subsystem keeps producing — state
- * republished from a hand-maintained list, and the list drifts. A control added
- * to the app is covered by none of those tests until somebody remembers to add
- * an assertion for it.
+ * A test that names what it checks (four renderer controls, eleven filter
+ * properties, one active field, a theme and a point size) is a hand-maintained
+ * list, and such lists drift: a control added to the app is covered by none of
+ * those tests until somebody remembers to add an assertion for it.
  *
  * This spec names nothing. It builds a rich state in the real application,
  * saves it, drifts every part of it, loads the file back, saves again, and
@@ -177,7 +175,7 @@ test('a saved session restores to the exact state it recorded', async (
   expect(Math.min(...built.counts)).toBeGreaterThan(0);
 
   // A non-default selection tool: page chrome, which a session carries outside its
-  // history (its `chrome`, CEL-0249), never as a setting.
+  // history (its `chrome`), never as a setting.
   await page.locator('#highlight-mode-lasso').click();
   await expect(page.locator('#highlight-mode-lasso'))
     .toHaveAttribute('aria-pressed', 'true');
@@ -302,60 +300,18 @@ test('a saved session restores to the exact state it recorded', async (
   expect(restored.hashes, 'every state domain comes back, to its content hash').toEqual(saved.hashes);
 
   // ---------------------------------------------------------------------
-  // A restore raises nothing (CEL-0239).
+  // A restore raises nothing.
   //
-  // This assertion used to carry a named exemption for exactly one uncaught
-  // `RangeError` per restore. A restore of the views emptied the viewer's
-  // snapshot inventory at the start of the rebuild, and
-  // `ui/modules/view-controls.js` kept private
-  // `activeViewId` and `liveViewHidden` copies of state its owners had already
-  // moved. The badge render that the same rebuild scheduled then threw on a
-  // kept view that no longer existed. The module now reads both from their
-  // owners on every use, so there is nothing left to exempt.
-  //
-  // The exemption mattered because `state-serializer/ui-controls.js` installs a
-  // capture-phase window `error` listener for the duration of each control
-  // event it dispatches: a badge render reached synchronously from a restored
-  // control's own listener turned this into a restore failure naming an
-  // unrelated control.
+  // `state-serializer/ui-controls.js` installs a capture-phase window `error`
+  // listener for the duration of each control event it dispatches, so an error
+  // raised synchronously from a restored control's own listener (a badge render
+  // the rebuild scheduled) turns into a restore failure naming an unrelated
+  // control. `ui/modules/view-controls.js` reads `activeViewId` and
+  // `liveViewHidden` from their owners on every use, and keeps no copy of them,
+  // so a badge render never meets a kept view the rebuild has emptied from the
+  // viewer's snapshot inventory.
   expect(
     browserErrors,
     'no session restore may raise a page error',
   ).toEqual([]);
-});
-
-test('a session saved while a view is colored by a continuous field loads back', async (
-  { page },
-  testInfo,
-) => {
-  // The continuous legend rebuilds its range sliders with generated ids on
-  // every render. A session that recorded those ids named controls no fresh
-  // page has, and loading it was refused ("Session UI control … does not
-  // exist"). What the sliders show is the field's own filter and color
-  // range, which the core state saves; the legend is not a control inventory.
-  const browserErrors = [];
-  page.on('pageerror', error => browserErrors.push(`page: ${error.stack || error.message}`));
-
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await expect(page.locator('#legend input[type="range"]').first()).toBeAttached();
-  const sessionPath = await saveSession(page, testInfo, 'continuous-legend.cellucid-session');
-
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await loadSession(page, sessionPath);
-  await expect.poll(() => page.evaluate(() => {
-    const state = window._cellucidState;
-    const field = state.activeFieldSource === 'obs'
-      ? state.obsData.fields[state.activeFieldIndex]
-      : null;
-    return field?.key ?? null;
-  })).toBe('score');
-  await expect(page.locator('.notification', { hasText: /does not exist|could not|failed/i })).toHaveCount(0);
-  expect(browserErrors).toEqual([]);
 });

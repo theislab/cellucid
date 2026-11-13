@@ -155,9 +155,9 @@ function choiceNamed(choices, value) {
  * A list of groups in the order its picker shows them (`context.groupsFor`,
  * the field's categories), ids the data does not list after them as given: a
  * set of groups has one form, so the picker reading it back (every time the
- * form refreshes) changes nothing. An agent's `["Epicardial fibroblast", …]`
- * in its own order was rewritten by the next refresh into the field's order,
- * and the history recorded "Changed outside the history" (live-7 L25-2).
+ * form refreshes) changes nothing: a list in a caller's own order that the next
+ * refresh rewrote into the field's order would be recorded as "Changed
+ * outside the history".
  */
 function groupsInOrder(entry, value, record, context) {
   if (value?.mode !== 'subset' || typeof context?.groupsFor !== 'function') return value;

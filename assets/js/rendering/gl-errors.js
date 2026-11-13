@@ -44,7 +44,7 @@ export const CONTEXT_REFUSED_ERROR_NAME = 'WebGLContextRefusedError';
  * The browser handed back no WebGL2 context for `owner` (`getContext`
  * answered null): a browser without WebGL2, or one whose graphics process
  * cannot make another context now (reset, blocklisted for this context, too
- * many contexts). `startup-failure.js` tells the two apart (R9E-6).
+ * many contexts). `startup-failure.js` tells the two apart.
  *
  * @param {string} owner
  * @returns {Error}
@@ -80,7 +80,8 @@ export function contextLostError(owner) {
  * validated, such a write fails only when the context is gone, and
  * `getError()` is a synchronous round trip to the GPU process that waits for
  * every queued command -- the previous frame's point draws included. A filter
- * tick at 10M points in four views spent 40 ms of 75 ms there. Allocations
+ * tick at 10M points in four views spends over half its time there
+ * (measured: 28_decisions_rendering_layers.md). Allocations
  * keep their check (`OUT_OF_MEMORY` lives there).
  *
  * @param {WebGL2RenderingContext} gl
@@ -162,11 +163,12 @@ export function describeWebGLError(gl, code) {
 // DEFERRED CHECKS
 //
 // `getError()` waits for the GPU process to run every queued command, and on
-// Firefox and WebKit for the GPU itself: read after a transform-feedback
-// write of 10M points it cost 10-13 ms of main thread there (Chromium under
-// 1 ms). A write made often -- highlight words at every highlight change, a
-// draw order adopted band by band in every frame -- is therefore checked
-// later instead: a fence is put after it, and once the GPU has passed the
+// Firefox and WebKit for the GPU itself: after a transform-feedback write of
+// millions of points it holds the main thread for milliseconds there
+// (measured: 28_decisions_rendering_layers.md). A write made often --
+// highlight words at every highlight change, a draw order adopted band by band
+// in every frame -- is therefore checked later instead: a fence is put after
+// it, and once the GPU has passed the
 // fence (polled each frame, which never waits) the error queue is read; the
 // read then waits for nothing. A failure is never silent: it goes to the
 // batch's `onError`, named by the batch's own `diagnose` (the batch run again

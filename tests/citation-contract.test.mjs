@@ -3,7 +3,7 @@
  *
  * `CITATION.cff` is the one place the citation is written. The README
  * sections, the documentation's "Citing Cellucid" page and the R package are
- * generated from it by `cellucid-private/scripts/sync_citation.py`; the Cite
+ * generated from it by the citation sync script; the Cite
  * dialog reads it at runtime through `assets/js/app/citation.js`. This file
  * holds the JavaScript reader to the generated documentation (when the
  * cellucid-python checkout is beside this one), to the placeholder rule, and
@@ -17,6 +17,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { pythonDocsRoot, skipAbsentSibling } from '../scripts/shared-files.mjs';
 import {
   CITING_PAGE_URL,
   PLACEHOLDER_NOTE,
@@ -29,8 +30,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CFF = await readFile(path.join(ROOT, 'CITATION.cff'), 'utf8');
 const INDEX = await readFile(path.join(ROOT, 'index.html'), 'utf8');
-const DOCS_ROOT = process.env.CELLUCID_PYTHON_DOCS
-  ?? path.resolve(ROOT, '..', 'cellucid-python', 'docs');
+const DOCS_ROOT = pythonDocsRoot();
 const CITING_PAGE = path.join(DOCS_ROOT, 'citing.md');
 
 test('the repository citation is a placeholder until it has a DOI, and says so', () => {
@@ -46,10 +46,7 @@ test('the repository citation is a placeholder until it has a DOI, and says so',
 });
 
 test('the dialog renders exactly the reference and BibTeX the documentation shows', async t => {
-  if (!existsSync(CITING_PAGE)) {
-    t.skip(`documentation not present at ${CITING_PAGE}`);
-    return;
-  }
+  if (skipAbsentSibling(t, existsSync(CITING_PAGE), `documentation not present at ${CITING_PAGE}`)) return;
   const page = await readFile(CITING_PAGE, 'utf8');
   const citation = parsePreferredCitation(CFF);
   const bib = /```bibtex\n([\s\S]*?)```/.exec(page);

@@ -46,7 +46,7 @@ const RUNS = [
   },
 ];
 const DEPLOYED = 'https://www.cellucid.com';
-// A field the dataset does not open colored by (it opens colored by its cell types, F21), so the turn changes the coloring.
+// A field the dataset does not open colored by (it opens colored by its cell types), so the turn changes the coloring.
 const TASK = 'Color the cells by the first continuous field of this dataset. Read the fields first. Reply in one short sentence.';
 
 // No trace, screenshot or video: nothing that could keep a request.

@@ -145,7 +145,7 @@ test('loading a session opens the dataset it records before applying it', async 
   assert.deepEqual(
     await loadSession({ recorded, openIdentity: null }),
     [
-      // Named as the Dataset box names it, never by its id (found 2026-11-10: "from the sample dataset "suo"").
+      // Named as the Dataset box names it, never by its id (not "from the sample dataset "suo"").
       ['notice', 'the session\'s dataset "Developing human immune system (Suo)" from the samples'],
       ['open', recorded],
       ['restore', true],
@@ -345,7 +345,7 @@ test('a newer session file retires the Reopen offer of the last one, and that of
   }
 });
 
-test('opening a saved state says whether it opened and, when not, why, to whoever asked (F114)', async () => {
+test('opening a saved state says whether it opened and, when not, why, to whoever asked', async () => {
   const notifications = getNotificationCenter();
   const { show, error } = notifications;
   const offers = [];

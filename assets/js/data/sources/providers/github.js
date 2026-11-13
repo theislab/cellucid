@@ -9,7 +9,7 @@
  * `owner/repo@ref[/path]`, a `github.com/<owner>/<repo>/tree|blob|raw/<ref>/...`
  * URL, or a `raw.githubusercontent.com` URL.
  *
- * What each link costs, measured against GitHub's hosts (HTTP/2, one
+ * What each link costs against GitHub's hosts (HTTP/2, one
  * connection carrying up to 100 requests; every request answered with
  * `Access-Control-Allow-Origin: *`, every preflight refused):
  *
@@ -35,7 +35,7 @@
  *   for the bytes unencoded: its length is the file's, never a compressed
  *   transfer's (GitHub Pages compresses binary files, and a page cannot see
  *   that it did). Neither raw host shows its `ETag` to other sites, so
- *   without the commit (GitHub's API refused this browser: 60 requests an
+ *   without the commit (GitHub's API allows 60 requests an
  *   hour without a sign-in, revalidations not counted) the file is read at
  *   its ref with no version (`size:<n>`): nothing kept of it is used.
  * - Every request is CORS-safelisted (a `HEAD`, a `GET`, one plain range),

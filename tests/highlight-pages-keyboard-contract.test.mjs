@@ -521,7 +521,7 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
 
     // Tab closes the menu and hands focus back to its button first, so the
     // browser's Tab moves on from there (the menu sits at the end of the
-    // page: a Tab from an item went to the page's first stop, LF-5).
+    // page: a Tab from an item would go to the page's first stop).
     combineButton.dispatch('click');
     combineMenu = document.body.querySelector('.popup-menu');
     press('Tab');

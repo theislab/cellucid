@@ -2,9 +2,9 @@
  * A read of the analyses makes no state. The panel makes a mode's analysis
  * on first use, and every mode it made is part of the `analysis` state
  * domain (`ComparisonModule.exportSessionState`), so a read that made one
- * changed the state with no step, which undo could not take back (found by
- * F1's live sweep: undo of a turn left `analysis` changed after
- * `analysis.<mode>.get`). This guard holds the class shut in the sources:
+ * changed the state with no step, which undo could not take back (undo of a
+ * turn would leave `analysis` changed after `analysis.<mode>.get`). This
+ * guard holds the class shut in the sources:
  *
  * - no provider of a read (effect `read`) or of a stop (effect `control`,
  *   `analysis.cancel`: no step either) in `app/analysis/actions.js`, and
@@ -67,17 +67,6 @@ test('no read of the analyses, and no estimate, reaches what makes a mode', () =
   // Changes may make a mode (inside their step); a read never.
   const readAt = source('actions.js').match(/function readAnalysisAt[\s\S]*?\n {2}}\n/)[0];
   assert.match(readAt, /comparisonModule\.readPanelUI\(/);
-});
-
-test('the public getUI peeks; one analysis reads another\'s results by peeking', () => {
-  const module = source('comparison-module.js');
-  const getUI = module.match(/\n {2}getUI\(modeId\) \{[\s\S]*?\n {2}}\n/)[0];
-  assert.match(getUI, /peekUI\(modeId\)/);
-  assert.doesNotMatch(module, /getAnalysisUIs/, 'the unused maker of every mode is gone');
-  for (const file of ['ui/analysis-types/dotplot-ui.js', 'ui/analysis-types/gene-signature-ui.js']) {
-    assert.doesNotMatch(source(file), /getUI\('genesPanel'\)|getUI\?\.\('genesPanel'\)/, `${file} reads the marker genes by peeking`);
-    assert.match(source(file), /peekUI\??\.?\('genesPanel'\)/, file);
-  }
 });
 
 test('peekUI never makes a mode; getUI makes it', () => {

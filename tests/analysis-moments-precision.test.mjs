@@ -1,5 +1,5 @@
 /**
- * Means and spreads keep their digits (audit NS-2, NS-14), checked against
+ * Means and spreads keep their digits, checked against
  * exact rational references (Python `fractions`, the t and F to 50 digits):
  *
  * - The Detailed view's Welch t and one-way ANOVA subtract means less one
@@ -73,7 +73,7 @@ test('a constant gene has no spread, exactly, and a constant group its value as 
   assert.equal(zeros.m2, 0);
 });
 
-test("markers' one-vs-rest Welch merges the rest from the other groups: a dominant group, a tight rest (NS-8)", async () => {
+test("markers' one-vs-rest Welch merges the rest from the other groups: a dominant group, a tight rest", async () => {
   const { createGroupingContext, groupMarkers } = await import('../assets/js/app/analysis/compute/gene-statistics.js');
   const { welchTTest } = await import('../assets/js/app/analysis/compute/math-utils.js');
   // 200,000 cells: group 0 wide around 6, groups 1 and 2 (60 cells) tight around 5.

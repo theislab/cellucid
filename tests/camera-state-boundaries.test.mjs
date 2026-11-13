@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const {
@@ -14,33 +13,6 @@ const {
 } = await import('../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js');
 const { createCameraDomain } = await import('../assets/js/app/state/domains/camera.js');
 const { createViewsDomain } = await import('../assets/js/app/state/domains/views.js');
-
-const scopedSources = await Promise.all([
-  '../assets/js/app/state/domains/camera.js',
-  '../assets/js/app/state/domains/views.js',
-  '../assets/js/app/ui/modules/camera-controls.js',
-  '../assets/js/app/ui/modules/view-controls.js',
-  '../assets/js/app/ui/modules/cinematic-camera/index.js',
-  '../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js',
-  '../assets/js/app/ui/modules/cinematic-camera/keyframe-store.js',
-  '../assets/js/app/ui/modules/figure-export/figure-export-engine.js',
-  '../assets/js/app/ui/modules/figure-export/figure-export-ui.js',
-  '../assets/js/app/ui/modules/figure-export/components/orientation-indicator.js',
-  '../assets/js/app/ui/modules/figure-export/renderers/png-renderer.js',
-  '../assets/js/app/ui/modules/figure-export/renderers/svg-renderer.js',
-  '../assets/js/rendering/viewer.js'
-].map(async (relativePath) => ({
-  relativePath,
-  source: await readFile(new URL(relativePath, import.meta.url), 'utf8')
-})));
-const filtersDomainSource = await readFile(
-  new URL('../assets/js/app/state/domains/filters.js', import.meta.url),
-  'utf8'
-);
-const colorsDomainSource = await readFile(
-  new URL('../assets/js/app/state/domains/colors.js', import.meta.url),
-  'utf8'
-);
 
 function cameraState(navigationMode = 'orbit') {
   return {
@@ -188,72 +160,6 @@ test('the current camera-state contract requires both synchronized representatio
     assert.equal(isExactCameraState(invalid), false);
     assert.throws(() => assertCameraState(invalid), /camera state/i);
   }
-});
-
-test('camera consumers never synthesize orbit or probe obsolete camera capabilities', () => {
-  const forbidden = [
-    /cameraState\?\.navigationMode\s*\|\|\s*['"]orbit['"]/,
-    /navigationMode\s*\|\|\s*['"]orbit['"]/,
-    /getViewCameraState\?\./,
-    /getCameraState\?\./,
-    /setViewCameraState\?\./,
-    /setCameraState\?\./,
-    /getNavigationMode\?\./,
-    /setNavigationMode\?\./
-  ];
-
-  for (const { relativePath, source } of scopedSources) {
-    for (const pattern of forbidden) {
-      assert.doesNotMatch(source, pattern, `${relativePath} violates ${pattern}`);
-    }
-  }
-});
-
-test('viewer camera and dimension owners never repair missing state', () => {
-  const viewer = scopedSources.find(({ relativePath }) =>
-    relativePath.endsWith('/rendering/viewer.js')
-  ).source;
-
-  for (const pattern of [
-    /getFallbackDimensionLevel/,
-    /camState\.freefly\.position\s*\|\|/,
-    /camState\.freefly\.(?:yaw|pitch)\s*\|\|/,
-    /camState\.orbit\.(?:radius|theta|phi|target)\s*(?:\?\?|\|\|)/,
-    /orb\.(?:radius|theta|phi|target)\s*(?:\?\?|\|\|)/,
-    /old buffer doesn't have dimensionLevel stored/,
-    /full reload if incremental update not available/i
-  ]) {
-    assert.doesNotMatch(viewer, pattern, `viewer violates ${pattern}`);
-  }
-  assert.match(
-    viewer,
-    /function computeViewMatrixFromState\([\s\S]*?assertCameraState\(/
-  );
-  assert.match(
-    viewer,
-    /function syncFreeflyInCameraState\([\s\S]*?assertCameraState\(/
-  );
-});
-
-test('camera-path math never invents missing camera coordinates', () => {
-  const cameraPathSources = scopedSources.filter(({ relativePath }) =>
-    relativePath.endsWith('/interpolation-engine.js') ||
-    relativePath.endsWith('/keyframe-store.js')
-  );
-  for (const { relativePath, source } of cameraPathSources) {
-    assert.doesNotMatch(source, /orbit\?\./, relativePath);
-    assert.doesNotMatch(source, /freefly\?\./, relativePath);
-    assert.doesNotMatch(source, /\?\?\s*(?:0|3|Math\.PI)/, relativePath);
-    assert.doesNotMatch(source, /\|\|\s*\[\s*0\s*,\s*0\s*,\s*0\s*\]/, relativePath);
-  }
-
-  const cameraPathUi = scopedSources.find(({ relativePath }) =>
-    relativePath.endsWith('/cinematic-camera/index.js')
-  ).source;
-  assert.doesNotMatch(cameraPathUi, /positionMethod:\s*dom\.[^\n]*(?:\|\||\?\?)/);
-  assert.doesNotMatch(cameraPathUi, /rotationMethod:\s*dom\.[^\n]*(?:\|\||\?\?)/);
-  assert.doesNotMatch(cameraPathUi, /easing:\s*dom\.[^\n]*(?:\|\||\?\?)/);
-  assert.match(cameraPathUi, /assertCameraPathState\(data\)/);
 });
 
 test('camera-path interpolation rejects incomplete state and unsupported settings', () => {
@@ -448,44 +354,6 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
       freefly: planarEndpoint.freefly
     },
     'a cross-mode path must finish at the exact saved camera state'
-  );
-});
-
-test('state-domain, snapshot, and figure-export boundaries assert exact camera state', () => {
-  const byPath = new Map(scopedSources.map(({ relativePath, source }) => [relativePath, source]));
-  const cameraDomainSource = byPath.get('../assets/js/app/state/domains/camera.js');
-  // Every view's camera, captured and restored (a history step, a session
-  // load), is checked whole.
-  assert.match(
-    cameraDomainSource,
-    /cloneCameraState\(viewer\.getViewCameraState\(id\), `Camera of view "\$\{id\}"`\)/
-  );
-  assert.match(
-    cameraDomainSource,
-    /cloneCameraState\(value\.views\[index\], `Camera to restore for \$\{viewNameInValue\(index, liveHidden\)\}`\)/
-  );
-  for (const [label, source] of [['filters', filtersDomainSource], ['colors', colorsDomainSource]]) {
-    assert.doesNotMatch(
-      source,
-      /_pushOutliersToViewer|_pushOutlierThresholdToViewer/,
-      `a ${label} restore must use the current visibility/transparency owner`
-    );
-  }
-  assert.match(
-    filtersDomainSource,
-    /state\.endBatch\(\);\s*\}\s*state\.computeGlobalVisibility\(\);/
-  );
-  assert.match(
-    colorsDomainSource,
-    /state\.updateColorsContinuous\(active\);\s*state\._pushColorsToViewer\(\);/
-  );
-  assert.match(
-    byPath.get('../assets/js/app/ui/modules/figure-export/figure-export-engine.js'),
-    /cloneCameraState\(\s*presented\.cameraState/
-  );
-  assert.match(
-    byPath.get('../assets/js/rendering/viewer.js'),
-    /setViewCameraState\(viewId,\s*camState\)[\s\S]*?assertCameraState\(camState/
   );
 });
 

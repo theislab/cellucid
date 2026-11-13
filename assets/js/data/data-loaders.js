@@ -30,7 +30,7 @@ import {
   getMetadataLoadSignal,
 } from './metadata-load-contract.js';
 import { requirePriority } from './fetch-scheduler.js';
-import { onAbort, throwIfAborted, awaitWithSignal, requireSignalOrNull } from '../utils/abort.js';
+import { throwIfAborted, awaitWithSignal, requireSignalOrNull } from '../utils/abort.js';
 import {
   isAnnDataUrl,
   anndataCellOrderDigest,
@@ -785,7 +785,7 @@ export function getEmbeddingsMetadata(identity) {
  * it: no gene name is read before the first view. The identity counts the
  * genes from metadata (`stats.n_genes`), and the list itself (`loadGeneList`
  * at `<base>var`) is read after the first view and checked against that
- * count (`app/main.js`).
+ * count (`app/dataset/publication.js`).
  *
  * @param {string} baseUrl - `anndata://<id>/`
  * @param {{candidateAnnDataBinding?: Object|null, expectedIdentityId: string, signal: AbortSignal}} options
@@ -1283,7 +1283,7 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
  * @returns {Promise<import('./connectivity-edges.js').ConnectivityEdges>}
  */
 export async function loadEdges(graphUrl, summary, options) {
-  // `readKey`: the key the graph's read is told under (R9F-9).
+  // `readKey`: the key the graph's read is told under.
   // Anything but a plain record is refused as the options contract says.
   const plain = options !== null && typeof options === 'object' && !Array.isArray(options);
   if (!plain) getMetadataLoadSignal(options, 'Connectivity edge loader');

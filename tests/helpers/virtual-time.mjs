@@ -23,9 +23,9 @@
  * `CompressionStream` inflate and deflate there (`node:zlib`). So zlib's work
  * is counted here (each chunk from when its transform starts to when it
  * finishes or its stream closes) and idle waits for it too. Without that the
- * clock moved while a chunk was still inflating, and requests its decoded
- * bytes lead to were counted a round late on a machine that inflates slowly
- * (macOS CI, 2026-11-01: a global heap read in 4 rounds, not 3).
+ * clock would move while a chunk was still inflating, and requests its
+ * decoded bytes lead to would be counted a round late on a machine that
+ * inflates slowly.
  */
 
 import zlib from 'node:zlib';

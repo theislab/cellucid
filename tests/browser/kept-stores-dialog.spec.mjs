@@ -12,12 +12,12 @@
  *   row and the dialog follow. Escape closes the dialog and gives the focus
  *   back to Manage….
  * - Where it's kept names this site's private storage, the browser's figures
- *   and whether it keeps it when space is low; Keep it when space is low asks
- *   the browser only on its click, and says what it answered.
- * - A window that gives the site no storage says it keeps data only until the
- *   tab closes, found by asking the browser for its storage.
+ *   and whether it keeps it when space is low.
  * - My datasets (the dataset the address opened is listed) is one row, never
  *   a row per dataset (`my-datasets.spec.mjs`); Remove all forgets it too.
+ * - What other code kept (a directory whose manifest carries another code
+ *   fingerprint) is never listed or counted, and the app removes it, of every
+ *   kind, when it starts; what this code kept stays.
  *
  * What is kept is written as the keepers write it (`transcode/space.js`
  * manifests), so the spec needs no large file.
@@ -26,6 +26,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { keptStoreDirectories } from './helpers/origin-storage.mjs';
 
 const START_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=kept-stores-dialog`;
 
@@ -74,6 +75,8 @@ async function keepItems(page) {
     const parent = await (await navigator.storage.getDirectory()).getDirectoryHandle(space.TRANSCODED_DIRECTORY, { create: true });
     const now = Date.now();
     const items = [
+      // Kept by other code (another code fingerprint): never listed or counted.
+      { dir: 'k0', key: 'f'.repeat(64), source: 'f'.repeat(64), about: { name: 'kept-by-other-code.rds', host: null }, bytes: 7 * 1_048_576, otherCode: true },
       { dir: 'k1', key: 'a'.repeat(64), source: 'a'.repeat(64), about: { name: 'pbmc3k.rds', host: null }, bytes: 3 * 1_048_576 },
       { dir: 'k2', kind: 'download', key: 'b'.repeat(64), source: 'c'.repeat(64), about: { name: 'atlas.h5ad', host: 'example.org' }, bytes: 5 * 1_048_576 },
       { dir: 'k3', kind: 'column-index', key: 'd'.repeat(64), source: 'c'.repeat(64), about: { name: 'atlas.h5ad', host: 'example.org', matrix: 'X', order: { order: 'file' } }, bytes: 1_048_576 },
@@ -89,10 +92,9 @@ async function keepItems(page) {
       await write('manifest.json', JSON.stringify({
         ...(item.kind ? { kind: item.kind } : {}),
         whole: true,
-        // Each kind is read at its own revision (`space.js` `revisionOf`):
-        // a manifest of another one is removed, not listed.
-        revision: item.kind === 'column-index' ? space.KEPT_INDEX_REVISION
-          : item.kind === 'download' ? space.KEPT_BYTES_REVISION : space.KEPT_STORE_REVISION,
+        // Each kind is stamped with its own code fingerprint (`space.js`
+        // `codeFingerprintOf`): a manifest stamped otherwise is removed, not listed.
+        codeFingerprint: item.otherCode ? 'other code' : space.codeFingerprintOf(item),
         persist: true,
         key: item.key,
         source: item.source,
@@ -131,7 +133,7 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  test.skip(!(await pageWritesStorage(page)), 'this window gives a page no storage it can write (covered by the test below)');
+  test.skip(!(await pageWritesStorage(page)), 'this window gives a page no storage it can write');
   // Nothing kept yet: the row is hidden, or names only the speed opening the sample measured of its host.
   const measured = await page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('cellucid:host-link:v1') ?? '{}')).length);
   if (measured === 0) await expect(page.locator('#kept-stores-line')).toBeHidden();
@@ -150,6 +152,7 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   await expect(dialog).toBeVisible();
   const sections = dialog.locator('.kept-dataset:not(.kept-hosts):not(.kept-library)');
   await expect(sections).toHaveCount(2);
+  await expect(dialog).not.toContainText('kept-by-other-code.rds');
   await expect(dialog.locator('.kept-library .kept-dataset-facts')).toHaveText('1 dataset opened in this browser');
   const atlas = sections.filter({ hasText: 'atlas.h5ad' });
   await expect(atlas.locator('.kept-dataset-facts')).toHaveText('example.org · 8.0 MB');
@@ -206,6 +209,41 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   expect(errors).toEqual([]);
 });
 
+test.describe('in a window whose storage lasts', () => {
+  // WebKit's ephemeral test contexts give a page no private storage (`helpers/test.mjs` `persistentStorage`).
+  test.use({ persistentStorage: true });
+
+  test('what other code kept is removed when the app starts, of every kind; what this code kept stays', async ({ page }) => {
+    const errors = collectBrowserErrors(page);
+    await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
+    await dismissWelcome(page);
+    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+    test.skip(!(await pageWritesStorage(page)), 'this window gives a page no storage it can write');
+    // One kept directory of every kind as other code left it, and one of this code's.
+    await page.evaluate(async () => {
+      const space = await import('/assets/js/data/anndata/transcode/space.js');
+      const parent = await (await navigator.storage.getDirectory()).getDirectoryHandle(space.TRANSCODED_DIRECTORY, { create: true });
+      const keep = async (dir, said, codeFingerprint) => {
+        const folder = await parent.getDirectoryHandle(dir, { create: true });
+        const writable = await (await folder.getFileHandle('manifest.json', { create: true })).createWritable();
+        await writable.write(JSON.stringify({ ...said, codeFingerprint, persist: true, key: dir.padEnd(64, '0'), source: 'e'.repeat(64), about: { name: `${dir}.h5ad`, host: null }, blobs: { 'd.bin': 1024 } }));
+        await writable.close();
+      };
+      for (const [dir, said] of [['other-store', { whole: true }], ['other-download', { kind: 'download', whole: true }], ['other-index', { kind: 'column-index' }], ['other-parts', { kind: 'parts', journal: true }]]) {
+        await keep(dir, said, 'other code');
+      }
+      await keep('mine-store', { whole: true }, space.codeFingerprintOf({}));
+    });
+    expect((await keptStoreDirectories(page)).filter(name => /^(other|mine)-/.test(name))).toEqual(['mine-store', 'other-download', 'other-index', 'other-parts', 'other-store']);
+    // The next visit: the app's start removes what other code kept.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+    await expect.poll(async () => (await keptStoreDirectories(page)).filter(name => /^(other|mine)-/.test(name))).toEqual(['mine-store']);
+    await expect(page.locator('#kept-stores-text')).toHaveText(/^1 dataset · 1\.0 KB kept/);
+    expect(errors).toEqual([]);
+  });
+});
+
 test('a saved state is listed under its dataset\'s name, and removed when chosen', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
@@ -233,61 +271,5 @@ test('a saved state is listed under its dataset\'s name, and removed when chosen
   await expect(saved).toHaveCount(0);
   expect(await page.evaluate(async () => (await import('/assets/js/app/history/autosave.js')).listSavedStates().then(list => list.length))).toBe(0);
   await expect(page.locator('#kept-stores-text')).not.toHaveAttribute('title', /saved state/);
-  expect(errors).toEqual([]);
-});
-
-test('Keep it when space is low asks the browser only on its click, and says what it answered', async ({ page }) => {
-  let asked = 0;
-  await page.exposeFunction('keptStoresPersistAsked', () => { asked++; });
-  await page.addInitScript(() => {
-    // The browser's answers, as a site sees them: it may clear the storage, and grants keeping it when asked.
-    let persisted = false;
-    const storage = navigator.storage;
-    if (storage === undefined) return;
-    Object.defineProperty(storage, 'persisted', { configurable: true, value: async () => persisted });
-    Object.defineProperty(storage, 'persist', { configurable: true, value: async () => { window.keptStoresPersistAsked(); persisted = true; return true; } });
-    Object.defineProperty(storage, 'estimate', { configurable: true, value: async () => ({ usage: 1_048_576, quota: 1_073_741_824 }) });
-  });
-  await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  test.skip(!(await pageWritesStorage(page)), 'this window gives a page no storage it can write (covered by the test below)');
-  await keepItems(page);
-  await page.locator('#kept-stores-manage-btn').click();
-  const where = page.locator('#kept-stores-where');
-  await expect(where.locator('dt:text-is("Space") + dd')).toHaveText("1.0 MB used · 1023 MB free (browser's figures)");
-  await expect(where.locator('dt:text-is("Kept when space is low") + dd')).toHaveText('no, the browser may clear it');
-  expect(asked, 'never asked unless the person asks').toBe(0);
-  await page.locator('#kept-stores-persist').click();
-  await expect(where.locator('dt:text-is("Kept when space is low") + dd')).toHaveText('yes');
-  await expect(page.locator('#kept-stores-persist')).toBeHidden();
-  expect(asked).toBe(1);
-});
-
-test('a window that gives the site no storage says it keeps data only until the tab closes', async ({ page }) => {
-  const errors = collectBrowserErrors(page);
-  await page.addInitScript(() => {
-    // No origin private file system, as a private window has none: found by asking for it.
-    const storage = navigator.storage;
-    if (storage !== undefined) {
-      Object.defineProperty(storage, 'getDirectory', { configurable: true, value: async () => { throw new DOMException('The operation is insecure.', 'SecurityError'); } });
-    }
-  });
-  await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await expect(page.locator('#kept-stores-line')).toBeVisible();
-  await expect(page.locator('#kept-stores-text')).toHaveText('Kept for this tab only');
-  // The dataset the address opened is listed in My datasets (until the window closes).
-  await expect.poll(() => page.evaluate(async () => (await (await import('/assets/js/app/library/my-datasets.js')).listMyDatasets()).length)).toBe(1);
-  await page.locator('#kept-stores-manage-btn').click();
-  await expect(page.locator('#kept-stores-dialog')).toBeVisible();
-  // Nothing is kept for a later visit; the connection speeds this window measured (its localStorage) may be listed, and My datasets is one row.
-  await expect(page.locator('#kept-stores-dialog .kept-dataset:not(.kept-hosts):not(.kept-library)')).toHaveCount(0);
-  await expect(page.locator('#kept-stores-dialog .kept-library')).toHaveCount(1);
-  await expect(page.locator('#kept-stores-empty')).toBeHidden();
-  await expect(page.locator('#kept-stores-where dt')).toHaveText(['Place']);
-  await expect(page.locator('#kept-stores-where dd')).toHaveText('This browser window keeps data only until the tab closes');
-  await expect(page.locator('#kept-stores-persist')).toBeHidden();
-  await expect(page.locator('#kept-stores-remove-all')).toBeEnabled();
   expect(errors).toEqual([]);
 });

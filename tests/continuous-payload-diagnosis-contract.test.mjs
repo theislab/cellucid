@@ -37,6 +37,7 @@ import {
 import {
   DataStateColorMethods,
 } from '../assets/js/app/state/managers/color-manager.js';
+import { refusedStatusError, transientStatusError } from '../assets/js/formats/io/byte-source.js';
 
 function tallyOf(values) {
   const tally = createNonFiniteTally(values.length);
@@ -160,11 +161,11 @@ test('the reader refuses an infinite field and names it, in one pass', () => {
     },
   );
 
-  // The case that was wrong: an obs column validated while a gene is the color
-  // source. `computeGlobalVisibility()` walks every filtered obs field on every
+  // An obs column validated while a gene is the color source.
+  // `computeGlobalVisibility()` walks every filtered obs field on every
   // recompute, so this is the common path, not a corner. Reading the active
-  // source made it a gene and handed the reader `adata.X` repair advice for a
-  // column that is not in `adata.X`.
+  // source would make it a gene and hand the reader `adata.X` repair advice
+  // for a column that is not in `adata.X`.
   const geneWhileColored = { kind: 'continuous', key: 'ACTB', values };
   const mixedOwner = makeColorOwner(values, 'var', [geneWhileColored]);
   assert.throws(
@@ -197,34 +198,33 @@ test('the reader still accepts a field that is partly missing', () => {
 
 test('a transport failure is explained by status, with the server quoted', () => {
   const subject = { kind: 'gene', name: 'A2ML1' };
-  const refused = Object.assign(
-    new Error('Failed to load https://host/data.h5ad: Internal Server Error — Internal server error'),
-    { status: 500, serverDetail: 'Internal server error' },
-  );
+  // Each failure is the one the read makes of the server's answer.
+  const answer = (status, body) => new Response(body, {
+    status,
+    headers: body === null ? {} : { 'Content-Type': 'text/plain' },
+  });
+  const refused = transientStatusError(answer(500, 'Internal server error'), 'https://host/data.h5ad', 'Internal server error');
   const message = explainContinuousPayloadFailure({ subject, error: refused });
   assert.match(message, /^Gene "A2ML1" could not be loaded: the server answered 500\./);
   assert.match(message, /The server said: Internal server error/);
   assert.match(message, /failed while reading the file this payload is in/);
   assert.match(message, /prints the reason to its own console/);
 
-  const missing = Object.assign(new Error('Failed to load x: Not Found'), {
-    status: 404,
-    serverDetail: null,
-  });
+  const missing = refusedStatusError(answer(404, 'Not found: /anndata/X/A2ML1'), 'https://host/x', 'Not found: /anndata/X/A2ML1');
   const missingMessage = explainContinuousPayloadFailure({
     subject,
     error: missing,
   });
+  assert.match(missingMessage, /The server said: Not found: \/anndata\/X\/A2ML1/);
   assert.match(missingMessage, /does not have this payload/);
-  assert.doesNotMatch(missingMessage, /The server said/);
 
-  const unclassified = Object.assign(new Error('Failed to load x: Teapot'), {
-    status: 418,
-    serverDetail: null,
-  });
+  // An answer with no words of its own is explained by its status alone.
+  const unclassified = refusedStatusError(answer(418, null), 'https://host/x');
+  const unclassifiedMessage = explainContinuousPayloadFailure({ subject, error: unclassified });
+  assert.doesNotMatch(unclassifiedMessage, /The server said/);
   assert.match(
-    explainContinuousPayloadFailure({ subject, error: unclassified }),
-    /Failed to load x: Teapot[\s\S]*Check the server console/,
+    unclassifiedMessage,
+    /https:\/\/host\/x: the host answered HTTP 418\.[\s\S]*Check the server console/,
   );
 });
 

@@ -6,12 +6,11 @@
  *   and returns to the opener, and Tab closes and hands focus back to the
  *   opener without taking the key, so the browser's Tab moves on from the
  *   opener. An open menu sits at the end of the page, so a Tab the browser
- *   took from an item landed on the page's first stop, the plot (lens-a11y
- *   LF-5).
+ *   took from an item would land on the page's first stop, the plot.
  * - A menu is built in one module only: `openMenu` for a menu of the moment;
  *   a menu written in the markup is bound by `initOpenDataMenu`, which answers
- *   the same keys. A second builder (the highlight pages' Combine had one,
- *   with its own look and no touch size) fails here.
+ *   the same keys. A second builder (with its own look and no touch size)
+ *   fails here.
  * - A menu button in the markup states whether its menu is open.
  */
 import assert from 'node:assert/strict';

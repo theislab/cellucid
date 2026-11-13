@@ -166,7 +166,7 @@ function runNode(doc, run) {
 
 /**
  * One line of inline Markdown (emphasis, inline code, http(s) links) as
- * elements, text nodes only: the history's notes (History v2 §3.13) are
+ * elements, text nodes only: the history's notes are
  * written in this subset.
  * @param {Document} doc
  * @param {string} text

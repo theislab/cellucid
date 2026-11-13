@@ -3,7 +3,6 @@
  * one exact, versioned plain object, read strictly, with no derived values.
  */
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -91,7 +90,7 @@ test('every enumerated and ranged value is checked', () => {
     [{ width: 9.9 }, /width must be a width in millimetres, at least 10/],
     [{ width: Number.NaN }, /width/],
     [{ width: '160' }, /width/],
-    // A preset is its own width; any other is custom (F271).
+    // A preset is its own width; any other is custom.
     [{ sizePreset: 'single-column', width: 90 }, /width must be 89 mm, the single-column width/],
     [{ height: 120 }, /unexpected: height/],
     [{ fontSizes: { base: 7.25, legend: 7, ticks: 6, axisLabel: 7, title: 8, centroidLabel: 6 } }, /fontSizes\.base must be a size in points from 1 to 375, in steps of 0\.5/],
@@ -115,21 +114,12 @@ test('every enumerated and ranged value is checked', () => {
   for (const [override, message] of invalid) {
     assert.throws(() => assertFigureExportSessionSettings(settings(override)), message, JSON.stringify(override));
   }
-  // Full vector until another is chosen: never "none chosen" (F160).
+  // Full vector until another is chosen: never "none chosen".
   assert.throws(() => assertFigureExportSessionSettings(settings({ svgStrategy: null })), /svgStrategy/);
   // Every journal column is its own width; a custom width has no widest.
   for (const [sizePreset, width] of [['single-column', 89], ['one-and-half-column', 120], ['double-column', 183], ['custom', 10], ['custom', 2400]]) {
     assert.doesNotThrow(() => assertFigureExportSessionSettings(settings({ sizePreset, width })), sizePreset);
   }
-});
-
-test('the panel publishes export and import through the one validator', async () => {
-  const source = await readFile(
-    new URL('../assets/js/app/ui/modules/figure-export/figure-export-ui.js', import.meta.url),
-    'utf8'
-  );
-  assert.match(source, /function exportSessionSettings\(\)[\s\S]+return assertFigureExportSessionSettings\(settings\);/);
-  assert.match(source, /function importSessionSettings\(settings\)[\s\S]+const exact = assertFigureExportSessionSettings\(settings\);/);
 });
 
 /** A number box as the panel's listeners meet it. */
@@ -192,20 +182,6 @@ test('decimal controls track the same way, and a value never valid is an error',
   assert.throws(() => never.read(), /width \(mm\) has never held a number of at least 10/);
 });
 
-test('every number setting the panel exports is its last committed value', async () => {
-  const source = await readFile(
-    new URL('../assets/js/app/ui/modules/figure-export/figure-export-ui.js', import.meta.url),
-    'utf8'
-  );
-  const start = source.indexOf('  function exportSessionSettings() {');
-  const end = source.indexOf('  function importSessionSettings(', start);
-  const body = source.slice(start, end);
-  for (const key of ['width', 'base', 'legend', 'ticks', 'axisLabel', 'title', 'centroidLabel', 'selectionMutedOpacity', 'optimizedTargetCount']) {
-    assert.match(body, new RegExp(`committedNumbers\\.${key}\\.read\\(\\)`), key);
-  }
-  assert.doesNotMatch(body, /Input\.value\)|parseInt|Number\((?!dpiSelect)/);
-});
-
 // ---------------------------------------------------------------------------
 // The settings as the parameters of `figure-export.set` (a step like any other)
 // ---------------------------------------------------------------------------
@@ -236,7 +212,7 @@ test('every setting of the record is a parameter of figure-export.set, in its sn
   assert.deepEqual(definition.touches, ['settings']);
   assert.equal(definition.params, FIGURE_EXPORT_PARAMS);
   assert.match(definition.describe({ width: 180, include_axes: false, frame: null }, null), /^Figure export: width 180, include axes off, frame none$/);
-  // Fit the cells (F161): a step's frame "cells", read back as the rect it made.
+  // Fit the cells: a step's frame "cells", read back as the rect it made.
   assert.equal(schemaProblem(FIGURE_EXPORT_PARAMS, { frame: 'cells' }), null);
   assert.notEqual(schemaProblem(FIGURE_EXPORT_PARAMS, { frame: 'view' }), null);
   assert.equal(definition.describe({ frame: 'cells' }, null), 'Figure export: frame fitted to the cells');
@@ -245,7 +221,7 @@ test('every setting of the record is a parameter of figure-export.set, in its sn
   assert.equal(schemaProblem(FIGURE_EXPORT_SETTINGS, params), null);
   assert.notEqual(schemaProblem(FIGURE_EXPORT_SETTINGS, { ...params, frame: 'cells' }), null, 'a setting read back is never "cells"');
   // A step of version 1 that left the strategy unchosen comes up as full vector; a step of
-  // version 1 or 2 sized in CSS pixels (1/96 inch) comes up in millimetres and points (F271):
+  // version 1 or 2 sized in CSS pixels (1/96 inch) comes up in millimetres and points:
   // its box's width is the figure's width (691.65 px is 183 mm, double column), its height
   // goes, its text sizes are points to the half point (12 px is 9 pt, 11 px 8.5).
   const { upgradeParams } = await import('../assets/js/app/actions/catalog.js');
@@ -285,46 +261,27 @@ test('what changed between two records, settings that change together carried to
   assert.deepEqual(Object.keys(moved), ['frame']);
 });
 
-test('the panel records a person\'s change of any setting as one figure-export.set step and provides the action', async () => {
-  const source = await readFile(new URL('../assets/js/app/ui/modules/figure-export/figure-export-ui.js', import.meta.url), 'utf8');
-  // One observer of the whole panel, not a recorder per control: a control added later is recorded too.
-  assert.match(source, /for \(const type of \['input', 'change', 'click', 'pointerup', 'keyup'\]\) listen\(container, type, observeSettings\);/);
-  assert.match(source, /recordObserved\('figure-export\.set', figureExportParamsOf\(changed\)\)/);
-  assert.match(source, /getActions\(\)\.provide\('figure-export\.set'/);
-  // A restore or the action itself puts the baseline the next change is compared with.
-  assert.match(source, /observedSettings = settingsNow\(\);\n  }\n/);
-});
-
-test('a saved record is read one setting at a time: an earlier version upgraded, a refused value kept as shown, never failing the others', async () => {
+test('a saved record is read one setting at a time: a record of another version refused whole, a refused value kept as shown, never failing the others', async () => {
   const { readSavedFigureExportSettings } = await import('../assets/js/app/ui/modules/figure-export/utils/session-settings.js');
   const current = settings({ width: 80, svgStrategy: 'hybrid' });
-  // Version 1 (before 2026-11-11), as an hour-old session and a dataset's starting view hold it:
-  // the SVG strategy unchosen, the size a box in CSS pixels, text in pixels. Every setting is
-  // read; the strategy is full vector, said nowhere as a loss (it is how the panel opens now);
-  // the box's width is the figure's width in millimetres, its height goes, text is in points.
-  const { version: _version, width: _width, sizePreset: _preset, fontSizes: _sizes, ...shared } = settings();
-  const older = {
-    ...shared, version: 1, svgStrategy: null, sizePreset: '1600x1200', width: 1600, height: 1200,
-    fontSizes: { base: 14, legend: 13, ticks: 12, axisLabel: 16, title: 22, centroidLabel: 11 },
-    title: 'Figure 2', titleFollowsDataset: false,
-  };
-  const read = readSavedFigureExportSettings(older, current);
-  assert.deepEqual(read.unread, []);
-  assert.equal(read.settings.version, 3);
-  assert.equal(read.settings.svgStrategy, 'full-vector');
-  assert.equal(read.settings.width, 423.3);
-  assert.equal(read.settings.sizePreset, 'custom');
-  assert.deepEqual(read.settings.fontSizes, { base: 10.5, legend: 10, ticks: 9, axisLabel: 12, title: 16.5, centroidLabel: 8.5 });
-  assert.equal(Object.hasOwn(read.settings, 'height'), false);
-  assert.equal(read.settings.title, 'Figure 2');
-  assert.doesNotThrow(() => assertFigureExportSessionSettings(read.settings));
+  // A record of any other version (or none) is refused whole and said once: the panel keeps its settings.
+  for (const version of [1, 2, 4, undefined, '3']) {
+    const other = { ...settings({ width: 160 }), version };
+    if (version === undefined) delete other.version;
+    const refused = readSavedFigureExportSettings(other, current);
+    assert.equal(refused.settings, current);
+    assert.equal(refused.unread.length, 1);
+    assert.equal(refused.unread[0].setting, 'settings');
+    assert.match(refused.unread[0].reason, /reads version 3/);
+  }
+  assert.match(readSavedFigureExportSettings({ ...settings(), version: 2 }, current).unread[0].reason, /saved as version 2/);
   // A value no version can use keeps the panel's, is named, and the rest is read.
   const odd = readSavedFigureExportSettings({ ...settings({ width: 160 }), dpi: 299, retired: true }, current);
   assert.equal(odd.settings.width, 160);
   assert.equal(odd.settings.dpi, current.dpi);
   assert.deepEqual(odd.unread.map(({ setting }) => setting), ['dpi', 'retired']);
   assert.match(odd.unread[0].reason, /dpi/);
-  // A preset and its width are read together (F271): an undo from a 1.5 column back to a double
+  // A preset and its width are read together: an undo from a 1.5 column back to a double
   // one is neither half alone (each refuses the other's value).
   const narrower = settings({ sizePreset: 'one-and-half-column', width: 120 });
   const wider = readSavedFigureExportSettings(settings({ sizePreset: 'double-column', width: 183 }), narrower);
@@ -337,6 +294,6 @@ test('a saved record is read one setting at a time: an earlier version upgraded,
   assert.deepEqual(both.unread, []);
   assert.deepEqual(both.settings.frame, framed.frame);
   // Not a record at all: nothing read, said once.
-  assert.deepEqual(readSavedFigureExportSettings(null, current), { settings: current, unread: [{ setting: 'figure export settings', reason: 'not a record of settings' }] });
+  assert.deepEqual(readSavedFigureExportSettings(null, current), { settings: current, unread: [{ setting: 'settings', reason: 'not a record of settings' }] });
 });
 

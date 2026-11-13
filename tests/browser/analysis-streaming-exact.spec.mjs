@@ -4,7 +4,7 @@
  * Differential expression and marker discovery stream one gene at a time: the
  * gene's column is read from the AnnData file in the reader worker, the two
  * groups are gathered through per-run plans, and the statistics run in the
- * analysis worker pool. Each of those steps was rewritten for speed, so this
+ * analysis worker pool. Each of those steps is built for speed, so this
  * pins the end result against references computed on the page itself from the
  * expression the file was written with -- tested with the shared two-sample
  * kernels -- and requires the same IEEE-754 numbers, not close ones.

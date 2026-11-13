@@ -10,7 +10,7 @@ const PREPARED_DATASET_URL =
 const MINIMUM_TARGET_SIZE = 24;
 /* The painted thumb is --space-3-5 (14px) across; the pointer target has to
    cover at least what the user can see, or the control lies about where it can
-   be clicked (CEL-AUDIT-0084). */
+   be clicked. */
 const PAINTED_THUMB_SIZE = 14;
 
 const SLIDERS = Object.freeze(['#point-size', '#lighting-strength', '#fog-density']);
@@ -134,7 +134,7 @@ test('range sliders paint a keyboard focus ring and accept pointer input across 
       expect(focusState.matchesFocusVisible).toBe(true);
       expect(
         focusState.outlineStyle,
-        `CEL-AUDIT-0077: ${theme} ${selector} suppressed its focus ring`
+        `${theme} ${selector} suppressed its focus ring`
       ).toBe('solid');
       expect(focusState.outlineWidth).toBe('2px');
 
@@ -142,7 +142,7 @@ test('range sliders paint a keyboard focus ring and accept pointer input across 
       const differing = countDifferingPixels(unfocused, focused);
       expect(
         differing,
-        `CEL-AUDIT-0077: ${theme} ${selector} focus produced no visible pixels`
+        `${theme} ${selector} focus produced no visible pixels`
       ).toBeGreaterThan(0);
       await page.evaluate(() => document.activeElement?.blur?.());
     }
@@ -150,9 +150,8 @@ test('range sliders paint a keyboard focus ring and accept pointer input across 
 
   await page.locator('#theme-select').selectOption('light');
 
-  /* Behavioral proof for CEL-AUDIT-0084: before the fix a click at the bottom
-     edge of the painted thumb landed on the parent container and moved
-     nothing. */
+  /* A click at the bottom edge of the painted thumb lands on the slider, not
+     on the parent container, and moves it. */
   const slider = page.locator('#point-size');
   await slider.scrollIntoViewIfNeeded();
   const offsets = [-(PAINTED_THUMB_SIZE / 2 - 1), 0, PAINTED_THUMB_SIZE / 2 - 1];
@@ -172,7 +171,7 @@ test('range sliders paint a keyboard focus ring and accept pointer input across 
         () => slider.inputValue(),
         {
           message:
-            `CEL-AUDIT-0084: a click ${offset}px from the track centre is `
+            `a click ${offset}px from the track centre is `
             + 'inside the painted thumb but did not reach the slider'
         }
       )

@@ -38,8 +38,9 @@
  * answered without folding every cell (`cellOrderDigest`). A whole read's
  * sums are taken after its payload is handed over (`_deferSums`), not
  * before, a slice at a time: the page places the cells while the worker
- * sums them, answering its requests between slices (a hash of each of 10M
- * cells cost a first view 0.1-0.15 s), and whatever needs the sums first
+ * sums them, answering its requests between slices (a hash of each cell
+ * delays a first view at 10M cells; measured: 23_decisions_partial_reading.md),
+ * and whatever needs the sums first
  * takes them at once (`_flushSums`).
  *
  * Both are made in pieces of at most `COORDINATE_PIECE_CELLS` cells: the
@@ -120,7 +121,8 @@ function placedRow(values, start, width) {
  * The rows of `values` (`width` 1 to 3 values each) finite on every axis
  * (placed: `placedRow`), counted, with `mins`/`maxs` widened by their
  * values: a loop a width, its bounds in locals (a call and an array a value
- * cost 10M-cell openings tens of milliseconds a pass).
+ * cost tens of milliseconds a pass at 10M cells; measured:
+ * 23_decisions_partial_reading.md).
  */
 function placedBounds(values, width, mins, maxs) {
   let placed = 0;
@@ -564,8 +566,8 @@ export class EmbeddingPayloads {
   /**
    * Sum a whole read's pieces after its payload is handed over, a slice of
    * `CELL_ORDER_SLICE_ROWS` rows a task (`_sumSlice`): the page's next
-   * requests are answered between slices, not behind every cell's sums (a
-   * 10M-cell opening's next request waited 154 ms behind them). @private
+   * requests are answered between slices, not behind every cell's sums
+   * (measured: 23_decisions_partial_reading.md). @private
    */
   _deferSums(key, columns, pieces, generation) {
     const width = columns.length;

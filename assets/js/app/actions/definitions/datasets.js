@@ -23,7 +23,7 @@
  * in the address bar or the chat, open now, or one of My datasets) is asked
  * about before anything is requested (`opensLinks`, the kind `unseen-link`:
  * an agent misled by text it read could otherwise make the tab send what it
- * read to any host, F121).
+ * read to any host).
  *
  * The implementation is the Open data controls'
  * (`app/ui/modules/dataset-open-action.js`), through the paths the person's
@@ -38,7 +38,7 @@ import { PLACES, placePath } from '../../ui/place-names.js';
 import { CELLS_TO_OPEN, cellsToOpenArguments, cellsToOpenWords, namesCellsToOpen } from './params.js';
 
 /** Where a name is looked for. */
-export const DATASET_NAME_KINDS = Object.freeze(['any', 'sample', 'my-datasets', 'link']);
+const DATASET_NAME_KINDS = Object.freeze(['any', 'sample', 'my-datasets', 'link']);
 
 const COUNT = Object.freeze({ type: 'integer', minimum: 0 });
 const NULLABLE_COUNT = Object.freeze({ type: ['integer', 'null'], minimum: 0 });

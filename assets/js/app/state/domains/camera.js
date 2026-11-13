@@ -30,7 +30,7 @@ const MODE_NAMES = Object.freeze({ orbit: 'orbit', planar: 'planar', free: 'free
  */
 export function createCameraDomain({ viewer, refreshUi }) {
   return {
-    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    // A step read the view it acted in: staleness compares that view's part alone.
     readPart: viewReadPart,
     capture() {
       return { views: viewIdsOf(viewer).map(id => cloneCameraState(viewer.getViewCameraState(id), `Camera of view "${id}"`)) };

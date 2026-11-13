@@ -28,7 +28,7 @@ import { computeRanksWithTies } from '../compute/math-utils.js';
 import { rMean, rMedian, rQuantile7 } from './limma.js';
 
 /** edgeR's prior count of `cpm(log = TRUE)`. */
-export const LOG_CPM_PRIOR_COUNT = 2;
+const LOG_CPM_PRIOR_COUNT = 2;
 
 /**
  * edgeR's `.calcFactorTMM` of one sample against the reference.

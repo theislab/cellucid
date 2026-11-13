@@ -25,7 +25,7 @@ import { residencyBudgetBytes } from '../../../data/memory-budget.js';
 import { createGeneIndex, filterGenes, geneIdentities, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
 import { geneMomentsFor, momentsMatrixOf } from '../shared/gene-moments-cache.js';
 import { RAW_VALUES } from '../../../data/expression-transform.js';
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 import { cellsReadFor, geneSampleUse, maskReadFor } from '../shared/gene-sample-cells.js';
 import { throwIfAborted } from '../../../utils/abort.js';
 

@@ -76,7 +76,7 @@ const WIDE_INTEGERS = /^(Int|UInt|int|uint)(32|64)$/;
 /**
  * A column of 64-bit integers anndata read holding a value past 2^53 (the
  * corpus's dtype extremes, -2^63 … 2^64 - 1): identifiers, read as the exact
- * decimal text of each value (F116, `values.js` `readExactIntegers`); null
+ * decimal text of each value (`values.js` `readExactIntegers`); null
  * for any other column.
  */
 function identifierTexts(column) {

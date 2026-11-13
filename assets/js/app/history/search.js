@@ -1,6 +1,6 @@
 /**
- * @fileoverview Searching a tracker's steps (History v2 §3.13 "Search and
- * filter", `history.search`): words in a step's label, its parameters, its
+ * @fileoverview Searching a tracker's steps (`history.search`):
+ * words in a step's label, its parameters, its
  * notes and its bookmark (any case, every word), and filters by who took it,
  * what its action changes, the domain it changed, notes, bookmarks, flags,
  * and a time range. One pass over the steps; the State panel's search box
@@ -12,7 +12,7 @@
 import { idNumber } from './model.js';
 
 /** Who took a step, as the search names it (`person`, `agent`, `python`, `r`, `replay`, `outside`, or another origin). */
-export function searchByOf(step) {
+function searchByOf(step) {
   const by = step.kind === 'squashed' ? step.squashed.by : [step.by];
   return by.map(each => {
     if (each.origin === 'user') return 'person';
@@ -22,7 +22,7 @@ export function searchByOf(step) {
 }
 
 /** What a step's action changes, as the search names it: its catalog effect (`state`, `view`, `layout`), or `state`. */
-export function searchKindOf(step, effectOf) {
+function searchKindOf(step, effectOf) {
   if (step.type !== null && step.type !== undefined) {
     const effect = effectOf(step.type);
     if (effect === 'view' || effect === 'layout') return effect;

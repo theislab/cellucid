@@ -230,7 +230,7 @@ test('a notification renders the line breaks its message carries', async () => {
   // DOM intact — and with the default `white-space: normal` the browser folds
   // it into a space, turning a role failure and its status into the run-on
   // "Unable to determine your role for … . Not Found Disconnected annotation
-  // repo." (CEL-0178). The break belongs to the message, so the rule that
+  // repo." The break belongs to the message, so the rule that
   // honors it belongs to the element the message is written into, not to the
   // call sites.
   const [css, controls] = await Promise.all([

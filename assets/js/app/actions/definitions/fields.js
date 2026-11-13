@@ -36,7 +36,7 @@ function groupedIntoWords(labels, rest, quote) {
   return `${labels.map(quote.bare).join(', ')} and ${quote.bare(rest)}`;
 }
 
-export const CONSENSUS_STATUSES = Object.freeze(['consensus', 'disputed', 'pending']);
+const CONSENSUS_STATUSES = Object.freeze(['consensus', 'disputed', 'pending']);
 
 const NAME = Object.freeze({
   type: 'string',
@@ -180,7 +180,7 @@ export const fieldActions = Object.freeze([
     title: 'Make a field from highlight pages',
     summary: 'A new categorical column whose categories are highlight pages, shown at once: each page\'s cells take its label; cells on several pages follow the overlap rule; cells on none keep their category of rest when it is given (refine an annotation: a page per new label, every other cell keeps its label), else take uncovered_label, a category only when there are such cells.',
     group: 'Fields',
-    // Version 2 added `rest` (bug hunt L25-3); a version-1 step had none, which version 2 reads the same.
+    // Version 2 added `rest`; a version-1 step had none, which version 2 reads the same.
     version: 2,
     upgrade: { 1: params => params },
     params: {

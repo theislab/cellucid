@@ -5,8 +5,9 @@
  * duplicate, empty, ambiguous, or missing selections before any source can
  * be replaced by another one. A refusal is the link's, said to the person
  * (`refusedLaunchLink`): Cellucid starts without the link and its opening
- * card names what is wrong with it, Open without this link first (R9E-1:
- * such a link stopped Cellucid on "Something went wrong while starting").
+ * card names what is wrong with it, Open without this link first (such a
+ * link would otherwise stop Cellucid on "Something went wrong while
+ * starting").
  */
 
 import { formatCountOf } from '../utils/format-units.js';

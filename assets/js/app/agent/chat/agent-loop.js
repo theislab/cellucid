@@ -39,7 +39,7 @@
  * - **Never silence.** A turn always ends with words for the person: the
  *   reply, a question with choices, or a note (stopped, an error, a
  *   refusal, the longest answer reached, the budget spent, or a reply with
- *   no words: a model may end after its reasoning alone, bug hunt F82).
+ *   no words: a model may end after its reasoning alone).
  *
  * @module app/agent/chat/agent-loop
  */
@@ -62,7 +62,7 @@ function turnLabelOf(text) {
 }
 
 /** First wait before a call is tried again; each failure doubles it. */
-export const RETRY_FIRST_MS = 1_000;
+const RETRY_FIRST_MS = 1_000;
 /** The longest wait between two tries (coming back online tries at once). */
 export const RETRY_CEILING_MS = 60_000;
 
@@ -268,8 +268,8 @@ export async function runAgentTurn({
   /**
    * Whether the next call would pass the chat's budget: it is not made. The
    * budget is a cap, so the call that would cross it is the one left out
-   * (each call reads the whole prompt again: checked only against what was
-   * spent, a 150,000-token budget ended at 209,751, L14-7).
+   * (each call reads the whole prompt again, so a check against only what was
+   * spent lets a budget end far past itself).
    */
   const overBudget = () => budget !== null && spentNow() + nextPrompt() > budget;
   /** Before another try: past the chat's budget, the turn ends there. */
@@ -404,8 +404,8 @@ export async function runAgentTurn({
         return ended('end');
       }
       // The calls' results, kept as each one comes (the conversation is saved then), so a reload
-      // mid-way keeps what finished: a read that ran was answered "the page closed before this call
-      // finished" (live pass 2, S4). Nothing is sent to a model before every call is answered.
+      // mid-way keeps what finished: a read that ran would be answered "the page closed before this call
+      // finished". Nothing is sent to a model before every call is answered.
       const answers = { role: 'tool', turn, results: [] };
       add(answers);
       const results = answers.results;
@@ -437,7 +437,7 @@ export async function runAgentTurn({
           actions, tools: toolIndex, name: call.name, args: call.args, agent, turn, signal,
           // The chat is the connection: a permission granted "in this chat" holds for its calls.
           connection: { id: conversation.id, kind: 'chat' }, scopeOf,
-          // The history's turn record: the model, the chat and the message that asked (History v2 §3.12).
+          // The history's turn record: the model, the chat and the message that asked.
           turnMeta: {
             model: model.id, conversation: conversation.id, message: turn,
             turnLabel: turnLabelOf(conversation.messages[userIndex].text),

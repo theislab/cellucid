@@ -199,7 +199,7 @@ function requireDatasetInventory(value, sourceType) {
  * browser will take, so "write it again" is the one action guaranteed to fail:
  * the user regenerates a byte-identical file and meets the identical wall.
  * The loader tells the two apart — `TOO_LARGE` is published by whichever
- * ceiling refused — so the UI does not have to guess (CEL-0219).
+ * ceiling refused — so the UI does not have to guess.
  */
 const DATA_SOURCE_FAILURES = Object.freeze({
   'not-found': Object.freeze({
@@ -332,8 +332,8 @@ export function describeDataSourceFailure(subject, verb, error) {
 /** What follows the subject and verb: `: why. What to do.`, or `. What to do.` */
 function failureReason(error) {
   // One dataset of a listing that could not be listed (`anndata-catalog.js`):
-  // named by its id, with its own cause said as any other (found 2026-11-10:
-  // the samples' notice quoted the store's URL).
+  // named by its id, with its own cause said as any other (not the store's
+  // URL).
   const unlisted = error?.details?.unlisted;
   if (typeof unlisted === 'string' && error.details.cause !== undefined) {
     return `: “${unlisted}” could not be listed${failureReason(error.details.cause)}`;
@@ -1071,11 +1071,11 @@ export function initDatasetConnections(options) {
     /**
      * Cellucid's own files chosen in File… (`CELLUCID_FILES`): a library file
      * goes to My datasets' Import, a session file loads as Load…'s does (its
-     * dataset opened with it, L25-8). Whether `file` was one.
+     * dataset opened with it). Whether `file` was one.
      */
     /**
      * A file refused before it could open: said as an opening's failure is,
-     * and withdrawn as one is when the next opening begins (R9U-13).
+     * and withdrawn as one is when the next opening begins.
      */
     const refusePick = message => getOpeningProgress().untilNextOpening(
       notifications.error(message, { category: 'data', title: 'Cannot open this file' })
@@ -1965,7 +1965,7 @@ export function initDatasetConnections(options) {
      */
     async function openAddress() {
       // The person typed or pasted it: an agent may open it later without
-      // asking them (`seen-addresses.js`, F121).
+      // asking them (`seen-addresses.js`).
       noteSeenAddress(dataAddressInput.value);
       // Asking the address whether it is a server is the opening's first
       // step: the connection that follows joins this opening, and how the

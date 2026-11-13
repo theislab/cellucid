@@ -1,5 +1,5 @@
 /**
- * Per-category state (K-13): a categorical field's colors and visibility are
+ * Per-category state: a categorical field's colors and visibility are
  * typed arrays never written in place (`app/utils/category-state.js`), so
  * kept views share them until one changes them, and each array (and each
  * category list) is checked once, not on every action.

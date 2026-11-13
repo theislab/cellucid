@@ -1628,7 +1628,7 @@ button.analysis-chip {
   min-height: 24px;
   border: none;
   background: none;
-  /* Quiet by the secondary text color, never by opacity (lens-a11y LF-10). */
+  /* Quiet by the secondary text color, never by opacity. */
   color: var(--color-text-secondary);
   font: inherit;
   cursor: pointer;

@@ -11,7 +11,6 @@ const moduleUrl = new URL(
   '../assets/js/app/ui/modules/dataset-controls.js',
   import.meta.url
 );
-const moduleSource = fs.readFileSync(moduleUrl, 'utf8');
 
 class FakeClassList {
   constructor() {
@@ -580,15 +579,6 @@ test('dataset teardown drains a rejected reload without publishing stale UI', as
     controls.selectDataset('target', 'local-demo'),
     /unavailable after destroy/
   );
-});
-
-test('dataset controls contain no dev global, reload, or guessed-source path', () => {
-  assert.doesNotMatch(moduleSource, /__CELLUCID_DEV__/);
-  assert.doesNotMatch(moduleSource, /runLocalUserInPlaceSwitchSelfTest/);
-  assert.doesNotMatch(moduleSource, /location\.reload|setTimeout/);
-  assert.doesNotMatch(moduleSource, /\|\|\s*['"]local-demo['"]/);
-  assert.doesNotMatch(moduleSource, /catch\s*\([^)]*\)\s*\{\s*\}/s);
-  assert.doesNotMatch(moduleSource, /catch\s*\{\s*\}/s);
 });
 
 test('dataset controls require their exact top-level contract', async () => {
@@ -1616,7 +1606,7 @@ test('the sample catalog lists its entries while the startup dataset opens and m
   listing.resolve(catalog);
   assert.deepEqual(await controls.catalogReady, { status: 'ready' });
   // The chosen sample says its name alone while the picker is at rest (the
-  // Dataset card says its cells: F8); its cells come back when the picker is
+  // Dataset card says its cells); its cells come back when the picker is
   // reached for.
   assert.deepEqual(
     texts(),
@@ -1647,7 +1637,7 @@ test('the sample catalog lists its entries while the startup dataset opens and m
 });
 
 test('a listing that settles after a failed switch keeps the switch\'s notice', async t => {
-  // F71: the samples' listing reads their files after the first view; a
+  // The samples' listing reads their files after the first view; a
   // person who picks a sample meanwhile, whose file then fails to open, must
   // keep the explanation and its retry when the listing settles after it.
   const suo = makeIdentity('suo', 'Suo atlas', 1200);
@@ -1857,10 +1847,10 @@ test('a dataset no listing named yet is "the dataset", never its id', async t =>
   await controls.destroy();
 });
 
-test('a change the person stops while it is the newest puts the Dataset box and the select back, saying nothing more (R9W-2)', async t => {
+test('a change the person stops while it is the newest puts the Dataset box and the select back, saying nothing more', async t => {
   // Kept by the person (the unkept-work question's Cancel, an agent's opening they denied, the
-  // opening's Cancel): the Dataset box kept saying "Loading …" and the select the other dataset,
-  // and a cancelled pick said "A newer dataset selection is now active."
+  // opening's Cancel): the Dataset box does not keep saying "Loading …", the select does not keep
+  // the other dataset, and a cancelled pick does not say "A newer dataset selection is now active."
   const shown = makeIdentity('shown', 'Shown data', 0);
   const other = makeIdentity('other', 'Other data', 1);
   const harness = makeHarness([

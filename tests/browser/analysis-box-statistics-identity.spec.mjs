@@ -2,8 +2,8 @@
  * A box plot that draws points hands Plotly precomputed statistics and only the
  * drawn points (assets/js/app/analysis/plots/plotly-box-statistics.js) instead
  * of every value. This spec draws each fixture twice in the real engine — once
- * through the application's box definition, once as the raw-value trace it
- * used to build — and requires the same calcdata (every statistic compared with
+ * through the application's box definition, once as the raw-value trace
+ * (every value handed to Plotly) — and requires the same calcdata (every statistic compared with
  * `Object.is`, every drawn point), the same box, whisker and point geometry,
  * the same autorange and the same hover text. Outliers are drawn without
  * jitter, so identical outliers land on one spot and the application draws at
@@ -105,7 +105,7 @@ test('precomputed box statistics draw exactly the raw-value box', async ({ page 
           failures.push(`${name} ${JSON.stringify(variant)} must hand Plotly the values`);
         }
         precomputedTraces += precomputed;
-        // The raw-value trace this module built before statistics were precomputed.
+        // The raw-value trace: every value handed to Plotly, the reference the precomputed box must equal.
         const raw = fresh.map((trace, index) => {
           const copy = { ...trace };
           for (const key of ['q1', 'median', 'q3', 'lowerfence', 'upperfence', 'mean', 'sd', 'notchspan']) delete copy[key];

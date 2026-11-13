@@ -1,12 +1,12 @@
 /**
  * A camera frames the same data on every screen shape.
  *
- * The field of view was 45° vertically on every screen, so on a phone held
- * upright (a portrait presented area) a camera framed to the data's height —
- * the default of each dimension, a sample's preset — cut the data off at both
- * sides. The 45° now applies to the presented area's shorter side
+ * The 45° field of view applies to the presented area's shorter side
  * (`rendering/viewer/field-of-view.js`): a landscape screen is unchanged, and
- * on a portrait one the horizontal extent equals the landscape's vertical one.
+ * on a portrait one the horizontal extent equals the landscape's vertical
+ * one. So on a phone held upright (a portrait presented area) a camera framed
+ * to the data's height (the default of each dimension, a sample's preset)
+ * does not cut the data off at both sides.
  *
  * Measured here on the projection the viewer draws with: every cell's
  * normalized device coordinates, for the default camera of 1D, 2D and 3D.
@@ -70,7 +70,11 @@ async function settledExtent(page) {
 }
 
 /** The default camera of each dimension, with the sidebar closed. */
-async function extentsAt(browser, contextOptions) {
+/**
+ * Opens the fixture in a context of its own and measures the default camera
+ * of each dimension with the sidebar hidden. The caller closes the context.
+ */
+async function openAndMeasure(browser, contextOptions) {
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
   await serveSyntheticCatalog(page, ROOT, {
@@ -114,74 +118,79 @@ async function extentsAt(browser, contextOptions) {
     await page.keyboard.press('r');
     extents[dimension] = await settledExtent(page);
   }
-  await closeContextWithApplicationRetirement(context);
-  return extents;
+  return { context, page, extents };
 }
 
-test('a portrait screen shows across what a landscape one shows down, in 1D, 2D and 3D', async ({ browser }) => {
-  const phone = await extentsAt(browser, PHONE);
-  const desktop = await extentsAt(browser, DESKTOP);
-  for (const dimension of [1, 2, 3]) {
-    // The phone's horizontal angle is the desktop's vertical one. So what the
-    // desktop shows across its width (aspect × its height) the phone shows
-    // across its own, and down the phone shows more, by its own aspect.
-    expect(phone[dimension].maxX, `${dimension}D across`)
-      .toBeCloseTo(desktop[dimension].maxX * desktop[dimension].aspect, 4);
-    expect(phone[dimension].maxY, `${dimension}D down`)
-      .toBeCloseTo(desktop[dimension].maxY * phone[dimension].aspect, 4);
-  }
-});
-
-test('a kept view\'s portrait pane shows across what the single view shows down: no map cropped at the sides', async ({ browser }) => {
-  // Found 2026-11-11 (Pancreas, 2-D UMAP): two views side by side make two portrait panes, which
-  // took the presented area's landscape field of view and cut the map off at both sides. Each
-  // pane now takes its own (`presented-view-layout.js`).
-  const context = await browser.newContext(DESKTOP);
-  const page = await context.newPage();
-  await serveSyntheticCatalog(page, ROOT, {
-    id: DATASET_ID, name: 'Framing fixture', cells: CORNERS.length,
-    obsm: { X_umap_1d: columns(1), X_umap_2d: columns(2), X_umap_3d: columns(3) },
-  });
-  await page.goto(`/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}&acceptance=framing-aspect-ci`, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect(page.locator('#filter-count')).toHaveText(`Showing all ${CORNERS.length} cells`);
-  await page.keyboard.press('2');
-  await expect.poll(() => page.evaluate(() => {
-    const state = window._cellucidState;
-    return state.getViewDimensionLevel(state.getActiveViewId());
-  })).toBe(2);
-  await page.keyboard.press('r');
-  await settledExtent(page);
-  await page.evaluate(async () => {
-    const { getActions } = await import('/assets/js/app/actions/index.js');
-    await getActions().dispatch('view.keep', {});
-  });
-  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPresentedLayout().panes.length)).toBe(2);
-  // Every pane's projection as it is drawn (`getPresentedViewState`), against the cells' corners.
-  const measured = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    return viewer.getPresentedLayout().panes.map(pane => {
-      const matrix = viewer.getPresentedViewState(pane.viewId).renderState.mvpMatrix;
-      let maxX = 0;
-      let maxY = 0;
-      for (const [x, y] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
-        const w = matrix[3] * x + matrix[7] * y + matrix[15];
-        maxX = Math.max(maxX, Math.abs((matrix[0] * x + matrix[4] * y + matrix[12]) / w));
-        maxY = Math.max(maxY, Math.abs((matrix[1] * x + matrix[5] * y + matrix[13]) / w));
+// The desktop page measured for the first step stays open for the second,
+// which keeps a view on it: two panes side by side, each portrait.
+test('portrait framing: a phone screen, and a kept view\'s pane, show across what a landscape view shows down', async ({ browser }) => {
+  const opened = await openAndMeasure(browser, PHONE);
+  await closeContextWithApplicationRetirement(opened.context);
+  const phone = opened.extents;
+  const { context, page, extents: desktop } = await openAndMeasure(browser, DESKTOP);
+  try {
+    await test.step('a portrait screen shows across what a landscape one shows down, in 1D, 2D and 3D', async () => {
+      for (const dimension of [1, 2, 3]) {
+        // The phone's horizontal angle is the desktop's vertical one. So what the
+        // desktop shows across its width (aspect × its height) the phone shows
+        // across its own, and down the phone shows more, by its own aspect.
+        expect(phone[dimension].maxX, `${dimension}D across`)
+          .toBeCloseTo(desktop[dimension].maxX * desktop[dimension].aspect, 4);
+        expect(phone[dimension].maxY, `${dimension}D down`)
+          .toBeCloseTo(desktop[dimension].maxY * phone[dimension].aspect, 4);
       }
-      // A planar camera straight above the plane at its distance: the corners' reach across is
-      // 1 / (distance · tan(half the horizontal angle)).
-      const distance = viewer.getViewCameraState(pane.viewId).freefly.position[2];
-      return { maxX, maxY, aspect: pane.cssWidth / pane.cssHeight, distance };
     });
-  });
-  for (const pane of measured) {
-    expect(pane.aspect).toBeLessThan(1);
-    // 45° across the upright pane (the landscape single view's 45° down): before, the
-    // presented area's 45° down gave the pane 2·atan(tan 22.5° · aspect) across, and a map
-    // framed to its height was cut at both sides.
-    expect(pane.maxX * pane.distance * Math.tan(Math.PI / 8)).toBeCloseTo(1, 4);
-    expect(pane.maxY).toBeCloseTo(pane.maxX * pane.aspect, 4);
+
+    await test.step('a kept view\'s portrait pane shows across what the single view shows down: no map cropped at the sides', async () => {
+      // Two views side by side make two portrait panes. Each takes its own field of view
+      // (`presented-view-layout.js`): with the presented area's landscape one, a map framed to its
+      // height would be cut off at both sides.
+      // The sidebar was hidden for the measurement above: it is shown again first.
+      await page.locator('#sidebar-toggle').click();
+      await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
+      await expect.poll(() => page.evaluate(
+        () => document.getElementById('sidebar').getAnimations().length,
+      )).toBe(0);
+      await page.keyboard.press('2');
+      await expect.poll(() => page.evaluate(() => {
+        const state = window._cellucidState;
+        return state.getViewDimensionLevel(state.getActiveViewId());
+      })).toBe(2);
+      await page.keyboard.press('r');
+      await settledExtent(page);
+      await page.evaluate(async () => {
+        const { getActions } = await import('/assets/js/app/actions/index.js');
+        await getActions().dispatch('view.keep', {});
+      });
+      await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPresentedLayout().panes.length)).toBe(2);
+      // Every pane's projection as it is drawn (`getPresentedViewState`), against the cells' corners.
+      const measured = await page.evaluate(() => {
+        const viewer = window._cellucidViewer;
+        return viewer.getPresentedLayout().panes.map(pane => {
+          const matrix = viewer.getPresentedViewState(pane.viewId).renderState.mvpMatrix;
+          let maxX = 0;
+          let maxY = 0;
+          for (const [x, y] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+            const w = matrix[3] * x + matrix[7] * y + matrix[15];
+            maxX = Math.max(maxX, Math.abs((matrix[0] * x + matrix[4] * y + matrix[12]) / w));
+            maxY = Math.max(maxY, Math.abs((matrix[1] * x + matrix[5] * y + matrix[13]) / w));
+          }
+          // A planar camera straight above the plane at its distance: the corners' reach across is
+          // 1 / (distance · tan(half the horizontal angle)).
+          const distance = viewer.getViewCameraState(pane.viewId).freefly.position[2];
+          return { maxX, maxY, aspect: pane.cssWidth / pane.cssHeight, distance };
+        });
+      });
+      for (const pane of measured) {
+        expect(pane.aspect).toBeLessThan(1);
+        // 45° across the upright pane (the landscape single view's 45° down): with the
+        // presented area's 45° down the pane would have 2·atan(tan 22.5° · aspect) across, and a map
+        // framed to its height would be cut at both sides.
+        expect(pane.maxX * pane.distance * Math.tan(Math.PI / 8)).toBeCloseTo(1, 4);
+        expect(pane.maxY).toBeCloseTo(pane.maxX * pane.aspect, 4);
+      }
+    });
+  } finally {
+    await closeContextWithApplicationRetirement(context);
   }
-  await closeContextWithApplicationRetirement(context);
 });

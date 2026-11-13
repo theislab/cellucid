@@ -7,7 +7,7 @@
  * `requestAnimationFrame` (a slider drag, a legend edit) runs *after* the
  * viewer in the next frame: the scene draws the old state, the control then
  * changes it, and the change is drawn a frame later -- one frame of latency on
- * every slider step, 50-90 ms at 10M cells in four views.
+ * every slider step (measured: 28_decisions_rendering_layers.md).
  *
  * So the viewer owns the order:
  *

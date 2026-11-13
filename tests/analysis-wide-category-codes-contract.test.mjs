@@ -2,9 +2,9 @@
  * Analysis reads categorical codes at the width the field stores them.
  *
  * A field with more categories than uint16 addresses (65,535) is stored as
- * uint32. Analysis used to copy every field into a Uint16Array, which turned a
- * uint32 code into code mod 65,536: a cell of category 65,536 was counted as
- * category 0, with no error. Every consumer below gets a field of 70,000
+ * uint32. Copying every field into a Uint16Array would turn a uint32 code into
+ * code mod 65,536: a cell of category 65,536 counted as category 0, with no
+ * error. Every consumer below gets a field of 70,000
  * categories whose cells sit at codes on both sides of 65,535 (and one past
  * the Int16 group-index range of the marker worker), and has to count each
  * cell under its own label, exactly.

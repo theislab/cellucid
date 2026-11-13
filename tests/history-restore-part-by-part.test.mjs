@@ -1,9 +1,9 @@
 /**
- * A saved history is restored part by part (F155): live pass 6 continued a
- * history kept minutes before the F149 rename (`expression` held
- * `{normalise, log1p}`), the Expression values' owner refused it, and the
- * whole restore was rolled back: the views, the steps and the conversation
- * were lost with the one part this version could not read. Now each domain
+ * A saved history is restored part by part: a history kept before the rename
+ * of the Expression values (`expression` held `{normalise, log1p}`) that the
+ * Expression values' owner refuses must not roll the whole restore back and
+ * lose the views, the steps and the conversation with the one part this
+ * version cannot read. Each domain
  * put back is one part: a part that cannot be put back keeps what is shown
  * and is named (`unrestored`), the others are restored, the history and its
  * conversations are loaded, and the gap is the tracker's own step, so what
@@ -75,7 +75,7 @@ async function makePage() {
 const CONVERSATION = { schema: 'cellucid-agent-transcript', updatedAt: 5, messages: [{ role: 'user', text: 'markers of beta cells' }] };
 
 /**
- * A history kept before the F149 rename: the Expression values as
+ * A history kept before the rename of the Expression values: the Expression values as
  * `{normalise, log1p}` (re-hashed, every step naming them re-pointed), with
  * a conversation kept with its tracker.
  */
@@ -184,7 +184,7 @@ test('a tracker this version cannot read is one part: left out and named; the on
   }
 });
 
-test('a state part this version does not have is left out of every step and named; the rest is restored (F164: load, load beside, journal)', async () => {
+test('a state part this version does not have is left out of every step and named; the rest is restored (load, load beside, journal)', async () => {
   for (const how of ['load', 'importTrackers']) {
     const source = await makePage();
     await source.dispatcher.dispatch('a.set', { v: 5 });
@@ -222,7 +222,7 @@ test('a state part this version does not have is left out of every step and name
   }
 });
 
-test('a conversation kept with a history that this version cannot show is said, never dropped silently (F155)', async () => {
+test('a conversation kept with a history that this version cannot show is said, never dropped silently', async () => {
   const { unreadConversationNotice, TRANSCRIPT_SCHEMA } = await import('../assets/js/app/agent/chat/conversation.js');
   assert.equal(unreadConversationNotice([]), null);
   assert.equal(unreadConversationNotice([['c-1', { schema: TRANSCRIPT_SCHEMA, messages: [] }]]), null, 'a readable one says nothing');
@@ -236,9 +236,9 @@ test('a conversation kept with a history that this version cannot show is said, 
   assert.match(failed.details, /has an id and messages/);
 });
 
-test('a part its owner refused half way is put back to what it showed: "left as it was shown" is true (R9H-11)', async () => {
-  // As the settings of h5ad-ui-smoke: the slider was set to the saved 100, then its renderer refused,
-  // and the notice said the settings were left as shown while the slider showed 100.
+test('a part its owner refused half way is put back to what it showed: "left as it was shown" is true', async () => {
+  // As the settings of h5ad-ui-smoke: the slider is set to the saved 100, then its renderer refuses,
+  // and the notice must not say the settings were left as shown while the slider shows 100.
   const panel = { slider: 15, scale: 0.35 };
   const domains = createDomainRegistry();
   domains.provide('settings', {

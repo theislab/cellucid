@@ -1586,17 +1586,16 @@ test(
       },
     };
     const docked = { openMode: null, modes: {} };
-    const analysis = createAnalysisDomain({
-      analysis: async () => ({
-        comparisonModule: {
-          exportSessionState: () => structuredClone(docked),
-          async importSessionState() {
-            events.push('docked');
-          },
+    const refs = {
+      comparisonModule: {
+        exportSessionState: () => structuredClone(docked),
+        async importSessionState() {
+          events.push('docked');
         },
-        analysisWindowManager: manager,
-      }),
-    });
+      },
+      analysisWindowManager: manager,
+    };
+    const analysis = createAnalysisDomain({ analysis: () => refs, analysisArrived: async () => refs });
 
     const result = analysis.restore({
       windows: [{ modeId: 'replacement' }],

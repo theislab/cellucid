@@ -1,18 +1,18 @@
 /**
- * Regression coverage for viewer layers a figure export used to drop without
- * saying so:
+ * Coverage for viewer layers a figure export must not drop without saying so:
  *
  * 1. The reference grid. `Grid (light)` is the viewer's default background
- *    (`index.html`), `drawGrid()` paints it behind every frame, and neither the
- *    SVG nor the PNG renderer emitted a single mark for it — nor did the
- *    fidelity gate mention it. A figure exported from the default view simply
- *    lost its spatial reference box.
+ *    (`index.html`), `drawGrid()` paints it behind every frame, so the SVG and
+ *    the PNG renderer must each emit its marks and the fidelity gate must
+ *    mention it: a figure exported from the default view keeps its spatial
+ *    reference box.
  * 2. Atmospheric fog. `fogDensity` starts at 0.5 and the `full` point shader
  *    fades and thins every point with distance, which is the depth cue a 3D
  *    scatter reads by. The `full-vector` and `optimized-vector` SVG strategies
- *    emitted raw colors, flattening the depth axis with no warning.
+ *    must reproduce it, not emit raw colors that flatten the depth axis with
+ *    no warning.
  * 3. The velocity vector field. Connectivity edges block the export; the
- *    velocity overlay, which is equally a data layer, did not.
+ *    velocity overlay, which is equally a data layer, is drawn.
  *
  * Every assertion here is written against produced markup, recorded Canvas2D
  * draw calls, or the shader source, so none of them can pass because a function
@@ -380,9 +380,6 @@ test('the strength curves match the grid fragment shader', async () => {
   assert.match(shaderSource, /float edgeWidth = lineWidth \* 1\.4;/);
   assert.match(shaderSource, /float w = lineWidth \* 1\.55;/);
   assert.match(shaderSource, /majorLineWidth = mainLineWidth \* 1\.20/);
-  // The grid's alpha carries no fog term, which is what makes an exact vector
-  // reproduction possible at all.
-  assert.match(shaderSource, /Alpha emphasizes lines while keeping surfaces airy \(no fog dependence\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -558,8 +555,8 @@ test('a light viewer grid is not exported as the dark one', () => {
 
 test('the grid honours a framing crop and takes raw crop input', () => {
   // `assertCropRect01()` returns a four-key rect that is not itself valid crop
-  // input; the preview passed its result straight back in and threw on every
-  // framed redraw.
+  // input; passing its result straight back in throws on
+  // every framed redraw.
   const crop = { enabled: true, x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
   const cropped = gridModel({ renderState: lookDownZRenderState() });
   const framed = buildReferenceGridModel({
@@ -816,7 +813,7 @@ test('the payload contract accepts only appearances the viewer publishes', () =>
 });
 
 // ---------------------------------------------------------------------------
-// Fog: the depth cue the vector strategies used to drop
+// Fog: the depth cue the vector strategies reproduce
 // ---------------------------------------------------------------------------
 
 test('the fog evaluator reproduces the shader formula', async () => {
@@ -904,7 +901,7 @@ test('full-vector SVG fades distant points exactly as the viewer does', async ()
     alpha: match[4] === undefined ? 1 : Number(match[4]),
   }));
 
-  // Before fog was reproduced both circles were drawn at full opacity.
+  // Fog fades both circles; neither is drawn at full opacity.
   for (const point of expected) {
     const hit = drawn.find(
       (candidate) =>
@@ -930,7 +927,7 @@ test('optimized-vector SVG carries the same fog as full-vector', async () => {
   };
   const optimized = await read('optimized-vector');
   assert.deepEqual(optimized, await read('full-vector'));
-  // Both strategies used to emit the source colors at full opacity.
+  // Neither strategy emits the source colors at full opacity.
   assert.equal(optimized.some((entry) => entry.endsWith('@1')), false);
 });
 
@@ -991,7 +988,7 @@ test('the velocity overlay state is read from the control that owns it', () => {
   assert.equal(readVelocityOverlayEnabled(null), null);
 });
 
-test('a shown vector field is drawn, not blocked; the edges still block (R9V-10)', () => {
+test('a shown vector field is drawn, not blocked; the edges still block', () => {
   const off = documentWith({ 'velocity-overlay-enabled': { checked: false } });
   const on = documentWith({ 'velocity-overlay-enabled': { checked: true } });
 
@@ -1078,7 +1075,7 @@ test('a dark-background SVG writes no near-black text', async () => {
     await renderFigureToSvgBlob({ payload })
   ).text();
 
-  // Before this fix the title, ticks and axis labels were all `#111` on
+  // The title, ticks and axis labels are not all `#111` on
   // #141719 paper — present in the file and invisible in the figure.
   const textFills = [...svg.matchAll(/<text[^>]*fill="(#[0-9a-fA-F]{6})"/g)]
     .map((match) => match[1].toLowerCase());

@@ -25,19 +25,27 @@
  * @module data/cell-subset-policy
  */
 
-import { createListenerSet } from '../utils/listener-set.js';
 
+/**
+ * A cell subset request: which cells an opening reads. Its mode says which
+ * other members it has (`anndata/subsample-plan.js` header).
+ *
+ * @typedef {{mode: 'auto'|'all'|'subsample'|'kept'|'chunks'|'prefix', [member: string]: any}} CellSubsetRequest
+ */
+
+/** @type {Readonly<CellSubsetRequest>} */
 const DEFAULT_REQUEST = Object.freeze({ mode: 'auto' });
 
+/** @type {Readonly<CellSubsetRequest>} */
 let tabRequest = DEFAULT_REQUEST;
+/** @type {Readonly<CellSubsetRequest>|null} */
 let nextRequest = null;
-const listeners = createListenerSet('the tab\'s cell subset request');
 
 /**
  * A cell subset request, checked and frozen.
  *
  * @param {Object} request
- * @returns {Readonly<Object>}
+ * @returns {Readonly<CellSubsetRequest>}
  */
 export function requireCellSubsetRequest(request) {
   if (request === null || typeof request !== 'object' || !['auto', 'all', 'subsample', 'kept', 'chunks', 'prefix'].includes(request.mode)) {
@@ -58,8 +66,8 @@ export function requireCellSubsetRequest(request) {
  * 'stream') is not carried, neither its fit nor its count: it is null, and
  * the opening fits the sample afresh against the rows its store holds then.
  * Its count is the rows held when it was sized (0 before any arrived),
- * not a choice; carried as one, a count of 0 was refused as a request and a
- * count of the rows held then stayed the sample after the whole matrix had
+ * not a choice; carried as one, a count of 0 would be refused as a request and a
+ * count of the rows held then would stay the sample after the whole matrix had
  * arrived.
  *
  * @param {{cells: number, of?: number, fit?: Object|null}|null} sample
@@ -83,8 +91,8 @@ export function geneSampleRequestOf(sample) {
  * other the request it ends with (`growth.final`). The one reading for every
  * place that names the open cells (the session's `cells` domain, the page
  * address, the Share link, Copy link): read from a step, a session saved
- * while Suo grew reopened its first 131,072 cells, and its link named them
- * (bug hunt F60, F64).
+ * while a dataset grows would reopen only the cells of that step, and its
+ * link would name them.
  *
  * @param {Object|null} subset - `AnnDataFileSource.getCellSubset()`
  * @returns {{spec: Object, autoFit: Object|null, reproduced: boolean|null}|null}
@@ -150,12 +158,6 @@ export function setTabCellSubsetRequest(request) {
   const checked = requireCellSubsetRequest(request);
   if (checked.mode === 'kept') throw new TypeError('A tab opens datasets by fraction, never by a recorded cell set.');
   tabRequest = checked;
-  listeners.notify(tabRequest);
-}
-
-/** Be told when the tab's request changes; returns the unsubscribe. */
-export function onTabCellSubsetRequest(listener) {
-  return listeners.add(listener);
 }
 
 /**

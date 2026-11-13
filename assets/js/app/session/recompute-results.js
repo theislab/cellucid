@@ -1,6 +1,6 @@
 /**
  * @fileoverview The analysis results a shared session left out, computed
- * again once it is open (History v2 §3.15.4: Share › Results "compute again
+ * again once it is open (Share › Results "compute again
  * on open").
  *
  * A share that leaves results out writes each as the record of a result

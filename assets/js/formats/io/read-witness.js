@@ -13,7 +13,7 @@
  * - a range never read has nothing of its own to compare: a few ranges read
  *   before are asked for again, under the new validator, and compared
  *   (`witnesses`). A read and its witnesses are CRC-32 (all but one in 2^32 of
- *   any change, `zip/crc32.js`, 2.2 GB/s on the reader's thread) with the exact
+ *   any change, `zip/crc32.js`, run on the reader's thread) with the exact
  *   length. Witnesses are evidence, not proof: a rewrite that keeps every byte
  *   read so far and changes only bytes never read is not seen, which no client
  *   can see.

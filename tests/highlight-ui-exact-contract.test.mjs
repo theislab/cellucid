@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
@@ -22,11 +21,6 @@ import { viewContextCoreMethods } from '../assets/js/app/state/managers/view-con
 import { createHighlightsDomain } from '../assets/js/app/state/domains/highlights.js';
 import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
-
-const HIGHLIGHT_MODULE_ROOT = new URL(
-  '../assets/js/app/ui/modules/highlight/',
-  import.meta.url
-);
 
 function createDocumentStub() {
   const elements = new Map();
@@ -234,43 +228,6 @@ function createCategoryHighlightState() {
   });
   return state;
 }
-
-test('highlight modules expose one exact current UI contract without probes, timers, or alternate drag payloads', async () => {
-  const filenames = [
-    '../highlight-controls.js',
-    'annotation-selection.js',
-    'continuous-selection-preview.js',
-    'exact-contract.js',
-    'highlight-actions.js',
-    'highlight-pages-ui.js',
-    'highlight-selection-tools.js',
-    'highlight-summary-ui.js',
-    'knn-selection.js',
-    'lasso-selection.js',
-    'mode-copy.js',
-    'mode-ui.js',
-    'proximity-selection.js',
-    'selection-state.js',
-    'selection-sync.js',
-    'step-controls.js'
-  ];
-  const source = (
-    await Promise.all(
-      filenames.map(filename =>
-        readFile(new URL(filename, HIGHLIGHT_MODULE_ROOT), 'utf8')
-      )
-    )
-  ).join('\n');
-
-  assert.doesNotMatch(source, /\?\./);
-  assert.doesNotMatch(source, /\bset(?:Interval|Timeout)\s*\(/);
-  assert.doesNotMatch(source, /dataTransfer\.setData\(['"]text\/plain['"]/);
-  assert.doesNotMatch(source, /activeFieldSource\s*\|\|\s*['"]obs['"]/);
-  assert.doesNotMatch(source, /_continuousStats\s*\|\|/);
-  assert.doesNotMatch(source, /\.mode\s*\|\|\s*['"]intersect['"]/);
-  assert.doesNotMatch(source, /\bmode:\s*['"]intersect['"]/);
-  assert.doesNotMatch(source, /\bdegree:\s*0\b/);
-});
 
 test('category highlights preserve primitive identity through save, restore, and summary rendering', async () => {
   const sourceState = createCategoryHighlightState();

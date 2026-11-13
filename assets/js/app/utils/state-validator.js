@@ -42,12 +42,12 @@ export class StateValidator {
    * accepts it long before the overlay and rename paths reach this check, so
    * the field loads and then throws when the reader touches it.
    *
-   * Two narrower rules used to live here and are gone for that reason. ':' is
+   * No narrower rule is applied, for that reason. ':' is
    * an ordinary drawable character that ATAC feature names use throughout
    * ('chr1:100-200'); nothing derived from a field key parses on it, because
    * the one ':'-delimited derived string -- DataLayer's cache key
    * `type:variableKey:pageIds[:v=...]` -- reads its page IDs from the tail. A
-   * length cap likewise rejected a name the writers publish and the app must
+   * length cap likewise would reject a name the writers publish and the app must
    * render regardless; over-long names are a layout question, not a validity
    * one.
    */
@@ -77,8 +77,8 @@ export class StateValidator {
    * A category label someone gives now (a rename, a merge, a group, a page's
    * label in Create categorical): the field-name rule for text, so a label
    * made here is one line, with no space at its ends and no character that
-   * has no glyph (bug hunt R9A-8: a rename made "Alpha\nnewline", which the
-   * legend drew on two lines and the community annotation cannot key). A
+   * has no glyph (a label with a line break would be drawn on two lines by
+   * the legend, and the community annotation cannot key it). A
    * label a dataset brings is read as it is (`validateCategoryLabel`).
    */
   static validateNewCategoryLabel(label) {

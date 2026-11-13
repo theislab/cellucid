@@ -190,8 +190,9 @@
  * @module data/anndata-reader-worker
  */
 
-import { AnnDataReader, describeAnnDataStore } from './anndata/reader.js';
-import { keptAbout } from './anndata/transcode/space.js';
+import { AnnDataReader } from './anndata/reader.js';
+import { describeAnnDataStore } from './anndata/probe.js';
+import { keptAbout } from './anndata/transcode/kept-format.js';
 import { createOpaqueId } from '../utils/opaque-id.js';
 import { linkIdentity } from './sources/link-credentials.js';
 import { explainFormatError, openDatasetStore, openTranscodedStore } from './anndata/open.js';
@@ -875,9 +876,8 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       // Read again with other cells (`AnnDataReaderClient.reopenCells`): the
       // source is the one this worker holds, not a copy of it sent again. A
       // file picked from this computer, copied to this worker a second
-      // time, read as empty in Linux WebKit ("WebKit encountered an internal
-      // error", Web contracts run 41269083996), where the copy it holds read
-      // on.
+      // time, reads as empty in Linux WebKit ("WebKit encountered an internal
+      // error"), where the copy the worker holds reads on.
       if (heldSource && (!reopen || openSource === null)) {
         throw new Error('The reader holds no dataset to read again with other cells.');
       }
@@ -910,8 +910,8 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       const sameFolder = key === null && reopen && reader !== null && held !== null && held.folder !== null &&
         held.folder.url === folderUrlOf(source) && held.folder.version !== null;
       // The folder's version is asked beside the step's own reads, not
-      // before them: a growth step waited one round trip for it, in series,
-      // at each step (F170, about 4% of an opening on 3G). The step reads
+      // before them: asked first, a growth step would wait one round trip for it,
+      // in series, at each step (measured: 23_decisions_partial_reading.md). The step reads
       // through the held store meanwhile and is kept only once the folder is
       // known unchanged; found changed, it stops at once, is discarded (the
       // open dataset keeps its reader and store) and the folder is opened

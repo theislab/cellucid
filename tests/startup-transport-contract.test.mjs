@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -186,8 +185,8 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
   });
 
   await t.test('a link Cellucid cannot read is refused as the link\'s, before anything is presented', () => {
-    // R9E-1: refused as the link's (said on its opening card, Cellucid
-    // running), never as Cellucid failing to start.
+    // Refused as the link's (said on its opening card, Cellucid running),
+    // never as Cellucid failing to start.
     for (const [search, said] of [
       ['remote=http%3A%2F%2Fserver.test&source=local-demo', /names a Cellucid server \("remote"\) but its "source" is "local-demo"; remove "source"\./],
       ['remote=http%3A%2F%2Fserver.test&data=x', /names both a Cellucid server \("remote"\) and data \("data"\)/],
@@ -453,43 +452,6 @@ test('startup thrown values normalize to one Error contract', () => {
   assert.equal(nonError.cause, 'failure');
 });
 
-test('main startup uses terminal source intent and one fatal surface', async () => {
-  const source = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
-    'utf8'
-  );
-  assert.match(source, /remoteUrlParam !== null/);
-  assert.match(source, /selectIntentDatasetId\(/);
-  assert.match(
-    source,
-    /const remoteDatasetId = selectConnectedDatasetId\(/
-  );
-  // Many server datasets: the user is told to choose one, and startup never
-  // activates the Sample dataset dropdown for them.
-  assert.match(
-    source,
-    /if \(remoteDatasetId === null\) \{\s*notifications\.info\(/
-  );
-  assert.doesNotMatch(source, /datasetSelectFocusRequested|datasetSelect\.focus\(/);
-  assert.doesNotMatch(
-    source,
-    /selectStartupDataset\(\s*['"]remote['"]\s*,\s*datasets\[0\]/
-  );
-  assert.match(source, /publishStartupFailure\(\{/);
-  assert.doesNotMatch(
-    source,
-    /Failed to connect to remote server.*console\.warn/s
-  );
-  assert.doesNotMatch(
-    source,
-    /Same-origin server detected but auto-connect failed/
-  );
-  assert.doesNotMatch(
-    source,
-    /healthRes\.json\(\)\.catch/
-  );
-});
-
 function createManagerSource(type, {
   onDeactivate = null
 } = {}) {
@@ -600,8 +562,8 @@ test('DataSourceManager cleanup failure retains the published new selection', as
 });
 
 test('a link\'s "remote" is spelled as the address bar spells a server', async () => {
-  // R9E-3: `?remote=http://127.0.0.1:8765/` (a trailing slash, as people
-  // write a server) was refused as "not one canonical spelling".
+  // `?remote=http://127.0.0.1:8765/` (a trailing slash, as people write a
+  // server) is not refused as "not one canonical spelling".
   const { canonicalServerAddress } = await import('../assets/js/app/ui/modules/address-routing.js');
   const { validateRemoteServerUrl } = await import('../assets/js/data/remote-source.js');
   for (const [given, canonical] of [
@@ -619,8 +581,8 @@ test('a link\'s "remote" is spelled as the address bar spells a server', async (
 });
 
 test('a browser with WebGL2 that refuses the viewer a context is told about its graphics, not "Something went wrong"', async () => {
-  // R9E-6: `getContext('webgl2')` null for the viewer only (a reset graphics
-  // process, too many contexts) was said as the app failing to start.
+  // `getContext('webgl2')` null for the viewer only (a reset graphics
+  // process, too many contexts) is not said as the app failing to start.
   const { contextRefusedError } = await import('../assets/js/rendering/gl-errors.js');
   const refused = contextRefusedError('The viewer');
   const graphics = describeStartupFailure(refused, { webgl2Available: true, hasLaunchSettings: true });

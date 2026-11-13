@@ -74,6 +74,7 @@ import { throwIfAborted } from '../../utils/abort.js';
 import { hexOfRgb01 } from '../../utils/hex-color.js';
 import { portableElementName } from '../../data/anndata/write/names.js';
 import { csvText } from '../analysis/compute/csv-export.js';
+import { openFileWritable } from '../../utils/file-writable.js';
 
 /** The first column of an obs-column CSV. */
 export const OBS_NAME_COLUMN = 'obs_name';
@@ -192,8 +193,8 @@ function obsNamesOf(adapter, cells) {
     // Listed out of the stored order (every cell of a file in priority
     // order, or opened in a subsample's order, listed by original
     // position): each batch's cells lie throughout the file, so batch by
-    // batch every name chunk was read again (every cell of a 10M-cell
-    // priority-ordered file: 15 GB in 400 s). The names of the open cells up
+    // batch every name chunk would be read again (measured:
+    // 25_decisions_exports.md). The names of the open cells up
     // to the last listed are read once, as one range in the stored order,
     // and the batches named from them.
     let read = null;
@@ -248,8 +249,7 @@ async function csvBlob(columns, adapter, cells, valuesAt, { onProgress = () => {
   // The next batches' names are asked for while this one is made and
   // written (`CSV_READ_AHEAD`): each read waits on the link for its
   // references and then its strings, and asked one after another the link
-  // idled between them (every cell of a 10M-cell file: 25 s, against 7 s
-  // when every name was one read).
+  // idles between them (measured: 25_decisions_exports.md).
   const asked = [];
   const ask = start => {
     if (start >= cells.length) return;
@@ -388,9 +388,9 @@ export function columnName(key, taken, renamed = null) {
 
 /**
  * Bytes a spool gathers before it writes them as one file: a slab, a
- * scheduling choice (a file a write, a CSV's 1 MB batches, cost a file's
- * creation each: 153 for every cell of a 10M-cell file, seconds of an
- * export the committed tree made in memory in 5 s).
+ * scheduling choice (a file a write, a CSV's 1 MB batches, would cost a
+ * file's creation each, seconds on a large export; measured:
+ * 25_decisions_exports.md).
  */
 const SPOOL_SEGMENT_BYTES = 32 * 1024 * 1024;
 
@@ -421,9 +421,9 @@ function storageFull(error) {
  * window's is a few hundred MB; gene indexes kept for a revisit share it),
  * the files of this page's earlier exports are removed and the segment
  * written again, and a segment that still fails is kept in memory, as is every one
- * after it: a full storage never fails an export (every cell of a 10M-cell
- * file failed with `QuotaExceededError` after a CSV export of 148 MB in the
- * same page). Nothing written is lost: a segment's bytes are in hand until
+ * after it: a full storage never fails an export (without this, a large
+ * `.h5ad` export fails with `QuotaExceededError` once an earlier export of
+ * the page has filled the storage). Nothing written is lost: a segment's bytes are in hand until
  * its file is written whole.
  *
  * @param {string} name
@@ -465,12 +465,12 @@ export async function createSpool(name, { segmentBytes = SPOOL_SEGMENT_BYTES } =
     try {
       const handle = await directory.getFileHandle(fileName, { create: true });
       if (typeof handle.createWritable !== 'function') throw new TypeError('This page cannot write its private storage.');
-      const writable = await handle.createWritable();
+      const writable = await openFileWritable(handle);
       try {
         await writable.write(segment);
         await writable.close();
       } catch (error) {
-        await writable.abort?.().catch(() => {});
+        await writable.abort(error).catch(() => {});
         throw error;
       }
       const file = await handle.getFile();

@@ -287,7 +287,7 @@ export async function readHeader(reader) {
 
 /**
  * @typedef {Object} RdsSink
- * @property {(byteLength: number|null, info: {path: string[], kind: string, length: number}) => {write: (view: Uint8Array) => (void|Promise<void>), close: () => (Object|Promise<Object>)}} open -
+ * @property {(byteLength: number|null, info?: {path: string[], kind: string, length: number}) => {write: (view: Uint8Array) => (void|Promise<void>), close: () => (Object|Promise<Object>)}} open -
  *   A writer for one kept payload of `byteLength` bytes (null: not known
  *   yet); `close()` resolves to its store handle
  * @property {(region: Object) => (void|Promise<void>)} [release] - Give back

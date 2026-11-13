@@ -164,235 +164,416 @@ async function keepCurrentViewThroughUi(page) {
   return 'snap_1';
 }
 
-test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
-  context,
-  page,
-}) => {
-  expect(await context.storageState()).toEqual({
-    cookies: [],
-    origins: [],
+// One opening. The first two steps leave the renderer exactly as they found it; the observer
+// step comes last because it switches the view to 2-D.
+test('the viewer keeps its renderer whole: invalid calls and a failed GPU publication change nothing, adaptive LOD publishes complete resources, a throwing navigation observer does not undo a dimension switch', async ({ page }) => {
+  const productErrors = observeProductErrors(page);
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=viewer-renderer-contracts`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  await test.step('public viewer controls reject invalid values before renderer mutation', async () => {
+    const result = await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const gl = viewer.getGLContext();
+      const originalCreateShader = gl.createShader.bind(gl);
+      let invalidCallShaderCreations = 0;
+      gl.createShader = (...args) => {
+        invalidCallShaderCreations += 1;
+        return originalCreateShader(...args);
+      };
+      const livePositions = viewer.getPositions();
+      const liveColors = viewer.getColors();
+      const liveTransparency = viewer.getViewTransparency('live');
+      const liveDimension = viewer.getViewDimension('live');
+      const before = {
+        connectivityShown: viewer.getShowConnectivity(),
+        connectivityLineWidth: viewer.getConnectivityLineWidth(),
+        connectivityAlpha: viewer.getConnectivityAlpha(),
+        connectivityColor: viewer.getConnectivityColor(),
+        centroidFlags: viewer.getCentroidFlags('live'),
+        liveViewLabel: viewer.getLiveViewLabel(),
+        liveViewHidden: viewer.getLiveViewHidden(),
+        viewLayout: viewer.getViewLayout(),
+        edgeTarget: viewer.getEdgeSelectionStatsForView('live')?.shownCount ?? null,
+        cellSelectionEnabled: viewer.getCellSelectionEnabled(),
+        lassoEnabled: viewer.getLassoEnabled(),
+        proximityEnabled: viewer.getProximityEnabled(),
+        knnEnabled: viewer.getKnnEnabled(),
+        positions: Array.from(livePositions),
+        colors: Array.from(liveColors),
+        transparency: Array.from(liveTransparency),
+        pointCount: viewer.getPointCount(),
+        dimension: liveDimension,
+      };
+      const invalidCalls = [
+        ['setShowCentroidPoints', [0, 'live']],
+        ['setShowCentroidLabels', [0, 'live']],
+        ['setLookSensitivity', [1]],
+        ['setMoveSpeed', [6]],
+        ['setOrbitInvertRotation', ['false']],
+        ['setOrbitInvertX', [1]],
+        ['setPlanarZoomToCursor', ['true']],
+        ['setPlanarInvertAxes', [null]],
+        ['setOrbitKeySpeed', [3]],
+        ['setPlanarPanSpeed', [0]],
+        ['setPointerLockEnabled', ['false']],
+        ['setPointerLockEnabled', [true]],
+        ['setPointerLockChangeHandler', [42]],
+        ['setProjectilesEnabled', ['false']],
+        ['setProjectilesEnabled', [false, 42]],
+        ['setShowOrbitAnchor', [1]],
+        ['setViewportLeftOcclusionRatio', [-0.1]],
+        ['setViewportLeftOcclusionRatio', [1.1]],
+        ['setViewportLeftOcclusionRatio', ['0.2']],
+        ['setShowConnectivity', ['false']],
+        ['setConnectivityLineWidth', [100]],
+        ['setConnectivityAlpha', [0]],
+        ['setConnectivityColor', [12.5, 20, 30]],
+        ['setEdgeVisibleTarget', [-1]],
+        ['setViewFocusHandler', [42]],
+        ['setNavigationModeChangeHandler', [42]],
+        ['setLiveViewLabel', ['   ']],
+        ['setLiveViewHidden', [1]],
+        ['setLiveViewHidden', [true]],
+        ['setCentroidLabels', [null, 'live']],
+        [
+          'setCentroids',
+          [{
+            positions: new Float32Array(),
+            colors: new Uint8Array(),
+            outlierQuantiles: new Float32Array(),
+          }],
+        ],
+        [
+          'setCentroids',
+          [{
+            positions: new Float32Array(3),
+            colors: new Uint8Array(3),
+          }],
+        ],
+        ['setVectorFieldOverlayEnabled', [1]],
+        ['setVectorFieldConfig', ['', 1]],
+        ['setVectorFieldConfig', ['unknown-setting', 1]],
+        ['setVectorFieldConfig', ['particleCount', 1.5]],
+        ['setActiveVectorField', ['  velocity  ']],
+        [
+          'setVectorFieldData',
+          ['velocity', '3d', {
+            vectors: new Float32Array([0, 0, Number.NaN]),
+            components: 3,
+            cellCount: 1,
+            maxMagnitude: 1,
+          }],
+        ],
+        ['hasVectorFieldForLayout', ['', '3d']],
+        ['hasVectorFieldForLayout', ['velocity', '']],
+        ['setViewEmbedding', ['live', { dimension: 3 }]],
+        ['setViewEmbedding', ['live', { dimension: 3, layoutKey: '' }]],
+        ['setAdaptiveLOD', [1]],
+        ['setFrustumCulling', [1]],
+        ['setForceLOD', [1.5]],
+        ['setViewLayout', ['garbage', 'live']],
+        ['setViewLayout', ['grid', 'ghost']],
+        ['setEdgeVisibleTarget', ['4.9']],
+        ['setViewFieldKindSource', ['categorical']],
+        ['setCellSelectionEnabled', ['false']],
+        ['setLassoEnabled', ['false']],
+        ['setProximityEnabled', ['false']],
+        ['setKnnEnabled', ['false']],
+        ['setCellSelectionCallback', [42]],
+        ['setSelectionStepCallback', [42]],
+        ['setSelectionPreviewCallback', [42]],
+        ['setLassoCallback', [42]],
+        ['setLassoPreviewCallback', [42]],
+        ['setLassoStepCallback', [42]],
+        ['setProximityCallback', [42]],
+        ['setProximityPreviewCallback', [42]],
+        ['setProximityStepCallback', [42]],
+        ['setKnnCallback', [42]],
+        ['setKnnPreviewCallback', [42]],
+        ['setKnnStepCallback', [42]],
+        ['setKnnEdgeLoadCallback', [42]],
+        ['setViewCameraState', ['ghost', viewer.getCameraState()]],
+        ['setViewNavigationMode', ['ghost', 'orbit']],
+        ['getCurrentLODLevel', ['ghost']],
+        ['updatePositions', [Array.from(livePositions)]],
+        [
+          'updatePositions',
+          [new Float32Array(livePositions.length - 3)],
+        ],
+        [
+          'updatePositions',
+          [Float32Array.from(livePositions, (value, index) =>
+            index === 0 ? Number.NaN : value)],
+        ],
+        ['updateColors', [new Uint8Array(liveColors.length - 4)]],
+        [
+          'updateTransparency',
+          [new Uint8Array(liveTransparency.length - 1)],
+        ],
+        [
+          'updateTransparency',
+          [Uint8Array.from(liveTransparency, (value, index) =>
+            index === 0 ? 2 : value)],
+        ],
+        [
+          'setData',
+          [{
+            positions: Array.from(livePositions),
+            colors: liveColors,
+            transparency: liveTransparency,
+            dimensionLevel: liveDimension,
+          }],
+        ],
+        [
+          'setData',
+          [{
+            positions: livePositions,
+            colors: liveColors,
+            transparency: liveTransparency,
+            dimensionLevel: liveDimension,
+            outlierQuantiles: new Float32Array(liveTransparency.length),
+          }],
+        ],
+        [
+          'setViewPositions',
+          ['ghost', new Float32Array(viewer.getViewPositions('live').length)],
+        ],
+      ];
+      const accepted = [];
+      const rejected = [];
+      for (const [method, args] of invalidCalls) {
+        try {
+          viewer[method](...args);
+          accepted.push(method);
+        } catch (error) {
+          rejected.push({
+            method,
+            errorName: error?.name,
+            message: error?.message,
+          });
+        }
+      }
+      gl.createShader = originalCreateShader;
+      const validLabel = document.createElement('div');
+      viewer.setCentroidLabels([
+        {
+          el: validLabel,
+          position: [0, 0, 0],
+          alpha: 0.5,
+        },
+      ], 'live');
+      viewer.setCentroidLabels([], 'live');
+      let ghostPositionsReadable = false;
+      try {
+        viewer.getViewPositions('ghost');
+        ghostPositionsReadable = true;
+      } catch {
+        ghostPositionsReadable = false;
+      }
+      const after = {
+        connectivityShown: viewer.getShowConnectivity(),
+        connectivityLineWidth: viewer.getConnectivityLineWidth(),
+        connectivityAlpha: viewer.getConnectivityAlpha(),
+        connectivityColor: viewer.getConnectivityColor(),
+        centroidFlags: viewer.getCentroidFlags('live'),
+        liveViewLabel: viewer.getLiveViewLabel(),
+        liveViewHidden: viewer.getLiveViewHidden(),
+        viewLayout: viewer.getViewLayout(),
+        edgeTarget: viewer.getEdgeSelectionStatsForView('live')?.shownCount ?? null,
+        cellSelectionEnabled: viewer.getCellSelectionEnabled(),
+        lassoEnabled: viewer.getLassoEnabled(),
+        proximityEnabled: viewer.getProximityEnabled(),
+        knnEnabled: viewer.getKnnEnabled(),
+        positions: Array.from(viewer.getPositions()),
+        colors: Array.from(viewer.getColors()),
+        transparency: Array.from(viewer.getViewTransparency('live')),
+        pointCount: viewer.getPointCount(),
+        dimension: viewer.getViewDimension('live'),
+      };
+      return {
+        accepted,
+        rejected,
+        before,
+        after,
+        ghostPositionsReadable,
+        invalidCallShaderCreations,
+        attempted: invalidCalls.length,
+        removedMethodsAbsent:
+          viewer.updateOutlierQuantiles === undefined &&
+          viewer.clearViewDimensionState === undefined &&
+          viewer.setEdgeLodLimit === undefined &&
+          viewer.setEdgeDebugMode === undefined,
+      };
+    });
+
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected).toHaveLength(result.attempted);
+    expect(result.after).toEqual(result.before);
+    expect(result.ghostPositionsReadable).toBe(false);
+    expect(result.invalidCallShaderCreations).toBe(0);
+    expect(result.removedMethodsAbsent).toBe(true);
+    expect(productErrors).toEqual([]);
   });
-  const productErrors = observeProductErrors(page);
-  await installSynthetic3dFixture(page);
 
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=fresh-3d-orbit-ci`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
+  await test.step('a failed GPU dataset publication preserves the complete live renderer', async () => {
+    const result = await page.evaluate(() => {
+      const viewer = window._cellucidViewer;
+      const gl = viewer.getGLContext();
+      const before = {
+        pointCount: viewer.getPointCount(),
+        dimension: viewer.getViewDimension('live'),
+        positions: Array.from(viewer.getPositions()),
+        colors: Array.from(viewer.getColors()),
+        transparency: Array.from(viewer.getViewTransparency('live')),
+        renderer: viewer.debugRendererStatus(),
+      };
+      const replacementCount = before.pointCount + 1;
+      // A 2D publication: two position components per point.
+      const replacement = {
+        positions: new Float32Array(replacementCount * 2),
+        colors: new Uint8Array(replacementCount * 4).fill(127),
+        transparency: new Uint8Array(replacementCount).fill(1),
+        dimensionLevel: 2,
+        layoutKey: '2d',
+      };
+      const originalBufferData = gl.bufferData.bind(gl);
+      let injected = false;
+      gl.bufferData = (...args) => {
+        if (!injected && args[0] === gl.ARRAY_BUFFER) {
+          injected = true;
+          throw new Error('synthetic candidate point-buffer upload failure');
+        }
+        return originalBufferData(...args);
+      };
+      let failure = null;
+      try {
+        viewer.setData(replacement);
+      } catch (error) {
+        failure = {
+          name: error?.name,
+          message: error?.message,
+        };
+      } finally {
+        gl.bufferData = originalBufferData;
+      }
+      const after = {
+        pointCount: viewer.getPointCount(),
+        dimension: viewer.getViewDimension('live'),
+        positions: Array.from(viewer.getPositions()),
+        colors: Array.from(viewer.getColors()),
+        transparency: Array.from(viewer.getViewTransparency('live')),
+        renderer: viewer.debugRendererStatus(),
+      };
+      return {
+        before,
+        after,
+        failure,
+        injected,
+        webglError: gl.getError(),
+      };
+    });
 
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-  await expect(page.locator('#dataset-cells')).toHaveText(String(CELL_COUNT));
-  await expect(page.locator('#dataset-genes')).toHaveText('0');
-  await expect(page.locator('#filter-count')).toHaveText(
-    `Showing all ${CELL_COUNT} cells`,
-  );
-  await expect(page.locator('#view-representation-select option:checked'))
-    .toHaveText(/ · 3D$/);
-  await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
-  await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
+    expect(result.injected).toBe(true);
+    expect(result.failure).toEqual({
+      name: 'Error',
+      message: 'synthetic candidate point-buffer upload failure',
+    });
+    expect(result.after).toEqual(result.before);
+    expect(result.webglError).toBe(0);
+    expect(productErrors).toEqual([]);
+  });
 
-  expect(productErrors).toEqual([]);
-});
-
-test('snapshot dimension switches publish one exact geometry generation', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await installSynthetic3dFixture(page);
-
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=snapshot-dimension-generation`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-
-  const snapshotId = await keepCurrentViewThroughUi(page);
-  const result = await page.evaluate(async (viewId) => {
-    const state = window._cellucidState;
-    const viewer = window._cellucidViewer;
-    const publish = async dimensionLevel => {
-      await state.showDefaultRepresentation(viewId, dimensionLevel);
-      await new Promise(resolve => {
+  await test.step('adaptive LOD publishes complete dimension-owned GPU resources', async () => {
+    const result = await page.evaluate(async () => {
+      const viewer = window._cellucidViewer;
+      viewer.setAdaptiveLOD(true);
+      // The tree with its levels is built off the main thread: waited for
+      // however long the build takes.
+      while (!(viewer.debugRendererStatus().lodLevelCount > 0)) {
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      }
+      await new Promise((resolve) => {
         requestAnimationFrame(() => requestAnimationFrame(resolve));
       });
+      const status = viewer.debugRendererStatus();
       return {
-        state: state.getViewDimensionLevel(viewId),
-        viewer: viewer.getViewDimension(viewId),
+        pointCount: status.pointCount,
+        dimension: status.currentDimensionLevel,
+        useAdaptiveLOD: status.useAdaptiveLOD,
+        spatialIndicesCount: status.spatialIndicesCount,
+        lodLevelCount: status.lodLevelCount,
+        drawOrder: status.drawOrder,
+        webglError: viewer.getGLContext().getError(),
       };
-    };
-    return {
-      twoDimensional: await publish(2),
-      threeDimensional: await publish(3),
-      webglError: viewer.getGLContext().getError(),
-    };
-  }, snapshotId);
-
-  expect(result).toEqual({
-    twoDimensional: {
-      state: 2,
-      viewer: 2,
-    },
-    threeDimensional: {
-      state: 3,
-      viewer: 3,
-    },
-    webglError: 0,
-  });
-  expect(productErrors).toEqual([]);
-});
-
-test('UI teardown fences an in-flight representation switch from the picker', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await installSynthetic3dFixture(page);
-
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=representation-picker-terminal-owner`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-  await keepCurrentViewThroughUi(page);
-
-  const result = await page.evaluate(async () => {
-    const state = window._cellucidState;
-    const viewer = window._cellucidViewer;
-    const ui = window._cellucidUi;
-    const originalSetViewRepresentation =
-      state.setViewRepresentation.bind(state);
-    let releaseSwitch;
-    let markStarted;
-    const started = new Promise(resolve => {
-      markStarted = resolve;
-    });
-    const release = new Promise(resolve => {
-      releaseSwitch = resolve;
-    });
-    let switched = null;
-    state.setViewRepresentation = async (...args) => {
-      markStarted();
-      await release;
-      switched = originalSetViewRepresentation(...args);
-      return switched;
-    };
-
-    // The selected kept view is switched to the 2D representation.
-    const picker = document.getElementById('view-representation-select');
-    const twoDimensional = picker.querySelector('optgroup[label="2D"] option');
-    if (!(twoDimensional instanceof HTMLOptionElement)) {
-      throw new Error('Representation terminal regression requires a 2D option.');
-    }
-    picker.value = twoDimensional.value;
-    picker.dispatchEvent(new Event('change', { bubbles: true }));
-    await started;
-    const disabledWhileSwitching = picker.disabled;
-    const destroying = ui.destroy();
-    await destroying;
-    const badgeCountAtFence = document.querySelectorAll(
-      '#split-view-badges-list .split-badge',
-    ).length;
-
-    releaseSwitch();
-    // The switch loads the 2D positions, so it is awaited rather than given
-    // a fixed 50 ms: on hosted runners it had not finished by then. A
-    // switch that fails shows up below as the dimension it left behind.
-    while (switched === null) await new Promise(resolve => setTimeout(resolve, 0));
-    await switched.catch(() => {});
-    const outcome = {
-      badgeCountAfterSwitch: document.querySelectorAll(
-        '#split-view-badges-list .split-badge',
-      ).length,
-      badgeCountAtFence,
-      disabledWhileSwitching,
-      switchNotices: [...document.querySelectorAll('#notification-center .notification')]
-        .filter(notice => /switch/i.test(notice.textContent)).length,
-      snapshotDimension: viewer.getViewDimension('snap_1'),
-    };
-    viewer.dispose();
-    return outcome;
-  });
-
-  // The switch itself completes in the state it began in; the retired
-  // interface publishes nothing for it.
-  expect(result).toEqual({
-    badgeCountAfterSwitch: 0,
-    badgeCountAtFence: 0,
-    disabledWhileSwitching: true,
-    switchNotices: 0,
-    snapshotDimension: 2,
-  });
-  expect(productErrors).toEqual([]);
-});
-
-test('a navigation observer failure cannot enter dimension rollback', async ({
-  page,
-}) => {
-  await installSynthetic3dFixture(page);
-
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=dimension-observer-boundary`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-
-  const result = await page.evaluate(async () => {
-    const state = window._cellucidState;
-    const viewer = window._cellucidViewer;
-    const marker = 'synthetic navigation observer failure';
-    const observedErrors = [];
-    const onError = event => {
-      observedErrors.push(event.error?.message ?? event.message);
-      event.preventDefault();
-    };
-    window.addEventListener('error', onError);
-    viewer.setNavigationModeChangeHandler(() => {
-      throw new Error(marker);
     });
 
-    let rejection = null;
-    try {
-      await state.showDefaultRepresentation('live', 2);
-    } catch (error) {
-      rejection = error instanceof Error ? error.message : String(error);
-    }
-    await new Promise(resolve => setTimeout(resolve, 0));
-    window.removeEventListener('error', onError);
-
-    return {
-      observedErrors,
-      rejection,
-      navigationMode: viewer.getNavigationMode(),
-      stateDimension: state.getViewDimensionLevel('live'),
-      viewerDimension: viewer.getViewDimension('live'),
-    };
+    expect(result).toMatchObject({
+      pointCount: CELL_COUNT,
+      dimension: 3,
+      useAdaptiveLOD: true,
+      spatialIndicesCount: 1,
+      webglError: 0,
+    });
+    // LOD keeps no GPU copy: its levels are prefixes of the one stored order,
+    // the renderer's ladder for this many cells (twelve cells are below its
+    // first rung, so their one level is every cell).
+    expect(result.lodLevelCount).toBe(lodLadder(CELL_COUNT).length);
+    // The live store holds the tree's whole order, in its fixed bands.
+    expect(result.drawOrder.split(', ')[0]).toBe(formatCountOf(drawBands(CELL_COUNT).bandEnds.length, 'band'));
+    expect(productErrors).toEqual([]);
   });
 
-  expect(result).toEqual({
-    observedErrors: ['synthetic navigation observer failure'],
-    rejection: null,
-    navigationMode: 'planar',
-    stateDimension: 2,
-    viewerDimension: 2,
+  await test.step('a navigation observer failure cannot enter dimension rollback', async () => {
+    const result = await page.evaluate(async () => {
+      const state = window._cellucidState;
+      const viewer = window._cellucidViewer;
+      const marker = 'synthetic navigation observer failure';
+      const observedErrors = [];
+      const onError = event => {
+        observedErrors.push(event.error?.message ?? event.message);
+        event.preventDefault();
+      };
+      window.addEventListener('error', onError);
+      viewer.setNavigationModeChangeHandler(() => {
+        throw new Error(marker);
+      });
+
+      let rejection = null;
+      try {
+        await state.showDefaultRepresentation('live', 2);
+      } catch (error) {
+        rejection = error instanceof Error ? error.message : String(error);
+      }
+      await new Promise(resolve => setTimeout(resolve, 0));
+      window.removeEventListener('error', onError);
+
+      return {
+        observedErrors,
+        rejection,
+        navigationMode: viewer.getNavigationMode(),
+        stateDimension: state.getViewDimensionLevel('live'),
+        viewerDimension: viewer.getViewDimension('live'),
+      };
+    });
+
+    expect(result).toEqual({
+      observedErrors: ['synthetic navigation observer failure'],
+      rejection: null,
+      navigationMode: 'planar',
+      stateDimension: 2,
+      viewerDimension: 2,
+    });
   });
 });
 
@@ -1036,406 +1217,5 @@ test('sidebar drag coalesces camera geometry without synchronous layout reads', 
   expect(readsAfterSettlement).toBeLessThanOrEqual(2);
 
   await waitForTargetVisualCenter(page, 400);
-  expect(productErrors).toEqual([]);
-});
-
-test('public viewer controls reject invalid values before renderer mutation', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await installSynthetic3dFixture(page);
-
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=viewer-public-control-contract`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-
-  const result = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const gl = viewer.getGLContext();
-    const originalCreateShader = gl.createShader.bind(gl);
-    let invalidCallShaderCreations = 0;
-    gl.createShader = (...args) => {
-      invalidCallShaderCreations += 1;
-      return originalCreateShader(...args);
-    };
-    const livePositions = viewer.getPositions();
-    const liveColors = viewer.getColors();
-    const liveTransparency = viewer.getViewTransparency('live');
-    const liveDimension = viewer.getViewDimension('live');
-    const before = {
-      connectivityShown: viewer.getShowConnectivity(),
-      connectivityLineWidth: viewer.getConnectivityLineWidth(),
-      connectivityAlpha: viewer.getConnectivityAlpha(),
-      connectivityColor: viewer.getConnectivityColor(),
-      centroidFlags: viewer.getCentroidFlags('live'),
-      liveViewLabel: viewer.getLiveViewLabel(),
-      liveViewHidden: viewer.getLiveViewHidden(),
-      viewLayout: viewer.getViewLayout(),
-      edgeTarget: viewer.getEdgeSelectionStatsForView('live')?.shownCount ?? null,
-      cellSelectionEnabled: viewer.getCellSelectionEnabled(),
-      lassoEnabled: viewer.getLassoEnabled(),
-      proximityEnabled: viewer.getProximityEnabled(),
-      knnEnabled: viewer.getKnnEnabled(),
-      positions: Array.from(livePositions),
-      colors: Array.from(liveColors),
-      transparency: Array.from(liveTransparency),
-      pointCount: viewer.getPointCount(),
-      dimension: liveDimension,
-    };
-    const invalidCalls = [
-      ['setShowCentroidPoints', [0, 'live']],
-      ['setShowCentroidLabels', [0, 'live']],
-      ['setLookSensitivity', [1]],
-      ['setMoveSpeed', [6]],
-      ['setOrbitInvertRotation', ['false']],
-      ['setOrbitInvertX', [1]],
-      ['setPlanarZoomToCursor', ['true']],
-      ['setPlanarInvertAxes', [null]],
-      ['setOrbitKeySpeed', [3]],
-      ['setPlanarPanSpeed', [0]],
-      ['setPointerLockEnabled', ['false']],
-      ['setPointerLockEnabled', [true]],
-      ['setPointerLockChangeHandler', [42]],
-      ['setProjectilesEnabled', ['false']],
-      ['setProjectilesEnabled', [false, 42]],
-      ['setShowOrbitAnchor', [1]],
-      ['setViewportLeftOcclusionRatio', [-0.1]],
-      ['setViewportLeftOcclusionRatio', [1.1]],
-      ['setViewportLeftOcclusionRatio', ['0.2']],
-      ['setShowConnectivity', ['false']],
-      ['setConnectivityLineWidth', [100]],
-      ['setConnectivityAlpha', [0]],
-      ['setConnectivityColor', [12.5, 20, 30]],
-      ['setEdgeVisibleTarget', [-1]],
-      ['setViewFocusHandler', [42]],
-      ['setNavigationModeChangeHandler', [42]],
-      ['setLiveViewLabel', ['   ']],
-      ['setLiveViewHidden', [1]],
-      ['setLiveViewHidden', [true]],
-      ['setCentroidLabels', [null, 'live']],
-      [
-        'setCentroids',
-        [{
-          positions: new Float32Array(),
-          colors: new Uint8Array(),
-          outlierQuantiles: new Float32Array(),
-        }],
-      ],
-      [
-        'setCentroids',
-        [{
-          positions: new Float32Array(3),
-          colors: new Uint8Array(3),
-        }],
-      ],
-      ['setVectorFieldOverlayEnabled', [1]],
-      ['setVectorFieldConfig', ['', 1]],
-      ['setVectorFieldConfig', ['unknown-setting', 1]],
-      ['setVectorFieldConfig', ['particleCount', 1.5]],
-      ['setActiveVectorField', ['  velocity  ']],
-      [
-        'setVectorFieldData',
-        ['velocity', '3d', {
-          vectors: new Float32Array([0, 0, Number.NaN]),
-          components: 3,
-          cellCount: 1,
-          maxMagnitude: 1,
-        }],
-      ],
-      ['hasVectorFieldForLayout', ['', '3d']],
-      ['hasVectorFieldForLayout', ['velocity', '']],
-      ['setViewEmbedding', ['live', { dimension: 3 }]],
-      ['setViewEmbedding', ['live', { dimension: 3, layoutKey: '' }]],
-      ['setAdaptiveLOD', [1]],
-      ['setFrustumCulling', [1]],
-      ['setForceLOD', [1.5]],
-      ['setViewLayout', ['garbage', 'live']],
-      ['setViewLayout', ['grid', 'ghost']],
-      ['setEdgeVisibleTarget', ['4.9']],
-      ['setViewFieldKindSource', ['categorical']],
-      ['setCellSelectionEnabled', ['false']],
-      ['setLassoEnabled', ['false']],
-      ['setProximityEnabled', ['false']],
-      ['setKnnEnabled', ['false']],
-      ['setCellSelectionCallback', [42]],
-      ['setSelectionStepCallback', [42]],
-      ['setSelectionPreviewCallback', [42]],
-      ['setLassoCallback', [42]],
-      ['setLassoPreviewCallback', [42]],
-      ['setLassoStepCallback', [42]],
-      ['setProximityCallback', [42]],
-      ['setProximityPreviewCallback', [42]],
-      ['setProximityStepCallback', [42]],
-      ['setKnnCallback', [42]],
-      ['setKnnPreviewCallback', [42]],
-      ['setKnnStepCallback', [42]],
-      ['setKnnEdgeLoadCallback', [42]],
-      ['setViewCameraState', ['ghost', viewer.getCameraState()]],
-      ['setViewNavigationMode', ['ghost', 'orbit']],
-      ['getCurrentLODLevel', ['ghost']],
-      ['updatePositions', [Array.from(livePositions)]],
-      [
-        'updatePositions',
-        [new Float32Array(livePositions.length - 3)],
-      ],
-      [
-        'updatePositions',
-        [Float32Array.from(livePositions, (value, index) =>
-          index === 0 ? Number.NaN : value)],
-      ],
-      ['updateColors', [new Uint8Array(liveColors.length - 4)]],
-      [
-        'updateTransparency',
-        [new Uint8Array(liveTransparency.length - 1)],
-      ],
-      [
-        'updateTransparency',
-        [Uint8Array.from(liveTransparency, (value, index) =>
-          index === 0 ? 2 : value)],
-      ],
-      [
-        'setData',
-        [{
-          positions: Array.from(livePositions),
-          colors: liveColors,
-          transparency: liveTransparency,
-          dimensionLevel: liveDimension,
-        }],
-      ],
-      [
-        'setData',
-        [{
-          positions: livePositions,
-          colors: liveColors,
-          transparency: liveTransparency,
-          dimensionLevel: liveDimension,
-          outlierQuantiles: new Float32Array(liveTransparency.length),
-        }],
-      ],
-      [
-        'setViewPositions',
-        ['ghost', new Float32Array(viewer.getViewPositions('live').length)],
-      ],
-    ];
-    const accepted = [];
-    const rejected = [];
-    for (const [method, args] of invalidCalls) {
-      try {
-        viewer[method](...args);
-        accepted.push(method);
-      } catch (error) {
-        rejected.push({
-          method,
-          errorName: error?.name,
-          message: error?.message,
-        });
-      }
-    }
-    gl.createShader = originalCreateShader;
-    const validLabel = document.createElement('div');
-    viewer.setCentroidLabels([
-      {
-        el: validLabel,
-        position: [0, 0, 0],
-        alpha: 0.5,
-      },
-    ], 'live');
-    viewer.setCentroidLabels([], 'live');
-    let ghostPositionsReadable = false;
-    try {
-      viewer.getViewPositions('ghost');
-      ghostPositionsReadable = true;
-    } catch {
-      ghostPositionsReadable = false;
-    }
-    const after = {
-      connectivityShown: viewer.getShowConnectivity(),
-      connectivityLineWidth: viewer.getConnectivityLineWidth(),
-      connectivityAlpha: viewer.getConnectivityAlpha(),
-      connectivityColor: viewer.getConnectivityColor(),
-      centroidFlags: viewer.getCentroidFlags('live'),
-      liveViewLabel: viewer.getLiveViewLabel(),
-      liveViewHidden: viewer.getLiveViewHidden(),
-      viewLayout: viewer.getViewLayout(),
-      edgeTarget: viewer.getEdgeSelectionStatsForView('live')?.shownCount ?? null,
-      cellSelectionEnabled: viewer.getCellSelectionEnabled(),
-      lassoEnabled: viewer.getLassoEnabled(),
-      proximityEnabled: viewer.getProximityEnabled(),
-      knnEnabled: viewer.getKnnEnabled(),
-      positions: Array.from(viewer.getPositions()),
-      colors: Array.from(viewer.getColors()),
-      transparency: Array.from(viewer.getViewTransparency('live')),
-      pointCount: viewer.getPointCount(),
-      dimension: viewer.getViewDimension('live'),
-    };
-    return {
-      accepted,
-      rejected,
-      before,
-      after,
-      ghostPositionsReadable,
-      invalidCallShaderCreations,
-      attempted: invalidCalls.length,
-      removedMethodsAbsent:
-        viewer.updateOutlierQuantiles === undefined &&
-        viewer.clearViewDimensionState === undefined &&
-        viewer.setEdgeLodLimit === undefined &&
-        viewer.setEdgeDebugMode === undefined,
-    };
-  });
-
-  expect(result.accepted).toEqual([]);
-  expect(result.rejected).toHaveLength(result.attempted);
-  expect(result.after).toEqual(result.before);
-  expect(result.ghostPositionsReadable).toBe(false);
-  expect(result.invalidCallShaderCreations).toBe(0);
-  expect(result.removedMethodsAbsent).toBe(true);
-  expect(productErrors).toEqual([]);
-});
-
-test('a failed GPU dataset publication preserves the complete live renderer', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await installSynthetic3dFixture(page);
-
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=renderer-data-transaction`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-
-  const result = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const gl = viewer.getGLContext();
-    const before = {
-      pointCount: viewer.getPointCount(),
-      dimension: viewer.getViewDimension('live'),
-      positions: Array.from(viewer.getPositions()),
-      colors: Array.from(viewer.getColors()),
-      transparency: Array.from(viewer.getViewTransparency('live')),
-      renderer: viewer.debugRendererStatus(),
-    };
-    const replacementCount = before.pointCount + 1;
-    // A 2D publication: two position components per point.
-    const replacement = {
-      positions: new Float32Array(replacementCount * 2),
-      colors: new Uint8Array(replacementCount * 4).fill(127),
-      transparency: new Uint8Array(replacementCount).fill(1),
-      dimensionLevel: 2,
-      layoutKey: '2d',
-    };
-    const originalBufferData = gl.bufferData.bind(gl);
-    let injected = false;
-    gl.bufferData = (...args) => {
-      if (!injected && args[0] === gl.ARRAY_BUFFER) {
-        injected = true;
-        throw new Error('synthetic candidate point-buffer upload failure');
-      }
-      return originalBufferData(...args);
-    };
-    let failure = null;
-    try {
-      viewer.setData(replacement);
-    } catch (error) {
-      failure = {
-        name: error?.name,
-        message: error?.message,
-      };
-    } finally {
-      gl.bufferData = originalBufferData;
-    }
-    const after = {
-      pointCount: viewer.getPointCount(),
-      dimension: viewer.getViewDimension('live'),
-      positions: Array.from(viewer.getPositions()),
-      colors: Array.from(viewer.getColors()),
-      transparency: Array.from(viewer.getViewTransparency('live')),
-      renderer: viewer.debugRendererStatus(),
-    };
-    return {
-      before,
-      after,
-      failure,
-      injected,
-      webglError: gl.getError(),
-    };
-  });
-
-  expect(result.injected).toBe(true);
-  expect(result.failure).toEqual({
-    name: 'Error',
-    message: 'synthetic candidate point-buffer upload failure',
-  });
-  expect(result.after).toEqual(result.before);
-  expect(result.webglError).toBe(0);
-  expect(productErrors).toEqual([]);
-});
-
-test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
-  page,
-}) => {
-  const productErrors = observeProductErrors(page);
-  await installSynthetic3dFixture(page);
-
-  await page.goto(
-    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=renderer-lod-transaction`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Deterministic 3-D orbit fixture',
-  );
-
-  const result = await page.evaluate(async () => {
-    const viewer = window._cellucidViewer;
-    viewer.setAdaptiveLOD(true);
-    // The tree with its levels is built off the main thread: waited for
-    // however long the build takes.
-    while (!(viewer.debugRendererStatus().lodLevelCount > 0)) {
-      await new Promise(resolve => requestAnimationFrame(resolve));
-    }
-    await new Promise((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    });
-    const status = viewer.debugRendererStatus();
-    return {
-      pointCount: status.pointCount,
-      dimension: status.currentDimensionLevel,
-      useAdaptiveLOD: status.useAdaptiveLOD,
-      spatialIndicesCount: status.spatialIndicesCount,
-      lodLevelCount: status.lodLevelCount,
-      drawOrder: status.drawOrder,
-      webglError: viewer.getGLContext().getError(),
-    };
-  });
-
-  expect(result).toMatchObject({
-    pointCount: CELL_COUNT,
-    dimension: 3,
-    useAdaptiveLOD: true,
-    spatialIndicesCount: 1,
-    webglError: 0,
-  });
-  // LOD keeps no GPU copy: its levels are prefixes of the one stored order,
-  // the renderer's ladder for this many cells (twelve cells are below its
-  // first rung, so their one level is every cell).
-  expect(result.lodLevelCount).toBe(lodLadder(CELL_COUNT).length);
-  // The live store holds the tree's whole order, in its fixed bands.
-  expect(result.drawOrder.split(', ')[0]).toBe(formatCountOf(drawBands(CELL_COUNT).bandEnds.length, 'band'));
   expect(productErrors).toEqual([]);
 });

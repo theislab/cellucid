@@ -14,12 +14,12 @@
  * | `obs` columns and index, categorical codes, nullable values and masks | the kept rows | `gatheredArray` |
  * | dense `obsm`, dense `X` / layers / `raw/X`, stored outlier quantiles | the kept rows | `gatheredArray` |
  * | CSR `X` / layers / `raw/X` / `obsm` | a CSR matrix of the kept rows: `indptr` recomputed from the stored one (read when the matrix is first read, the kept rows' only: invariant 4); `indices` and `data` the kept rows' entry ranges, one after another | `gatheredArray` over entry runs |
- * | CSC `X` / layers / `raw/X` | the stored matrix with `cellRows` set: the reader reads a gene's entries and keeps those of kept cells (`reader.js`, `_cellsOf`) | a gene's own entries |
+ * | CSC `X` / layers / `raw/X` | the stored matrix with `cellRows` set: the reader reads a gene's entries and keeps those of kept cells (`reader/matrices.js`, `_cellsOf`) | a gene's own entries |
  * | `obsp` graphs | as stored; the reader reads the induced subgraph (`graph-lines.js` `inducedGraphLines`, `readInducedGraph`) | the open rows' entry runs, or the whole graph streamed, whichever costs less; open columns renumbered |
  * | each modality | its rows the kept cells measured, its cell map renumbered to them | as the root's |
  * | `var`, `varm`, `varp`, the rest of `uns` | as stored | — |
  *
- * ## Interfaces (for the lanes building on it)
+ * ## Interfaces
  *
  * - `cellSubsetView(root, {nObs, kept, rows, mergeGapBytes, readOptions, indptrs, knownRowPointers, chunks, meter})`
  *   — `kept`: the **file row** of each view row, in view order (a
@@ -56,9 +56,10 @@
  *    read as boxes of the stored array, and two runs share a box only when
  *    no chunk lies wholly between them (a chunked array decoded whole), or
  *    when the gap between them costs less than a request on the link
- *    (`mergeGapBytes`, measured: an array read byte by byte — stored in one
- *    piece, or an unfiltered HDF5 chunk). The byte reader below batches the
- *    boxes of one read into as few requests as the link prices best.
+ *    (`mergeGapBytes`; an array read byte by byte — stored in one piece, or
+ *    an unfiltered HDF5 chunk — is measured: 23_decisions_partial_reading.md).
+ *    The byte reader below batches the boxes of one read into as few
+ *    requests as the link prices best.
  * 3. Memory: a read holds its output and at most two slabs (`SLAB_BYTES`)
  *    of decoded boxes at a time (boxes are read in waves in source order,
  *    the next asked for while one is copied), never the full-length array.
@@ -72,15 +73,13 @@
  *    (`readRowPointers`, which the reader awaits before it touches the
  *    matrix), and only the kept rows' (`readKeptRowPointers`): a subsample
  *    never reads the pointers of the cells it left out, nor those of a
- *    matrix it does not read (a `raw.X` or a layer next to `X`). On
- *    CELLxGENE's HLCA (2.3M cells, int64 pointers in gzip chunks of about
- *    1,250 rows) the three matrices' whole pointers were 19 of the 20 MB a
- *    1% subsample's opening fetched. A read of some of the kept rows only
+ *    matrix it does not read (a `raw.X` or a layer next to `X`): the whole
+ *    pointers of a large atlas's matrices are most of what a small
+ *    subsample's opening would fetch (measured:
+ *    23_decisions_partial_reading.md). A read of some of the kept rows only
  *    (a gene sample: the first open cells) reads only theirs
  *    (`readRowPointers` given `rows`) and reads them as a matrix of their
- *    own (`rowsMatrix`): the first gene of a 2,011-cell sample of a view of
- *    every cell of an 11.4M-cell CELLxGENE atlas read the whole `indptr`
- *    before (31 MB in 4,379 requests).
+ *    own (`rowsMatrix`), never the whole `indptr`.
  *
  * @module data/anndata/views/cell-subset
  */
@@ -174,8 +173,7 @@ export function runsOfPositions(kept) {
  *   a slot: 16 to 32 bytes a kept row), for a small share of the file;
  * - an array of every original row (4 bytes a row of the file), once the
  *   kept rows are more than about an eighth of them: every cell of a
- *   50M-cell file opened in priority order held 1.07 GB as a table, 200 MB
- *   as an array.
+ *   50M-cell file is 1.07 GB as a table, 200 MB as an array.
  *
  * Without `nOriginal` (rows of no known axis) it is the table.
  */
@@ -245,7 +243,7 @@ export class KeptPositions {
  * array form of `KeptPositions`: the one held when made, else one made for
  * this and let go): one write a row and one read a row in file order,
  * where the radix order makes two counting passes and two scattering ones
- * (a 50% uniform share of 10M cells: 132 ms → about 40); fewer rows take
+ * (measured: 23_decisions_partial_reading.md); fewer rows take
  * the radix order (the table would be mostly empty).
  *
  * @param {CellRows} cells
@@ -432,10 +430,9 @@ export class RowPointers {
    * The bucket of `2^shift` rows `row` is in, in a table of the first range
    * ending past each bucket's first row (about one range a bucket, 4 bytes
    * a range): a lookup then searches the few ranges of its bucket, not all
-   * of them. A binary search over millions of ranges (a
-   * uniform subsample's) misses the cache at nearly every step: 5M kept
-   * rows' pointers looked up in view order took 11 s, most of a 5M-cell
-   * induced subgraph's build. @private
+   * of them. A binary search over millions of ranges (a uniform subsample's)
+   * misses the cache at nearly every step (measured:
+   * 24_decisions_graph_edges_at_scale.md). @private
    */
   _bucketOf(row) {
     const n = this.starts.length;
@@ -487,7 +484,8 @@ export class RowPointers {
   /**
    * `indexOf` for rows asked in ascending order (each at least the one
    * before): a walk forward over the ranges, no search a row (rows in store
-   * order: a share's 2.5M runs searched one by one held up its first gene).
+   * order: a share's millions of runs searched one by one would hold up
+   * its first gene).
    */
   walker() {
     let range = 0;
@@ -794,10 +792,10 @@ const sourceOrders = new WeakMap();
  * for empty runs beside others (`rankedOrder` compares those): they
  * are sorted as numbers (the engine's own sort of a typed array) and each
  * run placed at its start's rank, where a comparator sort of a subsample's
- * million single-row runs took 1.7 s of a 10% share's first view (more than
- * opening every cell). Every run of a view is ordered once and kept; a read
- * of a quarter of them or more takes its runs from that order, a smaller one
- * orders its own.
+ * million single-row runs is slower than opening every cell (measured:
+ * 23_decisions_partial_reading.md). Every run of a view is ordered once and
+ * kept; a read of a quarter of them or more takes its runs from that order,
+ * a smaller one orders its own.
  */
 function runsBySource(runs, first, last) {
   const count = last - first;
@@ -823,9 +821,8 @@ function runsBySource(runs, first, last) {
  * ascending by their value (equal ones in position order): a stable radix
  * order of their 32-bit words (`orderByKey`, the high words, when any is
  * used, ordered stably after the low ones), linear in the runs. A sort of
- * the values with a binary search placing each run took 2.3 s of a 50%
- * uniform share's first view of a 10M-cell file (5M single-row runs), more
- * than every cell's whole first view.
+ * the values with a binary search placing each run is slower than every
+ * cell's whole first view (measured: 23_decisions_partial_reading.md).
  */
 function rankedOrder(starts, from, to) {
   const count = to - from;
@@ -865,8 +862,7 @@ function rowBytesOf(real, width) {
 
 /**
  * Values above which a copy of rows goes through a view (`copyRows`): below,
- * a loop is faster (Node 26, float32: 16 values 21 vs 37 ns, 32 even, 64
- * 75 vs 41 ns).
+ * a loop is faster (measured: 23_decisions_partial_reading.md).
  */
 const COPY_BY_VIEW_VALUES = 32;
 
@@ -892,7 +888,7 @@ const ROW_CHUNKS = new WeakMap();
  * lie in, ascending (`chunkOf`), and the position of the first row in each
  * (`firstAt`, one more: the rows' count): a pass over the rows, made once
  * for every column of that chunking read row by row (`rowWaves`), not once
- * a column (a 50% share of 10M cells: 70 ms a column, its pricing as much).
+ * a column (measured: 23_decisions_partial_reading.md).
  */
 function chunksOfRows(rows, chunkRows) {
   let byChunking = ROW_CHUNKS.get(rows);
@@ -951,40 +947,13 @@ function placeRows({ read, units, from, to }, { order, rows }, width, out) {
     }
     const source = (row - unitStart) * width;
     const target = order[k] * width;
-    // A 2-D embedding's two values as two copies, not a loop a row (5M
-    // rows of a 50% share: a third of the placement).
+    // A 2-D embedding's two values as two copies, not a loop a row (a third
+    // of a large share's placement: measured, 23_decisions_partial_reading.md).
     if (width === 2) {
       out[target] = block[source];
       out[target + 1] = block[source + 1];
     } else for (let i = 0; i < width; i++) out[target + i] = block[source + i];
   }
-}
-
-/**
- * A wave's rows (`rowWaves`) one after another in file order, `values`, and
- * the view row of each (`runs.rows`, the order's own positions, not copied):
- * what `readInSourceOrder` hands out (`values.js` `readRowsInStoreOrder`).
- */
-function rowsInFileOrder({ read, units, from, to }, { order, rows }, width) {
-  const fileRows = rows.kept;
-  const values = ArrayBuffer.isView(read[0]) ? allocateTypedArray(read[0].constructor, (to - from) * width, 'Kept rows') : new Array((to - from) * width);
-  let u = 0;
-  let unitEnd = units[0].end;
-  let unitStart = units[0].start;
-  let block = read[0];
-  for (let k = from; k < to; k++) {
-    const row = fileRows[k];
-    while (row >= unitEnd) {
-      u++;
-      unitEnd = units[u].end;
-      unitStart = units[u].start;
-      block = read[u];
-    }
-    const source = (row - unitStart) * width;
-    const target = (k - from) * width;
-    for (let i = 0; i < width; i++) values[target + i] = block[source + i];
-  }
-  return { values, runs: { rows: order.subarray(from, to) } };
 }
 
 /**
@@ -1034,14 +1003,14 @@ export function composedRuns(inner, outer) {
  * gather's link and decoded chunks (it is the one that reads the store). Its
  * own `chunks` are an estimate of kept rows per stored chunk, never a unit
  * of decoding: read through them, each of a slab's thousands of estimated
- * chunks would be a read of its own, all at once (on CELLxGENE's HLCA, a
- * gene of 3,401 cells held gigabytes of reads in flight for 20 MB of
- * entries).
+ * chunks would be a read of its own, all at once (gigabytes of reads in
+ * flight for a few MB of entries: measured, 23_decisions_partial_reading.md).
  *
  * @param {Object} real - An array node
  * @param {Runs} runs
- * @param {{path?: string, mergeGapBytes: () => number, chunks?: DecodedChunks|null}} options -
- *   `chunks`: the store's decoded chunks (`decoded-chunks.js`) the reads go through
+ * @param {{path?: string, mergeGapBytes: () => number, chunks?: DecodedChunks|null, meter?: ViewMeter|null}} options -
+ *   `chunks`: the store's decoded chunks (`decoded-chunks.js`) the reads go through;
+ *   `meter`: told the milliseconds of the gather's own work
  * @returns {Object}
  */
 export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chunks = null, meter = null }) {
@@ -1081,11 +1050,12 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
    * were made of rows (`CellRows.runs`); else null (the pass over pieces,
    * `waves`). The chunks are the pass's (those the rows lie in, each once),
    * consecutive ones read as one range as every cell's slabs are, a wave at
-   * most a slab of decoded rows, the next asked for while one is handed out; each row is one copy to its place, with
-   * none of the pass's pieces listed, ordered or walked through a
-   * permutation (a 50% uniform share of a 10M-cell file: its first view
-   * 4.7-7.0 s against every cell's 0.9 s, the same bytes, its 5M single-row
-   * pieces placed through three permuted arrays a row). Each wave is
+   * most a slab of decoded rows, the next asked for while one is handed
+   * out; each row is one copy to its place, with none of the pass's pieces
+   * listed, ordered or walked through a permutation (millions of single-row
+   * pieces placed through three permuted arrays a row make a uniform share's
+   * first view several times slower than every cell's, the same bytes:
+   * measured, 23_decisions_partial_reading.md). Each wave is
    * `{read, units, from, to}`: blocks `read[u]` of stored rows
    * `[units[u].start, units[u].end)`, holding the rows of positions
    * `[from, to)` of the rows ascending.
@@ -1132,8 +1102,9 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
    * rows (`runs.byRow`), whose runs are mostly single rows (fewer than two
    * rows a run). The pass over pieces does a few operations a piece and
    * copies a run whole, the rows path one a row (and orders every row once):
-   * every cell opened in a `blocks` order is 153 runs of 65,536 rows at 10M,
-   * which the rows path took as 10M rows (0.6 s of an opening).
+   * every cell opened in a `blocks` order is a few hundred runs of 65,536
+   * rows, which the rows path would take as every one of its millions of
+   * rows (measured: 23_decisions_partial_reading.md).
    */
   const readsRowByRow = (a, b) => a === 0 && b === length && typeof runs.byRow === 'function'
     && sourceChunkRows !== null && !byRows && 2 * runs.count > length;
@@ -1183,8 +1154,8 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
    * the stored array: a subsample's view rows, and every cell of a file
    * opened in a subsample's order (`subsample-plan.js`, `cellOrder`), are in
    * priority order, so a stretch of them lies all over the file, and read
-   * stretch by stretch each stretch's chunks lie apart (every cell of a 10M
-   * file in blocks order: the embedding in 318 requests, not 22).
+   * stretch by stretch each stretch's chunks lie apart (measured:
+   * 23_decisions_partial_reading.md).
    */
   async function* waves(pairs, options, kept, { counted = true } = {}) {
     const tail = pairs.slice(1);
@@ -1553,8 +1524,7 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
       const kept = chunks ?? new DecodedChunks(0);
       // Row by row in the rows' file order (`rowWaves`), each placed in its
       // view row as it is read: one slab of the view, in its order (a copy
-      // in file order and a scatter after it cost a 50% share of 10M cells
-      // a pass more a column than every cell's read).
+      // in file order and a scatter after it cost a pass more a column).
       let placed = null;
       for await (const wave of rowWaves(pairs, options)) {
         placed ??= ArrayBuffer.isView(wave.read[0]) ? allocateTypedArray(wave.read[0].constructor, (b - a) * width, `${real.path} kept rows`) : new Array((b - a) * width);
@@ -1573,7 +1543,7 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
 }
 
 /** A child made once, as `viewGroup` makes its children. */
-function passChildren(group, wrap = () => null) {
+function passChildren(group, wrap = /** @type {(key: string, node: object) => object|null} */ (() => null)) {
   return new Map(group.keys().map(key => [key, () => wrap(key, group.get(key)) ?? group.get(key)]));
 }
 
@@ -1630,13 +1600,6 @@ function sparseFormatOf(node) {
   return encoding === 'csr_matrix' ? 'csr' : encoding === 'csc_matrix' ? 'csc' : null;
 }
 
-/** The stored row count of a matrix node (a sparse group's `shape`, a dense array's first extent). */
-function matrixRowsOf(node) {
-  if (isArrayNode(node)) return node.shape[0];
-  const shape = attributeValue(node, 'shape');
-  return Array.isArray(shape) ? Number(shape[0]) : null;
-}
-
 /**
  * An `indptr` of exact counts (`pointers`, numbers) as the array a view
  * presents: the integers of the rows each read asks for, made then from
@@ -1691,7 +1654,7 @@ export function keptEntries(pointers, rows) {
   const runIndex = !ascending && pointers instanceof RowPointers ? pointers.runIndexFor(rows) : null;
   const indexOfRun = r => (values === pointers ? rowRuns.starts[r] : walk !== null ? walk(rowRuns.starts[r]) : runIndex !== null ? runIndex[r] : pointers.indexOf(rowRuns.starts[r]));
   // Entry runs in typed arrays, at most one a row run (lists grown an item
-  // at a time held a 50% uniform share's 2.5M runs as boxed numbers).
+  // at a time hold millions of runs as boxed numbers).
   let starts = allocateTypedArray(Float64Array, rowRuns.count, 'Kept entry runs');
   let ends = allocateTypedArray(Float64Array, rowRuns.count, 'Kept entry runs');
   let count = 0;
@@ -1963,18 +1926,22 @@ async function modalityRows(modality, rows, options, mergeGapBytes, chunks = nul
  * the kept cells.
  *
  * @param {Object} root
- * @param {{nObs: number, kept: Uint32Array, mergeGapBytes: () => number, readOptions?: Object,
- *   indptrs?: Map<string, Float64Array>, knownRowPointers?: Map<string, RowPointers>}} subset -
+ * @param {{nObs: number, kept: Uint32Array, rows?: CellRows|null, mergeGapBytes: () => number, readOptions?: Object,
+ *   indptrs?: Map<string, Float64Array>, knownRowPointers?: Map<string, RowPointers>,
+ *   chunks?: DecodedChunks|null, meter?: ViewMeter|null}} subset -
  *   `kept`: the file row of each view row, in view order, fewer than `nObs`; `mergeGapBytes`:
  *   the link's merge gap now (a function: it follows the link as measured);
  *   `indptrs`: CSR row pointers read whole before, by matrix path;
  *   `knownRowPointers`: the rows' pointers an earlier view of the same store
  *   read (`knownRowPointers()` of that view), taken over where they hold
- *   the kept rows' pointers
+ *   the kept rows' pointers; the view reads the map it is given, so a clear
+ *   of it lets them go
  * @returns {Promise<Object>}
  */
 export async function cellSubsetView(root, { nObs, kept, rows: given = null, mergeGapBytes, readOptions = {}, indptrs = new Map(), knownRowPointers = new Map(), chunks = null, meter = null }) {
-  const known = new Map([...knownRowPointers].map(([path, pointers]) => [pathKey(path), pointers]));
+  // The reader's own map, keyed as `knownRowPointersOf` keys it: the reader
+  // counts what it holds and lets it go (`_rowPointerBytes`, `trimResident`).
+  const known = knownRowPointers;
   // The reader's rows when it gives them (it counts what they and their
   // lookups hold): one set of runs and one inverse for the open cells.
   const rows = given ?? new CellRows(kept, nObs);
@@ -2024,8 +1991,8 @@ export async function cellSubsetView(root, { nObs, kept, rows: given = null, mer
    * every kept row's) cover view rows `rows`: the first `rows` (a number)
    * or the rows listed. A count of first rows is walked once: a run reads
    * thousands of genes, each asking for the gene sample's first rows, and a
-   * walk of their runs each time (O(sample) a read) made a markers run over
-   * a 9.5M-cell sample time out.
+   * walk of their runs each time (O(sample) a read) makes a markers run over
+   * a sample of millions of cells time out.
    */
   const heldCover = (key, rows) => {
     const first = typeof rows === 'number';
@@ -2053,9 +2020,9 @@ export async function cellSubsetView(root, { nObs, kept, rows: given = null, mer
    * `indices` and `data` can be made); or, given `rows`, only those view
    * rows' -- the first `rows` (a number) or the view rows listed -- for
    * `rowsMatrix`: a gene sample's first cells of a view of every cell of a
-   * 11.4M-cell file need about a hundred of the pointer chunks, not all
-   * 9,146 of them (31 MB in 4,379 requests there: CELLxGENE's writer lays
-   * the pointer chunks between the matrix's, so none merge). Pointers read
+   * large file need a small share of the pointer chunks, not all of them
+   * (CELLxGENE's writer lays the pointer chunks between the matrix's, so
+   * none merge; measured: 23_decisions_partial_reading.md). Pointers read
    * once, by either, are never read again: they are kept together
    * (`ctx.partial`) and copied from by every later read.
    */
@@ -2244,7 +2211,8 @@ export async function cellSubsetView(root, { nObs, kept, rows: given = null, mer
 /**
  * `rows` (file rows, any order) ascending and once each, through a bit a row
  * up to the largest: linear in the rows and the file, where a sort of a
- * priority-ordered selection of 50M rows takes 1.4 s; rows fewer than the
+ * priority-ordered selection of tens of millions of rows is slower (measured:
+ * 23_decisions_partial_reading.md); rows fewer than the
  * bit words that would hold them are radix-sorted instead (linear in the
  * rows alone).
  *
@@ -2308,8 +2276,9 @@ export function keptChunkShare(pointers, rows, chunkElements, nnz = pointers[poi
  * Over the rows ascending (a view presents them in priority order; rows
  * given ascending are walked as they are), consecutive rows a span, [their
  * first's pointer, the pointer after their last): two pointer reads a run
- * of rows (`PointerCursor`, a walk forward), not two a row (a lookup a row,
- * a 50% uniform share's 5M rows in open order, took 1.3 s of its first gene).
+ * of rows (`PointerCursor`, a walk forward), not two a row (a lookup a row
+ * over millions of rows in open order takes seconds: measured,
+ * 23_decisions_partial_reading.md).
  *
  * @param {Float64Array|RowPointers|{at: (row: number) => number}} pointers
  * @param {Uint32Array} rows - In any order
@@ -2402,7 +2371,7 @@ export function estimatedChunkShare(rows, nRows, nnz, chunkElements) {
   // fewer chunks than rows: chunk by chunk, the first kept row whose
   // entries end past the chunk's start found by halving, the chunk touched
   // when that row's entries start before its end -- a few looks a chunk,
-  // not a walk of every row (a 50% share of 10M rows: 50 ms of opening).
+  // not a walk of every row.
   if (perRow >= 1 && chunks < rows.length) {
     const kept = ascendingRowsOf(rows);
     let touched = 0;

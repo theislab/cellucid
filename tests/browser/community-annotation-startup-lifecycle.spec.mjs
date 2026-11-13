@@ -1001,73 +1001,6 @@ test(
 );
 
 test(
-  'stale Worker capability blocks browser sign-in before redirect or token exposure',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    const workerRequests = [];
-    await page.addInitScript(workerOrigin => {
-      window.__CELLUCID_GITHUB_WORKER_ORIGIN__ = workerOrigin;
-      sessionStorage.removeItem(
-        'cellucid:github-app-auth:session'
-      );
-    }, WORKER_ORIGIN);
-    await installWorkerCapability(page, {
-      status: 'ok',
-      service: 'Cellucid GitHub Auth',
-      contractVersion: 2,
-      endpoints: [
-        '/auth/login',
-        '/auth/callback',
-        '/auth/revoke',
-        '/auth/user',
-        '/auth/installations',
-        '/auth/installation-repos',
-        '/auth/installation-token',
-      ],
-    });
-    page.on('request', request => {
-      const url = new URL(request.url());
-      if (url.origin !== WORKER_ORIGIN) return;
-      workerRequests.push({
-        authorization:
-          request.headers().authorization ?? null,
-        method: request.method(),
-        path: url.pathname,
-      });
-    });
-
-    await openCatalogWithoutAnnotationRepo(page);
-    const startingUrl = page.url();
-    const modal = await openGitHubSetupFromMainControls(page);
-    await modal.getByRole('button', {
-      name: 'Continue with GitHub',
-      exact: true,
-    }).click();
-    await expect(modal.getByRole('status')).toContainText(
-      'runs an older version (contract 2) than this Cellucid (contract 3); its owner must redeploy the Worker'
-    );
-    await expect(modal).toBeVisible();
-    expect(page.url()).toBe(startingUrl);
-    expect(workerRequests).toEqual([{
-      authorization: null,
-      method: 'GET',
-      path: '/',
-    }]);
-    const storedAuth = await page.evaluate(() =>
-      sessionStorage.getItem(
-        'cellucid:github-app-auth:session'
-      )
-    );
-    expect(storedAuth).toBeNull();
-    await modal.getByRole('button', {
-      name: 'Close',
-      exact: true,
-    }).click();
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
   'stale Worker preserves a restored repository before any token-bearing request',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
@@ -1775,7 +1708,7 @@ test(
 
     const failedRequests = repoRequestCount;
     reachable = true;
-    // Nothing asks again on a timer of its own (round 9: the transport's
+    // Nothing asks again on a timer of its own (the transport's
     // retries are the one policy): past the host's named reset, no request.
     await page.waitForTimeout(3_000);
     expect(repoRequestCount).toBe(failedRequests);

@@ -1,12 +1,11 @@
 /**
- * Element names the app's writers make paths of (round 9, data-kinds lane):
- * the portable rule (`data/anndata/write/names.js`, as cellucid-python and
+ * Element names the app's writers make paths of: the portable rule (`data/anndata/write/names.js`, as cellucid-python and
  * cellucid-r apply it) takes at most 255 bytes in UTF-8, the longest file
  * name every platform takes; and a writer copying names it did not choose
  * writes each under its portable form and says so, never dropping a column
  * (a converted MatrixMarket folder's `CD4/CD8` and repeated metadata columns
- * were left out without a word) or writing a nested group in its place (a
- * copy of an `.h5ad` whose obs column is `a/b`, which anndata then could not
+ * must not be left out without a word) or writing a nested group in its place
+ * (a copy of an `.h5ad` whose obs column is `a/b`, which anndata could not
  * read).
  */
 import assert from 'node:assert/strict';

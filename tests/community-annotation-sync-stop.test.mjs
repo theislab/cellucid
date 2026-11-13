@@ -1,12 +1,11 @@
 /**
  * A stopped Pull or Publish reads as a cancellation wherever it is caught
- * (`community-annotation/sync-stop.js`, round 9): the stop was a plain
- * `Error` with a code, so the person's Cancel was said as "Pull failed" and
- * every catch that classified errors (`isCancellation`) missed it.
+ * (`community-annotation/sync-stop.js`): a stop that was a plain `Error`
+ * with a code would be said as "Pull failed" on the person's Cancel, and
+ * every catch that classifies errors (`isCancellation`) would miss it.
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -134,20 +133,4 @@ test('the caller\'s signal or the context stops the sync with its own reason, an
   caller.abort('not an error');
   assert.equal(isCancellation(controller.signal.reason), true);
   assert.throws(() => bindSyncOwner(new AbortController(), { aborted: false, addEventListener() {}, removeEventListener() {} }), /must be an AbortSignal/);
-});
-
-test('the controls stop their sync only through sync-stop, with a cancellation or an error saying why', () => {
-  const source = readFileSync(new URL('../assets/js/app/ui/modules/community-annotation-controls.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /ANNOTATION_SYNC_STOPPED|throwIfActiveSyncAborted|activeSyncFatalMessage/);
-  const stops = [...source.matchAll(/syncStop\.stop\(\s*(\w+(?:\s+\w+)?)\(/g)].map(match => match[1]);
-  assert.ok(stops.length >= 8);
-  for (const made of stops) assert.ok(made === 'cancelled' || made === 'new Error', made);
-  // Every catch reads a cancellation before any failure branch.
-  for (const start of ['async function pullExclusive', 'async function publishExclusive']) {
-    const flow = source.slice(source.indexOf(start));
-    const caught = flow.indexOf('syncFailureOf(caughtError, opAbort)');
-    const cancellation = flow.indexOf('if (isCancellation(err)) return stoppedSyncOutcome(', caught);
-    const failure = flow.indexOf('isStoppedForFailure(err, opAbort)', caught);
-    assert.ok(caught > 0 && cancellation > caught && failure > cancellation, start);
-  }
 });

@@ -3,7 +3,8 @@
  * codec pipeline (`codecs/`), which read what this writes. The format's
  * documents, dtypes and `vlen-utf8` bytes are `format-v2.js`'s (shared with
  * the transcoders' kept stores); what only a streamed, compressed store
- * needs is here, outside the transcoders' revision guards.
+ * needs is here, outside the code fingerprint of converted stores
+ * (`scripts/kept-code-fingerprints.mjs`).
  *
  * - **Metadata.** `.zgroup` / `.zattrs` / `.zarray` per node, and the
  *   consolidated `.zmetadata` (`zarr_consolidated_format: 1`) naming every
@@ -15,10 +16,7 @@
  *   `codecs/vlen.js` reads). Deflate is fflate's (`assets/external`, the
  *   inflater `io/inflate.js` measures against the platform's), synchronous
  *   and at the level asked, so a chunk's bytes are the same in every engine
- *   and in Node. Measured on 2^14-value chunks of shuffled `int32` gene
- *   indices: fflate 79 MB/s, Node's zlib 134, `CompressionStream` 93; of
- *   float32 expression values 23 MB/s for all three, fflate's output 5%
- *   smaller (Node 26, Apple M1 Pro). A compressor with no level
+ *   and in Node (measured: 25_decisions_exports.md). A compressor with no level
  *   (`CompressionStream`) cannot write the level the metadata names.
  * - **Chunks** are whole: a chunk at an array's edge holds the chunk's full
  *   shape (the fill value past the data), as every Zarr v2 writer stores it
@@ -187,7 +185,7 @@ export function chunkKeyV2(coords) {
  * array chunked along its first dimension only, as they come.
  */
 export class ZarrV2ArrayWriter {
-  /** @private */
+  /** Made by `ZarrV2StoreWriter.array()`, not by callers. */
   constructor(store, path, { shape, chunks, dtype, codecs }) {
     this.store = store;
     this.path = path;
@@ -416,9 +414,7 @@ export class ZarrV2StoreWriter {
 
   /**
    * Encode a chunk and put it in its turn: no more than `inFlight` are
-   * being encoded at once.
-   *
-   * @private
+   * being encoded at once. Called by the array writers of this store.
    */
   async putChunk(path, key, values, codecs) {
     if (this.finished) throw new Error('The Zarr store is finished.');

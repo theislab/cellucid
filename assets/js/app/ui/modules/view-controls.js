@@ -386,9 +386,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
    * `clearSnapshotViews`); the viewer holds the layout mode, which the
    * selector only shows (a session or a history step puts it back there).
    * A restore of the views can empty the inventory (`state/domains/views.js`),
-   * so a private copy of any of the three was stale from the next line
-   * onwards, and the badge render that the same rebuild scheduled threw on a
-   * view that no longer existed (CEL-0239).
+   * so a private copy of any of the three would be stale from the next line
+   * onwards, and the badge render that the same rebuild schedules would throw
+   * on a view that no longer exists.
    */
   function currentActiveViewId() {
     return requireViewId(state.getActiveViewId(), 'Active view id');
@@ -485,8 +485,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
    * keeps the person's layout while smoke is on: smoke draws the live view
    * alone in either layout, and only the selector says "single" meanwhile
    * (`effectiveLayoutMode`). Writing "single" into the viewer from a refresh
-   * in smoke undid a starting view's "grid" as it was put back, and the
-   * sample view failed (bug hunt F59).
+   * in smoke would undo a starting view's "grid" as it is put back.
    * @param {'grid'|'single'} [layoutMode]
    */
   function pushViewLayoutToViewer(layoutMode = currentLayoutMode()) {
@@ -503,7 +502,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   /**
    * Publish one active view to the owner, then draw from the owner.
    *
-   * Callers used to assign a private mirror and let this push it. Passing the
+   * A caller does not assign a private mirror and let this push it. Passing the
    * id is what keeps the owner the only copy: the value this notifies with is
    * the value the DataState accepted.
    *
@@ -848,8 +847,8 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   /**
    * Remove the live view's row: the live view is hidden and the kept views
-   * stay, however many there are (the × removes the view its row shows,
-   * F144). The first kept view is selected when the live view was. With one
+   * stay, however many there are (the × removes the view its row shows).
+   * The first kept view is selected when the live view was. With one
    * kept view left, that view shows alone and has no ×; Clear views (or
    * `view.clear`) brings the live view back.
    */
@@ -912,8 +911,8 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   // the rows. A selection or a camera focus changes only the rows' state, set
   // on the rows in place (`applyViewBadgeState`): a click selects its view
   // and redraws, and a row replaced between the two presses of a
-  // double-click lost the double-click on WebKit, which sends no dblclick
-  // when the second press's row is gone by its release (CI run 43106620008).
+  // double-click would lose the double-click on WebKit, which sends no dblclick
+  // when the second press's row is gone by its release.
   let renderedBadgeKey = null;
   let renderedPrefixKey = null;
 
@@ -989,7 +988,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   // A restore visiting the views (`visitingViews`) focuses each in turn, a
   // removed live view among them, and awaits field reads between them: the
-  // list is drawn from the person's focus once the visit ends (L14-3).
+  // list is drawn from the person's focus once the visit ends.
   let badgesAfterVisit = false;
   function renderSplitViewBadgesAfterVisit() {
     if (badgesAfterVisit) return;

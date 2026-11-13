@@ -87,7 +87,7 @@ function genomeGroups(root) {
 }
 
 /** Whether a store root is a 10x Cell Ranger HDF5 file (a matrix or a molecule table). */
-export function isTenxRoot(root) {
+function isTenxRoot(root) {
   if (!isGroup(root) || attributeValue(root, 'encoding-type') !== undefined) return false;
   const filetype = textAttribute(root, 'filetype');
   if (filetype === 'molecule') return true;

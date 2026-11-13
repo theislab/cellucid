@@ -45,105 +45,107 @@ async function copy(page, mode) {
   await page.locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`).dispatchEvent('click');
 }
 
-test('every analysis row is reachable at a finger\'s size, in three groups', async ({ page }) => {
+// One opening on the phone: the rows are measured before any window is copied.
+test("on a phone: every analysis row at a finger's size, and a window as a bottom sheet with snap heights, a grip, a collapsing header and tabs", async ({ page }) => {
   const errors = observeProductErrors(page);
   await openDataset(page);
-  const headings = await page.locator('.analysis-mode-section .section-title').allTextContents();
-  expect(headings).toEqual(['Genes', 'Cells', 'Explore']);
-  for (const mode of MODES) {
-    const header = page.locator(`#analysis-header-${mode}`);
-    await header.scrollIntoViewIfNeeded();
-    const box = await header.boundingBox();
-    // Sub-pixel layout can draw 36 px as 35.99997.
-    expect(Math.round(box.height), mode).toBeGreaterThanOrEqual(36);
-    expect(box.x + box.width, mode).toBeLessThanOrEqual(390);
-  }
-  expect(await noSidewaysScroll(page)).toBe(true);
-  expect(errors).toEqual([]);
-});
 
-test('a window is a bottom sheet with snap heights, a grip, a collapsing header and tabs', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  await copy(page, 'simple');
-  const first = page.locator(WINDOW).first();
-  await expect(first).toHaveClass(/\bfloating-sheet\b/);
-  await expect(first).toHaveClass(/\bsheet-active\b/);
-  await expectFloatingSettled(first);
-  const sheet = await first.boundingBox();
-  expect(sheet.x).toBe(0);
-  expect(sheet.width).toBe(390);
-  expect(Math.round(sheet.y + sheet.height)).toBe(844);
-  expect(Math.abs(sheet.height - 844 * 0.75)).toBeLessThanOrEqual(2);
-  await expect(first.locator('> .accordion-resize-handle').first()).toBeHidden();
-
-  const grip = first.locator('> .floating-sheet-grip');
-  expect(Math.round((await grip.boundingBox()).height)).toBe(24);
-  await expect(grip).toHaveAttribute('aria-valuenow', '75');
-  // A tap steps up; from the top it goes round to the smallest.
-  await grip.tap();
-  await expect(grip).toHaveAttribute('aria-valuenow', '100');
-  await expect.poll(async () => Math.round((await first.boundingBox()).height)).toBe(844);
-  await grip.tap();
-  await expect(grip).toHaveAttribute('aria-valuenow', '40');
-  // Arrow keys on the grip.
-  await grip.focus();
-  await page.keyboard.press('ArrowUp');
-  await expect(grip).toHaveAttribute('aria-valuenow', '75');
-
-  // A drag on the grip settles on the nearest height.
-  await grip.evaluate(element => {
-    const rect = element.getBoundingClientRect();
-    const fire = (type, y) => element.dispatchEvent(new PointerEvent(type, {
-      bubbles: true, cancelable: true, pointerId: 5, pointerType: 'touch', isPrimary: true,
-      button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
-      clientX: rect.left + rect.width / 2, clientY: y,
-    }));
-    fire('pointerdown', rect.top + 5);
-    for (let step = 1; step <= 5; step++) fire('pointermove', rect.top + 5 + step * 60);
-    fire('pointerup', 844 * 0.62);
+  await test.step("every analysis row is reachable at a finger's size, in three groups", async () => {
+    const headings = await page.locator('.analysis-mode-section .section-title').allTextContents();
+    expect(headings).toEqual(['Genes', 'Cells', 'Explore']);
+    for (const mode of MODES) {
+      const header = page.locator(`#analysis-header-${mode}`);
+      await header.scrollIntoViewIfNeeded();
+      const box = await header.boundingBox();
+      // Sub-pixel layout can draw 36 px as 35.99997.
+      expect(Math.round(box.height), mode).toBeGreaterThanOrEqual(36);
+      expect(box.x + box.width, mode).toBeLessThanOrEqual(390);
+    }
+    expect(await noSidewaysScroll(page)).toBe(true);
+    expect(errors).toEqual([]);
   });
-  await expect(grip).toHaveAttribute('aria-valuenow', '40');
 
-  // A tap on the header collapses the sheet to it.
-  await first.locator('> details > summary').tap();
-  await expect(first.locator('> details')).not.toHaveAttribute('open', '');
-  const collapsed = await first.boundingBox();
-  expect(collapsed.height).toBeLessThan(120);
-  expect(Math.round(collapsed.y + collapsed.height)).toBe(844);
-  await first.locator('> details > summary').tap();
-  await expect(first.locator('> details')).toHaveAttribute('open', '');
+  await test.step('a window is a bottom sheet with snap heights, a grip, a collapsing header and tabs', async () => {
+    await copy(page, 'simple');
+    const first = page.locator(WINDOW).first();
+    await expect(first).toHaveClass(/\bfloating-sheet\b/);
+    await expect(first).toHaveClass(/\bsheet-active\b/);
+    await expectFloatingSettled(first);
+    const sheet = await first.boundingBox();
+    expect(sheet.x).toBe(0);
+    expect(sheet.width).toBe(390);
+    expect(Math.round(sheet.y + sheet.height)).toBe(844);
+    expect(Math.abs(sheet.height - 844 * 0.75)).toBeLessThanOrEqual(2);
+    await expect(first.locator('> .accordion-resize-handle').first()).toBeHidden();
 
-  // A second window: one sheet shows, the tab strip names both.
-  await copy(page, 'detailed');
-  await expect(page.locator(WINDOW)).toHaveCount(2);
-  const second = page.locator(WINDOW).nth(1);
-  await expect(second).toHaveClass(/\bsheet-active\b/);
-  await expect(first).toBeHidden();
-  const tabs = second.locator('> .floating-sheet-tabs [role="tab"]');
-  await expect(tabs).toHaveCount(2);
-  await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
-  await tabs.nth(0).tap();
-  await expect(first).toBeVisible();
-  await expect(second).toBeHidden();
-  await expect(first.locator('> .floating-sheet-tabs [role="tab"]').nth(0)).toHaveAttribute('aria-selected', 'true');
-  // From the keyboard: an arrow moves to the next tab and shows its window,
-  // and the focus follows the tab into the window now in front (the strip is
-  // rebuilt there); End and Home reach the last and first.
-  await first.locator('> .floating-sheet-tabs [role="tab"]').nth(0).focus();
-  await page.keyboard.press('ArrowRight');
-  await expect(second).toBeVisible();
-  await expect(first).toBeHidden();
-  const focusedTab = () => page.evaluate(() => ({
-    selected: document.activeElement?.getAttribute('aria-selected') ?? null,
-    role: document.activeElement?.getAttribute('role') ?? null,
-  }));
-  await expect.poll(focusedTab).toEqual({ selected: 'true', role: 'tab' });
-  await page.keyboard.press('Home');
-  await expect(first).toBeVisible();
-  await expect.poll(focusedTab).toEqual({ selected: 'true', role: 'tab' });
-  expect(await noSidewaysScroll(page)).toBe(true);
-  expect(errors).toEqual([]);
+    const grip = first.locator('> .floating-sheet-grip');
+    expect(Math.round((await grip.boundingBox()).height)).toBe(24);
+    await expect(grip).toHaveAttribute('aria-valuenow', '75');
+    // A tap steps up; from the top it goes round to the smallest.
+    await grip.tap();
+    await expect(grip).toHaveAttribute('aria-valuenow', '100');
+    await expect.poll(async () => Math.round((await first.boundingBox()).height)).toBe(844);
+    await grip.tap();
+    await expect(grip).toHaveAttribute('aria-valuenow', '40');
+    // Arrow keys on the grip.
+    await grip.focus();
+    await page.keyboard.press('ArrowUp');
+    await expect(grip).toHaveAttribute('aria-valuenow', '75');
+
+    // A drag on the grip settles on the nearest height.
+    await grip.evaluate(element => {
+      const rect = element.getBoundingClientRect();
+      const fire = (type, y) => element.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, pointerId: 5, pointerType: 'touch', isPrimary: true,
+        button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
+        clientX: rect.left + rect.width / 2, clientY: y,
+      }));
+      fire('pointerdown', rect.top + 5);
+      for (let step = 1; step <= 5; step++) fire('pointermove', rect.top + 5 + step * 60);
+      fire('pointerup', 844 * 0.62);
+    });
+    await expect(grip).toHaveAttribute('aria-valuenow', '40');
+
+    // A tap on the header collapses the sheet to it.
+    await first.locator('> details > summary').tap();
+    await expect(first.locator('> details')).not.toHaveAttribute('open', '');
+    const collapsed = await first.boundingBox();
+    expect(collapsed.height).toBeLessThan(120);
+    expect(Math.round(collapsed.y + collapsed.height)).toBe(844);
+    await first.locator('> details > summary').tap();
+    await expect(first.locator('> details')).toHaveAttribute('open', '');
+
+    // A second window: one sheet shows, the tab strip names both.
+    await copy(page, 'detailed');
+    await expect(page.locator(WINDOW)).toHaveCount(2);
+    const second = page.locator(WINDOW).nth(1);
+    await expect(second).toHaveClass(/\bsheet-active\b/);
+    await expect(first).toBeHidden();
+    const tabs = second.locator('> .floating-sheet-tabs [role="tab"]');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
+    await tabs.nth(0).tap();
+    await expect(first).toBeVisible();
+    await expect(second).toBeHidden();
+    await expect(first.locator('> .floating-sheet-tabs [role="tab"]').nth(0)).toHaveAttribute('aria-selected', 'true');
+    // From the keyboard: an arrow moves to the next tab and shows its window,
+    // and the focus follows the tab into the window now in front (the strip is
+    // rebuilt there); End and Home reach the last and first.
+    await first.locator('> .floating-sheet-tabs [role="tab"]').nth(0).focus();
+    await page.keyboard.press('ArrowRight');
+    await expect(second).toBeVisible();
+    await expect(first).toBeHidden();
+    const focusedTab = () => page.evaluate(() => ({
+      selected: document.activeElement?.getAttribute('aria-selected') ?? null,
+      role: document.activeElement?.getAttribute('role') ?? null,
+    }));
+    await expect.poll(focusedTab).toEqual({ selected: 'true', role: 'tab' });
+    await page.keyboard.press('Home');
+    await expect(first).toBeVisible();
+    await expect.poll(focusedTab).toEqual({ selected: 'true', role: 'tab' });
+    expect(await noSidewaysScroll(page)).toBe(true);
+    expect(errors).toEqual([]);
+  });
 });
 
 /** Whether a tap at the center of the panel's bar lands on the bar. */

@@ -1,8 +1,8 @@
 /**
- * History v2 trackers built from the contract's own constructors
+ * History trackers built from the contract's own constructors
  * (`app/history/model.js`), for the State panel's tests: steps appended at
- * the step shown with History v2's branching rule (a step made where the
- * active branch does not end starts a new branch, §3.3.1), undo and jumps,
+ * the step shown with the history's branching rule (a step made where the
+ * active branch does not end starts a new branch), undo and jumps,
  * "Branch here", groups, turns, notes, bookmarks, archived and locked
  * branches, and the recording switch. Every tracker it gives back is checked
  * whole by `validateTracker`.

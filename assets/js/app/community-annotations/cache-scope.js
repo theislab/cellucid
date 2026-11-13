@@ -20,7 +20,6 @@
  */
 
 import { parseCanonicalGitHubRepositoryReference } from './github-reference.js';
-import { webStorage } from '../../utils/web-storage.js';
 
 const CACHE_ROOT_PREFIX = 'cellucid:community-annotations:cache:';
 
@@ -100,46 +99,4 @@ export function toPublishedViewKey(scope) {
   const key = toCacheScopeKey(scope);
   if (!key) return null;
   return `${CACHE_ROOT_PREFIX}${key}:published`;
-}
-
-/**
- * The suffix of a key the file cache no longer writes: Cellucid 0.9.6 and
- * earlier mirrored each cache scope's path → SHA index of a Pull into
- * localStorage (`<prefix><scope>:files:shas`, up to megabytes for a large
- * repository); the index now lives in IndexedDB alone (`file-cache.js`).
- */
-const RETIRED_FILE_SHA_INDEX_SUFFIX = ':files:shas';
-
-/**
- * Remove the retired SHA indexes from `storage` (the page's localStorage):
- * nothing reads them, and each one counts against the origin's storage
- * budget, which the session and the published views share. This deletes
- * dead data, it migrates nothing: only keys under this module's prefix that
- * end in the retired suffix (a session `:session` or published view
- * `:published` key never does). Runs once when community annotation starts.
- *
- * @param {Storage|null} [storage] - the page's localStorage when not given
- * @returns {number} how many keys were removed
- */
-export function removeRetiredFileShaIndexes(storage = undefined) {
-  const retired = [];
-  try {
-    storage = storage === undefined ? webStorage('localStorage') : storage;
-    if (!storage) return 0;
-    for (let index = 0; index < storage.length; index++) {
-      const key = storage.key(index);
-      if (
-        typeof key === 'string' &&
-        key.startsWith(CACHE_ROOT_PREFIX) &&
-        key.endsWith(RETIRED_FILE_SHA_INDEX_SUFFIX)
-      ) {
-        retired.push(key);
-      }
-    }
-    for (const key of retired) storage.removeItem(key);
-  } catch {
-    // A browser that keeps no site data, or refuses access: nothing to free.
-    return 0;
-  }
-  return retired.length;
 }

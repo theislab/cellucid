@@ -8,10 +8,8 @@
  * lightness, which RGB distances do not (gold and orange are far apart in
  * RGB, close to the eye). Two colors closer than
  * `MIN_DISTINCT_COLOR_DISTANCE` are taken for one. The threshold is 0.08,
- * measured on the colors the app had: the finding's pair (F111, Kanemaru:
- * "atrial cardiomyocytes" inherited amber #ECB100 from "Fetal atrial
- * cardiomyocyte" and the rest group bright orange #FF9900 from "Adventitial
- * fibroblast") is 0.063 apart, the default highlight pages' red and rose
+ * measured on the colors the app has: an inherited amber (#ECB100) and a
+ * bright orange (#FF9900) are 0.063 apart, the default highlight pages' red and rose
  * (#dc2626, #e11d48) 0.039, purple and violet 0.044, green and lime 0.057;
  * red and orange pages (#dc2626, #ea580c), which read as two, are 0.087
  * apart, and the ten colors of Scanpy's default palette (Matplotlib's tab10,
@@ -51,7 +49,7 @@ const toLinear = channel => (channel <= 0.04045 ? channel / 12.92 : ((channel + 
  * @param {ArrayLike<number>} rgb
  * @returns {[number, number, number]} L, a, b
  */
-export function oklabOf(rgb) {
+function oklabOf(rgb) {
   const r = toLinear(rgb[0]);
   const g = toLinear(rgb[1]);
   const b = toLinear(rgb[2]);

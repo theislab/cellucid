@@ -158,7 +158,7 @@ test('ORCID expanded search reads only documented fields and the requested rows'
 });
 
 test('one untidy or malformed ORCID record never empties a search', () => {
-  // Repro (CA-B audit R06): each of these used to throw for the whole search.
+  // Each of these must not throw for the whole search.
   const laure = (given, family = 'Haak') => ({
     'orcid-id': '0000-0001-5109-3700',
     'given-names': given,

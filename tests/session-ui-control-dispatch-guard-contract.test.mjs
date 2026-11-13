@@ -1,6 +1,6 @@
 /**
  * What the window `error` listener in `state-serializer/ui-controls.js` is for,
- * and how narrow it is (CEL-0239).
+ * and how narrow it is.
  *
  * `EventTarget.dispatchEvent()` does not propagate an exception thrown by a
  * listener to its caller: the DOM reports the exception to the global error

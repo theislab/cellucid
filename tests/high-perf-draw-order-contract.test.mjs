@@ -1353,7 +1353,7 @@ test('a tree built under a priority the cells no longer have is not adopted: no 
   assert.ok(tree && tree.drawOrder.ranked === true, 'the tree built under the cells\' priority is installed, its order by open position');
 });
 
-test('cells drawn beneath the others (a field\'s no-value grey) take a pass of their own first, at every level and in culled ranges (UX-8)', t => {
+test('cells drawn beneath the others (a field\'s no-value grey) take a pass of their own first, at every level and in culled ranges', t => {
   silenceCalculationNotifications(t);
   const gl = createGl();
   const pointCount = 30_000;

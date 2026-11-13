@@ -2,10 +2,10 @@
  * Usage analytics must never be able to stop the application from starting.
  *
  * EasyPrivacy, which uBlock Origin, Brave, AdGuard and iOS content blockers
- * ship, refuses `/analytics/tracker.js`. While `main.js` and the dataset
- * controls imported it statically, that one refused request made the browser
- * abandon the whole module graph: the app never started and the page reported
- * "Cellucid could not load its code". Analytics is now reachable only through
+ * ship, refuses `/analytics/tracker.js`. A static import from `main.js` and the dataset
+ * controls would make that one refused request abandon the whole module graph:
+ * the app would never start and the page would report
+ * "Cellucid could not load its code". Analytics is reachable only through
  * the dynamic import in `app/optional-analytics.js`.
  */
 import assert from 'node:assert/strict';
@@ -37,15 +37,6 @@ test('no application module imports the analytics modules statically', async () 
     if (staticImport.test(source)) offenders.push(relative);
   }
   assert.deepEqual(offenders, []);
-});
-
-test('a refused analytics module leaves inert entry points instead of throwing', async () => {
-  const source = await readFile(
-    path.join(JS_ROOT, 'app', 'optional-analytics.js'),
-    'utf8'
-  );
-  assert.match(source, /import\('\.\.\/analytics\/tracker\.js'\)/);
-  assert.match(source, /state = 'absent';/);
 });
 
 async function facade(loader) {

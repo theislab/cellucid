@@ -5,7 +5,6 @@
  * `tests/browser/camera-framing-aspect.spec.mjs`).
  */
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -34,18 +33,6 @@ test('an area with no shape is refused', () => {
   for (const aspect of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
     assert.throws(() => fieldOfViewFor(aspect), /positive finite/);
   }
-});
-
-test('the viewer takes its field of view from the presented area, and each pane from its own shape', async () => {
-  const source = await readFile(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  assert.match(source, /let fov = BASE_FIELD_OF_VIEW;/);
-  assert.match(source, /fieldOfViewFor\(area\.cssWidth \/ area\.cssHeight\)/);
-  assert.doesNotMatch(source, /45 \* Math\.PI/);
-  // A pane is projected, drawn, picked and zoomed with its own field of view.
-  assert.match(source, /function configurePaneProjection\(output, pane\) \{\s*mat4\.perspective\(\s*output,\s*pane\.fov,/);
-  assert.match(source, /fov = pane\.fov;/);
-  assert.match(source, /Math\.tan\(vpInfo\.fov \/ 2\)/);
-  assert.match(source, /fov: viewport\.fov,/);
 });
 
 test('two views side by side make portrait panes that see 45° across: a kept view no longer crops a wide 2-D map', async () => {

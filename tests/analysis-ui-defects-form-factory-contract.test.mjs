@@ -5,9 +5,9 @@
  * surface of that kit:
  *
  * - A labeled select binds its `<label for>` to the select, with an id that is
- *   unique per call: ids derived from the control's name alone repeated
- *   whenever an analysis mode was copied into a floating window, and the
- *   copy's label then operated the sidebar's control.
+ *   unique per call: ids derived from the control's name alone would repeat
+ *   whenever an analysis mode is copied into a floating window, and the
+ *   copy's label would then operate the sidebar's control.
  * - Labels never end in a colon.
  * - A field that needs explaining carries an (i) beside its label, never a
  *   help line under it.

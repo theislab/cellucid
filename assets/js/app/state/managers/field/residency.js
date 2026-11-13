@@ -3,10 +3,10 @@
  *
  * A loaded field keeps its per-cell arrays (continuous values, category codes,
  * outlier quantiles) on its field object, and every view context shares them.
- * Nothing used to release them: the obs and gene caches were bounded by entry
- * count, and evicting an entry dropped only the cache's own reference while
- * the field objects kept the arrays alive. Browsing genes therefore grew the
- * heap by four bytes per cell per gene until the tab ran out of memory.
+ * Nothing but this module releases them: a cache bounded by entry count drops
+ * only its own reference while the field objects keep the arrays alive, so
+ * browsing genes would grow the heap by four bytes per cell per gene until
+ * the tab ran out of memory.
  *
  * Arrays a view still needs are always resident: the active field of every
  * view, every field carrying filter state in any view (every filter applies
@@ -17,7 +17,7 @@
  * keeps what was set on it, its colors, every category shown and its full
  * range; the visibility pass reads no array for those. An inactive gene whose column has a
  * sparse form (`data/column-forms.js`: nearly every gene) keeps that form
- * alone, its entries instead of four bytes a cell (40 MB at 10M cells), and
+ * alone, its entries instead of four bytes a cell, and
  * selecting it again makes its column from the form without a read
  * (`compactedColumn`). The remaining inactive fields are released
  * least-recently-used first while their bytes exceed the inactive-field

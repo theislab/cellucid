@@ -2,10 +2,10 @@
  * Detailed's plot and plot options set by `analysis.detailed.set` (`setPlot`)
  * are the action's change, never reported as the person's: a person's change
  * is a step of its own even while an action runs (dispatcher
- * `recordObserved`, R9W-5), so a `setPlot` that went through the person's
- * handlers made its change the person's step and left the action with none
- * (round 9 gate, `actions-settings-layout-analysis.spec.mjs`). The plot
- * selector and the expanded view's options, a person's, still report theirs.
+ * `recordObserved`), so a `setPlot` that went through the person's handlers
+ * would make its change the person's step and leave the action with none
+ * (`actions-settings-layout-analysis.spec.mjs`). The plot selector and the
+ * expanded view's options, a person's, still report theirs.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

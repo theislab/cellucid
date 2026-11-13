@@ -120,9 +120,8 @@ const BROWSER_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Appl
  * The HTTP version each origin answers in, asked once with curl: a browser
  * keeps six connections to an HTTP/1.1 host and multiplexes an HTTP/2 one;
  * Node opens connections freely, so the recorder holds HTTP/1.1 hosts to six.
- * Asked without blocking: a synchronous curl per new origin (a public S3
- * object's six mirror addresses) held the event loop, so every request of
- * the app waited 0.5-1 s per origin (3.5 s of a CELLxGENE opening).
+ * Asked without blocking: a synchronous curl per new origin would hold the
+ * event loop, so every request of the app would wait for it.
  */
 const protocols = new Map();
 function protocolOf(origin) {
@@ -164,8 +163,7 @@ const BROWSER_CONNECTIONS_PER_HOST = 6;
  * shared bandwidth (null: as fast as the real link; 0: a stall, nothing
  * arrives); and `--drops <p>`: each body cut after a random part with
  * probability `p`, as a dropped connection cuts it (seeded: the same run
- * cuts the same answers). The owner's connection "sometimes gets slower,
- * sometimes faster".
+ * cuts the same answers).
  */
 const VARIABLE_PHASES = [
   { ms: 8000, extraMs: 0, MBps: null },

@@ -2,7 +2,7 @@
  * The plot canvas is `tabindex="0"`, which makes it the first Tab stop in the
  * document. An unnamed first stop is the first thing a screen-reader user meets
  * on every load, so the name, the role that permits the name, and the
- * description all have to be present in the shipped markup (CEL-AUDIT-0088).
+ * description all have to be present in the shipped markup.
  *
  * The description host is pinned deliberately. A collapsed `<details>` hides its
  * content with `content-visibility`, which drops the whole subtree out of the
@@ -211,12 +211,11 @@ test('every key the canvas description names is a key the shortcuts panel lists'
 
 /*
  * Naming the right keys is not the same as saying the right thing about them.
- * The description shipped "W A S D orbit or pan, = and - zoom": both keys are
- * real, both are in the panel, and both claims were wrong — free-fly moves on
+ * A description such as "W A S D orbit or pan, = and - zoom" names keys that
+ * are real and in the panel and still claims wrongly: free-fly moves on
  * W A S D, and free-fly has no keyboard zoom at all. A presence check cannot
  * see that, and a screen-reader user hears this sentence on every focus with no
- * visible panel to check it against, so the claims are pinned to the handlers
- * (CEL-0200).
+ * visible panel to check it against, so the claims are pinned to the handlers.
  */
 
 /** The body of one `viewer.js` per-frame navigation update. */

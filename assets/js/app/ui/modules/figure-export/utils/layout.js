@@ -80,7 +80,7 @@ const LEGEND_GAP = 16;
  * legend whose entries or title need more is as wide as they need. In ems, so
  * a figure set in print sizes (`utils/figure-size.js`) keeps the legend in
  * proportion to its text: a fixed 240 px (63 mm) left a single-column
- * figure's plot 15 mm wide (F271).
+ * figure's plot 15 mm wide.
  */
 const LEGEND_MIN_EMS_BESIDE = 10;
 const legendMinWidthBeside = fontPx => LEGEND_MIN_EMS_BESIDE * fontPx;
@@ -408,7 +408,7 @@ function gridCellMetrics(fontSize) {
  *   row's plots, or below it, as wide as the grid's inner width.
  * - A panel's title (`panelTitle`, drawn from its plot's left edge) widens its
  *   column when it is wider than what the column holds: a title is never cut
- *   off (L24-2: "C. Neurog3 (endocrine pro" at 24 px in three columns).
+ *   off.
  */
 function composeGrid({
   plotHeight,
@@ -800,10 +800,10 @@ export function computeGridFigureLayout({
       // without legends, it would be wider than that plot; else every legend
       // beside; else every legend below: the first arrangement that keeps to
       // the box (`arrangementOf`). Decided against the legend-free plot
-      // alone, a legend kept beside a plot that the legends then shrank was
-      // planned again beside the shorter plot in more columns: two panels of
-      // a wide view in an 800 × 600 box became 182 × 114 strips beside
-      // 862 px legends, in a figure 1550 px wide (F113).
+      // alone: a legend kept beside a plot that the legends then shrank would
+      // be planned again beside the shorter plot in more columns, until the
+      // plots are strips beside legends wider than themselves
+      // (36_decisions_figure_export.md).
       const mixed = own.map((legend, index) => {
         if (legend === null) return null;
         const beside = planLegend({
@@ -982,7 +982,7 @@ export function computeGridFigureLayout({
  * The payload's size is either a box (`width` × `height`, figure pixels: the
  * picture of a view) or a width the figure fills (`height: null`: the
  * Figure Export panel's physical width, `utils/figure-size.js`): the figure
- * is exactly `width` wide at its own height (`fillFigureWidth`).
+ * is exactly `width` wide at its own height (`fillSingleViewWidth`, `fillGridWidth`).
  *
  * @param {any} payload - an export payload (`figure-export-contract.js`)
  * @param {{ includeLegend?: boolean }} [options] - `includeLegend: false` lays
@@ -1098,7 +1098,8 @@ function widenTo(layout, width) {
  * A legend asked beside the plot that would make the figure wider than asked
  * stands below it instead when that keeps the figure narrower, as a grid's
  * legends do (`arrangementOf`): a single column with a legend of long names
- * or the vector field's key beside a short plot came out 101 mm wide.
+ * or the vector field's key beside a short plot would be wider than the
+ * column.
  * `legendMovedBelow` says so.
  *
  * @param {Parameters<typeof computeSingleViewLayout>[0]} options - `width`:

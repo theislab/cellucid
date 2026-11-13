@@ -30,7 +30,7 @@
  * Every journal of a file is filed under `{parts: identity, size}`: the
  * file's identity (its key and the version its host or provider stated for
  * this opening; signature and token query parameters never part of it,
- * `space.js` `cacheKey`) and its exact size, so a file that grew or shrank
+ * `kept-format.js` `cacheKey`) and its exact size, so a file that grew or shrank
  * is another file. Only a file whose identity names a version is kept
  * (`data/sources/identity.js` `persistsAcrossVisits`): a file known by its size alone may
  * change under it, and nothing of it is kept. Nothing is kept of a file
@@ -67,10 +67,14 @@
  *   a file removes what is kept of its other versions, of every kind
  *   (`space.js` `forgetOtherVersions`, called by `data/anndata/open.js`
  *   before anything kept is used);
- * - every journal's manifest is of this revision and identity, and its
- *   records are read only as far as they are whole, match their CRC-32s and
- *   name bytes its file holds; a journal still being written (by another
- *   tab: its writer holds its writing lock) is left to the next opening;
+ * - every journal's manifest is stamped with the code fingerprint of kept
+ *   parts (`space.js` `codeFingerprintOf`: a digest of the code that says
+ *   what a journal is, `kept-format.js`, `kept-journal.js` and the page
+ *   checksums; a journal stamped by other code is removed, never read) and
+ *   is of this identity, and its records are read only as far as they are
+ *   whole, match their CRC-32s and name bytes its file holds; a journal
+ *   still being written (by another tab: its writer holds its writing
+ *   lock) is left to the next opening;
  * - every read of kept bytes checks each 16 KiB page it touches against its
  *   CRC-32; a page that does not match is damage: the journal is forgotten
  *   (its ranges are no longer used, its directory removed once nobody holds
@@ -100,10 +104,10 @@ import {
   THIS_TAB,
   findKeptStores,
   forgetKeptFile,
-  identityDigest,
-  keptAbout,
   openKeptJournal,
 } from '../../data/anndata/transcode/space.js';
+import { identityDigest, keptAbout } from '../../data/anndata/transcode/kept-format.js';
+import { keptPartsIdentity } from '../../data/anndata/transcode/kept-journal.js';
 import { persistsAcrossVisits } from '../../data/sources/identity.js';
 import { allocateTypedArray } from '../../data/sparse-column-index.js';
 import { settleQuietly } from '../../utils/errors.js';
@@ -123,11 +127,6 @@ const live = new Set();
  */
 export function flushKeptParts() {
   return Promise.all([...live].map(parts => parts.flush())).then(() => {});
-}
-
-/** What a file's kept parts are filed under (`space.js` keeps every journal of it under this). */
-export function keptPartsIdentity(identity, size) {
-  return { parts: identity, size };
 }
 
 /** Whether the parts of a file with this identity are kept at all: only under a version. */

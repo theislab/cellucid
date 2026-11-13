@@ -1,6 +1,6 @@
 /**
  * Summing the cells' totals of normalized expression values is heavy work,
- * asked for by whatever change needs it (F151, lane queue-5 L25-2):
+ * asked for by whatever change needs it:
  *
  * - the dispatcher's `ctx.heavy(estimate)`: heavy work an implementation
  *   finds while it runs is asked of an agent's action as heavy work (its
@@ -318,7 +318,7 @@ test('an agent\'s undo and redo of normalized values hand the action\'s heavy as
   assert.deepEqual(questions, []);
 });
 
-test('the pass gives its words for a progress line; a load and a replay of normalized values hand it to the load (F167)', async () => {
+test('the pass gives its words for a progress line; a load and a replay of normalized values hand it to the load', async () => {
   const { state } = await makeState();
   const found = [];
   await state.setExpressionTransform(NORMALIZED, { heavy: async estimate => { found.push(estimate.doing); } });

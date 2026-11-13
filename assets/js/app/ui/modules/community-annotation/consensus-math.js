@@ -34,7 +34,7 @@ export function formatPctSigned11(value) {
   return formatPercent(Math.round(v * 100));
 }
 
-export function clampConsensusThreshold11(value) {
+function clampConsensusThreshold11(value) {
   if (!Number.isFinite(value)) return 0.5;
   return Math.max(-1, Math.min(1, value));
 }

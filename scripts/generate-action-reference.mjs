@@ -22,24 +22,18 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { pythonDocsRoot } from './shared-files.mjs';
 import { ACTION_CONFIRMS, ACTION_EFFECTS, createActionCatalog, isSteplessEffect, toolNameOf } from '../assets/js/app/actions/catalog.js';
 import { ACTION_DEFINITIONS } from '../assets/js/app/actions/definitions/index.js';
 import { DOMAINS, domainName } from '../assets/js/app/actions/domains.js';
 import { exampleOf } from '../assets/js/app/actions/schema.js';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
 /** Where the page is, inside the docs tree. */
 export const ACTION_REFERENCE_PAGE = path.join('user_guide', 'web_app', 'p_developer_docs', '30_action_reference.md');
 
-/** The docs tree this checkout's page is written into. */
-export function docsRoot(env = process.env) {
-  return env.CELLUCID_PYTHON_DOCS ?? path.resolve(ROOT, '..', 'cellucid-python', 'docs');
-}
-
 /** The page's path for `env`. */
 export function actionReferencePath(env = process.env) {
-  return path.join(docsRoot(env), ACTION_REFERENCE_PAGE);
+  return path.join(pythonDocsRoot(env), ACTION_REFERENCE_PAGE);
 }
 
 const EFFECT_WORDS = Object.freeze({

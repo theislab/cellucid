@@ -505,13 +505,13 @@ test('a refusal and an answer cut at its limit end the turn with a note', async 
   await assert.rejects(runAgentTurn({ conversation: createConversation(), turn: 'nope', signal: new AbortController().signal }), RangeError);
 });
 
-test('what changed in the history since the last turn goes to the model with the person\'s message, after the context (L3-15)', () => {
+test('what changed in the history since the last turn goes to the model with the person\'s message, after the context', () => {
   const conversation = createConversation();
   appendMessage(conversation, { role: 'user', text: 'Now color by Neurog3.', turn: 'turn-s', at: 1, context: 'Permissions: ask.', since: 'Since your last turn the history changed: Your step "Hid Ductal" was undone.' });
   assert.equal(modelMessages(conversation)[0].text, 'Now color by Neurog3.\n\n[Cellucid: Permissions: ask.]\n\n[Cellucid: Since your last turn the history changed: Your step "Hid Ductal" was undone.]');
 });
 
-test('each call\'s result is kept as it comes, so a reload between two calls keeps the one that finished (live pass 2, S4)', async () => {
+test('each call\'s result is kept as it comes, so a reload between two calls keeps the one that finished', async () => {
   const page = await chatPage([{ calls: [{ name: 'fields_list', args: {} }, { name: 'fields_list', args: {} }] }, { text: 'Done.' }]);
   const kept = [];
   page.changes.push = function push(change) {
@@ -534,7 +534,7 @@ test('each call\'s result is kept as it comes, so a reload between two calls kee
   assert.equal(results[1].interrupted, true, 'only the call that did not finish is said interrupted');
 });
 
-test('a reply with no words for the person (only reasoning, or nothing) ends the turn with a note, never silence (F82)', async () => {
+test('a reply with no words for the person (only reasoning, or nothing) ends the turn with a note, never silence', async () => {
   const page = await chatPage([{ calls: [{ name: 'fields_list', args: {} }] }, { text: '' }, { text: '   ' }]);
   assert.equal((await page.turn('Annotate the clusters', 'turn-e')).ended, 'empty');
   assert.deepEqual(page.conversation.messages.at(-1), { role: 'note', turn: 'turn-e', kind: 'empty', text: 'Claude ended its turn without a reply; ask it to go on, or try again.' });
@@ -658,8 +658,8 @@ test('a turn sends the effort chosen; the budget is a cap: no call that would pa
   assert.equal(first.ended, 'end');
   assert.equal(page.calls[0].effort, 'high');
   // 700 tokens used, and the next call reads the whole prompt again (estimated here, with no
-  // last usage given: system, tools and messages): it would pass 1,000, so it is not made (L14-7: checked against what was spent alone, a
-  // 150,000-token budget ended at 209,751).
+  // last usage given: system, tools and messages): it would pass 1,000, so it is not made (a check
+  // against what was spent alone would overrun the budget).
   const held = await page.turn('Again', 'turn-f', { budget: 1000 });
   assert.equal(held.ended, 'budget');
   assert.equal(page.calls.length, 1, 'no call that would pass the budget');
@@ -712,7 +712,7 @@ test('what left this browser in a turn: the message with what Cellucid added, ea
   assert.equal(sentOf(conversation, 't2').summariesOnly, true);
   assert.equal(sentOf(conversation, 't1').summariesOnly, false);
   assert.match(sentText(sentOf(conversation, 't2'), 'Anthropic'), /the dataset's files stay here, and the dataset was set to names and summaries only, so no result carried values of cells or a picture\.$/);
-  // A turn received with the conversation was sent by the browser it was made in, not this one (L24-9).
+  // A turn received with the conversation was sent by the browser it was made in, not this one.
   assert.equal(sentText(sent, 'Anthropic', { received: true }),
     'Nothing of this turn left this browser: it came with the conversation (a shared session or a saved state). The browser it was made in sent Anthropic the message and 2 tool results (15 characters, 1 picture); a result can carry part of the data (the values of cells, a picture of the plot).');
   assert.doesNotMatch(sentText(sentOf(conversation, 't2'), 'Anthropic', { received: true }), /your message|left this browser for this turn/);
@@ -919,7 +919,7 @@ test('a chat exported as Markdown, and a turn as the short note the history show
 
 test('what the empty chat offers: a first look; labelling the clustering (else the identity field\'s markers); comparing the identity field\'s groups; explaining the steps; no values read', async () => {
   assert.deepEqual(suggestionsFor(), ['Give me a first look at this dataset']);
-  // No dataset open: a first look "at this dataset" would ask about nothing (R9E-8).
+  // No dataset open: a first look "at this dataset" would ask about nothing.
   assert.deepEqual(suggestionsFor({ dataset: false, identity: 'cell_type', steps: 2 }), ['Open a sample dataset and give me a first look at it']);
   assert.deepEqual(suggestionsFor({ identity: 'cell_type', cluster: 'leiden', steps: 3 }), [
     'Give me a first look at this dataset',

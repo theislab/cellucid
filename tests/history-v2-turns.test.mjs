@@ -1,5 +1,5 @@
 /**
- * History v2 §3.3.10: an agent's turn. Undoing only its own steps when the
+ * An agent's turn. Undoing only its own steps when the
  * person's steps came between (A, P1, B, P2) applies each dependant once and
  * leaves every step's before-values its parent's; an agent's own move
  * carries its turn along, so its next change is not refused as `moved`; an
@@ -161,7 +161,7 @@ test('what a turn does outside the state (a vote published) stays in its record;
   assert.equal(historyProblem(history), null);
 });
 
-test('the next message tells the agent what changed since its last turn: its turn undone (all since, or only its steps), the person\'s steps (L3-15)', async () => {
+test('the next message tells the agent what changed since its last turn: its turn undone (all since, or only its steps), the person\'s steps', async () => {
   const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
   const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
   const { history, act, step } = await makePage();
@@ -184,7 +184,7 @@ test('the next message tells the agent what changed since its last turn: its tur
   assert.ok(!/<cellucid-data>/.test(sentence) && /<cellucid-data>"a = 2"<\/cellucid-data>/.test(historySinceSentence(history.active, seen, own)), 'labels are marked as data');
 });
 
-test('a step the person takes while the agent\'s turn runs is told with the next message, as taken during that turn (L18-4)', async () => {
+test('a step the person takes while the agent\'s turn runs is told with the next message, as taken during that turn', async () => {
   const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
   const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
   const { history, step } = await makePage();
@@ -224,7 +224,7 @@ test('Undo turn back to before the turn: its steps are undone, kept for redo; a 
   assert.equal(historySinceSentence(history.active, null, own), null);
 });
 
-test('another history shown since the last turn is said: which tracker, where it came from, its steps in effect, and the conversation left behind (F270)', async () => {
+test('another history shown since the last turn is said: which tracker, where it came from, its steps in effect, and the conversation left behind', async () => {
   const { historySeen, historySinceSentence, isHistorySeen } = await import('../assets/js/app/agent/history-link.js');
   const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
   const { history, step } = await makePage();
@@ -257,7 +257,7 @@ test('another history shown since the last turn is said: which tracker, where it
   }
 });
 
-test('a branch switch is said as one, not as an undo: the agent\'s steps stay on their branch; a step taken on the branch left is named (L12-1)', async () => {
+test('a branch switch is said as one, not as an undo: the agent\'s steps stay on their branch; a step taken on the branch left is named', async () => {
   const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
   const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
   const { history, act, step } = await makePage();

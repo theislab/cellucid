@@ -685,7 +685,7 @@ const KNN_ROW_BATCH_CELLS = 1 << 16;
  * of frontier cells at a time, the next batch asked for while one is
  * walked; while a view shows the graph, the source answers from the edges
  * the page holds when that is measured faster (`knnRowReader`,
- * `app/main.js`). No thread holds every cell's neighbor list for it.
+ * `app/ui/modules/connectivity-controls.js`). No thread holds every cell's neighbor list for it.
  *
  * Reached cells are kept in discovery order with the count reached by each
  * degree, so the cells at exactly degree d are one range of that list (the

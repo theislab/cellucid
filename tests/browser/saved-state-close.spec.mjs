@@ -3,15 +3,12 @@
  * the write (`app/history/autosave-store.js`, `utils/indexed-db-database.js`).
  *
  * The browser commits a transaction once it has no request left to run. The
- * store used to make its writes one at a time, each awaited: a page that
- * went away between two of them never made the next, and Firefox committed
- * what had been made (measured: 98 and 252 of 400 writes of one transaction,
- * 3 closes in 30). A history's saved state then held a conversation's count
- * and not its messages, and could not be opened: "This saved state is missing
- * messages of a conversation; it cannot be opened" (hosted macOS Firefox, Web
- * contracts run 42202865024, `agent-chat-interrupted`). The store now reads
- * first and makes all its writes at once, so they are all in the transaction
- * before any has run, and tells it to commit.
+ * store reads first and makes all its writes at once, so they are all in the
+ * transaction before any has run, and tells it to commit. Writes made one at a
+ * time, each awaited, are committed as far as they got when a page goes away
+ * between two of them, and a history's saved state would then hold a
+ * conversation's count and not its messages, and could not be opened
+ * (33_decisions_actions_domains_and_history.md).
  *
  * Here a tab is closed at several moments of one write, by the product's own
  * store, and what the next tab finds is the whole of it or none.

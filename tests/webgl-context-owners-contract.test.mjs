@@ -3,7 +3,7 @@
  * context that outlives its use. A browser keeps a page's live contexts to a
  * limit (16 in WebKit and Chromium) and, past it, loses the oldest one --
  * the viewer's. A probe made for each benchmark report and never released
- * did exactly that after eight reports (`dev/benchmark.js`, removed); a new
+ * would do exactly that after eight reports; a new
  * call site is added here with its reason, or the test says where it is.
  */
 import assert from 'node:assert/strict';
@@ -21,7 +21,7 @@ const OWNERS = new Map([
   ['app/ui/modules/figure-export/utils/webgl-point-rasterizer.js', [1, 'figure export: at most one cached context per antialias setting']],
   ['app/startup-failure.js', [1, 'a probe on a failed start, lost at once (`loseContext`)']],
   ['app/analysis/plots/plotly-loader.js', [1, 'a probe once a page, lost at once (`loseContext`)']],
-  ['app/main.js', [1, 'the viewer canvas: the viewer\'s context, no new one']],
+  ['app/ui/modules/benchmark/benchmark-controls.js', [1, 'the viewer canvas: the viewer\'s context, no new one']],
   ['app/ui/modules/benchmark/index.js', [1, 'the viewer canvas: the viewer\'s context, no new one']],
   ['dev/benchmark.js', [1, 'the viewer canvas (`_getGL`): the viewer\'s context, no new one']],
 ]);

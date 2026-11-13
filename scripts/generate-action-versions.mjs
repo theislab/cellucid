@@ -3,8 +3,7 @@
  * Keep examples of every version of the parameters of every action whose
  * steps are recorded (effect `state`, `view` or `layout`; a read or a move of
  * the history records no step, so it has no version), so a history recorded
- * with older parameters keeps replaying (History v2 §3.8, owner decision
- * 2026-11-04):
+ * with older parameters keeps replaying:
  *
  *   tests/fixtures/action-versions/<type>@<version>.json
  *     {type, version, params: <the shape of that version's params schema>, examples: [<params of that version>, …]}
@@ -29,13 +28,13 @@
  *   action declares values-only, `valuesOnlyUpgrade`, refuses instead, and
  *   that is its record);
  * - when a version of an action has no file, or a file names an action, or a
- *   version, the catalog does not record;
- * - when a file's bytes differ from the digest the test pins (a file deleted
- *   and written again, or edited by hand).
+ *   version, the catalog does not record.
+ *
+ * A file is written once and kept: this script never writes over one that
+ * exists, so a version's shape stays what it was when the version was made.
  *
  *   node scripts/generate-action-versions.mjs            # write the missing files, remove those of removed actions
  *   node scripts/generate-action-versions.mjs --check    # exit 1 when a file is missing, stale or orphaned
- *   node scripts/generate-action-versions.mjs --digests  # print the digest list the test pins
  *
  * An action removed from the catalog (or that no longer records steps)
  * takes its files with it: nothing can replay its steps any more ("Recorded
@@ -43,7 +42,6 @@
  * two-space indent, one trailing newline), as the catalog is.
  */
 
-import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -90,11 +88,6 @@ export function readVersionFiles(dir = ACTION_VERSIONS_DIR) {
     }
     return { name, type: match?.[1] ?? null, version: match === null ? null : Number(match[2]), record, text };
   });
-}
-
-/** `{<file name>: <SHA-256 of its bytes>}`, sorted: what the drift test pins. */
-export function versionFileDigests(files) {
-  return Object.fromEntries(files.map(file => [file.name, createHash('sha256').update(file.text).digest('hex')]));
 }
 
 /**
@@ -160,12 +153,8 @@ export function versionProblems(definitions, files) {
 
 function main() {
   const flags = process.argv.slice(2);
-  const unknown = flags.filter(flag => flag !== '--check' && flag !== '--digests');
-  if (unknown.length > 0) throw new Error(`Unknown argument ${unknown[0]}; the arguments are --check and --digests`);
-  if (flags.includes('--digests')) {
-    for (const [name, digest] of Object.entries(versionFileDigests(readVersionFiles()))) console.log(`  '${name}': '${digest}',`);
-    return;
-  }
+  const unknown = flags.filter(flag => flag !== '--check');
+  if (unknown.length > 0) throw new Error(`Unknown argument ${unknown[0]}; the only one is --check`);
   const catalog = createActionCatalog(ACTION_DEFINITIONS);
   const recorded = catalog.list().filter(definition => definition.version !== null);
   if (!flags.includes('--check')) {

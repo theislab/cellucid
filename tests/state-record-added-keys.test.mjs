@@ -1,25 +1,25 @@
 /**
- * A state domain's record saved before a key was added still reads (R9R-13,
- * the class of F181 and F244): `app/state/domains/record-keys.js`, and every
+ * A state domain's record saved before a key was added still reads:
+ * `app/state/domains/record-keys.js`, and every
  * domain's records declared once (`records.js`). Every sample's published
  * starting view (`cellucid-datasets/anndata/*.cellucid-session`, written
  * before camera path captions existed) restores its camera path through the
  * Camera Path module without a refusal, and a path that never turned
  * captions off saves byte for byte as before; every domain reads every
- * starting view and saved states the app wrote at earlier versions
- * (`fixtures/state-records/`: Pancreas saved by 0.9.7, a file saved during
- * round 9; kept as they were written, never regenerated) through its
- * declared records.
+ * starting view and the history goldens through its declared records.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readdir } from 'node:fs/promises';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { listOf, nullable, readRecordKeys, readRecordShape, record, writeRecordKeys, writeRecordShape } from '../assets/js/app/state/domains/record-keys.js';
 import { RECORDS } from '../assets/js/app/state/domains/records.js';
 import { readingRecords } from '../assets/js/app/state/domains/index.js';
 import { DOMAIN_IDS } from '../assets/js/app/actions/domains.js';
 import { openHistoryFile } from '../assets/js/app/session/history-file.js';
+import { absentSibling, siblingRoot, skipAbsentSibling } from '../scripts/shared-files.mjs';
 import { destroyMounted, installModuleEnvironment, mountCinematicCamera } from './helpers/cinematic-camera-harness.mjs';
 
 const KEYS = Object.freeze({ required: Object.freeze(['a', 'b']), added: Object.freeze({ c: true, d: Object.freeze([]) }) });
@@ -35,16 +35,13 @@ test('a record of before an added key reads with its default; a truly wrong reco
   assert.deepEqual(writeRecordKeys({ a: 1, b: 2, c: false, d: [] }, KEYS), { a: 1, b: 2, c: false });
 });
 
-const DATASETS = new URL('../../cellucid-datasets/', import.meta.url);
+/** The cellucid-datasets checkout (`CELLUCID_DATASETS_ROOT`, else beside this one), or null. */
+const DATASETS_ROOT = siblingRoot('cellucid-datasets');
+const DATASETS = DATASETS_ROOT === null ? null : pathToFileURL(`${path.resolve(DATASETS_ROOT)}${path.sep}`);
 
 test('every sample\'s published starting view restores its camera path, written before captions existed', async t => {
-  let files;
-  try {
-    files = (await readdir(new URL('anndata/', DATASETS))).filter(name => name.endsWith('.cellucid-session'));
-  } catch {
-    t.skip('cellucid-datasets is not checked out beside this repository');
-    return;
-  }
+  if (skipAbsentSibling(t, DATASETS !== null, 'cellucid-datasets is not checked out beside this repository')) return;
+  const files = (await readdir(new URL('anndata/', DATASETS))).filter(name => name.endsWith('.cellucid-session'));
   assert.ok(files.length >= 5, 'the five samples publish starting views');
   const { readStartingView } = await import(new URL('scripts/publish_session_preset.mjs', DATASETS).href);
   const { readFile } = await import('node:fs/promises');
@@ -64,15 +61,14 @@ test('every sample\'s published starting view restores its camera path, written 
   }
 });
 
-test('a record shape reads a value of before: added keys filled, dropped left out, the rest given back as it is; a wrong record refused where it is wrong', () => {
+test('a record shape reads a value of before: added keys filled, the rest given back as it is; a wrong record refused where it is wrong', () => {
   const shape = record({
     required: ['views'],
-    dropped: ['sizes'],
     fields: { views: listOf(nullable(record({ required: ['a'], optional: ['b'], added: { c: false }, fields: { b: record({ required: ['x'] }) } }))) },
   });
   const same = { views: [null, { a: 1, c: true }] };
   assert.equal(readRecordShape(same, shape, 'V'), same, 'nothing to fill: the value itself');
-  assert.deepEqual(readRecordShape({ views: [{ a: 1, b: { x: 2 } }], sizes: null }, shape, 'V'), { views: [{ a: 1, b: { x: 2 }, c: false }] });
+  assert.deepEqual(readRecordShape({ views: [{ a: 1, b: { x: 2 } }] }, shape, 'V'), { views: [{ a: 1, b: { x: 2 }, c: false }] });
   assert.throws(() => readRecordShape({ views: [null, { a: 1, b: { y: 2 } }] }, shape, 'The views to restore'),
     /The views to restore › views \[2\] › b must contain exactly x; missing x; unknown y\./);
   assert.throws(() => readRecordShape({ views: [{ a: 1, d: 0 }] }, shape, 'V'), /V › views \[1\] must contain exactly a, b \(optional\), c \(optional\); unknown d\./);
@@ -104,21 +100,18 @@ async function valuesOfFile(bytes) {
   return values;
 }
 
-test('every domain reads every saved state written by an earlier version and every published starting view through its records', async t => {
+test('every domain reads the history goldens and every published starting view through its records', async t => {
   const { readFile, readdir } = await import('node:fs/promises');
   const files = [];
-  for (const name of await readdir(new URL('fixtures/state-records/', import.meta.url))) {
-    files.push({ name, bytes: await readFile(new URL(`fixtures/state-records/${name}`, import.meta.url)) });
-  }
   // The format pins Python and R read (`scripts/generate-history-golden.mjs`) hold records the app reads too.
   for (const name of ['history-golden.cellucid-session', 'history-golden-state.cellucid-session']) {
     files.push({ name, bytes: await readFile(new URL(`fixtures/${name}`, import.meta.url)) });
   }
   let samples = [];
-  try {
-    samples = (await readdir(new URL('anndata/', DATASETS))).filter(name => name.endsWith('.cellucid-session'));
-  } catch {
+  if (absentSibling(DATASETS !== null, 'cellucid-datasets is not checked out beside this repository')) {
     t.diagnostic('cellucid-datasets is not checked out beside this repository: its starting views are not read');
+  } else {
+    samples = (await readdir(new URL('anndata/', DATASETS))).filter(name => name.endsWith('.cellucid-session'));
   }
   for (const name of samples) files.push({ name, bytes: await readFile(new URL(`anndata/${name}`, DATASETS)) });
   const read = new Set();
@@ -130,7 +123,7 @@ test('every domain reads every saved state written by an earlier version and eve
       read.add(domain);
     }
   }
-  // Every declared domain was read from a file of before.
+  // Every declared domain was read from a file.
   assert.deepEqual([...read].sort(), Object.keys(RECORDS).sort());
 });
 
@@ -138,10 +131,10 @@ test('the domains\' owners read through their records: a value of before restore
   const restored = [];
   const owner = { capture: () => ({ windows: [], docked: null }), restore: value => restored.push(value), describe: (a, b) => [JSON.stringify(a), JSON.stringify(b)] };
   const reading = readingRecords(owner, RECORDS.analysis, 'analysis');
-  // The analyses of a state saved before the remembered sizes moved to the layout.
-  await reading.restore({ windows: [], sizes: null, docked: null });
+  await reading.restore({ windows: [], docked: null });
   assert.deepEqual(restored, [{ windows: [], docked: null }]);
-  assert.deepEqual(reading.describe({ windows: [], sizes: null, docked: null }, { windows: [], docked: null }), ['{"windows":[],"docked":null}', '{"windows":[],"docked":null}']);
+  assert.deepEqual(reading.describe({ windows: [], docked: null }, { windows: [], docked: null }), ['{"windows":[],"docked":null}', '{"windows":[],"docked":null}']);
+  assert.throws(() => reading.restore({ windows: [], sizes: null, docked: null }), /unknown sizes/);
   assert.throws(() => reading.restore({ windows: [], docked: null, extra: 1 }), /The analysis to restore must contain exactly docked, windows; unknown extra\./);
   assert.deepEqual(reading.capture(), { windows: [], docked: null });
 });

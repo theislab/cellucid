@@ -138,7 +138,7 @@ function sliderToAutoPaceSpeed(raw) {
  * keyframes, the number the next keyframe takes, the keyframe a loop
  * returns to, and how it plays them.
  *
- * @param {object} data
+ * @param {object} saved
  * @returns {object} the same state
  */
 export function assertCameraPathState(saved) {
@@ -384,7 +384,7 @@ export function initCinematicCamera({
     getInterpolationOptions
   });
 
-  // Captions (F110): the named keyframe the film is at, over the plot. The
+  // Captions: the named keyframe the film is at, over the plot. The
   // timing table is resolved once per path and pace, not per frame.
   let captionTiming = null;
   const captionOverlay = createCaptionOverlay({
@@ -659,8 +659,8 @@ export function initCinematicCamera({
     const keyframes = keyframeStore.getAll();
     const hasLoopBack = hasLoopBackKeyframe();
     const nonLoopBackCount = getNonLoopBackCount();
-    // Nothing to clear: dimmed, as Undo is with nothing to undo (R9E-9: a
-    // click did nothing at all).
+    // Nothing to clear: dimmed, as Undo is with nothing to undo (a
+    // click would do nothing at all).
     dom.clearBtn.disabled = keyframes.length === 0;
 
     if (keyframes.length === 0) {
@@ -1148,7 +1148,7 @@ export function initCinematicCamera({
    * camera goes to the end of the path. Under reduced motion the play says
    * so (`ended: 'reduced-motion'`, `seconds`: how long the camera moved, 0
    * when it went there at once), so an agent never tells the person a film
-   * played that did not (live pass 5, L18-3).
+   * played that did not.
    */
   function playPath(signal, meta, ongoing) {
     const keyframes = keyframeStore.getAll();
@@ -1170,7 +1170,7 @@ export function initCinematicCamera({
     }
     transportBar.updateVisibility({ reveal: true });
     // From its first keyframe, wherever an earlier film stopped (a stop keeps
-    // its position for the person's Play, R9R-7).
+    // its position for the person's Play).
     playbackController.seekTo(0);
     playbackController.play();
     // Reduced motion completes the path at once: it went to its end without moving.
@@ -1178,12 +1178,12 @@ export function initCinematicCamera({
     const startedAt = performance.now();
     if (dom.loopCheckbox.checked) {
       // The step of a loop is its start: the camera at the first keyframe now,
-      // not at the next frame, so the step holds the change it made (it was
-      // answered "it was so already"; L11-6). Where the loop is stopped is
+      // not at the next frame, so the step holds the change it made (it would be
+      // answered "it was so already"). Where the loop is stopped is
       // recorded then (camera-controls.js `setCameraPathPlaying`).
       playbackController.seekTo(0);
       // The loop plays on after this answers, and belongs to the turn that
-      // started it: that turn's Stop stops it where it is (R9R-8); it lets go
+      // started it: that turn's Stop stops it where it is; it lets go
       // once the loop comes to rest another way.
       const release = ongoing(() => {
         if (playbackController.getState() !== 'STOPPED') playbackController.stop({ resetCamera: false });
@@ -1211,7 +1211,7 @@ export function initCinematicCamera({
       };
       // The person's Stop of the turn stops the film where it is, as a
       // pause and camera-path.stop do: it answers "stopped" and its step
-      // keeps that camera (`keepsWhenStopped`, F104).
+      // keeps that camera (`keepsWhenStopped`).
       const onAbortPlay = () => {
         finish();
         if (playbackController.getState() !== 'STOPPED') playbackController.stop({ resetCamera: false });

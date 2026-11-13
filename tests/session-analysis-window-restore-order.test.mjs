@@ -81,7 +81,8 @@ function createDocked(initial = { openMode: null, modes: {} }) {
 function createPage({ state, analysisWindowManager, comparisonModule, extra = {} }) {
   const domains = createDomainRegistry();
   domains.provide('highlights', createHighlightsDomain({ state, refreshUi: () => {} }));
-  domains.provide('analysis', createAnalysisDomain({ analysis: async () => ({ comparisonModule, analysisWindowManager }) }));
+  const refs = { comparisonModule, analysisWindowManager };
+  domains.provide('analysis', createAnalysisDomain({ analysis: () => refs, analysisArrived: async () => refs }));
   for (const [id, owner] of Object.entries(extra)) domains.provide(id, owner);
   for (const id of domains.missing()) domains.provide(id, { capture: () => null, restore: () => {} });
   const history = createHistory({
@@ -179,9 +180,8 @@ test('the docked analysis panel round-trips its open mode, settings and typed re
       throw new Error('no window is reopened while the windows are unchanged');
     },
   };
-  const source = createAnalysisDomain({
-    analysis: async () => ({ comparisonModule: { exportSessionState: () => saved }, analysisWindowManager: idleManager }),
-  });
+  const sourceRefs = { comparisonModule: { exportSessionState: () => saved }, analysisWindowManager: idleManager };
+  const source = createAnalysisDomain({ analysis: () => sourceRefs, analysisArrived: async () => sourceRefs });
   const value = await source.capture();
   assert.deepEqual(value.docked, saved);
   assert.equal(value.docked.modes.differential.result.pValue, saved.modes.differential.result.pValue,

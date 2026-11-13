@@ -85,7 +85,7 @@
   display: none;
 }
 
-/* No dataset on screen and no opening (R9E-10): what the viewer is waiting
+/* No dataset on screen and no opening: what the viewer is waiting
    for and where to open one, with the button that shows that place. */
 .opening-overlay[data-state="empty"] .opening-bar,
 .opening-overlay[data-state="empty"] .opening-detail,

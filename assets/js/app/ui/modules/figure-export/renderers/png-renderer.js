@@ -111,10 +111,9 @@ import {
  * x = 82 starts at 256.25). A point raster drawn into that fractional
  * rectangle was resampled by the 2D canvas: every pixel of it was blended
  * with its neighbors (a quarter-pixel blur), and the bytes depended on how
- * the browser resampled. On the macOS Firefox runners one unchanged view,
- * exported before and after a kept view came and went, differed by one level
- * at the same few antialiased point edges in every run. The raster is
- * therefore rendered at exactly the snapped size and copied one to one onto
+ * the browser resampled: one unchanged view exported twice could differ by one
+ * level at antialiased point edges (36_decisions_figure_export.md). The raster
+ * is therefore rendered at exactly the snapped size and copied one to one onto
  * these pixels.
  *
  * @param {CanvasRenderingContext2D} ctx - with a scale-and-translate transform

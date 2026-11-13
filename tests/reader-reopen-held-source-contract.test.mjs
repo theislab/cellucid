@@ -2,10 +2,9 @@
  * A dataset read again with other cells (Apply in Cells to open, a growth
  * step) is read through the source the reader worker holds: the page sends
  * no copy of it (`AnnDataReaderClient.reopenCells` `heldSource`). A file
- * picked from this computer copied to the worker a second time read as
- * empty in Linux WebKit (Web contracts run 41269083996), while the copy the
- * worker held read on. A file that cannot be read is said to be that, not
- * empty (`anndata/open.js`).
+ * picked from this computer copied to the worker a second time reads as
+ * empty in Linux WebKit, while the copy the worker holds reads on. A file
+ * that cannot be read is said to be that, not empty (`anndata/open.js`).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

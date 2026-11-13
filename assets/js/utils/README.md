@@ -4,7 +4,7 @@ Pure helpers with no DOM state of their own and no app knowledge, importable
 from the page and from every worker. A module here imports only other
 `utils/` modules (`machine.js` also `../workers/worker-script.js`, of the
 same layer, to hand what it holds to the workers a thread starts). Before writing a helper anywhere else, look here first:
-parallel copies are the most common tidiness finding in this codebase.
+a parallel copy of one of these is a defect.
 
 | Module | Use it for |
 | --- | --- |
@@ -13,17 +13,21 @@ parallel copies are the most common tidiness finding in this codebase.
 | `errors.js` | How a failure reaches the person exactly once (`markReported`, `isReported`, `settleQuietly`, `failureText`). |
 | `listener-set.js` | Whoever must be told of a change (`createListenerSet(name)`: `add` returns an idempotent unsubscribe, `notify`, `notifyWhile` for news a listener can make stale, `delete`, `clear`, `size`): every listener is told, one that throws is reported once on the console naming the set (`reportListenerFailure`, also `onAbort`'s), a notice reaches who was in when it began. `app/utils/event-emitter.js` builds on it. Never a `Set` of callbacks and a loop of your own (`tests/one-implementation-contract.test.mjs`); callbacks whose results are used (awaited, passed on) are not listeners. |
 | `error-wire.js` | The one wire format of a failed request across a thread boundary (`toWire`, `fromWire`). |
-| `large-arrays.js` | Typed arrays larger than one `ArrayBuffer`, and moving any typed array between threads in pieces. |
+| `large-arrays.js` | Typed arrays larger than one `ArrayBuffer`, and moving any typed array between threads in pieces. Also a new array of another's kind (`sameKind`, never `new array.constructor(n)`) and the JSDoc type of a typed-array constructor held as a value (`TypedArrayConstructor`). |
+| `promise-resolvers.js` | A promise settled from outside its executor (`promiseWithResolvers`: the promise with its `resolve` and `reject`): a lease released later, a wait another call ends. The type check does not follow a `let` assigned inside `new Promise(...)` and called after it. |
+| `apply-mixin.js` | A method group mixed onto a class (`applyMixin(Target.prototype, Group.prototype)`: every member by its descriptor, getters copied, never run; the group's `constructor` left out): `DataState`, the field manager and `AnnDataReader` are composed this way, typed as `types/mixins.d.ts` says. Never `Object.assign` onto a prototype for this, nor a private copy (`tests/one-implementation-contract.test.mjs`). |
 | `radix-order.js` | Ordering millions of cells by a key without a comparator sort (`orderByKey`, `sortUint32`). |
 | `string-index.js` | Strings to indices at scale (cell names to cells, labels to codes). |
 | `text-case.js` | A first letter upper or lower case: `upperFirst` (a sentence starts), `lowerFirst` (it goes on; a name in capitals such as "PCA" kept). Never `charAt(0).toUpperCase()` by hand (`tests/one-implementation-contract.test.mjs`). |
 | `format-units.js` | Every count (exact and compact, "4M"), byte size, rate, duration, percent and p-value shown to the person. |
 | `nice-ticks.js` | Axis ticks at 1/2/5 × 10^n (`niceNumbers`): figure export's axes and the analysis plots that set their own ticks (the volcano's, beside its +∞ band). |
+| `clean-string.js` | A value as text without edge whitespace, `null` and `undefined` as empty (`toCleanString`): community annotation's labels, names and ids. |
 | `exact-record.js` | Records that hold exactly the keys they may. |
 | `hex-color.js` | Every color read from or written as hex text (`HEX_COLOR` the lowercase `#rrggbb` Cellucid writes, `isHexColor`, `hexOfBytes`, `hexOfRgb01`, `bytesOfHex`, `rgb01OfHex`): sessions, exports, color inputs, Scanpy's `uns['<key>_colors']`, plot colors. Do not parse or format `#rrggbb` anywhere else. |
 | `byte-text.js` | Bytes written as text and read back (`hexOfByteArray`, `randomHex`, `randomBytes`, `base64OfBytes`, `bytesOfBase64`, `base64UrlOfBytes`, `bytesOfBase64Url`): digests, sign-in states, PKCE, share ids, pictures, kept stores, cell records, GitHub contents. Do not call `btoa`/`atob` or write a byte as two hex digits anywhere else (`tests/byte-text-contract.test.mjs`). |
 | `sha256.js` | The one SHA-256 (`sha256Hex`, `sha256Bytes`, `sha256HexWithoutWebCrypto`): WebCrypto where there is one, the same digest in script on a plain-HTTP origin (a LAN address), where `crypto.subtle` is absent. Nothing else calls `crypto.subtle.digest`. |
 | `opaque-id.js` | A random v4 UUID in or out of a secure context (`createOpaqueId`): keyframes, saved queries, history and session ids, reader requests. |
+| `file-writable.js` | A file's writable stream that writes exactly the bytes it is given in every engine (`openFileWritable`, `exactChunk`): WebKit writes the whole buffer under a typed-array view handed to a stream's `write()`, so a view of part of its buffer goes as a Blob of its bytes. The only module that calls `createWritable` (`tests/file-writable-contract.test.mjs`): kept downloads, export spools and the dataset copy write through it. |
 | `fnv1a.js` | FNV-1a over a string's UTF-16 code units (`fnv1a32`): a quick hash of text, the same on every engine (string tables, retry spreads, figure seeds, pull-request branch names); not a digest. |
 | `loopback.js` | Whether a host is this machine, in its two senses: a loopback host a browser trusts over plain HTTP (`isSecureContextLoopbackHost`: `localhost`, `*.localhost`, 127.0.0.0/8, `::1`; where a secret may go over http: `ALLOWED_ORIGINS`, a local relay) and this machine (`isLoopbackHostname`, `isLoopbackUrl`: those or `0.0.0.0`; served stores, the address box, the Share dialog, kept parts). |
 | `origin-allowlist.js` | A Worker's exact `ALLOWED_ORIGINS` list (`parseOriginAllowlist`: https, or http on `isSecureContextLoopbackHost`); the community-annotation Worker imports it, the agent relay's copy (`relay/http.js`) is held to it by test. |
@@ -43,9 +47,8 @@ source on a local server, its generated bundle in `assets/workers/`
 elsewhere; and what a thread hands every worker it starts, `handToWorkers`) and `idle-retirement.js` (the one idle-lifetime rule of the
 worker pools).
 
-Other utility folders exist today (`app/utils/`, `app/analysis/shared/`);
-their merge into this folder is stage 1 of the reorganization plan
-(`cellucid-private/plans/audit-2026-10-28/code-organisation.md` §B).
+Other utility folders exist (`app/utils/`, `app/analysis/shared/`) for helpers that know
+the app.
 
 ## Decision records
 

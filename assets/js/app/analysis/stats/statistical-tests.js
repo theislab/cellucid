@@ -76,7 +76,7 @@ function requireNumericArrayLike(values, label) {
     // not are the BigInt ones, which read back `bigint`, so they are the only
     // case that still has to be rejected — and rejecting them by constructor
     // is exactly as strict as scanning every element, at O(1) instead of O(n).
-    // This matters: the scan ran twice per group on every gene of a
+    // This matters: the scan would run twice per group on every gene of a
     // differential-expression run.
     if (values instanceof BigInt64Array || values instanceof BigUint64Array) {
       throw new TypeError(`${label} must contain a numeric value at every index`);

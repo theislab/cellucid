@@ -4,10 +4,9 @@
  *
  * An `aria-label` on the input is not a substitute: it fixes the accessible
  * name but not the label's click target, so a sighted pointer user clicking
- * the caption gets nothing. This whole subsystem had drifted into the
- * "bare label + sibling input carrying a duplicate aria-label" idiom, so the
- * rule is enforced over every label-creation site rather than the ones that
- * happened to be reported.
+ * the caption gets nothing. The rule is enforced over every label-creation
+ * site, so the "bare label + sibling input carrying a duplicate aria-label"
+ * idiom cannot return anywhere in the subsystem.
  *
  * Scope note: this pins the *construction* rule. `createInfoLabel()` in
  * `controls-panel.js` also renders section headings that name a group rather

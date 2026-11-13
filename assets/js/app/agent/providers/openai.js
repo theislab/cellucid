@@ -342,7 +342,7 @@ function refusesReasoningInclude(error) {
 /**
  * @param {{fetch?: typeof fetch}} [options]
  */
-export function createOpenAIProvider({ fetch: fetchImpl = (...args) => globalThis.fetch(...args) } = {}) {
+export function createOpenAIProvider({ fetch: fetchImpl = (input, init) => globalThis.fetch(input, init) } = {}) {
   /** Models found not to take `include: reasoning.encrypted_content`. */
   const withoutReasoning = new Set();
 

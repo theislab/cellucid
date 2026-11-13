@@ -47,6 +47,7 @@ import {
 } from '../shared/page-derivation-utils.js';
 import { priorityPrefix } from '../../../data/cell-priority.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
+import { sameKind } from '../../../utils/large-arrays.js';
 import {
   isCategoricalCodes,
   missingCategoryCode
@@ -94,16 +95,7 @@ function matrixName(matrix, counts = false) {
   return counts ? `${name} · counts` : name;
 }
 
-/**
- * The values a run computes from (`DataLayer.runValues`): the expression
- * transform, the cells' totals when it normalizes (null otherwise), its
- * `key` (`transformKey`) and what a result keeps of them (`record`, null for
- * the values as stored).
- *
- * @typedef {Readonly<{transform: import('../../../data/expression-transform.js').ExpressionTransform,
- *   sizes: import('../../../data/library-sizes.js').LibrarySizes|null, key: string,
- *   record: {normalize: boolean, log1p: boolean, totals: string|null}|null}>} RunValues
- */
+/** @typedef {import('../compute/task-values.js').RunValues} RunValues */
 
 /** The values as stored, as a run's values. */
 export const RAW_RUN_VALUES = Object.freeze({ transform: RAW_VALUES, sizes: null, key: transformKey(RAW_VALUES), record: null });
@@ -192,7 +184,7 @@ export function excludeMissingCategoricalValues(pageData) {
     const missing = counts.get(null) ?? 0;
     if (missing === 0) return page;
     const kept = page.values.length - missing;
-    const values = new page.values.constructor(kept);
+    const values = sameKind(page.values, kept);
     const cellIndices = new Uint32Array(kept);
     let write = 0;
     for (let index = 0; index < page.values.length; index++) {
@@ -489,8 +481,9 @@ const EMPTY_CELLS = new Uint32Array(0);
  * A single list that is already strictly ascending is the union itself — a
  * category highlight, a lasso, a host's selection all are — so its size is
  * its length and it is its own cell list, never copied: the page selectors
- * ask for counts on every highlight change, and a 5,000,000-cell selection
- * copied into an array for a count cost 85 ms of that change. Several lists,
+ * ask for counts on every highlight change, and a selection of millions of
+ * cells copied into an array for a count would cost most of that change's time
+ * (measured: 37_decisions_analysis.md). Several lists,
  * or an unordered one, are united through a dataset-sized membership mask
  * scanned in index order into a cell list sized by the count, which is
  * linear and runs no comparator. Lists carrying indices past the dataset's
@@ -499,7 +492,8 @@ const EMPTY_CELLS = new Uint32Array(0);
  *
  * Every page membership is a `Uint32Array` (4 bytes a cell, transferable),
  * never a JavaScript number array: at 10 million cells an `Array.from` of
- * one cost 0.3 s and 40–80 MB per read.
+ * one costs time and tens of megabytes per read (measured:
+ * 37_decisions_analysis.md).
  *
  * @param {ArrayLike<number>[]} lists
  * @param {number|undefined} pointCount
@@ -870,9 +864,9 @@ export class DataLayer {
     // indices, and the fetch that follows needs the very same set. Keeping the
     // set beside its digest means the pass happens once instead of twice, and
     // — more importantly — it makes the values a cache entry holds provably
-    // the values its key describes: the two used to be built by separate
-    // traversals with an `await` between them, so a membership change in that
-    // window was cached under the version it no longer matched.
+    // the values its key describes: built by separate traversals with an
+    // `await` between them, a membership change in that window would be cached
+    // under the version it no longer matched.
     /** @type {Map<string, {hash: string, indices?: Uint32Array, membership?: PageMembershipRecord}>} */
     this._pageIndexSnapshots = new Map();
 
@@ -1094,7 +1088,7 @@ export class DataLayer {
   getVariableInfo(type, key) {
     if (type === 'gene_expression') {
       // One gene's record, found through the key index: describing every gene
-      // of an 8,192-gene panel to read one cost a record per gene per read.
+      // of a gene panel to read one would cost a record per gene per read.
       const index = this._getGeneFieldIndexMap().get(key);
       const field = index === undefined ? undefined : this.state.varData?.fields?.[index];
       return field === undefined ? null : geneVariableInfo(field, index);
@@ -1382,9 +1376,10 @@ export class DataLayer {
    * A page's membership is the union of its enabled groups' cell indices. The
    * analysis paths ask for it on every read — `getDataForPages` refreshes the
    * page version for every gene a signature or correlation loads, and the page
-   * selectors ask for counts on every render — and each ask used to rebuild a
-   * `Set` of every index, sort it through a comparator and digest it again:
-   * 26 ms for one 250,000-cell page, 1.3 s of a 1.8 s fifty-gene signature.
+   * selectors ask for counts on every render — and an ask that rebuilt a
+   * `Set` of every index, sorted it through a comparator and digested it again
+   * would take most of a many-gene signature's time (measured:
+   * 37_decisions_analysis.md).
    *
    * The record is reused while the page, its group list, every group object,
    * each group's `enabled` flag, its `cellIndices` array and that array's length
@@ -1764,7 +1759,7 @@ export class DataLayer {
   /**
    * Whether an "Expression matrix" value holds counts, as its label says
    * ("· counts": the Data mapping's `counts`, from the stored
-   * values, `data/anndata/reader.js` `storedValueFacts`): the matrices the
+   * values, `data/anndata/probe.js` `storedValueFacts`): the matrices the
    * expression transform applies to (`runValues`).
    *
    * @param {string} [matrix='mapped']
@@ -2480,11 +2475,10 @@ export class DataLayer {
    * request goes on for the other callers and stops when none is left, and
    * a stopped request is never cached.
    *
-   * @param {FetchOptions} options - Fetch options
-   * @param {boolean} [options.silent=false] - Suppress loading notifications (for bulk operations)
-   * @param {AbortSignal|null} [options.signal=null] - Ends this caller's wait
-   * @param {string|null} [options.owner=null] - The job a gene read it starts
-   *   is for (`app/jobs/cancellable-job.js`)
+   * @param {FetchOptions & {silent?: boolean, signal?: AbortSignal|null, owner?: string|null}} options -
+   *   Fetch options. `silent`: suppress loading notifications (for bulk
+   *   operations); `signal`: ends this caller's wait; `owner`: the job a
+   *   gene read it starts is for (`app/jobs/cancellable-job.js`)
    * @returns {Promise<PageData[]>} Array of page data objects
    *
    * @example
@@ -2621,8 +2615,8 @@ export class DataLayer {
 
   /**
    * Internal fetch implementation (without caching)
-   * @param {FetchOptions} options - Fetch options
-   * @param {boolean} [options.silent=false] - Suppress loading notifications
+   * @param {FetchOptions & {silent?: boolean}} options - Fetch options;
+   *   `silent`: suppress loading notifications
    * @param {number} [datasetGeneration]
    * @param {AbortSignal|null} [signal=null] - Stops the request's field load
    * @returns {Promise<PageData[]>}
@@ -3609,7 +3603,7 @@ export class DataLayer {
    * an ordered record the callers read positionally.
    *
    * @param {string[]} obsFields - Field keys to load
-   * @param {Function} [onProgress] - Progress callback
+   * @param {Function|null} onProgress - Progress callback
    * @param {Function} publishField - Exact field publication callback
    * @param {AbortSignal|null} [signal] - Stops the loads still to start and
    *   ends the wait for those under way

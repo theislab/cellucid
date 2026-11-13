@@ -1,7 +1,7 @@
 /**
- * Nested actions are quiet ("Nested actions are quiet" in assets/css/README.md;
- * owner, 2026-11-11: buttons in "a very nested area ... should get more and
- * more muted"). Held at the source:
+ * Nested actions are quiet ("Nested actions are quiet" in assets/css/README.md:
+ * the deeper an area is nested, the more muted its buttons). Held at the
+ * source:
  *
  * - the modules that draw nested areas (a list item's row or details, a chat
  *   turn, an agent's activity line, an array's row, a suggestion card) build
@@ -223,12 +223,12 @@ test('nested areas name their actions in words or with an ICONS glyph, never a t
 });
 
 /**
- * A button never borrows a text link's look (F102, coordinator's decision of
- * the owner's consistency rule): the analysis windows' `.analysis-link-btn`
- * and Community annotation's underlined comment Edit/Delete, View merged,
- * View full evidence and View all comments were a second quiet look beside
- * `.btn-quiet` — tertiary text faded to 75% (below AA contrast) and no
- * target size. Every underline the stylesheet draws, other than on hover or
+ * A button never borrows a text link's look: the analysis windows'
+ * `.analysis-link-btn` and Community annotation's underlined comment
+ * Edit/Delete, View merged, View full evidence and View all comments would be
+ * a second quiet look beside `.btn-quiet` — tertiary text faded to 75% (below
+ * AA contrast) and no target size. Every underline the stylesheet draws, other
+ * than on hover or
  * focus, is listed here with the link it marks; a new one fails until it is
  * listed or drawn as `.btn-quiet`.
  */
@@ -268,9 +268,9 @@ test('no button is drawn as an underlined text link, apart from the listed links
 
 /**
  * A chip's removal (and a page's combine) glyph is quiet by the secondary text
- * color (a quiet button's), never by opacity: the kept view's × faded to 50% read at 3.22:1
- * (lens-a11y LF-10), and the highlight pages' ⋈ and × and the gene chips' ×
- * were faded the same way. Opacity stacks on whatever color the chip has; a
+ * color (a quiet button's), never by opacity: the kept view's × faded to 50% reads at 3.22:1,
+ * and so would the highlight pages' ⋈ and × and the gene chips' ×.
+ * Opacity stacks on whatever color the chip has; a
  * text token is held to AA by `theme-contrast-contract`.
  */
 test('a removal glyph is quiet by color, not faded', async () => {

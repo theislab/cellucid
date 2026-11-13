@@ -1,6 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
 import { resolveBrowserTestPorts } from './scripts/browser-test-ports.mjs';
+import { smokeSpecs } from './scripts/test-suites.mjs';
 
 // The server this config launches reads the same environment, so both halves of
 // a run agree on the address without the port appearing twice.
@@ -58,6 +59,19 @@ const controlWalk = process.env.CELLUCID_CONTROL_WALK ?? '';
 if (!['', 'apart', 'only'].includes(controlWalk)) {
   throw new Error(`CELLUCID_CONTROL_WALK is "apart", "only" or unset, not "${controlWalk}".`);
 }
+
+// `CELLUCID_BROWSER_SET=smoke` (`npm run test:browser:smoke`): each engine
+// runs its smoke specs only (`scripts/test-suites.mjs`), the short walk from
+// start to export that answers while code is being changed. Unset, a run
+// holds every spec.
+const browserSet = process.env.CELLUCID_BROWSER_SET ?? '';
+if (!['', 'smoke'].includes(browserSet)) {
+  throw new Error(`CELLUCID_BROWSER_SET is "smoke" or unset, not "${browserSet}".`);
+}
+if (browserSet === 'smoke' && controlWalk !== '') {
+  throw new Error('CELLUCID_BROWSER_SET=smoke and CELLUCID_CONTROL_WALK cannot both be set: the control walk is no smoke spec.');
+}
+const onlySmoke = engine => (browserSet === 'smoke' ? { testMatch: smokeSpecs(engine) } : {});
 
 export default defineConfig({
   testDir: './tests/browser',
@@ -119,10 +133,12 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      ...onlySmoke('chromium'),
       use: { ...devices['Desktop Chrome'] },
     },
     {
       name: 'firefox',
+      ...onlySmoke('firefox'),
       use: {
         ...devices['Desktop Firefox'],
         launchOptions: {
@@ -132,6 +148,7 @@ export default defineConfig({
     },
     {
       name: 'webkit',
+      ...onlySmoke('webkit'),
       use: { ...devices['Desktop Safari'] },
     },
   ],

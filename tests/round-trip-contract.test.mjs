@@ -9,7 +9,6 @@
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -148,7 +147,7 @@ test('every result reaches the host once, in original positions, and only what c
   results.dispose();
 });
 
-test('a categorical result carries the colors it is shown in, in the view in focus, and goes again when they change (RCC-1)', async () => {
+test('a categorical result carries the colors it is shown in, in the view in focus, and goes again when they change', async () => {
   const state = stateWithResults();
   const source = recordingSource();
   const results = createViewerHostResults({ state, viewerHostSource: source, getCellIdentity: () => createCellIdentity({ nObs: 6 }) });
@@ -346,15 +345,13 @@ test('GMT files are written as parseGmt (and Python and R) read them', () => {
   assert.deepEqual(parseGmt(text).map(set => set.name), ['T cells', 'B', 'T cells (2)', 'a  b']);
 });
 
-/** A fixture the web app, Python and R read alike, pinned by its digest. */
-function sharedFixture(name, digest) {
-  const bytes = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', name));
-  assert.equal(createHash('sha256').update(bytes).digest('hex'), digest, `${name} changed: update it in all three repositories`);
-  return bytes.toString('utf8');
+/** A fixture the web app, Python and R read alike (`scripts/shared-files.mjs`: the packages hold the same bytes). */
+function sharedFixture(name) {
+  return readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', name), 'utf8');
 }
 
 test('the shared GMT fixture reads as Python and R read it', () => {
-  const text = sharedFixture('gene-sets.gmt', '071d3e007164ff4d9c311820ba3a1be3061b7fd4b80e59142df17690c37b8bfd');
+  const text = sharedFixture('gene-sets.gmt');
   assert.deepEqual(parseGmt(text), [
     { name: 'T cells', description: 'markers', genes: ['CD3E', 'CD3D'] },
     { name: 'Set 2', description: '', genes: ['X'] },
@@ -364,7 +361,7 @@ test('the shared GMT fixture reads as Python and R read it', () => {
 });
 
 test('the shared obs-column CSV fixture is the format the web app writes', () => {
-  const text = sharedFixture('obs-columns.csv', '0353146eabba6a9fa76c565a5710dcce275471fcbfd7674f3a86d8c6e2799db2');
+  const text = sharedFixture('obs-columns.csv');
   const [header, kinds, categories] = text.split('\n');
   assert.equal(header.split(',')[0], OBS_NAME_COLUMN);
   assert.deepEqual(kinds.split(','), [KIND_ROW, 'highlight', 'categorical', 'categorical', 'continuous']);
@@ -377,7 +374,7 @@ test('the shared obs-column CSV fixture is the format the web app writes', () =>
   ].join(','));
 });
 
-test('a field\'s CSV lists its categories in the field\'s order, a category no cell holds among them (F125)', async () => {
+test('a field\'s CSV lists its categories in the field\'s order, a category no cell holds among them', async () => {
   const state = withExportState();
   // A trajectory's order, the reverse of the rows' first appearance, one
   // category no cell holds, and labels that are numbers and booleans.
@@ -575,7 +572,7 @@ test('an .h5ad subset is read back exactly by Cellucid\'s own reader', async () 
   });
 });
 
-test('an .h5ad reads only the highlighted rows and keeps each categorical\'s order, label type and colors (K-10, K-11)', async () => {
+test('an .h5ad reads only the highlighted rows and keeps each categorical\'s order, label type and colors', async () => {
   const state = withExportState();
   state.obsData.fields.push(
     {

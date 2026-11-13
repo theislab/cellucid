@@ -83,8 +83,7 @@ let visits = 0;
  * reads, so a frame can come in between. What redraws the view list and the
  * sidebar from the focused view waits for the visit's end
  * (`ui-coordinator.js`, `view-controls.js`): a frame in a visit of a hidden
- * live view threw "A hidden live view cannot be the active view" when a
- * saved lung analysis with its live view removed was reopened (L14-3).
+ * live view would throw "A hidden live view cannot be the active view".
  */
 export function visitingViews() {
   return visits > 0;
@@ -141,7 +140,7 @@ export function differingViews(current, target, same = sameValue) {
  * reads: its entry at the `focus` of `views` (the `views` value the step ran
  * with), or undefined when there is none. An owner's `readPart`
  * (`actions/domains.js`): staleness compares this part, so keeping another
- * view or changing another view's state never makes a step stale (F156).
+ * view or changing another view's state never makes a step stale.
  *
  * @param {{views?: unknown[]}|null|undefined} value
  * @param {{focus?: number}|null|undefined} views

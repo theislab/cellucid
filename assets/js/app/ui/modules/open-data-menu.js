@@ -30,6 +30,7 @@
 import { onAbort } from '../../../utils/abort.js';
 import { menuKeyDown } from '../components/menu.js';
 import { StyleManager } from '../../../utils/style-manager.js';
+import { holdPlace } from '../../utils/dom-utils.js';
 
 /**
  * @param {Object} options
@@ -62,7 +63,7 @@ export function initOpenDataMenu({ button, menu, items, onChoose, signal }) {
   function place() {
     const natural = menu.getBoundingClientRect();
     const anchor = button.getBoundingClientRect();
-    home = { parent: menu.parentNode, next: menu.nextSibling, anchor: { top: anchor.top, left: anchor.left } };
+    home = { parent: menu.parentNode, goBack: holdPlace(menu), anchor: { top: anchor.top, left: anchor.left } };
     (button.closest('dialog[open]') ?? ownerDocument.body).append(menu);
     menu.classList.add('open-menu-placed');
     const view = ownerDocument.defaultView;
@@ -80,14 +81,18 @@ export function initOpenDataMenu({ button, menu, items, onChoose, signal }) {
   function putBack() {
     if (home === null) return;
     menu.classList.remove('open-menu-placed');
-    if (home.parent?.isConnected) home.parent.insertBefore(menu, home.next?.parentNode === home.parent ? home.next : null);
+    if (home.parent?.isConnected && !home.goBack()) home.parent.append(menu);
     home = null;
   }
 
   function open(focusIndex) {
-    menu.hidden = false;
-    place();
-    button.setAttribute('aria-expanded', 'true');
+    // An arrow key on the button of an open menu only moves focus: the menu
+    // is placed once, from where it lives in the page.
+    if (!isOpen()) {
+      menu.hidden = false;
+      place();
+      button.setAttribute('aria-expanded', 'true');
+    }
     items.at(focusIndex)?.focus({ preventScroll: true });
   }
 

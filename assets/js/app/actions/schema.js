@@ -32,7 +32,7 @@ import { formatCountOf } from '../../utils/format-units.js';
 /**
  * What a `pattern` in use asks for, in words: a refusal says it ("a name with
  * no space at its start or end"), never "does not have the expected form",
- * which leaves a person or an agent to guess (R9R-5). A pattern not listed is
+ * which leaves a person or an agent to guess. A pattern not listed is
  * said by its schema's first example; a contract test keeps every pattern of
  * the catalog said one way or the other.
  */
@@ -152,7 +152,7 @@ function describeValue(value) {
   if (Array.isArray(value)) return 'an array';
   if (ArrayBuffer.isView(value)) return value.constructor.name;
   if (typeof value === 'object') {
-    // Was "[object Object]": the model could not see what it had sent (live-7 L25-15).
+    // The object is written out: "[object Object]" would not show the model what it had sent.
     const text = JSON.stringify(value);
     return `the object ${text.length > 60 ? `${text.slice(0, 60)}…` : text}`;
   }
@@ -162,7 +162,7 @@ function describeValue(value) {
 /**
  * A field given as `{source, key}` where its name alone is asked for: the
  * analysis options name fields by name, the other tools by `{source, key}`,
- * and a model sent the one form for the other (live-7 L25-15).
+ * and a model sent the one form for the other.
  */
 function nameFormHint(types, value) {
   if (!types.includes('string') || value === null || typeof value !== 'object' || Array.isArray(value)) return '';

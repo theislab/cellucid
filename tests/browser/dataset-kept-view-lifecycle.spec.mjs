@@ -222,7 +222,7 @@ function readPngIdat(bytes) {
 }
 
 test(
-  'direct dataset replacement retires every kept view before refreshing active-view UI',
+  'a borrowed view fails its fence on a publication inside it, and a dataset replacement retires every kept view before refreshing active-view UI',
   async ({ page }, testInfo) => {
     const productErrors = observeProductErrors(page);
     const alternateRequests = await installAlternateDataset(page);
@@ -240,6 +240,76 @@ test(
         `#dataset-select option[value="${ALTERNATE_DATASET_OPTION}"]`,
       ),
     ).toContainText(ALTERNATE_DATASET_NAME);
+
+    // First, on the dataset as it opened: the viewer's own check of what a
+    // borrowed view was captured from. It puts the positions back itself.
+    await test.step('same-N publication inside a borrowed callback commits but fails its ownership fence', async () => {
+      const result = await page.evaluate(() => {
+        const viewer = window._cellucidViewer;
+        const original = viewer.getPositions();
+        const replacement = new Float32Array(original);
+        replacement[0] = Math.fround(replacement[0] + 0.125);
+        const before = viewer.getPresentedViewState('live').certificate;
+        let error = null;
+        try {
+          viewer.withBorrowedViewData('live', borrowed => {
+            if (
+              borrowed.pointCount !==
+                replacement.length / borrowed.dimensionLevel
+            ) {
+              throw new Error('Replacement changed the point count.');
+            }
+            viewer.updatePositions(replacement, borrowed.dimensionLevel);
+            return borrowed.positions[0];
+          });
+        } catch (caught) {
+          error = {
+            message: caught instanceof Error ? caught.message : String(caught),
+            name: caught instanceof Error ? caught.name : null,
+          };
+        }
+        const published = viewer.getPositions();
+        const after = viewer.getPresentedViewState('live').certificate;
+        viewer.updatePositions(original, 2);
+        return {
+          after: {
+            cacheKey: after.cacheKey,
+            dataGeneration: after.dataGeneration,
+            geometryGeneration: after.geometryGeneration,
+          },
+          before: {
+            cacheKey: before.cacheKey,
+            dataGeneration: before.dataGeneration,
+            geometryGeneration: before.geometryGeneration,
+          },
+          committedValue: published[0],
+          error,
+          expectedValue: replacement[0],
+          pointCount: viewer.getPointCount(),
+        };
+      });
+
+      expect(result.error).toMatchObject({
+        name: 'Error',
+      });
+      expect(result.error.message).toMatch(
+        /borrowed point data.*changed during capture/i,
+      );
+      expect(result.committedValue).toBe(result.expectedValue);
+      expect(result.pointCount).toBe(120);
+      expect(result.after.dataGeneration).not.toBe(
+        result.before.dataGeneration,
+      );
+      expect(result.after.geometryGeneration).not.toBe(
+        result.before.geometryGeneration,
+      );
+      expect(result.after.cacheKey).not.toBe(result.before.cacheKey);
+      await settleRendering(page);
+      expect(await page.evaluate(
+        () => window._cellucidViewer.getGLContext().getError(),
+      )).toBe(0);
+      expect(productErrors).toEqual([]);
+    });
 
     await selectCategoricalOutlierView(page);
     await expect(page.locator('#filter-count')).toHaveText(
@@ -392,87 +462,6 @@ test(
     );
     await expect(page.locator('.notification-error')).toHaveCount(0);
     await settleRendering(page);
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
-  'same-N publication inside a borrowed callback commits but fails its ownership fence',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await page.goto(CATALOG_DATASET_URL, {
-      waitUntil: 'domcontentloaded',
-    });
-    await dismissWelcome(page);
-    await openCollapsedPanels(page);
-    await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI fixture',
-    );
-
-    const result = await page.evaluate(() => {
-      const viewer = window._cellucidViewer;
-      const original = viewer.getPositions();
-      const replacement = new Float32Array(original);
-      replacement[0] = Math.fround(replacement[0] + 0.125);
-      const before = viewer.getPresentedViewState('live').certificate;
-      let error = null;
-      try {
-        viewer.withBorrowedViewData('live', borrowed => {
-          if (
-            borrowed.pointCount !==
-              replacement.length / borrowed.dimensionLevel
-          ) {
-            throw new Error('Replacement changed the point count.');
-          }
-          viewer.updatePositions(replacement, borrowed.dimensionLevel);
-          return borrowed.positions[0];
-        });
-      } catch (caught) {
-        error = {
-          message: caught instanceof Error ? caught.message : String(caught),
-          name: caught instanceof Error ? caught.name : null,
-        };
-      }
-      const published = viewer.getPositions();
-      const after = viewer.getPresentedViewState('live').certificate;
-      viewer.updatePositions(original, 2);
-      return {
-        after: {
-          cacheKey: after.cacheKey,
-          dataGeneration: after.dataGeneration,
-          geometryGeneration: after.geometryGeneration,
-        },
-        before: {
-          cacheKey: before.cacheKey,
-          dataGeneration: before.dataGeneration,
-          geometryGeneration: before.geometryGeneration,
-        },
-        committedValue: published[0],
-        error,
-        expectedValue: replacement[0],
-        pointCount: viewer.getPointCount(),
-      };
-    });
-
-    expect(result.error).toMatchObject({
-      name: 'Error',
-    });
-    expect(result.error.message).toMatch(
-      /borrowed point data.*changed during capture/i,
-    );
-    expect(result.committedValue).toBe(result.expectedValue);
-    expect(result.pointCount).toBe(120);
-    expect(result.after.dataGeneration).not.toBe(
-      result.before.dataGeneration,
-    );
-    expect(result.after.geometryGeneration).not.toBe(
-      result.before.geometryGeneration,
-    );
-    expect(result.after.cacheKey).not.toBe(result.before.cacheKey);
-    await settleRendering(page);
-    expect(await page.evaluate(
-      () => window._cellucidViewer.getGLContext().getError(),
-    )).toBe(0);
     expect(productErrors).toEqual([]);
   },
 );

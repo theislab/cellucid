@@ -164,6 +164,8 @@ test('readObsNames of listed cells names them in their order from their own chun
   const chunks = fetched.slice(before).filter(key => key.startsWith('obs/_index/'));
   // Rows 5-7 in chunk 0, 200 in chunk 6, 399 in chunk 12: never the other ten.
   assert.deepEqual([...new Set(chunks)].sort(), ['obs/_index/0', 'obs/_index/12', 'obs/_index/6']);
+  // Listed cells and a range of rows are two readings, never one.
+  await assert.rejects(reader.readObsNames({ cells, rows: [0, 10] }), TypeError);
 });
 
 test('matrixRowsCost prices an export\'s rows before reading them: the bytes the read then fetches', async () => {

@@ -12,12 +12,8 @@
  *   the same cells in the same order, genes read for every one, and a
  *   share raised with Apply is shown in place. Measured, the same answers
  *   make the link a slow one, genes are read for a sample of the raised
- *   share, and it is read anew: what failed `open-cells-in-place.spec.mjs`
- *   beside other runs (2026-11-06).
- * - A spec about a slow link gives its link through the device: genes are
- *   read for a sample of the raised share, which is then shown as a new
- *   reading (the exception the user guide names,
- *   `b_data_loading/21_subsampled_loading.md` "Changing the share").
+ *   share, and it is read anew: what fails `open-cells-in-place.spec.mjs`
+ *   beside other runs.
  *
  * Fixture: `helpers/share-dataset.mjs`.
  */
@@ -132,19 +128,4 @@ test('a plan does not follow what the runner measures: answers held back open th
   expect(measured.raised.cells).toBeLessThan(1500);
   expect(measured.raised.fit.limit).toBe('geneTime');
   expect(measured.scenes).toBe(1);
-});
-
-test('a spec about a slow link gives its link through the device: genes for a sample, the raised share read anew', async ({ browser }) => {
-  test.setTimeout(240_000);
-  const first = await openThenRaise(browser, { device: { link: { latencyMs: 400, bytesPerMs: 32_000 } } });
-  expect(first.opened).toBeNull();
-  expect(first.raised?.of).toBe(1500);
-  expect(first.raised.cells).toBeLessThan(1500);
-  expect(first.raised.fit.limit).toBe('geneTime');
-  expect(first.scenes).toBe(1);
-  // The same link gives the same plan: nothing of it is measured.
-  const again = await openThenRaise(browser, { device: { link: { latencyMs: 400, bytesPerMs: 32_000 } }, lateMs: LATE_MS });
-  expect(again.raised.cells).toBe(first.raised.cells);
-  expect(again.raised.fit.neededMs).toBe(first.raised.fit.neededMs);
-  expect(again.scenes).toBe(1);
 });

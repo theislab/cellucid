@@ -1,13 +1,12 @@
 /**
- * @fileoverview Deleting steps and restoring from Recently deleted (History
- * v2 §3.3.4, §3.3.9), for `history.js`. A delete takes steps out and applies
+ * @fileoverview Deleting steps and restoring from Recently deleted, for `history.js`. A delete takes steps out and applies
  * again only the steps below them whose touched domains changed or whose
  * inputs (result inputs and name context) changed but for generated ids
  * (`canonical`), each on its new parent's values, with Cancel. A restore puts
  * an entry back exactly (tried on the records and checked whole first) or
  * as new objects (removed steps applied again by name as branches, each line
  * on its restored parent, journaled itself); undoing a rename whose old name
- * was taken since is refused with the name to use instead (§5 #51).
+ * was taken since is refused with the name to use instead.
  *
  * @module app/history/delete-restore
  */
@@ -32,11 +31,11 @@ const RENAME_OPS = Object.freeze(['branch.rename', 'group.rename', 'tracker.rena
  */
 export function createDeleteRestore(h) {
   const {
-    byOf, catalog, dispatcher, domains, journaled, liveTrackers, notify, notifyEdit, now, off, pausedDraftAt, replayAsBranch, replayableParams, requireExclusive, restoreTo, sameCanonical, settleBeforeMove, show, withoutOff,
+    byOf, catalog, dispatcher, journaled, liveTrackers, notify, notifyEdit, now, off, pausedDraftAt, replayAsBranch, replayableParams, requireExclusive, restoreTo, sameCanonical, settleBeforeMove, show, withoutOff,
   } = h;
 
   // -------------------------------------------------------------------------
-  // Deleting a step, with only its dependants applied again (§3.3.4)
+  // Deleting a step, with only its dependants applied again
 
   /** The domains a recorded step's action may write (its catalog's, else what it recorded). */
   function touchesOf(step) {
@@ -222,7 +221,7 @@ export function createDeleteRestore(h) {
     }
     const clash = restoreClash(tracker, entry);
     if (clash !== null && RENAME_OPS.includes(entry.op)) {
-      // Undoing a rename whose old name was taken since (§5 #51): refused, with the name it can take instead.
+      // Undoing a rename whose old name was taken since: refused, with the name it can take instead.
       const taken = clash.kind === 'tracker' ? liveTrackers().map(other => other.name)
         : clash.kind === 'bookmark' ? [...tracker.steps.values()].flatMap(step => (step.bookmark === null ? [] : [step.bookmark]))
           : [...tracker[clash.kind === 'branch' ? 'branches' : 'groups'].values()].map(record => record.name);

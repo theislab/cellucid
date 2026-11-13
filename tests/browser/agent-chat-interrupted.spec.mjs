@@ -5,7 +5,7 @@
  * call is answered with what became of it (here: nothing was applied), its
  * row says interrupted rather than running for ever, and the next message is
  * sent a conversation in which every call has its result (a provider refuses
- * one that has not). From the agents bug hunt of 2026-11-04.
+ * one that has not).
  */
 import { closePageWithApplicationRetirement, expect, test } from './helpers/test.mjs';
 import { continueWhereLeftOff, dismissWelcome } from './helpers/welcome.mjs';

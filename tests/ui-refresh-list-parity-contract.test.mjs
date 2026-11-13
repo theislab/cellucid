@@ -34,9 +34,9 @@ const COORDINATOR_URL = new URL(
  */
 function callsIn(body, shared = null) {
   // One caller delegates to the extracted sequence rather than repeating it,
-  // so the comparison has to follow that call. Before the extraction the two
-  // view-refresh paths were seven identical lines differing by one; they now
-  // share by construction, and what remains to check is the state-load path.
+  // so the comparison has to follow that call. The two view-refresh paths
+  // share the sequence by construction, and what remains to check is the
+  // state-load path.
   if (shared !== null && /refreshViewDependentSurfaces\(/.test(body)) {
     body = `${body}\n${shared}`;
   }

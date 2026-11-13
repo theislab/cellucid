@@ -107,11 +107,11 @@ float getVoxelSize() {
 // The splat maps a point p in [-1,1] to index space (p + 1) / 2 * (gridSize-1),
 // so voxel i carries the density of normalized position i / (gridSize - 1). A
 // 3D texture's texel i is centred at (i + 0.5) / gridSize instead. Feeding the
-// normalized position straight to the sampler therefore read the volume through
-// the wrong affine map: every feature was reconstructed at (gridSize-1)/gridSize
+// normalized position straight to the sampler would therefore read the volume
+// through the wrong affine map: every feature reconstructed at (gridSize-1)/gridSize
 // of its true size -- 0.79% small at 128 -- and displaced towards the volume
 // centre by up to half a texel. This is the exact inverse of the splat's map,
-// so the smoke now sits on the cells it represents.
+// so the smoke sits on the cells it represents.
 //
 // The map is affine, scale (grid - 1) / grid and offset 0.5 / grid; main()
 // derives both once per pixel into these globals instead of every sample
@@ -128,9 +128,9 @@ vec3 densityTexCoord(vec3 p01) {
 // contains break and continue, and GLSL ES 3.00 leaves screen-space derivatives
 // -- and therefore the implicit mip level -- undefined in non-uniform control
 // flow. The volume is LINEAR_MIPMAP_LINEAR because the lighting pass reads its
-// level 1 (LIGHT_VOLUME_FS), so an undefined level answered with a coarser mip whose
-// support is wider than the data's: density was reported outside the true
-// support and inflated the silhouette. Level 0 is the data.
+// level 1 (LIGHT_VOLUME_FS), so an undefined level could answer with a coarser mip
+// whose support is wider than the data's: density would be reported outside the
+// true support and inflate the silhouette. Level 0 is the data.
 vec4 sampleVolume(vec3 p01) {
   return textureLod(u_densityTex3D, densityTexCoord(p01), 0.0);
 }
@@ -284,7 +284,14 @@ void main() {
   float sigmaScale = u_densityMultiplier / voxelSize;
 
   float jitter = getBlueNoiseJitter(gl_FragCoord.xy);
-  float t = tEnter + jitter * stepLen;
+  // Each sample is at tBase + n * stepLen, n a whole number of steps since the
+  // last sample that lengthened its stride (which moves tBase). A leap over an
+  // empty block sets n to the first such sample past the block, so it lands on
+  // a sample the march without leaps takes too, computed the same way: the
+  // two give the same pixels, the skipped samples all reading zero.
+  float tBase = tEnter + jitter * stepLen;
+  float n = 0.0;
+  float t = tBase;
   const float OCCUPANCY_BLOCK = ${OCCUPANCY_BLOCK}.0;
 
   // 4. Lighting that is constant along the ray.
@@ -309,13 +316,14 @@ void main() {
   vec3 invVolumeSize = 1.0 / volumeSize;
   ivec3 occupancyMax = textureSize(u_occupancyTex3D, 0) - 1;
   for (int i = 0; i < MAX_STEPS; i++) {
+    t = tBase + n * stepLen;
     if (t > tExit || transmittance < 0.01) break;
 
     vec3 pos = rayOrigin + rayDir * t;
     vec3 p01 = (pos - u_volumeMin) * invVolumeSize;
 
-    // Empty-space skipping: leap over a whole empty block to its far face,
-    // then resume on this pixel's jittered sample phase.
+    // Empty-space skipping: leap over a whole empty block to the first
+    // sample past its far face.
     vec3 index = clamp(p01, 0.0, 1.0) * (grid - 1.0);
     vec3 block = floor(index / OCCUPANCY_BLOCK);
     if (texelFetch(u_occupancyTex3D, min(ivec3(block), occupancyMax), 0).r == 0.0) {
@@ -324,14 +332,14 @@ void main() {
       vec3 axisT = (farWorld - rayOrigin) / mix(vec3(1e-6), rayDir, greaterThan(abs(rayDir), vec3(1e-6)));
       axisT = mix(vec3(1e9), axisT, greaterThan(abs(rayDir), vec3(1e-6)));
       float blockExit = min(min(axisT.x, axisT.y), axisT.z);
-      t = max(t + stepLen * 0.25, blockExit + jitter * stepLen);
+      n = max(n + 1.0, ceil((blockExit - tBase) / stepLen));
       continue;
     }
 
     vec4 cloud = sampleCloud(pos, p01, animTime, lodFactor, t);
     float density = cloud.a;
     if (density <= 0.0) {
-      t += stepLen;
+      n += 1.0;
       continue;
     }
 
@@ -369,7 +377,8 @@ void main() {
     float alpha = 1.0 - exp(-density * sigmaScale * stride);
     accColor += transmittance * alpha * sampleColor;
     transmittance *= 1.0 - alpha;
-    t += stride;
+    tBase = t + stride;
+    n = 0.0;
   }
 
   // Premultiplied output: rgb never exceeds alpha because the tone curve < 1.

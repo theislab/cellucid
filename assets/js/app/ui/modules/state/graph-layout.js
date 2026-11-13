@@ -1,5 +1,5 @@
 /**
- * @fileoverview The branch graph as rows (History v2 §3.9): pure, so it is
+ * @fileoverview The branch graph as rows: pure, so it is
  * proved in Node and the panel only draws it.
  *
  * **Rows**, in tree order (the order a screen reader walks them):
@@ -11,12 +11,12 @@
  *   stub is followed by that branch's own steps in its column, with their
  *   own stubs nested;
  * - **turns** (an agent's or a notebook's) as one header row with the turn's
- *   steps under it (expanded unless collapsed); **groups** (§3.15.2) as one
+ *   steps under it (expanded unless collapsed); **groups** as one
  *   node (collapsed unless expanded), which says when the step shown or a
  *   fork is inside it; **runs** of consecutive view or layout steps (camera
  *   moves, panels, open sections, colors: never one that changes what is
- *   colored by or filtered) as one folded row, "Camera ×6 · Layout ×2"
- *   (§3.3.8): display only, undo still goes step by step;
+ *   colored by or filtered) as one folded row, "Camera ×6 · Layout ×2":
+ *   display only, undo still goes step by step;
  * - while recording is paused, a **paused** marker after the step shown.
  *
  * With a **filter** (search), containers are flattened, the steps that do not

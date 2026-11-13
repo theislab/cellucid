@@ -1,13 +1,13 @@
 /**
  * A history in words (`assets/js/app/history/exports/`): the pseudocode, the
- * methods paragraph and the printable report of History v2 records made with
+ * methods paragraph and the printable report of history records made with
  * the model's own constructors (`app/history/model.js`) and validated whole:
  * a person's, an agent's and a notebook's steps, two groups, a bookmark,
  * notes on steps, a group, a branch and the tracker (its abstract), a camera
  * step, a change made outside an action, a step that no longer applies, a
  * squashed step of each cause (recording paused, steps merged, history
  * cleared, a state shared), the note and bookmark a merge kept (carried), and a second branch exported without being shown.
- * The golden history (`history-golden-fixture.test.mjs`) pins the same
+ * The golden history (`history-golden-fixture.test.mjs`) holds the same
  * exports byte for byte for Python and R.
  */
 import test from 'node:test';

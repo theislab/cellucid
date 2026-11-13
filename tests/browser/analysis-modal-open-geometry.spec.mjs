@@ -2,14 +2,13 @@
  * The expanded analysis view opens at one layout, whatever its open transition
  * is doing.
  *
- * The card opens with `transform: scale(0.96)` easing to `scale(1)`. Opening
- * anchored it at its centered position by reading `getBoundingClientRect()` in
- * a 200 ms timer, and placed the panel-resizer corner from rectangles read in
- * a 250 ms timer. A client rectangle is the transformed box, so whenever the
- * transition had not finished by then — a slow frame, a busy machine — the
- * card was anchored off centre and the corner landed off the resizer crossing,
- * by a different amount on every open. Screenshots of the same view differed
- * run to run.
+ * The card opens with `transform: scale(0.96)` easing to `scale(1)`. A client
+ * rectangle is the transformed box, so anchoring the card at its centered
+ * position, or placing the panel-resizer corner, from rectangles read in a
+ * timer is off whenever the transition has not finished by then (a slow
+ * frame, a busy machine): the card is anchored off centre and the corner
+ * lands off the resizer crossing, by a different amount on every open, and
+ * screenshots of the same view differ run to run.
  *
  * The spec makes the transition long enough that a timer cannot outwait it,
  * observes the transition start in the task that opens the view (never after a
@@ -51,8 +50,8 @@ test('an expanded analysis view settles centred with its resizer corner on the c
   // Open, and observe the open transition start. `getAnimations()` flushes
   // the style change that starts it, so it is read in the same task as the
   // open: nothing on the clock decides whether it is seen. (A read after a
-  // fixed sleep was a race: where the page stalled for longer than the
-  // transition, it had already ended and nothing was running.) The
+  // fixed sleep is a race: where the page stalls for longer than the
+  // transition, it has already ended and nothing is running.) The
   // `transitionrun` event, listened for before the open, records the start
   // even if the transition has ended by the time it is read.
   const opened = await page.evaluate(async () => {
@@ -75,7 +74,7 @@ test('an expanded analysis view settles centred with its resizer corner on the c
     }
     return { running, started };
   });
-  // Opening anchored the card while its transform was still in flight.
+  // The card is not anchored while its transform is still in flight.
   expect(opened.running).toEqual(['running']);
   expect(opened.started).toContain('transform');
   // Then wait for the transition itself rather than a longer timer.
@@ -123,7 +122,7 @@ test('an expanded analysis view settles centred with its resizer corner on the c
   // The transition has finished, so client rectangles are layout boxes now.
   expect(['none', 'matrix(1, 0, 0, 1, 0, 0)']).toContain(geometry.transform);
   // Layout offsets are whole pixels, so the anchor is within half a pixel of
-  // the centered position; a rectangle read mid-transition was several off.
+  // the centered position; a rectangle read mid-transition is several off.
   expect(Math.abs(geometry.left - geometry.centredLeft)).toBeLessThanOrEqual(0.5);
   expect(Math.abs(geometry.top - geometry.centredTop)).toBeLessThanOrEqual(0.5);
   expect(Math.abs(geometry.corner.x - geometry.crossing.x)).toBeLessThanOrEqual(1);

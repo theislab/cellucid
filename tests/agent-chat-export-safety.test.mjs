@@ -1,23 +1,21 @@
 /**
  * The chat's Markdown export runs nothing in a renderer that does not
- * sanitise (LG-1, round 8 security lens). `markdownSafe` used to guess where
- * CommonMark puts code (a backtick run to any backtick run; fences as a
- * toggle) and left what it guessed was code unescaped: every misguess was
- * live HTML (`` `<img onerror>`` `` with an unequal closing run, a code span
- * opened on an earlier line, fences out of phase, a fence inside a list that
- * the list's end closes, a fence left open into the next reply), and link
- * reference definitions (`[a]: javascript:…`) and images were never looked
- * at. Now the structure is the chat's own (`markdown.js`), written back in a
- * form CommonMark reads one way.
+ * sanitise. `markdownSafe` does not guess where CommonMark puts code: a guess
+ * (a backtick run to any backtick run, fences as a toggle) leaves what it
+ * took for code unescaped, and every misguess is live HTML (`` `<img onerror>`` ``
+ * with an unequal closing run, a code span opened on an earlier line, fences
+ * out of phase, a fence inside a list that the list's end closes, a fence left
+ * open into the next reply); link reference definitions (`[a]: javascript:…`)
+ * and images are looked at too. The structure is the chat's own
+ * (`markdown.js`), written back in a form CommonMark reads one way.
  *
  * The invariant checked here is what makes any CommonMark renderer safe:
  * outside a fenced block of the export's own form, every character that can
  * start markup (`<`, `[`, `!`, `~`, a backtick) is escaped, or is the fence
  * of a code span that no run inside it can close, or opens a link to an
- * http(s) address. The same 4,000 generated texts were also rendered with
- * markdown-it 3.0 (CommonMark, HTML on, link validation off) when the fix
- * was made: no tag but p, code, pre, em, strong, br, blockquote, lists,
- * headings, hr and http(s) links (lane-lens-security.md, LG-1).
+ * http(s) address. Rendered with markdown-it 3.0 (CommonMark, HTML on, link
+ * validation off), generated texts yield no tag but p, code, pre, em, strong,
+ * br, blockquote, lists, headings, hr and http(s) links.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

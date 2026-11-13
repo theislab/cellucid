@@ -103,9 +103,9 @@ function firstViewEmbedding(root, nObs) {
  * `toFetch`) costs no transfer. What is kept is the chunks an earlier visit
  * read -- its first view's and its growth's, the first open cells' -- never
  * spread evenly, so each chunk is priced at its own bytes to fetch when
- * anything is kept, not at the mean: a revisit of a GitHub Zarr folder
- * whose first visit kept 65,536 of its 561,947 cells priced every chunk at
- * 88% of its bytes and opened 750 cells.
+ * anything is kept, not at the mean: the mean prices every chunk of a
+ * partly kept file near its full bytes, and the revisit opens fewer cells
+ * than the first visit kept (measured: 23_decisions_partial_reading.md).
  *
  * @param {Object} root - The store's root (every cell)
  * @param {number} nObs
@@ -452,8 +452,8 @@ export async function planProgressiveOpening(resolution, { nObs, costOf, link, d
   if (!priced(link) && !(msPerCell > 0)) return null;
   // A share over a link whose round trips cost anything opens whole
   // (`grownLater`, and `chunkedPlan`'s own completion check): decided
-  // before its first view is priced (`costOf` walks its cells: 60 ms of a
-  // 50% share's opening of 10M cells).
+  // before its first view is priced (`costOf` walks its cells: measured,
+  // 23_decisions_partial_reading.md).
   if (kept !== null && priced(link) && loadedRoundTripMs(link) > 0) return null;
   const cost = priced(link) ? await costOf(target) : null;
   // Measured after `costOf`, which may have decoded the first chunk to measure it.
@@ -481,16 +481,15 @@ export async function planProgressiveOpening(resolution, { nObs, costOf, link, d
  */
 /**
  * Whether a growth of a share would put all its cells on the map later
- * than one reading of them (`plan.wholeMs`): the
- * owner's rule, a share never costs more than everything, judged by when
- * the cells asked for are all shown, not by the first picture. A growth
+ * than one reading of them (`plan.wholeMs`): a share never costs more than
+ * everything, judged by when the cells asked for are all shown, not by the
+ * first picture. A growth
  * reads the same bytes in more readings, each a loaded round trip of its
  * own (`loadedRoundTripMs`), so as priced it ends later wherever a round
  * trip costs anything (the bandwidth measured at opening is a lower bound:
- * it prices both alike). Measured, a 50% uniform share of a 10M-cell file
- * on a local web host: grown from chunks, all 5M cells at 4.5 s; read
- * whole, 2.8 s. Every cell of a priority-ordered file grows as before: its
- * prefixes are the file's own order.
+ * it prices both alike; measured: 23_decisions_partial_reading.md). Every
+ * cell of a priority-ordered file grows: its prefixes are the file's own
+ * order.
  */
 function grownLater(resolution, plan, link) {
   if (resolution.kept === null) return false;

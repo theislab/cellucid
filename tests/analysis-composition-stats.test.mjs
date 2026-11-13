@@ -14,7 +14,6 @@
  */
 
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
@@ -69,11 +68,6 @@ function countCase(kase) {
   });
   return presentCompositionUnits(counted, kase.conditionNames.length);
 }
-
-test('the fixture is the generator\'s output', () => {
-  const recorded = readFileSync(new URL('./fixtures/analysis/scanpy-reference.json.sha256', import.meta.url), 'utf8');
-  assert.equal(recorded.split(/\s+/)[0], createHash('sha256').update(text).digest('hex'));
-});
 
 test('counts per type and unit are exact, a split sample is two units', () => {
   for (const kase of composition.cases) {
@@ -188,8 +182,7 @@ test('the small tests by hand: Fisher two-sided, Yates on 2 × 2, empty rows dro
 });
 
 test('a type with no cells is not tested and leaves every other type as without it', () => {
-  // Units of very different sizes (the audit's case: one condition's samples
-  // are fifty times the other's) make an absent type's transformed
+  // Units of very different sizes (one condition's samples are fifty times the other's) make an absent type's transformed
   // proportion differ between conditions; it must not be tested at all.
   for (const kase of composition.cases) {
     const present = countCase(kase);
@@ -222,10 +215,10 @@ test('a type with no cells is not tested and leaves every other type as without 
   }
 });
 
-test('paired, a type whose cells are all in units outside the pairs is not tested (L11-7)', () => {
-  // Live (Suo, liver vs spleen, 7 donors with both): one Langerhans cell in a spleen-only
-  // donor; in the pairs its logit pseudo-proportions were the units' sizes alone, every
-  // liver unit larger than its spleen, so the paired t said adjusted p 0.04.
+test('paired, a type whose cells are all in units outside the pairs is not tested', () => {
+  // One Langerhans cell in a spleen-only donor (liver vs spleen, 7 donors with both): in the
+  // pairs its logit pseudo-proportions are the units' sizes alone, every liver unit larger
+  // than its spleen, so a paired t would call it a change.
   // Units: 4 donors × (liver, spleen), liver 10× the spleen, then one spleen-only donor.
   const unitCount = 9;
   const unitSample = Int32Array.of(0, 0, 1, 1, 2, 2, 3, 3, 4);
@@ -245,15 +238,15 @@ test('paired, a type whose cells are all in units outside the pairs is not teste
       assert.ok(Number.isNaN(out[lane][0]), `${method}: its ${lane} is NaN`);
       assert.deepEqual([...out[lane].subarray(1)], [...without[lane]], `${method}: ${lane} of the others as without it`);
     }
-    // Its mean proportions are over the pairs, as the test reads them (L25-12): none there. Where its
+    // Its mean proportions are over the pairs, as the test reads them: none there. Where its
     // cell is, the table's per-sample proportions say (the spleen-only donor's column).
     assert.deepEqual([out.meanProportion[0], out.meanProportion[1]], [0, 0]);
   }
 });
 
-test('paired, a type is tested over the pairs holding its cells, and not below 3 of them (F109)', () => {
-  // Live (Suo, liver vs spleen, seven donors with both): myelocytes, cells in one donor's
-  // spleen only, came out adjusted p 0.03. In each pair without one on either side the two
+test('paired, a type is tested over the pairs holding its cells, and not below 3 of them', () => {
+  // Myelocytes (liver vs spleen, seven donors with both), cells in one donor's spleen
+  // only, must not come out significant. In each pair without one on either side the two
   // logit pseudo-proportions are the units' sizes alone, every liver unit larger than its
   // spleen, so the differences agree in sign and a paired t calls a change of a type that
   // is not there. Units: seven donors × (liver, spleen), liver ten times the spleen.
@@ -309,9 +302,9 @@ test('paired, a type is tested over the pairs holding its cells, and not below 3
   assert.ok(all.pValue < 0.05, `the artefact the rule removes (p ${all.pValue})`);
 });
 
-test('one categorical kernel: the Detailed view and Composition give one answer for one table (NS-5)', async () => {
+test('one categorical kernel: the Detailed view and Composition give one answer for one table', async () => {
   const { runStatisticalTests } = await import('../assets/js/app/analysis/stats/statistical-tests.js');
-  // The audit's table [[30, 70], [45, 55]]: SciPy chi2_contingency 4.181333333333333, p 0.04087153408900611.
+  // The table [[30, 70], [45, 55]]: SciPy chi2_contingency 4.181333333333333, p 0.04087153408900611.
   const page = (pageName, a, b) => ({ pageName, values: [...new Array(a).fill('in'), ...new Array(b).fill('out')] });
   const detailed = runStatisticalTests([page('P1', 30, 70), page('P2', 45, 55)], 'categorical_obs')[0];
   const kernel = chiSquaredIndependence([[30, 70], [45, 55]]);

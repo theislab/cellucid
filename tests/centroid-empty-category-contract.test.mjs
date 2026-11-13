@@ -2,12 +2,11 @@
  * A category no cell holds has no centroid.
  *
  * A centroid is the mean position of a category's cells. The centroid pass
- * used to return one entry for every category of the inventory, so a
- * category without cells got a centroid at the origin with `n_points: 0`,
- * and every consumer built a point and a label for it: a field with 70,000
- * categories of which three hold cells drew 69,997 labels stacked at (0, 0,
- * 0). The list now holds exactly the categories with cells, in inventory
- * order, and its consumers find a centroid's category by identity, never by
+ * returns exactly the categories with cells, in inventory order: an entry
+ * for a category without cells would sit at the origin with `n_points: 0`,
+ * and every consumer would build a point and a label for it (a field with
+ * 70,000 categories of which three hold cells would draw 69,997 labels
+ * stacked at (0, 0, 0)). Its consumers find a centroid's category by identity, never by
  * its position in the list. A category that gains its first cell (an edit, a
  * rebuilt consensus column) gets its centroid, and one that loses its last
  * loses it.

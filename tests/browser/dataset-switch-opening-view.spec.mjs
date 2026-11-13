@@ -4,12 +4,12 @@
  * colors its file stores. Nothing the previous dataset (or its published
  * preset) left behind carries over.
  *
- * The owner opened a 28,317-cell segmentation export after Suo (562k cells,
- * 3D, whose preset puts the camera inside the cloud and the point size at
- * 0.64) and saw a canvas of giant gray spheres: the new 2D file was framed by
- * Suo's camera. Here the 96-cell 3D catalog dataset stands in for Suo, given
- * the same kind of pose and point size, and `data-mapping-crowded.h5ad` (the
- * same shape as that export: three 2-column UMAPs, a 3-column t-SNE and
+ * Suo (562k cells, 3D) has a preset that puts the camera inside the cloud and
+ * the point size at 0.64: a 2D file opened over it must not be framed by that
+ * camera (a canvas of giant gray spheres). Here the 96-cell 3D catalog
+ * dataset stands in for Suo, given the same kind of pose and point size, and
+ * `data-mapping-crowded.h5ad` (the shape of a 28,317-cell segmentation
+ * export: three 2-column UMAPs, a 3-column t-SNE and
  * spatial array, a 4-column integer `coordinates`, wide PCA and latent
  * matrices, no `X_umap`, no `uns['cellucid']`, and Scanpy's colors for
  * `cell_type`) is opened over it.
@@ -148,8 +148,8 @@ test('a file opened after a 3D dataset with a close-up preset opens on its own e
 
   // Scanpy's colors: `cell_type` opens in the palette its file stores. The
   // fresh page opened with its panels folded, so the field's panel is opened
-  // first, as a person would (a forced choice skipped every check that the
-  // control could be used).
+  // first, as a person would (a forced choice would skip every check that the
+  // control can be used).
   await openCollapsedPanels(page);
   await page.locator('#categorical-field').selectOption('cell_type');
   await expect.poll(() => page.evaluate(() => {

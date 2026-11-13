@@ -1,10 +1,10 @@
 /**
- * The camera's held keys (`rendering/navigation-keys.js`). Round 9, R9K-3:
- * the viewer read "is the key down now" at frame time, so on a slow frame
- * (1–8 s per frame for 562K cells in the bug hunt's browser) a tap between
- * two frames moved nothing and equal holds moved the camera by very
- * different amounts (−0.586 against +0.034 rad for the same 400 ms hold).
- * Each key is now credited with the share of each frame it was held.
+ * The camera's held keys (`rendering/navigation-keys.js`). Each key is
+ * credited with the share of each frame it was held, not read as "is the key
+ * down now" at frame time: on a slow frame (seconds per frame for a large
+ * dataset) a tap between two frames would move nothing and equal holds would
+ * move the camera by very different amounts (−0.586 against +0.034 rad for
+ * the same 400 ms hold).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

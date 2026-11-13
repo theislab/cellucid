@@ -34,7 +34,7 @@ import { bytesOfBase64 } from '../../utils/byte-text.js';
  * @property {number|null} itemSize
  * @property {'numeric'|'float16'|'bool'|'bytes-string'|'utf32'|'vlen'|'opaque'|'compound'} form
  * @property {boolean} littleEndian - Stored byte order of multi-byte numbers and UTF-32
- * @property {Function} [valueClass] - Typed array class of numeric, float16 and bool values
+ * @property {import('../../utils/large-arrays.js').TypedArrayConstructor} [valueClass] - Typed array class of numeric, float16 and bool values
  * @property {Array<{name: string, offset: number, type: StoredType, shape: number[], count: number}>} [fields]
  * @property {'utf-8'|'bytes'} [vlen]
  * @property {ZarrUnsupportedError} [unsupported] - Why values cannot be read

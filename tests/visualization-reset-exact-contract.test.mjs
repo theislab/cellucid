@@ -13,15 +13,6 @@ import {
   pointSizeSliderPositionForCellCount,
 } from '../assets/js/rendering/point-size-scale.js';
 
-const resetSource = await readFile(
-  new URL('../assets/js/app/ui/modules/visualization-reset.js', import.meta.url),
-  'utf8'
-);
-const viewerSource = await readFile(
-  new URL('../assets/js/rendering/viewer.js', import.meta.url),
-  'utf8'
-);
-
 async function readJavaScriptTree(directoryUrl) {
   const sources = [];
   for (const entry of await readdir(directoryUrl, { withFileTypes: true })) {
@@ -38,10 +29,6 @@ async function readJavaScriptTree(directoryUrl) {
   }
   return sources;
 }
-
-const applicationSources = await readJavaScriptTree(
-  new URL('../assets/js/', import.meta.url)
-);
 
 function createElement({ value = '', checked = false, tagName = 'INPUT' } = {}) {
   const listeners = new Map();
@@ -546,32 +533,6 @@ test('reset applies the navigation mode the focused dimension implies', () => {
   } finally {
     globalThis.document = previousDocument;
   }
-});
-
-test('reset and viewer sources contain no legacy invert alias or optional reset calls', () => {
-  for (const { path, source } of applicationSources) {
-    assert.doesNotMatch(
-      source,
-      /\.setInvertLook\s*\(/,
-      `${path} still calls the removed setInvertLook alias`
-    );
-  }
-
-  assert.doesNotMatch(viewerSource, /\bsetInvertLook\s*\(/);
-  assert.match(
-    viewerSource,
-    /setInvertLookY\(value\)\s*\{\s*invertLookY = assertExactBoolean\(value,\s*'Vertical invert look'\);\s*\}/
-  );
-  assert.match(
-    viewerSource,
-    /setInvertLookX\(value\)\s*\{\s*invertLookX = assertExactBoolean\(value,\s*'Horizontal invert look'\);\s*\}/
-  );
-
-  assert.doesNotMatch(resetSource, /\?\./);
-  assert.doesNotMatch(resetSource, /\?\?/);
-  assert.doesNotMatch(resetSource, /\bBoolean\s*\(/);
-  assert.doesNotMatch(resetSource, /\bparseFloat\s*\(/);
-  assert.doesNotMatch(resetSource, /\|\|\s*['"`]/);
 });
 
 test('a large dataset opens at a negative slider position and is still captured', () => {

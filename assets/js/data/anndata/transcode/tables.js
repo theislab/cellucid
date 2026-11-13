@@ -112,8 +112,8 @@ const FIRST_ROWS = 1024;
  * row (a column of numbers that turns out to be labels, rare); otherwise
  * nothing is read twice. No line, row or value is held as a string past its
  * row, and no `Map` holds the cells, so a table of tens of millions of
- * cells costs a few bytes a row and a value (a 2M-row table of 30 columns:
- * 0.6 GB less than when its bytes were kept for a second pass).
+ * cells costs a few bytes a row and a value (the table's bytes are not
+ * kept for a second pass: measured, 23_decisions_partial_reading.md).
  *
  * @param {{size: number, read: Function}} reader
  * @param {{cells: ArrayLike<string>|StringIndex, signal?: AbortSignal|null, activity?: Object|null, header?: boolean|null,

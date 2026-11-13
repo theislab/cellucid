@@ -18,15 +18,14 @@
  *
  * Every frame read is a steady frame of the highlight's pulse, and what both
  * sides submitted to the GPU in it is asserted equal before their pixels
- * (`helpers/gl-submissions.mjs`): a frame read four animation frames after a
- * change was, on a slow renderer, still the first frame after it on one side
- * and a later one on the other.
+ * (`helpers/gl-submissions.mjs`): a frame read a fixed four animation frames
+ * after a change can, on a slow renderer, still be the first frame after it on
+ * one side and a later one on the other.
  */
 
 import { expect, test } from './helpers/test.mjs';
 import { labelProgramsBySource, recordSubmissions } from './helpers/gl-submissions.mjs';
 import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
-import { ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX } from './helpers/pixel-parity.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
@@ -70,11 +69,10 @@ function captureScene(page, { pointCount, segmentPoints, camera }) {
     viewer.setForceLOD(-1);
     // The stores in their tree's order, whole (`StoreOrder#complete`): a tree
     // is built in a worker and its order adopted over frames, as long as the
-    // machine takes (the test's timeout bounds it). This once compared a
-    // `drawOrder` the store order does not have, for 900 animation frames a
-    // scene, and went on whatever they showed: on a renderer that takes
-    // seconds a frame those frames were the test's ten minutes (hosted macOS
-    // and Windows Firefox, nightly runs 41382954122 to 42156397746).
+    // machine takes (the test's timeout bounds it). A wait for frames that
+    // compares a `drawOrder` the store order does not have goes on whatever they
+    // show: on a renderer that takes seconds a frame, a fixed count of frames is
+    // the test's whole timeout.
     let tree = null;
     for (;;) {
       tree = renderer.spatialIndices.get(renderer.currentDimensionLevel) ?? null;
@@ -86,10 +84,9 @@ function captureScene(page, { pointCount, segmentPoints, camera }) {
     const level = tree.lodLevels.findIndex(candidate => candidate.pointCount > segmentPoints && candidate.isFullDetail !== true);
     if (level < 0) throw new Error(`No reduced level of ${pointCount} points spans a segment of ${segmentPoints}.`);
     // Full detail is the tree's last level, forced: with adaptive LOD on, no
-    // forced level (-1) is whatever level the camera distance picks, and at
-    // 12,000 cells that was level 5, 3,050 cells inside the first segment of
-    // 4,096, drawn in one call a pass on either side (hosted macOS Firefox,
-    // full-matrix run 42320991390).
+    // forced level (-1) is whatever level the camera distance picks, which can
+    // lie inside the first segment of 4,096 points and be drawn in one call a
+    // pass on either side.
     const fullDetail = tree.lodLevels.length - 1;
     if (tree.lodLevels[fullDetail].isFullDetail !== true) throw new Error('The tree\'s last level is not full detail.');
     const read = () => {
@@ -301,15 +298,7 @@ for (const pattern of ['atlas', 'flatumap']) {
       // The same draws with the same uniforms, in more calls: one a segment.
       expect(frame.submittedDifference, `${name}: what the two frames submitted`).toBeNull();
       expect(frame.calls[1], `${name}: the segmented frame takes more draw calls`).toBeGreaterThan(frame.calls[0]);
-      if (isHostedMacosFirefox(browserName)) {
-        // Two GPU objects holding the same bytes: hosted macOS Firefox has drawn such
-        // pairs a few pixels apart (`helpers/hosted-gl.mjs`). Everything above is held
-        // there exactly; of the pixels, that no more than rounding's share differs.
-        expect(frame.differingPixels, `${name}: pixels that differ ${JSON.stringify(frame.differing)}`)
-          .toBeLessThanOrEqual(frame.lit * ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX);
-      } else {
-        expect(frame.differing, `${name}: pixels that differ (x, y, one segment, segmented)`).toEqual([]);
-      }
+      expect(frame.differing, `${name}: ${frame.differingPixels} pixels differ, first (x, y, one segment, segmented)`).toEqual([]);
     }
     expect(pageErrors).toEqual([]);
   });

@@ -7,19 +7,17 @@
  * Such a frame redraws the whole scene, and the animation asks for one every
  * display frame for as long as it runs. Where the machine draws a frame
  * within a display interval, that is free. Where it does not, back-to-back
- * ambient frames took the machine from the page for good, on either of the
+ * ambient frames take the machine from the page for good, on either of the
  * two resources a frame uses:
  * - **The main thread** (a software renderer, a headless browser that reads
- *   every WebGL frame back for compositing, millions of points): a marker
- *   run of 400 genes, 32 ms of statistics, took over 40 s because its worker
- *   replies only ran between frames.
- * - **The GPU** (Chromium's SwiftShader through ANGLE, which runs WebGL in
- *   the GPU process and leaves the main thread free; Firefox on the hosted
- *   macOS runners, where a 1024² fragment pass takes a minute): the page's
- *   own frames queued behind the viewer's GPU work. Measured under
- *   SwiftShader with the velocity overlay on: the page ran 17 frames a
- *   second instead of 60; on hosted macOS Firefox each click waited 10 to
- *   15 s for the frames it needs (CI run 42350760019).
+ *   every WebGL frame back for compositing, millions of points): the replies
+ *   of a worker (an analysis's) only run between frames, so a job of a few
+ *   milliseconds waits behind the animation for as long as it runs.
+ * - **The GPU** (a software renderer that runs WebGL in the GPU process and
+ *   leaves the main thread free; Firefox on a GPU that takes a minute for a
+ *   1024² fragment pass): the page's own frames queue behind the viewer's GPU
+ *   work, and each click waits for the frames it needs (measured:
+ *   28_decisions_rendering_layers.md).
  *
  * **The main-thread rule.** An ambient frame is due once the main thread has
  * been free since the last drawn frame for as long as that frame held it, so
@@ -39,9 +37,9 @@
  * next animation frame before any task queued during the last one: Firefox
  * does whenever a display interval has passed, and every engine does once
  * rendering has waited long enough behind tasks. An ambient frame decided
- * then, from the frame before, was drawn back to back with the one still
+ * then, from the frame before, would be drawn back to back with the one still
  * unmeasured, and under a queue of tasks (an analysis's worker replies)
- * every frame was. So the measurement owes its answer before any ambient
+ * every frame would be. So the measurement owes its answer before any ambient
  * frame is drawn, and the wake that brings the loop back is armed from the
  * answer.
  *
@@ -57,11 +55,12 @@
  * **The GPU rule: the page's frames are timed, as a person sees them.** The
  * GPU's share of a frame is not on the main thread, and a fence does not
  * read it either: the GPU runs frames in a pipeline, so a fence after a
- * frame passes a frame or more later on a GPU that keeps up (Metal on an
- * Apple M1 Pro), and pacing every frame by it took smoke there from 60 to
- * 45 frames a second. What a GPU that falls behind does to the page is make
- * its animation frames come late: the browser starts the next frame once the
- * GPU has room for it. So every animation frame the viewer's loop runs in is
+ * frame passes a frame or more later on a GPU that keeps up, and pacing every
+ * frame by it would hold such a GPU back (measured:
+ * 28_decisions_rendering_layers.md). What a GPU that falls behind does to the
+ * page is make its animation frames come late: the browser starts the next
+ * frame once the GPU has room for it. So every animation frame the viewer's
+ * loop runs in is
  * timed from the one before it (their timestamps, `frameStarted`). One that
  * came a whole display frame late or more (rounded to whole display
  * intervals: WebKit's timestamps jitter by up to a third of one) while the
@@ -72,18 +71,14 @@
  * half the time. While only this rule holds an ambient frame back, the
  * viewer runs the animation frames in between without drawing
  * (`watchesNextFrame`), and they are timed too: a pipeline hides the cost of
- * the first two or three frames of a burst (measured under SwiftShader, the
- * lateness of three frames came two frames after them), and a GPU still
+ * the first two or three frames of a burst (under a software renderer the
+ * lateness of three frames comes two frames after them), and a GPU still
  * working through them lengthens the wait. The wait ends once the GPU keeps
  * up again, and a GPU that keeps up makes no frame late: nothing is ever
- * held back there. Measured on an Apple M1 Pro (2026-11-07), the velocity
- * overlay of `data-mapping-multi.h5ad`: under SwiftShader through ANGLE the
- * page ran 34 to 38 frames a second instead of 17 with the overlay still
- * drawing 17, a change was shown in 60 ms instead of up to 112 and two
- * animation frames came in 10 to 60 ms instead of 71 to 112 (animated
- * smoke: 41 instead of 25, smoke still at 25); on Metal (Chromium, 60 Hz),
- * Firefox (120 Hz) and WebKit (60 Hz) every display frame still drew one,
- * overlay or smoke.
+ * held back there. On a GPU that falls behind, the page's frames and clicks
+ * stay prompt while the animation draws more slowly; on one that keeps up
+ * every display frame still draws one (measured:
+ * 28_decisions_rendering_layers.md).
  *
  * **Late because of the GPU, not because the page stopped.** Browsers stop
  * animation frames for a hidden document or an iframe scrolled out of view
@@ -100,8 +95,9 @@
  * display interval after the one before says only that the GPU finished
  * somewhere in that gap, so the GPU's part ends at the read before it, and
  * the frame counts as late only by the display frames up to the first after
- * that (one more for the timestamps' rounding). Before this bound, a page
- * hidden 10 s after such a frame held its ambient animation 10 s once shown.
+ * that (one more for the timestamps' rounding). Without this bound, a page
+ * hidden 10 s after such a frame would hold its ambient animation 10 s once
+ * shown.
  * A frame the GPU held throughout (still running at the late frame's start:
  * the fence passes in order) is late by all of it. Nor does a frame after
  * one some change or input asked for count: that frame is the page's own
@@ -141,8 +137,7 @@ const DREW_OTHER = 2;
  * third of an interval apart from the display's); only the first and the
  * last count in a mean of consecutive periods, so over eight the jitter is
  * within a twelfth of an interval, far inside the half a late frame is told
- * by. Two periods measured 14.5 ms in WebKit and 7.5 ms in Firefox on 60 Hz
- * and 120 Hz displays.
+ * by (measured: 28_decisions_rendering_layers.md).
  */
 const INTERVAL_PERIODS = 8;
 

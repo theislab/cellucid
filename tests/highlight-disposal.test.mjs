@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  createLassoOverlay,
   HighlightRenderer,
   HighlightTools,
 } from '../assets/js/rendering/highlight-renderer.js';
@@ -603,4 +604,224 @@ test('highlight tools disposal fences callbacks and attempts every DOM/GPU owner
   assert.equal(classRemovalAttempts.get('lassoing'), 2);
   assert.equal(classRemovalAttempts.get('lasso-mode'), 1);
   assert.equal(cursorCleanupAttempts, 1);
+});
+
+// The lasso overlay reads the page through `document`, `window` and `ResizeObserver`; these stand-ins
+// hold just what it touches, with the parent's children kept so a test can count the overlays in it.
+class StubElement {
+  constructor(rect = { width: 20, height: 10 }) {
+    this.children = [];
+    this.id = '';
+    this.parentElement = null;
+    this.rect = rect;
+    this.style = { cssText: '', position: '' };
+  }
+
+  appendChild(child) {
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+
+  remove() {
+    if (this.parentElement === null) return;
+    this.parentElement.children = this.parentElement.children.filter(child => child !== this);
+    this.parentElement = null;
+  }
+
+  getBoundingClientRect() {
+    return this.rect;
+  }
+
+  getContext() {
+    return { setTransform() {}, scale() {} };
+  }
+
+  overlayCount() {
+    return this.children.filter(child => child.id === 'lasso-overlay').length;
+  }
+}
+
+function withLassoHost({ matchMedia, resizeObserver = class { observe() {} disconnect() {} } }, callback) {
+  const names = ['document', 'window', 'ResizeObserver'];
+  const previous = new Map(names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const host = { devicePixelRatio: 1 };
+  Object.defineProperties(host, {
+    getComputedStyle: { value: () => ({ position: 'static' }) },
+    matchMedia: { value: matchMedia },
+  });
+  Object.assign(globalThis, {
+    document: { createElement: () => new StubElement() },
+    window: host,
+    ResizeObserver: resizeObserver,
+  });
+  try {
+    return callback(host);
+  } finally {
+    for (const [name, descriptor] of previous) {
+      if (descriptor === undefined) delete globalThis[name];
+      else Object.defineProperty(globalThis, name, descriptor);
+    }
+  }
+}
+
+function mountedCanvas(rect) {
+  const parent = new StubElement();
+  const canvas = parent.appendChild(new StubElement(rect));
+  return { canvas, parent };
+}
+
+test('the lasso backing store follows DPR-only changes and every media generation is retired', () => {
+  const generations = [];
+  const matchMedia = query => {
+    const listeners = new Set();
+    generations.push({
+      query,
+      emit() {
+        for (const listener of [...listeners]) listener({ matches: false, media: query });
+      },
+      get listenerCount() {
+        return listeners.size;
+      },
+    });
+    return {
+      matches: true,
+      media: query,
+      addEventListener(type, listener) {
+        if (type === 'change') listeners.add(listener);
+      },
+      removeEventListener(type, listener) {
+        if (type === 'change') listeners.delete(listener);
+      },
+    };
+  };
+  withLassoHost({ matchMedia }, host => {
+    const { canvas } = mountedCanvas({ width: 20, height: 10 });
+    const overlay = createLassoOverlay(canvas);
+    const snapshot = () => ({
+      size: [overlay.lassoCanvas.width, overlay.lassoCanvas.height],
+      listeners: generations.map(item => item.listenerCount),
+      queries: generations.map(item => item.query),
+    });
+    assert.deepEqual(snapshot(), {
+      size: [20, 10],
+      listeners: [1],
+      queries: ['(resolution: 1dppx)'],
+    });
+
+    host.devicePixelRatio = 2;
+    generations[0].emit();
+    assert.deepEqual(snapshot(), {
+      size: [40, 20],
+      listeners: [0, 1],
+      queries: ['(resolution: 1dppx)', '(resolution: 2dppx)'],
+    });
+
+    overlay.resizeSubscription.disconnect();
+    host.devicePixelRatio = 3;
+    generations.at(-1).emit();
+    assert.deepEqual(
+      { size: snapshot().size, listeners: snapshot().listeners },
+      { size: [40, 20], listeners: [0, 0] },
+      'a disconnected overlay neither resizes nor keeps a listener'
+    );
+  });
+});
+
+test('a lasso overlay whose DPR listener cannot be attached rolls back its observer, DOM and parent lease', () => {
+  let disconnectCalls = 0;
+  const matchMedia = () => ({
+    addEventListener() {
+      throw new Error('synthetic DPR-listener setup failure');
+    },
+    removeEventListener() {},
+  });
+  const resizeObserver = class {
+    observe() {}
+    disconnect() {
+      disconnectCalls++;
+    }
+  };
+  withLassoHost({ matchMedia, resizeObserver }, () => {
+    const { canvas, parent } = mountedCanvas();
+    assert.throws(
+      () => createLassoOverlay(canvas),
+      error => error.name === 'Error' && error.message === 'synthetic DPR-listener setup failure'
+    );
+    assert.equal(disconnectCalls, 1);
+    assert.equal(parent.overlayCount(), 0);
+    assert.equal(parent.style.position, '');
+  });
+});
+
+test('lasso disposal fences DPR callbacks and retries only the cleanup it still holds', () => {
+  let listener = null;
+  let removeCalls = 0;
+  let disconnectCalls = 0;
+  const matchMedia = () => ({
+    addEventListener(type, candidate) {
+      if (type === 'change') listener = candidate;
+    },
+    removeEventListener(type, candidate) {
+      if (type !== 'change' || candidate !== listener) return;
+      removeCalls++;
+      if (removeCalls === 1) throw new Error('synthetic DPR-listener cleanup failure');
+      listener = null;
+    },
+  });
+  const resizeObserver = class {
+    observe() {}
+    disconnect() {
+      disconnectCalls++;
+    }
+  };
+  withLassoHost({ matchMedia, resizeObserver }, host => {
+    const { canvas } = mountedCanvas({ width: 20, height: 10 });
+    const overlay = createLassoOverlay(canvas);
+    const retainedListener = listener;
+
+    assert.throws(
+      () => overlay.resizeSubscription.disconnect(),
+      error => error instanceof AggregateError &&
+        error.errors.map(item => item.message).join() === 'synthetic DPR-listener cleanup failure'
+    );
+    host.devicePixelRatio = 2;
+    retainedListener({ matches: false });
+    assert.deepEqual(
+      [overlay.lassoCanvas.width, overlay.lassoCanvas.height],
+      [20, 10],
+      'a callback the host still delivers after disposal began changes nothing'
+    );
+
+    overlay.resizeSubscription.disconnect();
+    assert.equal(listener, null);
+    assert.equal(removeCalls, 2);
+    assert.equal(disconnectCalls, 1, 'the observer that disconnected is not disconnected again');
+  });
+});
+
+test('overlays sharing a parent keep its positioning until the last owner is disposed', () => {
+  const matchMedia = () => ({ addEventListener() {}, removeEventListener() {} });
+  withLassoHost({ matchMedia }, () => {
+    const parent = new StubElement();
+    const tools = [parent.appendChild(new StubElement()), parent.appendChild(new StubElement())].map(canvas => {
+      const overlay = createLassoOverlay(canvas);
+      return Object.assign(Object.create(HighlightTools.prototype), {
+        _disposeState: null,
+        _disposed: false,
+        _lassoResizeSubscription: overlay.resizeSubscription,
+        _lassoParentPositionLease: overlay.parentPositionLease,
+        _knnExpansion: null,
+        canvas: { classList: { remove() {} }, style: { cursor: '' } },
+        lassoCanvas: overlay.lassoCanvas,
+        highlightRenderer: { dispose() {} },
+      });
+    });
+    const state = () => ({ overlays: parent.overlayCount(), position: parent.style.position });
+    assert.deepEqual(state(), { overlays: 2, position: 'relative' });
+    assert.equal(tools[0].dispose(), true);
+    assert.deepEqual(state(), { overlays: 1, position: 'relative' });
+    assert.equal(tools[1].dispose(), true);
+    assert.deepEqual(state(), { overlays: 0, position: '' });
+  });
 });

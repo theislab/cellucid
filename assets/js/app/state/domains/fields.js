@@ -45,7 +45,7 @@ export function compareRefs(a, b) {
  * @param {'obs'|'var'} source
  * @returns {Map<string, {field: object, index: number}>}
  */
-export function fieldsByRef(data, source) {
+function fieldsByRef(data, source) {
   const out = new Map();
   const fields = data?.fields ?? [];
   for (let index = 0; index < fields.length; index++) {

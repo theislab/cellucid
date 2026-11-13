@@ -15,8 +15,8 @@
  *    are appended to `data` as soon as the block is placed.
  * 3. **Rows.** The same passes over `indices` alone (blocks of a row each,
  *    so fewer of them) give `indices`, written after `data`: each array's
- *    chunks lie together in the archive (cellucid-python measured
- *    alternating them: reading one array alone fetched the other too).
+ *    chunks lie together in the archive (alternating them makes a read of
+ *    one array fetch the other's chunks too).
  *    When the whole matrix fits one block, the rows of step 2 are written
  *    as they are, with no pass more.
  *

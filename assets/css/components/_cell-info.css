@@ -43,7 +43,7 @@
 /* Color dot, value, and (for a category) its visible count. The card is
    aria-hidden and takes no pointer, so nothing on it can be revealed later:
    a long label or field name wraps (inside its 240 px column) instead of
-   being cut with an ellipsis (R9U-4). */
+   being cut with an ellipsis. */
 .cell-info-head {
   display: flex;
   align-items: flex-start;

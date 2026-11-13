@@ -26,8 +26,7 @@ carries the turn, the provider's agent name and the chat as its connection (`met
 `{id: <conversation>, kind: 'chat'}`), so the timeline groups it, Undo turn takes it back, and a
 permission granted "in this chat" holds for it. Tool calls run one after the other, in the model's
 order. The tools are the same all chat long, and say no permission: a model's reasoning is bound to
-the exact tools it was given (Anthropic refuses reasoning sent back with other tools: measured
-2026-11-04), and the prompt cache holds only while they stay. The model is told the permissions and
+the exact tools it was given (Anthropic refuses reasoning sent back with other tools), and the prompt cache holds only while they stay. The model is told the permissions and
 the person's own instructions with the message after either changes; after a summary, the last
 told before it goes with the summary.
 
@@ -50,14 +49,12 @@ the summarizer's calls, are carried by the next message or note of the turn (`ot
 tokens shown and the budget count them.
 
 **Kept with the history:** after every message, `history.setChat(tracker, id, transcript)` (no
-providers' reasoning, no pictures). The chat belongs to the tab; a history to its dataset: another
-tracker, dataset or loaded session shows its latest conversation (or a new one). A turn running
-then stops and is kept where it began, unless its own agent opened that dataset (an action of
-effect `dataset`): then it goes on there and the conversation is kept with both histories. Messages
-and steps find each other through `../history-link.js` only. A conversation kept mid-turn (the page
-reloaded or closed while a call ran or waited for the person) holds calls with no result; shown
-again, each is answered with what became of it (`closeInterrupted`: the step the history kept for
-it, else nothing applied), so its rows say so and a model accepts it again.
+providers' reasoning, no pictures). The chat belongs to the tab; a history to its dataset, so
+another tracker, dataset or loaded session shows its latest conversation (or a new one). Messages
+and steps find each other through `../history-link.js` only. What a running turn does when the
+dataset changes, and how a conversation kept mid-turn is answered (`closeInterrupted`), is
+developer doc 32, "Conversations and the history"
+(`cellucid-python/docs/user_guide/web_app/p_developer_docs/32_agents_in_the_tab.md`).
 
 **Invariants:**
 - One tool list (`bridge/mcp-tools.js`) plus the chat's question with choices (`ask.js`), one call

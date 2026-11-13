@@ -159,7 +159,7 @@ const histogramDefinition = {
   },
 
   buildLayout(pageData, options) {
-    const { barmode = 'overlay', histnorm = '' } = options;
+    const { barmode = 'overlay' } = options;
     const layout = PlotFactory.createLayout({ pageData, options, custom: { barmode } });
     PlotFactory.configureHistogramAxes(layout, { pageData, options });
     return layout;

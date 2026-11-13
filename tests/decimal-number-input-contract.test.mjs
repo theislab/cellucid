@@ -82,10 +82,23 @@ test('no number box built by a script takes a decimal', () => {
 });
 
 test('the decimal boxes are the control kit\'s, read by the one rule', async () => {
-  const controls = readFileSync(path.join(ROOT, 'assets/js/app/ui/components/controls.js'), 'utf8');
-  assert.match(controls, /export function createDecimalInput\(/);
-  assert.match(controls, /input\.type = 'text';\s*\n\s*input\.inputMode = 'decimal';/);
-  assert.match(controls, /export function readDecimalInput\(input\) \{\s*\n\s*return parseDecimalText\(input\.value\);/);
+  const { createDecimalInput, readDecimalInput } = await import('../assets/js/app/ui/components/controls.js');
+  const previousDocument = globalThis.document;
+  globalThis.document = { createElement: () => ({ attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } }) };
+  try {
+    const box = createDecimalInput({ id: 'rate', ariaLabel: 'Rate', value: 0.15 });
+    assert.equal(box.type, 'text');
+    assert.equal(box.inputMode, 'decimal');
+    assert.equal(box.value, '0.15');
+    assert.equal(box.attributes['aria-label'], 'Rate');
+    box.value = '2,5';
+    assert.equal(readDecimalInput(box), 2.5);
+    box.value = '';
+    assert.ok(Number.isNaN(readDecimalInput(box)));
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
   // A plot option of a type chosen at run time routes a fractional step to it.
   const options = readFileSync(path.join(ROOT, 'assets/js/app/analysis/ui/components/options.js'), 'utf8');
   assert.match(options, /if \(type === 'number' && !Number\.isInteger\(step\)\) \{\s*\n\s*input = createDecimalInput\(/);

@@ -106,7 +106,7 @@ export function createCellsDomain({ openCells }) {
     capture,
     // `heavy`: the running action's `ctx.heavy` (a history move of an agent): asked before the
     // cells' totals of normalized values are summed for the cells read. `signal`: the move's
-    // (its Stop): the reading is canceled and the restore throws why, promptly (F147); the
+    // (its Stop): the reading is canceled and the restore throws why, promptly; the
     // history then puts back what was shown.
     async restore(value, { heavy = null, signal = null } = {}) {
       if (value === null || typeof value !== 'object' || !Object.hasOwn(value, 'open') || !Object.hasOwn(value, 'genes')) {

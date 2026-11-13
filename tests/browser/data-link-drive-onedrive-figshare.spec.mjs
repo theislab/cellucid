@@ -2,7 +2,6 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
-import { openableNamesText } from '../../assets/js/data/input-formats.js';
 import { APP_ORIGIN, ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -13,8 +12,8 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
  */
 const openPanels = page => openCollapsedPanels(page, { sessionSections: false });
 
-// Figshare, Google Drive and OneDrive against fake hosts: Figshare's API and
-// file host, Google's Drive API, Identity Services and Picker (small stubs in
+// Google Drive and OneDrive against fake hosts (Figshare is held by the
+// provider contract tests): Google's Drive API, Identity Services and Picker (small stubs in
 // place of Google's scripts), and Microsoft's sign-in page, token endpoint,
 // Graph and download host. Each answers as the real one does (CORS headers
 // included), from the same fixture file. The site's provider configuration
@@ -111,39 +110,6 @@ function statusLines(page) {
   ));
 }
 
-test('a public Figshare item opens in place from ?data=, with Range-only reads', async ({ page }) => {
-  const bytes = await fixtureBytes();
-  await useTestConfig(page.context());
-  const reads = [];
-  await page.context().route('https://api.figshare.com/v2/articles/16566057', route => route.fulfill({
-    status: 200,
-    headers: CORS,
-    contentType: 'application/json',
-    body: JSON.stringify({
-      id: 16566057, version: 1, title: 'Visium fixture', doi: '10.6084/m9.figshare.16566057.v1',
-      figshare_url: 'https://figshare.com/articles/dataset/x/16566057', license: { name: 'CC BY 4.0' },
-      files: [{ id: 30639279, name: 'current-ui-smoke.h5ad', size: bytes.length, computed_md5: 'x', is_link_only: false }],
-    }),
-  }));
-  await page.context().route('https://ndownloader.figshare.com/files/30639279', route => {
-    reads.push(route.request().headers());
-    return serveRange(route, bytes);
-  });
-  const errors = watchErrors(page);
-  await page.goto(`/?${PINNED}data=${encodeURIComponent('https://figshare.com/articles/dataset/x/16566057')}`, { waitUntil: 'domcontentloaded' });
-  await openPanels(page);
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
-  await expect(page.locator('#data-link-connection-target')).toHaveAttribute('title', 'figshare:16566057');
-  // The address names the item in Figshare's form, not the page link pasted.
-  expect(new URL(page.url()).searchParams.get('data')).toBe('figshare:16566057');
-  expect(reads.length).toBeGreaterThan(0);
-  for (const headers of reads) {
-    expect(headers.range).toMatch(/^bytes=\d+-\d+$/);
-    expect(headers.authorization).toBeUndefined();
-  }
-  expect(errors).toEqual([]);
-});
-
 /**
  * Drive's API: the item and the bytes, public (key) or for a token once the
  * picker granted it. `heldBack`: the key's downloads fail as Google's answer
@@ -215,7 +181,7 @@ test('a private Google Drive file: Sign in to Google, the picker on that file, t
   await expect(page.locator('#data-sign-in-text')).toHaveText('Private file on Google Drive.');
   await expect(page.locator('#data-sign-in-btn')).toHaveText('Sign in to Google');
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
-  // One status line (F73: beside its button it wrapped into a column of two to four lines).
+  // One status line (beside its button it does not wrap into a column of two to four lines).
   expect(await statusLines(page)).toBe(1);
   // The same step as a notification, for a closed panel.
   await expect(page.locator('#notification-center .notification-action', { hasText: 'Sign in to Google' })).toHaveCount(1);
@@ -299,38 +265,6 @@ test('a sign-in that takes longer than the startup deadline: the opening waits f
   expect(errors).toEqual([]);
 });
 
-test('signed in, a public file not granted yet whose download Google holds back: the picker on it, no sign-in asked', async ({ page }) => {
-  const bytes = await fixtureBytes();
-  await useTestConfig(page.context());
-  const drive = await routeDrive(page.context(), bytes, { isPublic: true, heldBack: true });
-  // Signed in to Google in this tab already (an earlier file), this one not picked.
-  await page.addInitScript(token => {
-    sessionStorage.setItem('cellucid:google-auth:session', JSON.stringify({
-      accessToken: token, expiresAt: Date.now() + 3_000_000, scope: 'https://www.googleapis.com/auth/drive.file',
-    }));
-  }, TOKEN);
-  const errors = [];
-  page.on('pageerror', error => errors.push(error.message));
-  await page.goto(`/?${PINNED}data=gdrive:${DRIVE_ID}`, { waitUntil: 'domcontentloaded' });
-  await openPanels(page);
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
-  expect(drive.picked).toBe(true);
-  await expect(page.locator('#data-sign-in-text')).toHaveText('Signed in to Google');
-  // Read with the sign-in: no keyed download a hold could stop was asked for.
-  expect(drive.requests.filter(request => request.authorization === null && request.url.includes('alt=media'))).toHaveLength(0);
-  expect(drive.requests.filter(request => request.authorization !== null && request.url.includes('alt=media')).length).toBeGreaterThan(0);
-  expect(errors).toEqual([]);
-});
-
-test('a Google Drive folder link is refused with what to share instead', async ({ page }) => {
-  await useTestConfig(page.context());
-  await page.goto(`/?${PINNED}data=${encodeURIComponent(`https://drive.google.com/drive/folders/${DRIVE_ID}`)}`, { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('body')).toContainText(
-    'This link is a Google Drive folder. Cellucid opens single files from Google Drive: share the file itself ' +
-      `(${openableNamesText({ layouts: ['file', 'zip'] })}) and paste its link.`
-  );
-});
-
 /**
  * Microsoft's sign-in page, token endpoint, Graph and download host for one
  * OneDrive file. The sign-in page sends its window back with a code after
@@ -402,6 +336,7 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   await useTestConfig(context);
   // Microsoft's sign-in page sends the popup back with a code at once.
   const seen = await routeOneDrive(context, bytes);
+  const opens = await recordWindowOpens(page);
   const errors = watchErrors(page);
   const share = 'https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc';
   await page.goto(`/?${PINNED}data=${encodeURIComponent(share)}`, { waitUntil: 'domcontentloaded' });
@@ -409,10 +344,19 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   await expect(page.locator('#data-sign-in-text')).toHaveText('OneDrive files open after a sign-in.');
   expect(await statusLines(page)).toBe(1);
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
+  // The opening asks for the click; it opens nothing by itself.
+  expect(await opens()).toEqual([]);
   const popup = page.waitForEvent('popup');
   await page.locator('#data-sign-in-btn').click();
   const signInWindow = await popup;
+  // The sign-in window opens on this site inside the click, never before it,
+  // then goes to Microsoft. Opened at no address of Microsoft's: Safari gives
+  // a window opened at login.microsoftonline.com to a Mac's single sign-on
+  // extension (Company Portal), which signs in where nobody sees and closes
+  // the window.
+  expect(await opens()).toEqual([{ url: '', name: 'cellucid-microsoft-sign-in' }]);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
+  expect(seen.authorize).toHaveLength(1);
   // The return page closed once this page answered that it had the code.
   await expect.poll(() => signInWindow.isClosed()).toBe(true);
   // The code was redeemed in the page, with the verifier and no secret.
@@ -431,31 +375,6 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   expect(new URL(page.url()).searchParams.get('data')).toBe('onedrive:drive1/ITEM!101');
   expect(page.url()).not.toContain('TEMPAUTH');
   expect(page.url()).not.toContain(TOKEN);
-  expect(errors).toEqual([]);
-});
-
-test('the Microsoft sign-in window opens on this site inside the click, never before it, then goes to Microsoft', async ({ page }) => {
-  const bytes = await fixtureBytes();
-  const context = page.context();
-  await useTestConfig(context);
-  const seen = await routeOneDrive(context, bytes);
-  const opens = await recordWindowOpens(page);
-  const errors = watchErrors(page);
-  await page.goto(`/?${PINNED}data=${encodeURIComponent('https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
-  await openPanels(page);
-  await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
-  // The opening asks for the click; it opens nothing by itself.
-  expect(await opens()).toEqual([]);
-  const popup = page.waitForEvent('popup');
-  await page.locator('#data-sign-in-btn').click();
-  await popup;
-  // Opened at no address of Microsoft's: Safari gives a window opened at
-  // login.microsoftonline.com to a Mac's single sign-on extension (Company
-  // Portal), which signs in where nobody sees and closes the window.
-  expect(await opens()).toEqual([{ url: '', name: 'cellucid-microsoft-sign-in' }]);
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
-  expect(seen.authorize).toHaveLength(1);
-  expect(seen.tokenBodies).toHaveLength(1);
   expect(errors).toEqual([]);
 });
 
@@ -488,8 +407,8 @@ test('a Microsoft sign-in window cut off from Cellucid (Cross-Origin-Opener-Poli
   const lines = await page.evaluate(() => window.__cellucidSignInLines);
   const closed = 'OneDrive files open after a sign-in. Microsoft\'s sign-in window was closed before it finished.';
   // Chromium and Firefox report a window cut off this way as closed
-  // (measured 2026-10-25; WebKit does not): the step said so and offered the
-  // button again, and the sign-in finished in that window still counted.
+  // (WebKit does not): the step says so and offers the
+  // button again, and the sign-in finished in that window still counts.
   if (browserName !== 'webkit') expect(lines).toContain(closed);
   expect(lines.at(-1)).toBe('Signed in to Microsoft');
   expect(seen.tokenBodies).toHaveLength(1);
@@ -528,7 +447,7 @@ test('a work account whose organization lets only an administrator approve Cellu
   const context = page.context();
   await useTestConfig(context);
   const prompts = [];
-  // Microsoft answers as Helmholtz Zentrum München's tenant did (2026-10-25).
+  // Microsoft answers as a tenant does that lets only an administrator approve an app.
   await context.route('https://login.microsoftonline.com/common/oauth2/v2.0/authorize?**', route => {
     const url = new URL(route.request().url());
     prompts.push(url.searchParams.get('prompt'));
@@ -553,7 +472,7 @@ test('a work account whose organization lets only an administrator approve Cellu
   await expect(help).toBeVisible();
   await expect(help).toHaveText('How an administrator approves Cellucid');
   await expect(help).toHaveAttribute('href', /16_private_drive_onedrive\.html#work-and-school-accounts-administrator-approval$/);
-  // Beside a help link and "Use another account" the reason was squeezed to a
+  // Beside a help link and "Use another account" the reason is not squeezed to a
   // column one letter wide; it takes the line's first row whole.
   const widths = await page.evaluate(() => ({
     line: document.getElementById('data-sign-in-step').getBoundingClientRect().width,

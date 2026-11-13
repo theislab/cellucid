@@ -56,6 +56,7 @@ import { carryCategoryCodesProof } from './category-codes.js';
 import { requireCellPriority } from '../../../data/cell-priority.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { sameKind } from '../../../utils/large-arrays.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../../rendering/alpha-visibility.js';
 
 const FIELD_ARRAY_KEYS = Object.freeze(['values', 'codes', 'outlierQuantiles']);
@@ -101,11 +102,11 @@ export function resizedCellArray(array, from, to, { added = null, fill = 0, widt
  * `array` (`width` values a cell) with its cells in another order: cell `j`
  * of the result is cell `order[j]` of `array`. A new array the caller owns.
  */
-export function movedCellArray(array, order, width = 1) {
+function movedCellArray(array, order, width = 1) {
   if (!ArrayBuffer.isView(array) || array.length !== order.length * width) {
     throw new RangeError(`A per-cell array of ${formatCountOf(order.length, 'cell')} holds ${formatCountOf(order.length * width, 'value')}, not ${array?.length}.`);
   }
-  const out = new array.constructor(array.length);
+  const out = sameKind(array, array.length);
   for (let j = 0; j < order.length; j++) {
     const from = order[j] * width;
     for (let w = 0; w < width; w++) out[j * width + w] = array[from + w];
@@ -143,9 +144,10 @@ function cellRange(from, to) {
  * once. A group made on the cells now open (a category clicked while the
  * cells read again were restoring) already holds the newly open cells its
  * category takes in (`takeInNewCells` runs after it); taken twice, a cell
- * was listed twice and a highlight's cells were no cell set. `a` itself
- * when `b` adds no cell, so the group is not changed (an analysis of its page running meanwhile
- * goes on: changing it ended that run without a word).
+ * would be listed twice and a highlight's cells would be no cell set. `a`
+ * itself when `b` adds no cell, so the group is not changed (an analysis of
+ * its page running meanwhile goes on: changing the group would end that run
+ * without a word).
  */
 function mergedCells(a, b) {
   if (b.length === 0) return a;
@@ -243,6 +245,7 @@ export class DataStateOpenCellsMethods {
    * added row is read before it is called, and it publishes the new cells to
    * the viewer at once.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{
    *   n: number,
    *   identity: import('../../../data/cell-identity.js').CellIdentity,
@@ -374,6 +377,7 @@ export class DataStateOpenCellsMethods {
    * and scores name the cells' new positions. Synchronous; the caller
    * publishes (`publishResizedCells`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{identity: import('../../../data/cell-identity.js').CellIdentity,
    *   priority: {seed: number|null, originals: Uint32Array|null},
    *   positions: Float32Array, order: Uint32Array}} change - `positions`: the
@@ -496,6 +500,7 @@ export class DataStateOpenCellsMethods {
    * released (`resumeActive`) waits for its caller to load it again; the
    * view is shown uncolored meanwhile.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{layoutKey: string|null, from: number, capacity?: number|null}} options - The layout
    *   the live view shows; the open cell count before the resize; the cells
    *   a growth under way reaches (its GPU storage is made for them once)
@@ -541,6 +546,7 @@ export class DataStateOpenCellsMethods {
    * whose field or category is gone leaves its group the cells it has.
    * The fields read must be loaded first.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Uint32Array} cells
    * @param {Array<{group: object, rule: object}>} [rules]
    * @returns {{fields: number, groups: number}} The fields and groups that took cells
@@ -576,7 +582,9 @@ export class DataStateOpenCellsMethods {
 
   /**
    * The codes `derivedCodes` gives a user-defined category made from a
-   * file's loaded column, or null. @private
+   * file's loaded column, or null.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
    */
   _derivedUserDefinedCodes(template, cells) {
     const sourceKey = template._sourceField?.sourceKey;
@@ -593,6 +601,7 @@ export class DataStateOpenCellsMethods {
    * `cells` in their category or range that are visible in the live view,
    * as clicking the category or brushing the range would; `rules` binds
    * carried groups to their rule first (`takeInNewlyOpenCells`). @private
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number} The groups that took cells
    */
   _takeInHighlightGroups(cells, rules) {
@@ -663,7 +672,9 @@ export class DataStateOpenCellsMethods {
 
   /**
    * One field's arrays as `n` cells (`resizeOpenCells`), and what was
-   * derived from them made again or dropped. @private
+   * derived from them made again or dropped.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
    */
   _resizeFieldArrays(field, key, source, from, n, addedRows, outcome) {
     // Derived from every cell: made again when used.
@@ -739,7 +750,8 @@ export class DataStateOpenCellsMethods {
   /**
    * A continuous field's statistics measured again over its resized values,
    * with its filter and color ranges carried (`carriedRange`); a range
-   * nothing of which lies within the new values is reset, and said. @private
+   * nothing of which lies within the new values is reset, and said.
+   * @this {import('../core/data-state.js').DataState}
    */
   _carryContinuousRanges(field, n, outcome) {
     if (field._continuousStats === undefined) return;
@@ -769,7 +781,9 @@ export class DataStateOpenCellsMethods {
    * (`_userDefinedFieldCopies`): a category's codes (added cells labeled
    * from its source column when it was made from one, else missing),
    * a value field's values (added cells NaN); a copy of a field takes its
-   * source's arrays. Centroids are counted again. @private
+   * source's arrays. Centroids are counted again.
+   * @this {import('../core/data-state.js').DataState}
+   * @private
    */
   _resizeUserDefinedFields(from, n, outcome) {
     const registry = this._userDefinedFields;

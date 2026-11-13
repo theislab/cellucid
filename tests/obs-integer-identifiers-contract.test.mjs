@@ -1,6 +1,6 @@
 /**
- * An obs column of 64-bit integers holding values past 2^53 (F116, owner
- * decision 2026-11-11): such values are identifiers, never measurements, and
+ * An obs column of 64-bit integers holding values past 2^53: such values
+ * are identifiers, never measurements, and
  * no number holds them exactly, so the column is read exactly as text, in
  * every reader and format, and says why in one line. A column of 64-bit
  * integers that are all safe stays numbers, exactly (float64).

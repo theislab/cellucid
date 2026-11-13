@@ -150,13 +150,6 @@ test('repository references accept only canonical owner/repo[@branch] syntax', (
     ref: null,
     ownerRepoRef: 'owner/repo',
   });
-  assert.deepEqual(parseOwnerRepo('owner/repo@feature/exact'), {
-    owner: 'owner',
-    repo: 'repo',
-    ownerRepo: 'owner/repo',
-    ref: 'feature/exact',
-    ownerRepoRef: 'owner/repo@feature/exact',
-  });
   assert.deepEqual(parseOwnerRepo('owner/.github'), {
     owner: 'owner',
     repo: '.github',

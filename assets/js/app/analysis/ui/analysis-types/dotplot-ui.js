@@ -651,7 +651,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
       columns,
       rows: chosen.map(row => columns.map(column => (typeof row[column] === 'number' && !Number.isFinite(row[column]) ? null : row[column]))),
       total: rows.length,
-      // What a mean is of: an agent read raw-count means as expression levels.
+      // What a mean is of: a mean of raw counts is not an expression level.
       about: {
         group_by: summary.groupBy,
         expression_matrix: summary.matrixLabel,

@@ -1,7 +1,7 @@
 /**
- * Copying always says how it went (round 9, one-implementation lane): copied,
- * or why not. The Marker genes "Copy genes" button swallowed a refusal in
- * silence; five callers wrote the clipboard each their own way.
+ * Copying always says how it went: copied, or why not. A refusal is never
+ * swallowed in silence (the Marker genes "Copy genes" button), and every
+ * caller writes the clipboard the one way.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

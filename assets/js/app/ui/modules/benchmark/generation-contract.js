@@ -5,11 +5,10 @@
  * can invent a field the other does not publish.
  *
  * It also owns the point-count bounds, because the control and the validators
- * used to state three different rules: `#benchmark-count` advertised
- * 1,000–50,000,000, `assertSyntheticCount` accepted one point and no ceiling,
- * and `dev/benchmark.js` accepted the same but only checked it on the GLB
- * path. `dev/benchmark.js` now imports the bounds, `index.html` declares them,
- * and `benchmark-generation-contract.test.mjs` fails when the markup drifts.
+ * would otherwise state different rules (`#benchmark-count` advertising
+ * 1,000–50,000,000, `assertSyntheticCount` accepting one point and no
+ * ceiling): `dev/benchmark.js` imports the bounds, `index.html` declares
+ * them, and `benchmark-generation-contract.test.mjs` fails when the markup drifts.
  *
  * @module app/ui/modules/benchmark/generation-contract
  */
@@ -95,6 +94,24 @@ export function assertSyntheticCount(count) {
 }
 
 /**
+ * Whether `value` is a URL that stands alone: parsed with no base, so a
+ * document-relative one (which a worker would resolve against its own
+ * script) is refused.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isAbsoluteUrl(value) {
+  if (typeof value !== 'string') return false;
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Validate a request before it crosses the worker boundary.
  *
  * @param {unknown} request - Candidate request.
@@ -117,7 +134,7 @@ export function assertGenerationRequest(request) {
   const count = assertSyntheticCount(request.count);
   const sourceUrl = request.sourceUrl ?? null;
   if (FETCHED_PATTERNS.includes(pattern)) {
-    if (typeof sourceUrl !== 'string' || sourceUrl.length === 0) {
+    if (!isAbsoluteUrl(sourceUrl)) {
       throw new TypeError(
         `Generation pattern "${pattern}" requires one absolute sourceUrl; ` +
         'a worker cannot resolve a document-relative one.'

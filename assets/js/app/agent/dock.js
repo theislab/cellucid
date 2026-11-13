@@ -11,8 +11,6 @@
  *   moves in by the same width. The column's left edge is a grip: drag it,
  *   or use ←/→ on it, to set the width (remembered in this browser,
  *   `cellucid:agent-panel-width`); a double click restores the default.
- *   (Found 2026-11-11: the chat over the bottom of the plot hid the cells
- *   the agent was changing.)
  * - **Bar** (`data-layout="bar"`): the collapsed chat's button, or the open
  *   chat on a narrow window (a phone), along the bottom of the part of the
  *   plot the sidebar does not cover (the viewer's presented area, as the
@@ -27,8 +25,7 @@
  * so the film is not played under it, and comes back when the path stops or
  * pauses ({@link chatFoldsForFilm}; the chat applies it, `chat/index.js`). The
  * side panel stays: it covers no cell, and folding it would widen the plot
- * mid-shot. (Found 2026-11-11, F87: on a narrow window the chat bar covered
- * the lower third of every frame of the film.)
+ * mid-shot.
  *
  * @module app/agent/dock
  */
@@ -41,7 +38,7 @@ import { webStorage } from '../../utils/web-storage.js';
  * widest is not a number of its own: half the window, and never so wide
  * that the plot beside it is narrower than {@link PLOT_MIN_WIDTH}.
  */
-export const PANEL_WIDTH = Object.freeze({ default: 400, min: 320 });
+const PANEL_WIDTH = Object.freeze({ default: 400, min: 320 });
 
 /** The narrowest plot the side panel leaves beside itself and the sidebar. */
 const PLOT_MIN_WIDTH = 480;
@@ -49,7 +46,7 @@ const PLOT_MIN_WIDTH = 480;
 /** One arrow key on the grip moves the edge this far. */
 const KEY_STEP = 24;
 
-export const PANEL_WIDTH_STORAGE_KEY = 'cellucid:agent-panel-width';
+const PANEL_WIDTH_STORAGE_KEY = 'cellucid:agent-panel-width';
 
 /**
  * The panel's width for a window: at least its minimum, never more than half
@@ -60,7 +57,7 @@ export const PANEL_WIDTH_STORAGE_KEY = 'cellucid:agent-panel-width';
  * @param {number} windowWidth
  * @param {number} [sidebarWidth] - what the sidebar covers of the window's left
  */
-export function clampPanelWidth(asked, windowWidth, sidebarWidth = 0) {
+function clampPanelWidth(asked, windowWidth, sidebarWidth = 0) {
   const room = windowWidth - sidebarWidth - PLOT_MIN_WIDTH;
   const max = Math.max(PANEL_WIDTH.min, Math.min(Math.floor(windowWidth / 2), Math.floor(room)));
   const value = Number.isFinite(asked) ? Math.round(asked) : PANEL_WIDTH.default;
@@ -73,7 +70,7 @@ export function clampPanelWidth(asked, windowWidth, sidebarWidth = 0) {
  * what the sidebar covers of the window's left, 0 when it is closed).
  * @param {{windowWidth: number, panelWidth: number, sidebarWidth: number}} sizes
  */
-export function sideLayoutFits({ windowWidth, panelWidth, sidebarWidth }) {
+function sideLayoutFits({ windowWidth, panelWidth, sidebarWidth }) {
   return windowWidth - panelWidth - sidebarWidth >= PLOT_MIN_WIDTH;
 }
 
@@ -93,7 +90,7 @@ export function chatFoldsForFilm({ playing, sidePanel, drafting, asking, kept })
  * @param {HTMLElement} dock
  * @param {{presentedArea: {cssLeft: number, cssWidth: number}}} layout
  */
-export function placeAgentDock(dock, layout) {
+function placeAgentDock(dock, layout) {
   const area = layout?.presentedArea;
   if (!area || !Number.isFinite(area.cssLeft) || !Number.isFinite(area.cssWidth) || area.cssLeft < 0 || area.cssWidth <= 0) {
     throw new TypeError('The agent dock is placed in one presented layout.');

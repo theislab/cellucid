@@ -12,9 +12,11 @@
  * archive of over 5 GiB (a sparse file on disk) whose entries lie past
  * 4 GiB.
  *
- * Runs where this machine has a Python with anndata, mudata and zarr (the
- * workspace's environment, `.environments/python/venv`, or `python3`) and
- * the cellucid-python checkout; skipped, saying why, where it has not.
+ * Runs where this machine has a Python with anndata, mudata and zarr
+ * (`CELLUCID_PYTHON`, the workspace's environment,
+ * `.environments/python/venv`, or `python3`) and the cellucid-python
+ * checkout; skipped, saying why, where it has not, and a failure where
+ * `CELLUCID_REQUIRE_VIEWERS=1` (the CI job with those packages) asks for it.
  */
 import assert from 'node:assert/strict';
 import { closeSync, ftruncateSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';

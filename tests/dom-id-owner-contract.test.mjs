@@ -9,8 +9,8 @@
  * on a deployment the project documents and supports.
  *
  * Uniqueness here is uniqueness *within one document*, which a counter gives by
- * construction. Randomness was never the requirement, so needing a secure
- * context for it was a cost with nothing bought.
+ * construction. Randomness is not the requirement, so needing a secure
+ * context for it is a cost with nothing bought.
  */
 
 import assert from 'node:assert/strict';
@@ -130,7 +130,7 @@ test('there is exactly one DOM id generator in the tree', async () => {
 });
 
 // A minted id is recognized by its form, so the page keeps nothing per id it
-// mints (F123, LC-5: a set of every minted id grew for the page's life).
+// mints (a set of every minted id would grow for the page's life).
 
 test('a minted id holds the reserved separator, and is recognised by it with nothing kept', async () => {
   const { isGeneratedDomId, MINTED_ID_SEPARATOR } = await import('../assets/js/app/ui/components/dom-id.js');

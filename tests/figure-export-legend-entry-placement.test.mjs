@@ -1,12 +1,12 @@
 /**
- * L6-2 (2026-11-11): a legend entry stands at one place in both formats.
+ * A legend entry stands at one place in both formats.
  *
- * The SVG set an entry label's bottom at the swatch's bottom
- * (`dominant-baseline="ideographic"`), the PNG its alphabetic baseline there:
- * the two formats of one export placed every label differently, and in a
- * legend font larger than the swatch (Auto text on a large grid figure) the
- * first label rose into the legend's title. Now swatch and label are centered
- * on the entry's row, the label on an alphabetic baseline, in both formats.
+ * Swatch and label are centered on the entry's row, the label on an
+ * alphabetic baseline, in both formats. A label whose bottom is set at the
+ * swatch's bottom (`dominant-baseline="ideographic"` in the SVG, the
+ * alphabetic baseline in the PNG) is placed differently by the two formats of
+ * one export, and in a legend font larger than the swatch (Auto text on a
+ * large grid figure) the first label rises into the legend's title.
  */
 
 import assert from 'node:assert/strict';

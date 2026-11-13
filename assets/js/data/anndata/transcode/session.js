@@ -4,7 +4,7 @@
  * opened before (in this tab, another one, or an earlier visit) is reused;
  * otherwise a space is opened, the format's `build` writes one store per
  * object the source holds, the manifest is written last, and the person
- * picks among several objects (D20).
+ * picks among several objects.
  *
  * @module data/anndata/transcode/session
  */

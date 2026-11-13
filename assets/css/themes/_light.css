@@ -65,7 +65,7 @@
   --color-info-soft: var(--blue-50);
   --color-info-text: var(--blue-700);
 
-  /* History branch lanes (History v2 §3.9): eight color slots a branch keeps
+  /* History branch lanes: eight color slots a branch keeps
      for life (Branch.lane); color is never the only cue (names and glyphs
      carry identity). The graph draws its nodes as text glyphs, so each clears
      4.5:1 against the panel surfaces. */

@@ -1,8 +1,8 @@
 /**
- * The field action buttons are icon-only and were named by their `title`
- * attribute alone, which also meant two buttons in the same panel answered to
- * the same name (CEL-AUDIT-0086). This measures the computed name in the
- * running browser, which is the only place the ambiguity was visible.
+ * The field action buttons are icon-only: named by their `title` attribute
+ * alone, two buttons in the same panel would answer to the same name. This
+ * measures the computed name in the running browser, which is the only place
+ * the ambiguity is visible.
  */
 
 import { expect, test } from './helpers/test.mjs';
@@ -34,7 +34,7 @@ const FIELD_ACTION_GROUPS = Object.freeze([
   'Gene expression actions'
 ]);
 
-test('every field action button answers to exactly one name', async ({ page }) => {
+test('every field action button answers to exactly one name, and the sidebar toggle keeps its name and state', async ({ page }) => {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
@@ -46,28 +46,22 @@ test('every field action button answers to exactly one name', async ({ page }) =
     await expect(page.getByRole('button', { name, exact: true })).toHaveCount(1);
   }
 
-  // The group label existed already but sat on a bare <div>, where naming is
-  // prohibited, so it named nothing.
+  // The group label is on an element that may be named: naming is prohibited on
+  // a bare <div>, where it would name nothing.
   for (const name of FIELD_ACTION_GROUPS) {
     await expect(page.getByRole('group', { name, exact: true })).toHaveCount(1);
   }
-});
+  await test.step('the sidebar toggle keeps the name and state its module publishes', async () => {
+    const toggle = page.locator('#sidebar-toggle');
+    await expect(toggle).toHaveAccessibleName('Hide sidebar');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
 
-test('the sidebar toggle keeps the name and state its module publishes', async ({
-  page
-}) => {
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
+    await toggle.click();
+    await expect(toggle).toHaveAccessibleName('Show sidebar');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
 
-  const toggle = page.locator('#sidebar-toggle');
-  await expect(toggle).toHaveAccessibleName('Hide sidebar');
-  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
-
-  await toggle.click();
-  await expect(toggle).toHaveAccessibleName('Show sidebar');
-  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
-
-  await toggle.click();
-  await expect(toggle).toHaveAccessibleName('Hide sidebar');
-  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await toggle.click();
+    await expect(toggle).toHaveAccessibleName('Hide sidebar');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  });
 });

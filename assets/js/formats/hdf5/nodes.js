@@ -32,6 +32,7 @@ import { filterName } from './filters.js';
 import { DatasetReader } from './read-plan.js';
 import { Hdf5UnsupportedError } from './errors.js';
 import { setOwnDataProperty } from '../../utils/exact-record.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 function joinPath(parent, name) {
   return parent === '/' ? `/${name}` : `${parent}/${name}`;
@@ -237,13 +238,9 @@ Hdf5Tree.prototype.nodeAs = function nodeAs(node, path) {
  * plan of more collections joins neighbors that one a part could not, and
  * costs no time, since its requests would have waited anyway. While the link
  * has room (a multiplexed link, an idle one), each part's collections are
- * loaded as it arrives: nothing waits for a batch to fill. Measured on a
- * CSR `.h5ad`'s obs index of strings (a lane measurement, 1% uniform):
- * every part's collections loaded as they arrived took 85.8 s at 10M over
- * 150 ms HTTP/1.1 (2,067 requests) and 71.8 s at 100M over 20 ms HTTP/2;
- * one union after every part 68.8 s and 87.7 s (a barrier: the link idle
- * while every reference arrived); batches of a round of the link's
- * concurrent requests 80.2 s and 87.1 s.
+ * loaded as it arrives: nothing waits for a batch to fill (measured against
+ * one union after every part and against batches of a round of requests:
+ * 22_decisions_link_model_and_request_planning.md).
  *
  * A collection is held while a part given still points into it, and let go
  * once every such part has decoded, kept a while among the recently let go
@@ -288,8 +285,7 @@ export class HeapStream {
 
   /** Settled at the next flush: a part waits for the one asking its collections. */
   nextFlush() {
-    let resolve;
-    const promise = new Promise(settle => { resolve = settle; });
+    const { promise, resolve } = promiseWithResolvers();
     return { promise, resolve };
   }
 
@@ -585,9 +581,7 @@ export class Hdf5Array extends Hdf5Node {
     const untilAsked = j => {
       if (references[j] !== undefined) return Promise.resolve();
       if (asked[j] === undefined) {
-        let resolve;
-        const promise = new Promise(settle => { resolve = settle; });
-        asked[j] = { promise, resolve };
+        asked[j] = promiseWithResolvers();
       }
       return asked[j].promise;
     };
@@ -596,12 +590,16 @@ export class Hdf5Array extends Hdf5Node {
     for (let k = 0; k < boxes.length; k++) {
       const box = boxes[k];
       const bytes = (box.end - box.start) * size;
-      while (outstanding > 0 && outstanding + bytes > windowBytes) await new Promise(resolve => { wake = resolve; });
+      while (outstanding > 0 && outstanding + bytes > windowBytes) {
+        const woken = promiseWithResolvers();
+        wake = woken.resolve;
+        await woken.promise;
+      }
       throwIfAborted(signal);
       outstanding += bytes;
       // References are not kept past the read (`options.chunks` is not
       // used): a share holds its own rows' strings, not every row's
-      // references (160 MB at 10M cells); a later read of other rows (a
+      // references; a later read of other rows (a
       // growth step) reads their chunks again, a fraction of the heap it
       // reads anyway.
       const read = this.reader.read([[box.start, box.end]], options).finally(() => {

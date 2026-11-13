@@ -364,8 +364,8 @@ export function buildGroupCategoriesTransform(categories, groups, restLabel) {
  * a grouping: a kept category keeps its own; each group, in order, takes the
  * color of the first category it holds when that can be told apart from the
  * kept categories' and the earlier groups' (`distinct-colors.js`), else the
- * next palette color that can (F111: two groups whose first categories were
- * gold and orange looked like one); each is shown while any of its
+ * next palette color that can (two groups whose first categories are gold
+ * and orange would look like one); each is shown while any of its
  * categories was.
  *
  * @param {ReturnType<typeof buildGroupCategoriesTransform>} transform

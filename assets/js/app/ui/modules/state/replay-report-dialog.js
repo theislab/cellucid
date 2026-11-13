@@ -1,6 +1,6 @@
 /**
- * @fileoverview The report of a replay (History v2 §3.10; E2's report, in a
- * dialog): "Replayed “Main” on Sample B · 14 of 16 steps applied", then each
+ * @fileoverview The report of a replay, in a
+ * dialog: "Replayed “Main” on Sample B · 14 of 16 steps applied", then each
  * step replayed, ✓ applied, = unchanged here, ✗ not applied (with why),
  * skipped or stopped; a step not applied is shown in the graph by its button.
  * It reads the tracker's own record (`start.report`), so a saved and loaded
@@ -33,7 +33,7 @@ const KIND_WORDS = Object.freeze({ field: 'field', category: 'category', gene: '
  * The report's heading for a replayed tracker.
  * @param {object} tracker
  */
-export function replayHeading(tracker) {
+function replayHeading(tracker) {
   const start = tracker.start;
   const report = start?.report ?? [];
   const applied = report.filter(entry => entry.outcome === 'applied' || entry.outcome === 'unchanged').length;
@@ -47,7 +47,7 @@ export function replayHeading(tracker) {
  * @param {Array<{outcome: string, missing?: object|null}>} report
  * @returns {Array<{kind: string, name: string, field: string|null}>}
  */
-export function missingNames(report) {
+function missingNames(report) {
   const seen = new Map();
   for (const entry of report) {
     if (entry.outcome !== 'unmatched' || entry.missing == null) continue;

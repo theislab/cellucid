@@ -86,23 +86,3 @@ export function setup({ withHistoryActions = false } = {}) {
   return { state, domains, dispatcher, history };
 }
 
-/** Two trackers; the first with a branch, a cell set, a coalesced camera and a conversation. */
-export async function richHistory() {
-  const page = setup({ withHistoryActions: true });
-  const { dispatcher, history } = page;
-  await history.startTracker({ name: 'Annotation' });
-  // Every tenth cell of 1000: a strictly increasing Uint32Array, stored as a cell set.
-  const cells = Uint32Array.from({ length: 100 }, (_, i) => i * 10);
-  await dispatcher.dispatch('highlight.cells', { label: 'T cells', cells });
-  await dispatcher.dispatch('color.by', { field: 'leiden' });
-  await history.undo();
-  await dispatcher.dispatch('color.by', { field: 'sample' });
-  for (const at of [1, 2, 3]) await dispatcher.dispatch('camera.set', { at });
-  await dispatcher.dispatch('history.branch.rename', { branch: history.active.activeBranch, name: 'By sample' });
-  history.setChat(history.active.id, 'c1', { messages: [{ role: 'user', text: 'Which cluster is CD8?' }] });
-  await history.startTracker({ name: 'Exploration' });
-  await dispatcher.dispatch('color.by', { field: 'stage' });
-  await history.useTracker('t-00000000-0000-4000-8000-000000000001');
-  return page;
-}
-

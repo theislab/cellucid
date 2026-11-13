@@ -22,9 +22,9 @@
  * a large directory keeps the files to ask for coming while it is listed.
  * The files are returned sorted by path, whatever order they arrived in.
  *
- * What it gains is the engine's (measured on 22,000-file and 6,272-file
- * Zarr folders): WebKit answers each file on a background thread, so its
- * listing takes about 0.73 of the time; Chromium's file system answers one
+ * What it gains is the engine's: WebKit answers each file on a background
+ * thread, so its listing takes a fraction of the time (measured:
+ * 22_decisions_link_model_and_request_planning.md); Chromium's file system answers one
  * call at a time however many are asked (its handles are the faster way,
  * read where a drop gives one, `ui/modules/dataset-drop.js`); Firefox
  * answers a file in microseconds, with nothing to overlap.

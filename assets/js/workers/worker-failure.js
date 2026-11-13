@@ -7,9 +7,9 @@
  * server no longer has it, a module of its graph failed, the browser could
  * not start one more thread) arrives as a plain `Event`, with no message in
  * any engine: it is said so, and that this browser is offline when it is,
- * never as an unknown error. Measured: a spatial-tree worker started after
- * the browser went offline reported "Background spatial index worker
- * failed: unknown error" (Web contracts run 41213981681).
+ * never as an unknown error (a spatial-tree worker started after the browser
+ * went offline would otherwise report "Background spatial index worker
+ * failed: unknown error").
  *
  * The browser says no more than that, so `explainWorkerFailure` asks for
  * the worker's script itself, as the worker did, and names what it gets: no
@@ -17,17 +17,13 @@
  * for a bundle the server no longer has: 404), a type that is not a script,
  * or the script served as it should be, which leaves a module it imports
  * (a worker started from its sources, `worker-script.js`) or the browser's
- * refusal to start another thread. Measured: a reader worker of a dataset
- * opened in a Chromium browser-test run said only "The AnnData reader could
- * not start (its code could not be loaded)", the run's trace gone with its
- * worktree, and nothing told which of those it was (audit of 2026-11-07,
- * `figure-export.spec.mjs`, 1 run in 750).
+ * refusal to start another thread. A reader worker that fails to start would
+ * otherwise say only "The AnnData reader could not start (its code could not
+ * be loaded)", and nothing would tell which of those it was.
  *
- * Kept apart from `worker-script.js`, which the kept-store and kept-index
- * revision digests guard (`tests/transcode-cache-contract.test.mjs`,
- * `tests/kept-column-index-contract.test.mjs`): wording is not what a kept
- * store holds. So the address a worker was started from is noted here, by
- * whoever starts it (`noteWorkerScript`).
+ * `worker-script.js` says where a worker's script comes from; what a
+ * failure to start one is said as is here. So the address a worker was
+ * started from is noted here, by whoever starts it (`noteWorkerScript`).
  *
  * @module workers/worker-failure
  */
@@ -36,7 +32,7 @@
 const scripts = new WeakMap();
 
 /**
- * @param {Event|ErrorEvent|null|undefined} event
+ * @param {(Event & {message?: unknown})|null|undefined} event - An `ErrorEvent` has a message; a plain event none
  * @returns {string} what the event itself says, trimmed; empty when nothing
  */
 function eventMessage(event) {

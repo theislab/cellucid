@@ -118,12 +118,10 @@ async function writeMatrix(writer, path, matrix) {
  *
  * X is kept by feature (`csc_matrix`), so a gene is one contiguous range, as
  * in a Cellucid-ready AnnData, each gene's rows ascending, with its prefix
- * counts (`priority.js` `matrixInOrder`, in bounded memory). Measured on a
- * 50,000-cell Seurat object (75 M entries a layer, Node, Apple M1 Pro):
- * laying X out by feature takes 4 s more per matrix (6.7 s with none, 10.9 s
- * with X, 14.8 s with X and counts), and every later visit reads a gene in
- * 7 ms instead of building a column index first (1.2 s and 0.9 s for the
- * first two genes, 800 MB of memory, on every visit). The other layers, read
+ * counts (`priority.js` `matrixInOrder`, in bounded memory). Laying X out
+ * by feature takes seconds more per matrix, and every later visit reads a
+ * gene in milliseconds instead of building a column index first (measured:
+ * 23_decisions_partial_reading.md). The other layers, read
  * only when the data mapping picks one, keep the object's layout, their
  * rows in priority order, and are indexed then.
  */

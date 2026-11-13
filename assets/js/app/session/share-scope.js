@@ -1,6 +1,6 @@
 /**
  * @fileoverview What a Save or a Share chose, made into the trackers a
- * session file holds (History v2 §3.11, §3.15.3). Pure: no page, no pool
+ * session file holds. Pure: no page, no pool
  * reads beyond the values it is handed; importable in Node.
  *
  * A **choice** (`ShareChoice`) names:

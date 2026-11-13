@@ -106,9 +106,9 @@ test('a module imported at its own address imports nothing but other such module
       assert.ok(PAGE_EXTERNALS.includes(imported), `${path} imports ${imported}, which is not in PAGE_EXTERNALS`);
     }
   }
-  // The builder refuses one (round 9: worker-script.js came to import
-  // utils/listener-set.js, not then an external, which a deployed page asked
-  // for from the sources beside its copy in the bundle).
+  // The builder refuses one: a module a worker script imports that is not an
+  // external would make a deployed page ask for it from the sources beside its
+  // copy in the bundle.
   const workerScript = 'assets/js/workers/worker-script.js';
   const text = `import { cancel } from '../utils/abort.js';\n${await readFile(join(ROOT, ...workerScript.split('/')), 'utf8')}`;
   assert.deepEqual(externalImports(workerScript, text), ['assets/js/utils/abort.js', 'assets/js/utils/listener-set.js']);

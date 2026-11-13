@@ -272,8 +272,8 @@ test('the slider track ends are the exact data bounds', async () => {
   );
 });
 
-test('a bound is typed exactly, a slider sets a short one, and only the moved bound changes (NS-10)', async () => {
-  // total_counts from 500 to 100,000: a 1% step was 995 counts, so "≥ 1,500" could not be set.
+test('a bound is typed exactly, a slider sets a short one, and only the moved bound changes', async () => {
+  // total_counts from 500 to 100,000: a 1% step is 995 counts, so "≥ 1,500" cannot be set by it.
   const legend = renderLegend([500, 900, 1500, 2000, 40000, 100000]);
   legend.minBox.value = '1500';
   await legend.fire(legend.minBox, 'change');
@@ -317,7 +317,7 @@ test('drawing the legend does not rewrite the filter it displays', () => {
   assert.deepEqual(legend.field._continuousFilter, { min: 1.234, max: 8.765 });
 });
 
-test('a color range following a filter of "≥ 1" on counts keeps the cells at 1 colored; with gray for zero, only zeros are gray (NS-10)', async () => {
+test('a color range following a filter of "≥ 1" on counts keeps the cells at 1 colored; with gray for zero, only zeros are gray', async () => {
   const { NEUTRAL_GRAY_UINT8 } = await import('../assets/js/app/state/core/constants.js');
   const counts = [0, 0, 1, 1, 1, 2, 5, 9];
   const legend = renderLegend(counts);
@@ -336,7 +336,7 @@ test('a color range following a filter of "≥ 1" on counts keeps the cells at 1
   assert.equal(colors[2 * 4 + 3], 255);
 });
 
-test('a diverging colormap over data spanning 0 is centred there; a sequential one and one-signed data are not (NS-13)', async () => {
+test('a diverging colormap over data spanning 0 is centred there; a sequential one and one-signed data are not', async () => {
   const { buildColorScaleNote } = await import('../assets/js/app/ui/modules/figure-export/components/legend-builder.js');
   const { CONTINUOUS_COLORMAPS } = await import('../assets/js/data/palettes.js');
   assert.deepEqual(
@@ -419,7 +419,7 @@ const paletteBar = (legend) => legend.drawn().find((node) => node.className === 
 const paletteOption = (legend, label) => legend.drawn().find((node) => String(node.className ?? '').startsWith('colormap-option') && node.children.some((child) => child.textContent === label));
 const liveSwitch = (legend) => legend.drawn().find((node) => node.attributes.role === 'switch' && node.children.some((child) => child.textContent === 'Live filtering'));
 
-test('the palette menu marks the palette the field is drawn in now, and choosing it applies it (R9F-1)', async () => {
+test('the palette menu marks the palette the field is drawn in now, and choosing it applies it', async () => {
   const legend = renderLegend([0, 1, 2, 3]);
   await press(paletteBar(legend));
   await press(paletteOption(legend, 'Plasma'));
@@ -433,7 +433,7 @@ test('the palette menu marks the palette the field is drawn in now, and choosing
   assert.equal(legend.field._colormapId, 'plasma');
 });
 
-test('choosing a palette keeps Live filtering off and the bounds moved but not filtered (R9F-1)', async () => {
+test('choosing a palette keeps Live filtering off and the bounds moved but not filtered', async () => {
   const legend = renderLegend([0, 1, 2, 3, 4]);
   await legend.fire(liveSwitch(legend), 'click');
   assert.equal(liveSwitch(legend).attributes['aria-checked'], 'false');
@@ -448,7 +448,7 @@ test('choosing a palette keeps Live filtering off and the bounds moved but not f
   assert.equal(paletteBar(legend).attributes['aria-label'], 'Color palette: Magma');
 });
 
-test('Live filtering, turned off, stays off when the legend is drawn again (R9F-2)', async () => {
+test('Live filtering, turned off, stays off when the legend is drawn again', async () => {
   const legend = renderLegend([0, 1, 2, 3, 4]);
   await legend.fire(liveSwitch(legend), 'click');
   legend.redraw();

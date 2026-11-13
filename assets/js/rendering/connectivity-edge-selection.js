@@ -336,8 +336,8 @@ function growScratch(scratch, name, length) {
   return scratch[name];
 }
 
-// Costs in nanoseconds, measured on the app's kernels (Apple M1 Pro,
-// Node and Chromium; 10M cells, k = 15, 70M edges): a rank of the shown-order
+// Costs of the scan's steps in nanoseconds (measured on the app's kernels:
+// 24_decisions_graph_edges_at_scale.md): a rank of the shown-order
 // prefix is one sequential record; a rank past it reads its edge's order step
 // and destination (a hidden destination ends there), and a visible
 // destination adds the source search; the cell walk reads each cell's mask

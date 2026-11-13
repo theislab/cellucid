@@ -23,7 +23,7 @@ export class RObjectRefusal extends LayoutRefusal {
 }
 
 /**
- * Data with no cell embedding (D4).
+ * Data with no cell embedding.
  *
  * @param {string} subject - What was opened ("This Seurat object", "This MatrixMarket folder")
  * @param {{outs?: boolean, fromLink?: boolean}} [options] - `outs`: a 10x

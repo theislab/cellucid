@@ -121,9 +121,9 @@ export async function observePage(page) {
       // the recorder attaches when the center is appended to the body.
       // A notification is known by the id it was published with. Dismissing
       // one takes the id off its element while it animates out, and keyed by
-      // its current id that exiting card was a second notification with the
-      // same text: on a runner slow enough that a success card's four
-      // seconds ran out before the check, "announced once" counted two.
+      // its current id, that exiting card would count as a second
+      // notification with the same text, and "announced once" would count
+      // two when a card's seconds run out before the check.
       const publishedIds = new WeakMap();
       // A card is held hidden for its first second (NOTICE_AFTER_MS in
       // notification-center.js) and one that settles quietly in that time

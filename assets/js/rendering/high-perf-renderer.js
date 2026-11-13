@@ -163,17 +163,8 @@ function createEmptyPointPrograms() {
   };
 }
 
-/**
- * Debug flag for LOD and frustum culling logs.
- * Set to true to enable verbose console output during rendering.
- * This should be false in production to avoid performance impact.
- */
-let DEBUG_LOD_FRUSTUM = false;
 
 
-const VISIBLE_INDEX_GROWTH_FACTOR = 1.5;
-const VISIBLE_INDEX_SHRINK_RATIO = 4;
-const VISIBLE_INDEX_MIN_RECLAIM = 256 * 1024;
 /**
  * Largest number of separate row regions one alpha publication may send.
  *
@@ -238,13 +229,11 @@ function collectAlphaUploadRegions(dirtyRows, height, regions) {
  * (`GpuPermuter`), so no client allocation proportional to the point count
  * exists for it either.
  *
- * The two streams are also what makes a recolor cheap. Position and color
- * used to share one 16-byte record, so every color change repacked and
- * re-uploaded the positions beside it; now a recolor writes only the 4-byte
- * color stores and a dimension switch only the position stores (4 bytes per
- * embedding axis a point: 4, 8 or 12).
- * Splitting costs no vertex throughput: measured on Chromium/Metal with 5M
- * points, the split full-detail draw was within noise of the interleaved one.
+ * The two streams are also what makes a recolor cheap: a recolor writes only
+ * the 4-byte color stores and a dimension switch only the position stores (4
+ * bytes per embedding axis a point: 4, 8 or 12), where one record holding both
+ * would repack and re-upload the other on every change. Splitting costs no
+ * vertex throughput (measured: 28_decisions_rendering_layers.md).
  *
  * WebGL's per-buffer caps are byte caps. They were measured on all three
  * engines by bisecting to the exact refusing byte count -- Chromium 2^31 - 2^21,
@@ -270,9 +259,10 @@ function collectAlphaUploadRegions(dirtyRows, height, regions) {
  * Most draw ranges one frustum-culled draw issues where each range is its
  * own `drawArrays` (engines without `WEBGL_multi_draw`: Firefox). Ranges are
  * coarsened to fit by bridging the gaps that hide the fewest points: drawing
- * a few points outside the frustum costs less than another draw call. At 10M
- * points, 252 coarsened ranges drew a zoomed view in 7 ms on all three
- * engines, against 21-31 ms for the per-point index path they replace.
+ * a few points outside the frustum costs less than another draw call: 252
+ * coarsened ranges draw a zoomed view of 10M points several times faster than
+ * the per-point index path they replace on all three engines (measured:
+ * 28_decisions_rendering_layers.md).
  */
 const MAX_CULLED_DRAW_RANGES = 256;
 
@@ -280,11 +270,10 @@ const MAX_CULLED_DRAW_RANGES = 256;
  * Points a frame puts in a tree's draw order, across every store, while a
  * store takes the order band by band (see "STORE ORDERS"): the frames meanwhile
  * keep drawing every level of detail. At least one band moves a frame (a band
- * holds at most `DRAW_BAND_POINTS`, the same count). Measured with 8M 3D cells
- * (Apple M1 Pro): 8M in one frame held the main thread 29 ms (Chromium), 54 ms
- * (Firefox) and 104 ms (WebKit), mostly writing the slot map's texels; at
- * this count a frame of the adoption takes a median 12.5 / 3 / 23 ms (the
- * first, which allocates the map and the source, up to 22 / 40 / 65 ms).
+ * holds at most `DRAW_BAND_POINTS`, the same count). Adopting a store's order
+ * whole in one frame holds the main thread for tens of milliseconds at
+ * millions of points, mostly writing the slot map's texels
+ * (measured: 28_decisions_rendering_layers.md).
  */
 const STORE_ORDER_POINTS_PER_FRAME = 2 ** 21;
 
@@ -325,18 +314,16 @@ const UNREAD_ONLY_DRAW_PASSES = Object.freeze([UNREAD_DRAW_PASS]);
  * loaded dataset already occupies, and the transient peak it reaches on top of
  * that.
  *
- * Fitted from a 5M/10M/20M/30M curve measured on Chromium: the settled heap is
- * 79.8 B a point plus 24 MiB with the LOD index built and 51.9 B a point plus
- * 20 MiB without it, so the build *retains* 27.9 B a point plus 4 MiB. The
- * transient term is the scratch that is live simultaneously during the build
- * and enumerable from the code: three `Uint32Array(pointCount)` in the
- * ordering pass at calibration time (12 B; the priority order that replaced it,
- * `data/cell-priority.js`, holds at most 8 B for a dataset opened whole and 16 B
- * for a `blocks` subsample), the leaves and the geometric child chain
- * `buildNode` (`high-perf/spatial-tree.js`) holds (~8.6 B), and 16 B that at calibration time was a
- * point-count-sized packing scratch. Stores are now gathered on the GPU, so
- * that scratch no longer exists; the 16 B stays in the projection as margin
- * until the 40M Chromium hang is measured again.
+ * The retained term is the settled heap with the LOD index built less the one
+ * without it, fitted from a curve of point counts measured on Chromium
+ * (27_decisions_memory_model.md). The transient term is the scratch that is
+ * live simultaneously during the build and enumerable from the code: three
+ * `Uint32Array(pointCount)` in the ordering pass (12 B; the priority order,
+ * `data/cell-priority.js`, holds at most 8 B for a dataset opened whole and
+ * 16 B for a `blocks` subsample), the leaves and the geometric child chain
+ * `buildNode` (`high-perf/spatial-tree.js`) holds (~8.6 B), and a margin of
+ * 16 B a point (stores are gathered on the GPU, so no packing scratch of that
+ * size exists).
  *
  * A build that fits its settled size but not its peak is the worst outcome
  * available: the engine neither completes nor throws, it collects a multi-GiB
@@ -352,10 +339,9 @@ const LOD_BUILD_HEAP_FIXED_BYTES = 4 * 1024 * 1024;
  * thread: only the decoded tree's nodes, about one per thousand points. The
  * rest of what comes back (the draw order, the leaves' ids) are typed arrays,
  * whose bytes live outside the JS heap and are not what `jsHeapSizeLimit`
- * bounds (Chromium accepted 15 GiB of `ArrayBuffer`s with a 4.1 GiB limit,
- * plans/scale-50m-100m.md §3.1); the build's scratch is the worker's.
- * Measured in V8 (Node 26, 3D, 1,000 points a leaf): 1.06 B a point at 2M
- * and 1.53 B at 10M, retained after a collection; rounded up.
+ * bounds (Chromium accepts `ArrayBuffer`s far beyond that limit); the build's
+ * scratch is the worker's. Measured in V8 per point after a collection and
+ * rounded up (27_decisions_memory_model.md).
  */
 const LOD_WORKER_RESULT_HEAP_BYTES_PER_POINT = 2;
 
@@ -2648,7 +2634,7 @@ export class HighPerfRenderer {
       }
       this._flushPendingPositionUpload();
       // The live generation already is this geometry, on the CPU and on the
-      // GPU. Copying it cost the snapshot a second array and a second VBO of
+      // GPU. Copying it would cost the snapshot a second array and a second VBO of
       // the same coordinates: 4 bytes per axis per point twice over, 240 MB
       // for one kept view of a 10,000,000-point 3D embedding.
       geometry = {
@@ -4430,7 +4416,6 @@ export class HighPerfRenderer {
    */
   _releaseDormantSnapshotStores() {
     if (!(this.snapshotBuffers instanceof Map)) return 0;
-    const gl = this.gl;
     let released = 0;
     for (const snapshot of this.snapshotBuffers.values()) {
       if (!this._isDormantSnapshot(snapshot)) continue;
@@ -4526,7 +4511,8 @@ export class HighPerfRenderer {
     // evict it can only be reported, so a caller that recovers from a failed
     // allocation later (`onError`) has it checked in a later frame instead:
     // reading the error queue now waits for every command before it, a
-    // whole 100M-point frame and more (0.7 s at a 100M 3D adoption's start).
+    // whole 100M-point frame and more (measured:
+    // 28_decisions_rendering_layers.md).
     if (onError !== null && this.getRetainedGeometryBytes() + this.getKeptColorBytes() + this._dormantSnapshotStoreBytes() === 0) {
       allocate();
       deferWebGLErrorCheck(gl, {
@@ -5124,7 +5110,7 @@ export class HighPerfRenderer {
    *   maxY: number,
    *   minZ: number,
    *   maxZ: number
-   * }|null} [overrideBounds=null]
+   * }|null} overrideBounds - null: the bounds of the cells
    * @param {{fogNear: number, fogFar: number}|HighPerfRenderer} target
    * @returns {{fogNear: number, fogFar: number}|HighPerfRenderer}
    */
@@ -5470,17 +5456,8 @@ export class HighPerfRenderer {
 
     const {
       mvpMatrix,
-      viewMatrix,
-      modelMatrix,
-      projectionMatrix,
       pointSize,
-      sizeAttenuation,
       viewportHeight,
-      fov,
-      lightingStrength,
-      fogDensity,
-      fogColor,
-      lightDir,
       cameraDistance,
       cameraPosition,
       forceLOD,
@@ -5525,8 +5502,8 @@ export class HighPerfRenderer {
     // The view's tree (built in a worker; nothing is built here), and the
     // order its store holds: the tree's order is adopted band by band
     // (`_ensureStoreDrawOrder`) whenever the tree exists (a hover tree counts
-    // too), since the order alone draws a 10M full-detail frame about 3x
-    // faster in 2D and in 3D.
+    // too), since the order alone draws a 10M full-detail frame several times
+    // faster in 2D and in 3D (measured: 28_decisions_rendering_layers.md).
     const needsSpatialIndex = this._needsSpatialIndex(forceLOD);
     const needsLOD = this._needsLodResources(forceLOD);
     const spatialIndex = needsSpatialIndex
@@ -5896,7 +5873,7 @@ export class HighPerfRenderer {
    * Publish the per-draw point uniforms every point pass shares. A location the
    * active quality's shader does not declare is null and skipped. The fog range
    * is the renderer-wide value the current frame computed. The products the
-   * shaders used to form per vertex or per fragment (model-view matrix, point
+   * shaders would form per vertex or per fragment (model-view matrix, point
    * scale, Blinn half vector) are derived here once per draw into renderer
    * scratch, see `writePointShaderFrame`.
    */
@@ -5986,9 +5963,8 @@ export class HighPerfRenderer {
   // is one `drawArrays` prefix and frustum culling draws node ranges -- no
   // per-point index ever leaves the CPU after the order is built. Neighboring
   // points are also neighbors in memory and on screen, which is what makes
-  // the stored order faster to draw at full detail than source order (10M
-  // points: 18 ms against 68 ms on Chromium, 15 against 57 on WebKit, 14
-  // against 57 on Firefox).
+  // the stored order faster to draw at full detail than source order
+  // (measured: 28_decisions_rendering_layers.md).
   //
   // Positions are per geometry, so each geometry carries its order; colors
   // are per view and are gathered into the order of the geometry the view
@@ -6755,7 +6731,6 @@ export class HighPerfRenderer {
     if (this._liveColorOrder !== order && !this._colorsDirty && !sameStoreOrders(this._liveColorOrder, order)) {
       // The live view now shows another geometry: keep the store it leaves,
       // and draw with the one kept for this order (or a new one).
-      const gl = this.gl;
       const buffer = this._swapColorStore(
         this._liveColorCache,
         {
@@ -6815,7 +6790,6 @@ export class HighPerfRenderer {
     if (!(snapshot.colorCache instanceof Map)) snapshot.colorCache = new Map();
     // The view now shows another geometry: keep the store it leaves, and
     // draw with the one kept for this order (or a new one).
-    const gl = this.gl;
     const buffer = this._swapColorStore(
       snapshot.colorCache,
       {
@@ -8907,8 +8881,11 @@ export class HighPerfRenderer {
    *   reference (null: every cell shown).
    * @param {Float32Array} viewPositions - Exact positions owned by this view.
    * @param {number} dimensionLevel - Exact published view dimension.
-   * @param {boolean} [forceGeometryPublication=false] - Treat even the same
+   * @param {boolean} forceGeometryPublication - Treat even the same
    *   input identity as a new immutable geometry publication.
+   * @param {boolean} replaceColor - Whether `colors` replaces the snapshot's.
+   * @param {boolean} replaceAlpha - Whether `alphas` replaces the snapshot's;
+   *   only together with its colors.
    * @returns {boolean} Success
    */
   _replaceSnapshotResources(
@@ -9825,10 +9802,7 @@ export class HighPerfRenderer {
 
     const gl = this.gl;
     const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity,
-      fogColor, lightDir,
+      mvpMatrix,
       cameraPosition, cameraDistance,
       forceLOD,
       quality,
@@ -10113,7 +10087,6 @@ export class HighPerfRenderer {
       this._disposed = true;
       return;
     }
-    const gl = this.gl;
     const failures = [];
     this._ensureRetirementOwnershipState();
 

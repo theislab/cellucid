@@ -1,17 +1,16 @@
 /**
  * Reading the open dataset again with other cells (`cells.open`, a history
  * move that puts other cells back) stopped while the cells are read ends
- * promptly as a cancellation, and the reading is cancelled with it (bug hunt
- * F147).
+ * promptly as a cancellation, and the reading is cancelled with it.
  *
  * The dispatcher waits for a stopped action to end before it puts back what
- * it changed (LB-1), so an action that waits on a reading not tied to its
- * signal holds every later history move for as long as the dataset is read
- * (on an atlas, a minute). The reading had a Cancel of its own (the Dataset
- * box), but the action and the `cells` domain's restore never reached it:
- * `reopenOpenDataset`, `reopenKeeping`, the domain's `reopen`/`readGenes`
- * took no signal. Now the signal goes down to the reading, which is
- * cancelled as Cancel cancels it: the cells open before stay open.
+ * it changed, so an action that waits on a reading not tied to its signal
+ * holds every later history move for as long as the dataset is read (on an
+ * atlas, a minute). The reading has a Cancel of its own (the Dataset box);
+ * the action and the `cells` domain's restore reach it through the signal
+ * that `reopenOpenDataset`, `reopenKeeping` and the domain's
+ * `reopen`/`readGenes` pass down. The reading is cancelled as Cancel cancels
+ * it: the cells open before stay open.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';

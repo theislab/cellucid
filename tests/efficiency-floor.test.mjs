@@ -10,7 +10,7 @@
  * chunk and the ratio of fetched bytes to the floor's is exact: it must be
  * 1.00 (every chunk of the floor fetched once, none beside it). The same
  * floor over real files, real links and the HDF5 reader is measured by
- * `scripts/efficiency-floor.mjs` (`cellucid-private/plans/efficiency-floor-*.md`).
+ * `scripts/efficiency-floor.mjs`.
  *
  * Elements: obs (categorical codes, continuous, boolean, strings), obsm
  * embeddings in 2 and 3 dimensions (switching back to one read before is
@@ -607,12 +607,11 @@ test('a gene sample of a CSR atlas opened whole reads its own rows\' pointers, i
 test('every cell opened in a cell order reads a field over many slabs in the stored order: each chunk once, ascending', async () => {
   // Every cell of a file in its own order opens in the default blocks
   // subsample's order (`cellOrder`): the open cells are the file's blocks
-  // shuffled. Read a slab of open cells at a time, each slab's chunks lay
-  // all over the file, apart, and the byte reader joined none of them: the
-  // first view of a 10M-cell `.h5ad` (150 ms, HTTP/1.1) took 344 requests
-  // where every cell in file order took 58 (the embedding 318 against 34).
-  // A read of many open cells (`readRowsInStoreOrder`) asks the stored
-  // chunks in ascending order, wave after wave, each wave's together: 48.
+  // shuffled. Read a slab of open cells at a time, each slab's chunks lie
+  // all over the file, apart, and the byte reader joins none of them
+  // (measured: 23_decisions_partial_reading.md). A read of many open cells
+  // (`readRowsInStoreOrder`) asks the stored chunks in ascending order, wave
+  // after wave, each wave's together.
   const nObs = 5_000_000;
   const chunkRows = 65_536;
   assert.ok(nObs * 8 > SLAB_BYTES, 'more than a slab of float64');
@@ -951,10 +950,10 @@ test('a later visit of a remote file kept in this browser: nothing it read befor
   assert.ok(fetched.bytes > 0);
   const before = { ...fetched };
   assert.deepEqual(await visit([3, 7]), first);
-  // The later visit measured nothing over the link (it fetched nothing):
-  // what it keeps -- the raw values read by range too -- costs nothing, so
-  // its genes are read for every cell, as on the first visit; a cell whose
-  // values were priced as fetched would have had no price at all.
+  // The later visit fetches nothing over the link: what it keeps -- the raw
+  // values read by range too -- costs nothing, so its genes are read for
+  // every cell, as on the first visit; a cell whose values were priced as
+  // fetched would have no price at all.
   assert.deepEqual(samples, [null, null], 'genes read for every cell on both visits');
   assert.deepEqual({ bytes: fetched.bytes - before.bytes, requests: fetched.requests - before.requests }, { bytes: 0, requests: 0 }, 'the floor of what was read before is nothing');
 });

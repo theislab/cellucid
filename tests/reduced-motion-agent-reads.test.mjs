@@ -1,11 +1,10 @@
 /**
- * Live pass 5, L18-3: under reduced motion a camera path went to its last
- * keyframe at once, but `camera-path.play` answered as if it had played
- * (`{seconds: 18.3, ended: 'end'}`), and the agent told the person "it ran
- * all 18.3 s"; nothing it could read said that the person's system asks for
- * reduced motion. The play now answers `ended: 'reduced-motion'` with the
- * seconds the camera moved (0), its step says so, and `views.state` names the
- * preference (`reduced_motion`).
+ * Under reduced motion a camera path goes to its last keyframe at once, and
+ * `camera-path.play` answers `ended: 'reduced-motion'` with the seconds the
+ * camera moved (0), its step says so, and `views.state` names the preference
+ * (`reduced_motion`). An answer as if it had played (`{seconds: 18.3,
+ * ended: 'end'}`) makes the agent tell the person "it ran all 18.3 s", with
+ * nothing it can read saying that the person's system asks for reduced motion.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

@@ -67,9 +67,9 @@ const INCOMPLETE = new Set([INCOMPLETE_PAGES, INCOMPLETE_NAME]);
  * `page:changed` announces only the page inventory — created, renamed,
  * recolored, switched, deleted. Adding a lasso to a page, disabling a group,
  * or clearing one announces `highlight:changed` instead. Listening to the first
- * alone left the preview describing the selection as it stood before the user's
- * most recent one, while the Create button stayed enabled and the column that
- * appeared did not match the numbers on screen.
+ * alone would leave the preview describing the selection as it stood before the
+ * user's most recent one, while the Create button stays enabled and the column
+ * that appears does not match the numbers on screen.
  */
 /** Whether two `_previewInputs` describe the same cells. */
 function samePreviewInputs(left, right) {
@@ -532,7 +532,7 @@ export class CategoryBuilder {
       this._updatePreview(true);
       this._updateConfirmState();
     }, { signal });
-    // Cells on no page keep their category of a field (bug hunt L25-3): split one label of an
+    // Cells on no page keep their category of a field: split one label of an
     // annotation with a page per new label, every other cell keeping its label.
     uncoveredKeep.addEventListener('change', () => {
       this._updatePreview(true);
@@ -642,8 +642,8 @@ export class CategoryBuilder {
   /**
    * Offer every highlight page that is not already a category label.
    *
-   * The drop zone's only source used to be a `draggable` page tab, which is not
-   * focusable and publishes nothing a keyboard can act on.
+   * A `draggable` page tab is not focusable and publishes nothing a keyboard
+   * can act on, so it cannot be the drop zone's only source.
    */
   _renderPageSources() {
     this._assertInitialized();
@@ -701,7 +701,8 @@ export class CategoryBuilder {
 
     this._droppedPages.forEach((p, idx) => {
       requireObjectRecord(p, `Dropped page ${idx}`);
-      const page = this._getPage(p.pageId);
+      // The page must be one of the inventory's.
+      this._getPage(p.pageId);
       if (typeof p.label !== 'string') {
         throw new TypeError(
           `Dropped page ${idx} label must be a string`
@@ -1205,7 +1206,7 @@ export class CategoryBuilder {
     categoriesWrap.className = 'preview-categories';
     // Each page's category in its page's color, the rest the palette's: the
     // colors the field is made with (`pageFieldPalette`), so the preview is
-    // the result (F124).
+    // the result.
     const pageColors = this._droppedPages.map(page => requireHexColor(
       this._state.getHighlightPageColor(page.pageId),
       `Highlight page "${page.pageId}" color`

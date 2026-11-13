@@ -53,8 +53,8 @@ const GROUPS = [...new Set(SWEPT.map(action => action.group))];
 /**
  * What some actions need in place first that the fixture, as it opens, does
  * not have (its history is one branch, Main; no highlight, filter or note):
- * said in the task so a model makes it rather than asking which (live sweep
- * L1-1: Haiku asked, rightly, or reported there was nothing to act on).
+ * said in the task so a model makes it rather than asking which or reporting
+ * there was nothing to act on.
  */
 const SETUP = Object.freeze({
   'history.branch.archive': 'First make a branch other than Main (`history_branch_create` from an earlier step, then one change), and archive that branch.',
@@ -72,7 +72,7 @@ const SETUP = Object.freeze({
 /**
  * What the person does before the task, for an action that can only work on
  * steps outside the agent's turn: a turn's later steps join its own group, so
- * a group extends only to another turn's steps (L21-8).
+ * a group extends only to another turn's steps.
  */
 const PREPARE = Object.freeze({
   'history.group.extend': page => page.evaluate(async () => {

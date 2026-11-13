@@ -159,7 +159,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       else state.purgeUserDefinedField(target.userDefinedId, target.source);
       return { name: ref.key };
     },
-    'field.create-from-pages': async (params, { signal } = {}) => {
+    'field.create-from-pages': async (params, { signal } = /** @type {{signal?: AbortSignal|null}} */ ({})) => {
       requireDataset(state);
       requireNewName(state, FieldSource.OBS, params.key);
       for (const entry of params.pages) requireNewCategoryLabel(entry.label);
@@ -194,7 +194,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       } else if (params.intersection_labels.length > 0) {
         throw new ActionRefused('Intersection labels are given only with overlap "intersections".', { code: 'bad-params' });
       }
-      // The cells on no page keep their category of `rest` (L25-3): its labels and each open cell's code.
+      // The cells on no page keep their category of `rest`: its labels and each open cell's code.
       let rest = null;
       if (params.rest !== undefined) {
         const target = await resolveLoadedField(state, params.rest, { kind: 'category', signal });
@@ -524,7 +524,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       if (JSON.stringify(next) === JSON.stringify(current)) return null;
       const origin = meta.origin === 'host' ? 'notebook' : meta.origin === 'session' ? 'session' : 'user';
       // Normalized values of another counts matrix sum its cells' totals: asked as heavy work.
-      // Stopped, it ends at once and puts back what it had published (F147).
+      // Stopped, it ends at once and puts back what it had published.
       await state.applyDataMapping(next, { origin, heavy, signal });
       return { groups: Object.keys(changes).length };
     },

@@ -8,15 +8,14 @@ import { expectFloatingSettled } from './helpers/panels.mjs';
    cover.
 
    A panel whose content overflows has a scroller of its own, and that scroller
-   is an opaque compositor layer. While it sat directly over the WebGL canvas,
-   Chromium's software compositor culled the canvas under it at the vertically
-   mirrored position (the canvas texture is bottom-left origin, and the culled
-   part of it was drawn flipped), so the page background showed through at the
-   scroller's mirror image across the canvas center: a band under the Session
-   panel, the same width as the panel, until the panel was docked again. The
-   canvas's own pixels were right all along; only what reached the screen was
-   wrong. `_accordion.css` now composites each floating window as one surface,
-   so none of its layers occludes the plot.
+   is an opaque compositor layer. Directly over the WebGL canvas, Chromium's
+   software compositor culls the canvas under it at the vertically mirrored
+   position (the canvas texture is bottom-left origin, and the culled part of it
+   is drawn flipped), so the page background shows through at the scroller's
+   mirror image across the canvas center: a band under the Session panel, the same
+   width as the panel, until the panel is docked again. The canvas's own pixels
+   are right; only what reaches the screen is wrong. `_accordion.css` composites
+   each floating window as one surface, so none of its layers occludes the plot.
 
    The check is therefore the screen against the canvas: a viewport screenshot
    of the region that went missing must show the canvas's own pixels. A crop
@@ -53,8 +52,8 @@ async function undock(page, panelId, edge = 's') {
   await frame.locator('> .accordion-panel-actions > .accordion-undock-btn').click();
   // The region beside the frame is measured from its box and its card's
   // shadow, so both must be the settled ones: read during the lift, the box
-  // was up to 4% short and the shadow `--shadow-sm`/`--shadow-md` instead of
-  // `--shadow-lg`, and the region then ran under the frame (WebKit: the panel
+  // is short (up to 4%) and the shadow `--shadow-sm`/`--shadow-md` instead of
+  // `--shadow-lg`, and the region then runs under the frame (WebKit: the panel
   // "covers" it) or under the tail of its final shadow (Firefox, Chromium:
   // the region's top device rows three levels dark).
   await expectFloatingSettled(frame);
@@ -93,9 +92,9 @@ async function undock(page, panelId, edge = 's') {
  * defines a blur radius as a Gaussian of standard deviation half that radius,
  * and engines draw it out to three deviations (1.5 blur radii), where it is
  * below one level; the radius itself is only two deviations. A fixed 24 px
- * did not clear the card's `--shadow-lg` (6 px down, 16 px blur) everywhere:
- * on Linux WebKit the region's top three device rows were its tail, three
- * levels darker than the plot, a constant mismatch however long it waited.
+ * does not clear the card's `--shadow-lg` (6 px down, 16 px blur) everywhere:
+ * its tail reaches the region's top device rows (three levels darker than the
+ * plot on Linux WebKit), a constant mismatch however long it waits.
  */
 async function regionBeside(frame) {
   return frame.evaluate(element => {
@@ -133,7 +132,7 @@ async function regionBeside(frame) {
 
 /**
  * Compares a viewport screenshot with the canvas's own pixels over `region`
- * (CSS pixels) and returns the fraction of device pixels that differ.
+ * (CSS pixels) and returns the fraction of device pixels whose color differs.
  */
 async function screenMismatch(page, region) {
   expect(region.width).toBeGreaterThan(100);
@@ -151,8 +150,8 @@ async function screenMismatch(page, region) {
 
     // Only the compared region is drawn and read back: a full-size surface
     // per source is two viewport-sized fills and reads at deviceScaleFactor 2,
-    // seconds of main-thread work on a hosted runner, for pixels never looked
-    // at. `draw` maps a region of the screenshot's device pixels onto the
+    // far more main-thread work than the pixels compared need. `draw` maps a
+    // region of the screenshot's device pixels onto the
     // surface's origin.
     const pixels = draw => {
       const surface = document.createElement('canvas');
@@ -200,18 +199,12 @@ async function screenMismatch(page, region) {
     const canvas = canvasCrop.data;
     let differing = 0;
     for (let index = 0; index < screen.length; index += 4) {
-      const delta = Math.max(
-        Math.abs(screen[index] - canvas[index]),
-        Math.abs(screen[index + 1] - canvas[index + 1]),
-        Math.abs(screen[index + 2] - canvas[index + 2]),
-      );
-      // The plot's own background is a few levels off the page's, so a
-      // missing plot differs from the canvas by little more than that.
-      if (delta > 2) differing++;
+      if (screen[index] !== canvas[index] || screen[index + 1] !== canvas[index + 1]
+        || screen[index + 2] !== canvas[index + 2]) differing++;
     }
     const fraction = differing / (screen.length / 4);
     // A mismatch carries both crops, so a failure shows which pixels differ.
-    return fraction < 0.01
+    return fraction === 0
       ? { fraction }
       : {
           fraction,
@@ -226,15 +219,15 @@ async function expectPlotShownBeside(page, panelId) {
   // The plot settles (a sidebar slide, the frame after a layout change), and
   // the screenshot and the read-back must catch the same frame. The poll keeps
   // the suite's expect timeout: one comparison is a full-viewport screenshot
-  // at deviceScaleFactor 2 and a read-back of the plot, and on hosted macOS
-  // Firefox that single comparison took 36 s and found no mismatch at all,
-  // after a fixed fifteen-second poll had already expired.
+  // at deviceScaleFactor 2 and a read-back of the plot, and on a hosted macOS
+  // Firefox runner a single comparison takes tens of seconds, so no shorter fixed
+  // poll is used.
   let last = null;
   try {
     await expect.poll(async () => {
       last = await screenMismatch(page, region);
       return last.error ?? last.fraction;
-    }).toBeLessThan(0.01);
+    }).toBe(0);
   } catch (error) {
     // Written to the test's output directory (not attached as an in-memory
     // body, which only a reporter keeps), so CI uploads them with the rest
@@ -251,7 +244,7 @@ async function expectPlotShownBeside(page, panelId) {
 
 // One test per sidebar state, each undocking the panel first, so the closed
 // case still slides the sidebar away from under a floating panel. Together
-// they were two full-viewport comparisons at deviceScaleFactor 2 in one test,
+// they would be two full-viewport comparisons at deviceScaleFactor 2 in one test,
 // more than one test's time on a runner that renders in software.
 for (const sidebar of ['open', 'closed']) {
   test(`the plot shows below an undocked panel, with the sidebar ${sidebar}`, async ({

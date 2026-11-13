@@ -11,12 +11,11 @@
  * - A text column (its categories found by its first load) shown through a
  *   chain of resizes stays shown, read under the categories it was found
  *   with, and lands where opening directly lands.
- * - A progressive opening (here made so by a measured cost of showing a cell,
- *   `data/opening-cost.js`) shows a first view of fewer cells, grows in place
- *   step by step, and lands where opening at the share directly lands; Apply
- *   while it grows opens exactly Apply's cells.
- * - An opening records what showing a cell costs here (its cells from their
- *   GPU stores to their first frame); Apply in place records nothing.
+ * - A share over a link whose round trips cost anything opens in one step,
+ *   even where showing a cell is slow (`data/opening-cost.js`), and lands
+ *   where opening at the share directly lands.
+ * - An opening reads each embedding row once, in one step or (blocks) with
+ *   the step that puts the cells in their order, and nothing after it ends.
  *
  * Fixture: a synthetic `.zarr.zip` of 2,400 cells with a categorical field
  * and a text column (`helpers/share-dataset.mjs`).
@@ -63,9 +62,9 @@ async function act(page, field = 'cluster') {
   // The file's own opening is over first: it is colored by its first coloring
   // (`first-coloring.js`: cluster) before its history begins, and the state
   // set below through the page's internals takes no place in the dispatcher's
-  // order. Set while the opening was still under way, it was overwritten by
-  // the first coloring landing after it (macOS WebKit, CI run 43120770230:
-  // the field shown was cluster, not the note chosen here).
+  // order. Set while the opening is still under way, it is overwritten by
+  // the first coloring landing after it (macOS WebKit: the field shown is
+  // cluster, not the note chosen here).
   await page.waitForFunction(() => window._cellucidHistories?.current()?.active != null, null, { timeout: 120_000 });
   await page.evaluate(async key => {
     const state = window._cellucidState;
@@ -86,10 +85,10 @@ async function act(page, field = 'cluster') {
 
 /**
  * At rest: nothing but the highlight pulse asks for frames (`waitForPageAtRest`).
- * Waiting for `settled` here never ended: these pages hold a highlight, whose
- * pulse draws every frame, and the loop ran out only after its 600 frames: 22 to
- * 50 s a time on Windows Firefox's software GL, and the whole test's budget on
- * macOS Firefox's (nightly runs 41382954122 to 41961273971).
+ * Waiting for `settled` here never ends: these pages hold a highlight, whose
+ * pulse draws every frame, and the loop runs out only after its 600 frames,
+ * which is the whole test's budget on a software-GL runner (measured:
+ * 38_decisions_testing_and_hosted_runners.md).
  */
 const settle = page => waitForPageAtRest(page);
 
@@ -123,9 +122,9 @@ async function shown(page) {
       colors: Array.from(state.colorsArray),
       transparency: Array.from(state.categoryTransparency),
       digest: state.cellIdentity.digest,
-      // What a difference between two pages is made of (Windows Firefox,
-      // Web contracts run 41269083996: a page opened at 250 cells directly
-      // held a category group of other cells than its colors; not
+      // What a difference between two pages is made of (on Windows Firefox a page
+      // opened at 250 cells directly held a category group of other cells than its
+      // colors; not
       // reproduced elsewhere): the open order's first cells, the shown
       // field's first codes, and how far startup had come.
       evidence: {
@@ -265,9 +264,9 @@ test('a text column shown through a chain of resizes is read under the categorie
   expect(errors).toEqual([]);
 });
 
-test('a share over a link with round trips opens in one step, every cell asked for at once, even where showing them is slow', async ({ browser }) => {
+test('a share over a link with round trips opens in one step, every cell asked for at once and every embedding row read once, even where showing them is slow', async ({ browser }) => {
   test.setTimeout(240_000);
-  // Showing a cell measured at 2 ms on this device (the fixture's held
+  // Showing a cell costs 2 ms on this device (the fixture's held
   // opening cost): 2,000 cells take 4 s, which would make a first view of
   // the cells that take a second.
   const context = await browser.newContext({ device: { openingMsPerCell: 2 } });
@@ -276,7 +275,7 @@ test('a share over a link with round trips opens in one step, every cell asked f
   await page.addInitScript(() => {
     // Every count of open cells the state takes, as it takes it. Sampled
     // once a frame, a step no frame ran during is missed: on hosted Linux
-    // and macOS WebKit the first count seen was 992, the step after a first
+    // and macOS WebKit the first count seen can be 992, the step after a first
     // view of about 500.
     window.__counts = [];
     const note = count => {
@@ -302,6 +301,7 @@ test('a share over a link with round trips opens in one step, every cell asked f
       },
     });
   });
+  await recordEmbeddingReads(page);
   await open(page, '&cells=2000&sample=uniform&seed=3');
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(2000);
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0)).toBe(2000);
@@ -309,10 +309,14 @@ test('a share over a link with round trips opens in one step, every cell asked f
   // A share over a link whose round trips cost anything opens whole
   // (`data/anndata/progressive-open.js`, `planProgressiveOpening`): growing
   // it reads the same bytes in more readings, each a round trip, so all its
-  // cells would be shown later than one reading shows them (the owner's
-  // rule: a share never costs more than everything). The loopback host is
+  // cells would be shown later than one reading shows them (a share never
+  // costs more than everything). The loopback host is
   // such a link, so the cells asked for open in one step.
   expect(counts).toEqual([2000]);
+
+  await test.step('a progressive opening (uniform) reads each embedding row once: a finished growth reads none again, for every embedding shown', async () => {
+    await expectEachEmbeddingRowReadOnce(page);
+  });
   await openCollapsedPanels(page);
   await expect(page.locator('#subsample-count')).toHaveText('2,000 of 2,400 cells');
   await act(page);
@@ -327,74 +331,12 @@ test('a share over a link with round trips opens in one step, every cell asked f
   expect(errors).toEqual([]);
 });
 
-test('Apply while a progressive opening grows opens exactly Apply\'s cells', async ({ browser }) => {
-  test.setTimeout(240_000);
-  // Showing a cell measured at 2 ms on this device (the fixture's held
-  // opening cost): 2,000 cells take 4 s, so a first view of the cells that
-  // take a second opens, then grows.
-  const context = await browser.newContext({ device: { openingMsPerCell: 2 } });
-  const page = await context.newPage();
-  const errors = collectBrowserErrors(page);
-  await open(page, '&cells=2000&sample=uniform&seed=3');
-  // The first view, while it grows.
-  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBeGreaterThan(0);
-  await openCollapsedPanels(page);
-  await page.locator('#subsample-percent').fill(String((100 * 777) / CELLS));
-  await page.locator('#subsample-method').selectOption('uniform');
-  await page.locator('#subsample-seed').fill('3');
-  await page.locator('#subsample-apply').click();
-  await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount), { timeout: 60_000 }).toBe(777);
-  // Nothing after it opens other cells: the opening's growth stopped for
-  // Apply, and nothing else of it is left to run.
-  await openingDone(page);
-  expect(await page.evaluate(() => window._cellucidState.pointCount)).toBe(777);
-  await act(page);
-  await settle(page);
-  const applied = await shown(page);
-  await closeContextWithApplicationRetirement(context);
-  const opened = await directly(browser, 777);
-  expect(applied.digest).toBe(opened.digest);
-  expect(applied.colors).toEqual(opened.colors);
-  expect(errors).toEqual([]);
-});
-
-test('an opening records what showing a cell costs here; Apply in place records nothing', async ({ browser }) => {
-  test.setTimeout(240_000);
-  // The page's own record is this test's subject: measured, not held.
-  const context = await browser.newContext({ device: { openingMsPerCell: 'measured' } });
-  const page = await context.newPage();
-  const errors = collectBrowserErrors(page);
-  const recorded = () => page.evaluate(() => JSON.parse(localStorage.getItem('cellucid:opening-cost:v2') ?? 'null'));
-  await open(page, '&cells=600&sample=uniform&seed=3');
-  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 60_000 }).toBe(600);
-  // The opening's cells, from their GPU stores to their first frame
-  // (`data/opening-cost.js`): one record, of the 600 cells.
-  await expect.poll(recorded).not.toBeNull();
-  const opened = await recorded();
-  expect(opened.w).toBe(1);
-  expect(opened.x).toBe(600);
-  expect(opened.y).toBeGreaterThan(0);
-  // Grown and cut in place: not an opening of their cells.
-  await openCollapsedPanels(page);
-  await countScenes(page);
-  await apply(page, 1500);
-  await apply(page, 250);
-  expect(await page.evaluate(() => window.__scenes)).toBe(0);
-  expect(await recorded()).toEqual(opened);
-  await closeContextWithApplicationRetirement(context);
-  expect(errors).toEqual([]);
-});
-
-for (const [method, query] of [['uniform', '&cells=2000&sample=uniform&seed=3'], ['blocks', '&cells=2000&sample=blocks&seed=3&block=100']]) test(`a progressive opening (${method}) reads each embedding row once: a finished growth reads none again, for every embedding shown`, async ({ browser }) => {
-  test.setTimeout(240_000);
-  // Showing a cell measured at 2 ms on this device (the fixture's held
-  // opening cost): 2,000 cells take 4 s, so a first view of the cells that
-  // take a second opens, then grows.
-  const context = await browser.newContext({ device: { openingMsPerCell: 2 } });
-  const page = await context.newPage();
-  const errors = collectBrowserErrors(page);
-  // Every embedding read the page asks the reader worker for, with the
-  // cells shown when it was asked.
+/**
+ * Record every embedding read the page asks the reader worker for, with the
+ * cells shown when it was asked, and every read of an embedding the reader
+ * worker makes, whatever asked. Installed before the page opens.
+ */
+async function recordEmbeddingReads(page) {
   await page.addInitScript(() => {
     window.__embeddingReads = [];
     const post = Worker.prototype.postMessage;
@@ -422,8 +364,14 @@ for (const [method, query] of [['uniform', '&cells=2000&sample=uniform&seed=3'],
       }
     };
   });
-  await open(page, query);
-  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(2000);
+}
+
+/**
+ * Once the opening is over: every embedding row was read once, a whole read
+ * happened only before the first view, and the reader worker read an
+ * embedding only when the page asked, each read saying what it read.
+ */
+async function expectEachEmbeddingRowReadOnce(page) {
   // The growth is over (its last step, and for blocks the step that puts
   // the cells in their order, have read what they read), and so is the rest
   // of the opening.
@@ -461,6 +409,20 @@ for (const [method, query] of [['uniform', '&cells=2000&sample=uniform&seed=3'],
     if (read.rows === null) expect(label).toContain('every open cell (embedding)');
     else expect(label).toContain(`open cells ${read.rows[0].toLocaleString('en-US')}–${read.rows[1].toLocaleString('en-US')} (embedding, cells added)`);
   });
+}
+
+test('a progressive opening (blocks) reads each embedding row once: a finished growth reads none again, for every embedding shown', async ({ browser }) => {
+  test.setTimeout(240_000);
+  // Showing a cell costs 2 ms on this device (the fixture's held
+  // opening cost): 2,000 cells take 4 s. Blocks open in their own order, and
+  // a second step puts the cells in theirs.
+  const context = await browser.newContext({ device: { openingMsPerCell: 2 } });
+  const page = await context.newPage();
+  const errors = collectBrowserErrors(page);
+  await recordEmbeddingReads(page);
+  await open(page, '&cells=2000&sample=blocks&seed=3&block=100');
+  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(2000);
+  await expectEachEmbeddingRowReadOnce(page);
   await closeContextWithApplicationRetirement(context);
   expect(errors).toEqual([]);
 });

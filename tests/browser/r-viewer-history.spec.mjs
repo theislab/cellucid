@@ -14,9 +14,10 @@
  *   its head); one the page refuses is R's error, with the page's reason.
  *
  * The page runs the viewer's own modules (`helpers/host-history-page.mjs`).
- * Needs CELLUCID_RSCRIPT set to an Rscript whose library (R_LIBS) has
- * cellucid and SingleCellExperiment installed; without it the file is
- * skipped, as the other live-server specs are.
+ * Needs CELLUCID_RSCRIPT set to an Rscript whose library (R_LIBS) has cellucid
+ * and SingleCellExperiment installed; without it the file is skipped, as the
+ * other live-server specs are, and CELLUCID_REQUIRE_VIEWERS=1 (set by the CI
+ * job that runs this spec) makes that a failure.
  */
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -27,8 +28,9 @@ import { fileURLToPath } from 'node:url';
 
 import { openHostHistoryPage } from './helpers/host-history-page.mjs';
 import { expect, test } from './helpers/test.mjs';
+import { viewerInterpreter } from './helpers/viewer-interpreters.mjs';
 
-const RSCRIPT = process.env.CELLUCID_RSCRIPT ?? null;
+const RSCRIPT = viewerInterpreter('CELLUCID_RSCRIPT');
 const GOLDEN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'history-golden.cellucid-session');
 
 const SERVER = `

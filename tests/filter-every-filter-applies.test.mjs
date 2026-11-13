@@ -1,6 +1,6 @@
 /**
  * Every filter keeps applying until it is removed, whatever the view is
- * colored by (owner decision 2026-10-28, audit F-6): a gene's range filter
+ * colored by: a gene's range filter
  * and a categorical field's outlier filter hide cells exactly as an obs
  * range or category filter does, after the view is colored by another
  * field. The Active filters list (and figure provenance, which reads it)
@@ -122,7 +122,7 @@ test('the counts read the same filters as the visibility pass', () => {
   assert.deepEqual(continuous, { available: 2, visible: 2 });
 });
 
-test('cells without a category are counted, and hidden or shown like a category (K-06)', () => {
+test('cells without a category are counted, and hidden or shown like a category', () => {
   for (const Codes of [Uint8Array, Uint32Array]) {
     const { state, cluster, gene } = liveState();
     gene._continuousFilter = { min: 0, max: 2 };
@@ -144,10 +144,10 @@ test('cells without a category are counted, and hidden or shown like a category 
 });
 
 test('the filter list names the smaller side of a legend, and "Missing" only when a cell has no category', () => {
-  // Found 2026-11-10 on Suo: Hide all, then CD4 T and CD8 T shown, read
+  // On Suo: Hide all, then CD4 T and CD8 T shown, must not read
   // "cell_type: hiding AXL+ and SIGLEC6+ DCs, B1 cells, CD5- mature B, CD8AA +64 more":
-  // the 67 hidden named instead of the 2 shown, and "Missing" counted (68) though
-  // no cell lacked a category and the legend had no Missing row.
+  // it names the 2 shown, not the 67 hidden, and counts no "Missing" (68) when
+  // no cell lacks a category and the legend has no Missing row.
   const names = Array.from({ length: 8 }, (_, i) => `c${i}`);
   const field = (codes, shown, missingVisible = true) => ({
     kind: 'category',

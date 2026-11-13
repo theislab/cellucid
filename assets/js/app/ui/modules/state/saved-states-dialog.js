@@ -1,12 +1,12 @@
 /**
- * @fileoverview Load (History v2 §3.10: Saved states moved into Load…): every
+ * @fileoverview Load: every
  * history this browser keeps, autosaved and named, for every dataset, with
  * its dataset, name, dates, steps and size; open one (its dataset first when
  * another is shown), replay its steps on the dataset shown (in a new tracker
  * linked to it), rename it, delete it (asked first, in its row: the dialog is
  * modal, so nothing over it could be answered), or keep the history shown
  * under a name, as the history, the current state only or the steps only
- * (`history.save`, §3.15.3). Below, a session file is opened (`Open a session
+ * (`history.save`). Below, a session file is opened (`Open a session
  * file…`, `session-controls.js`) or replayed on the dataset shown.
  *
  * The store is this browser's saved histories (`app/history/current.js`
@@ -55,8 +55,8 @@ function listedName(entry) {
 
 /**
  * How the dialog's messages name it, as the list does: "Opening the autosave at
- * “Colored by gene CD8B”" (found 2026-11-10: the list named an autosave by its
- * latest step and its notice said "Opening Autosave").
+ * “Colored by gene CD8B”" (the list names an autosave by its latest step, so
+ * its notice does too, not "Opening Autosave").
  */
 function spokenName(entry) {
   if (entry.name != null) return entry.name;
@@ -233,8 +233,7 @@ export function createSavedStatesDialog({
         }
         if (outcome.opened || outcome.problem === null) {
           // Opened; or not, and why is on the page (the opening's progress, a
-          // newer choice), which this modal dialog would cover. It said
-          // "Opened" whatever happened (2026-11-11).
+          // newer choice), which this modal dialog would cover.
           say(outcome.opened ? `Opened ${name}.` : '', outcome.opened ? 'success' : 'muted');
           if (dialog.open) app.close();
           break;

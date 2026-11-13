@@ -14,7 +14,6 @@
 // together.
 
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
@@ -50,10 +49,8 @@ import { withObsmPayloads } from './helpers/anndata-mapping-mocks.mjs';
 const FIXTURE_URL = new URL('./fixtures/data-mapping-conformance.json', import.meta.url);
 
 // cellucid-python (tests/test_data_mapping_conformance.py) and cellucid-r
-// (tests/testthat/test-data-mapping-conformance.R) pin this same digest.
-// Update all three together.
-const FIXTURE_SHA256 =
-  'a3b615e6377f3936ce5701764622ee74ee3c30b95d24303e815eb83476451200';
+// (tests/testthat/test-data-mapping-conformance.R) hold the same bytes
+// (scripts/shared-files.mjs; tests/shared-files-contract.test.mjs compares them).
 
 /**
  * A JSON number literal written with a fraction or an exponent, such as
@@ -118,11 +115,7 @@ function assertDataMappingError(callback, code) {
   });
 }
 
-test('the fixture is the pinned shared copy', () => {
-  assert.equal(
-    createHash('sha256').update(FIXTURE_BYTES).digest('hex'),
-    FIXTURE_SHA256
-  );
+test('the fixture is the shared one, at its version', () => {
   assert.equal(FIXTURE.version, 9);
   assert.deepEqual(Object.keys(FIXTURE), [
     '_about',

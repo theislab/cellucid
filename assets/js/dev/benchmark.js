@@ -67,7 +67,7 @@ const MEBIBYTE = 1024 * 1024;
 // Before the renderer publishes its measured figure, GPU memory is estimated
 // from what the points renderer stores per cell: 4 bytes per position axis
 // (positions keep exactly the embedding's dimension), 4 bytes of RGBA color
-// and 1 byte of alpha. Measured: 13 B/point in 2D and 17 B/point in 3D.
+// and 1 byte of alpha: 13 B/point in 2D and 17 B/point in 3D.
 const GPU_POSITION_BYTES_PER_AXIS = 4;
 const GPU_COLOR_AND_ALPHA_BYTES_PER_POINT = 5;
 
@@ -91,9 +91,9 @@ function estimatePrePublicationGpuMemoryMB(pointCount, dimension) {
  * Bound a generation request by the one rule the whole product declares.
  *
  * The bounds are imported rather than restated: the point-count control, the
- * off-thread message contract and these generators used to carry three
- * different rules, so a value could be accepted here, rejected at the worker
- * boundary, and advertised as out of range by the control.
+ * off-thread message contract and these generators would otherwise carry
+ * three different rules, so a value could be accepted here, rejected at the
+ * worker boundary, and advertised as out of range by the control.
  *
  * @param {unknown} count - Candidate point count.
  * @returns {number} The exact point count.
@@ -130,11 +130,11 @@ function normalizedByte(value) {
 /**
  * Seed every synthetic dataset is built from unless a caller changes it.
  *
- * Generation used to draw from the platform RNG, so every benchmark window
- * measured a different point cloud: two runs of "20M clusters" disagreed on
- * where the points were, how they were ordered, and therefore on overdraw,
- * LOD occupancy and frustum residency. That makes a frame time from one
- * session incomparable with a frame time from the next, which is the whole
+ * Generation does not draw from the platform RNG: every benchmark window
+ * would measure a different point cloud (two runs of "20M clusters" would
+ * disagree on where the points were, how they were ordered, and therefore on
+ * overdraw, LOD occupancy and frustum residency), which makes a frame time
+ * from one session incomparable with a frame time from the next, the whole
  * purpose of running the benchmark. A fixed seed makes the dataset a constant
  * of the measurement rather than a variable of it.
  */
@@ -1070,7 +1070,6 @@ export class SyntheticDataGenerator {
 
     const anchorPoints = Math.floor(count * anchorFrac);
     const trajectoryPoints = Math.floor(count * trajFrac);
-    const rarePoints = count - anchorPoints - trajectoryPoints;
 
     // Anchor clusters
     for (let i = 0; i < anchorPoints; i++) {
@@ -1396,10 +1395,12 @@ export class SyntheticDataGenerator {
   /**
    * Load GLB file from URL and sample points
    * @param {number} count - Number of points to generate
-   * @param {string} url - URL to the GLB file
+   * @param {string} url - The GLB file's absolute URL, which the page
+   *   resolves (`generation.js`): this runs in the generation worker, which
+   *   resolves a relative URL against its own script and has no page address.
    * @returns {Promise<Object>} - { positions: Float32Array, colors: Uint8Array (RGBA), dimensionLevel: number }
    */
-  static async fromGLBUrl(count, url = 'assets/img/kemal-inecik.glb') {
+  static async fromGLBUrl(count, url) {
     requireSyntheticPointCount(count);
     if (
       typeof url !== 'string' ||
@@ -1410,14 +1411,11 @@ export class SyntheticDataGenerator {
         'GLB benchmark URL must be one non-empty exact string.'
       );
     }
-    const resolvedUrl = typeof window !== 'undefined'
-      ? new URL(url, window.location.href).toString()
-      : url;
-    console.log(`Loading GLB from: ${resolvedUrl}`);
-    let bufferPromise = glbBufferPromises.get(resolvedUrl);
+    console.log(`Loading GLB from: ${url}`);
+    let bufferPromise = glbBufferPromises.get(url);
     if (bufferPromise === undefined) {
       bufferPromise = (async () => {
-        const response = await fetch(resolvedUrl, { cache: 'default' });
+        const response = await fetch(url, { cache: 'default' });
         if (!response.ok) {
           throw new Error(
             `Failed to load GLB: ${response.status} ${response.statusText}`
@@ -1429,14 +1427,14 @@ export class SyntheticDataGenerator {
         }
         return buffer;
       })();
-      glbBufferPromises.set(resolvedUrl, bufferPromise);
+      glbBufferPromises.set(url, bufferPromise);
     }
     let buffer;
     try {
       buffer = await bufferPromise;
     } catch (error) {
-      if (glbBufferPromises.get(resolvedUrl) === bufferPromise) {
-        glbBufferPromises.delete(resolvedUrl);
+      if (glbBufferPromises.get(url) === bufferPromise) {
+        glbBufferPromises.delete(url);
       }
       throw error;
     }
@@ -2073,8 +2071,8 @@ export class BottleneckAnalyzer {
       // whenever the frame fits its budget, and mixing CPU, GPU, compositor and
       // browser scheduling into one number. A noise floor derived from the same
       // instrument inherits the same unreliability — a floor measured from a
-      // repeated arm was tried and observed to pass a 22ms "separation" on a
-      // machine whose frames were 100% janky, where the true effect is zero.
+      // repeated arm would pass a "separation" on a
+      // machine whose frames were all janky, where the true effect is zero.
       // There is no regime in which a verdict from this instrument both fires
       // and is trustworthy, so it emits none.
       //
@@ -2125,9 +2123,6 @@ export class BottleneckAnalyzer {
         estimatedFromCPU: true
       };
     }
-
-    // Collect GPU timings already gathered during baseline
-    const gpuStats = this.gpuTimer.getStats();
 
     // Additional GPU-specific measurements
     const renderParams = this._getDefaultRenderParams();
@@ -2972,7 +2967,7 @@ export class BottleneckAnalyzer {
     if (sprite === null || sprite === undefined || !Number.isFinite(sprite.pointSizeMax)) {
       throw new TypeError(
         'Bottleneck analysis draws with the viewer\'s sprite: construct it with ' +
-        '{pointSizeMax} as app/main.js does; received ' + String(sprite && JSON.stringify(sprite)) + '.'
+        '{pointSizeMax} as the Benchmark panel does (benchmark-controls.js); received ' + String(sprite && JSON.stringify(sprite)) + '.'
       );
     }
     const identityMatrix = new Float32Array([
@@ -3069,8 +3064,8 @@ export class BottleneckAnalyzer {
 
     // Ordered by the points each level drew, not by its index: level 0 is
     // the smallest sample and the last level every cell, so ordering by
-    // index read a frame that does not follow the point count (a GPU with
-    // room to spare) as the most vertex-bound one (round 9, R9P-3).
+    // index would read a frame that does not follow the point count (a GPU with
+    // room to spare) as the most vertex-bound one.
     const byPoints = levels.map(level => lodTests[level]).sort((a, b) => a.visiblePoints - b.visiblePoints);
     const fewest = byPoints[0];
     const most = byPoints[byPoints.length - 1];
@@ -3990,11 +3985,11 @@ export class BenchmarkReporter {
 
       // Media capabilities
       media: {
-        audioContext: typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined',
+        audioContext: typeof AudioContext !== 'undefined' || 'webkitAudioContext' in globalThis,
         mediaRecorder: typeof MediaRecorder !== 'undefined',
         mediaSource: typeof MediaSource !== 'undefined',
         speechSynthesis: 'speechSynthesis' in (typeof window !== 'undefined' ? window : {}),
-        speechRecognition: typeof SpeechRecognition !== 'undefined' || typeof webkitSpeechRecognition !== 'undefined'
+        speechRecognition: 'SpeechRecognition' in globalThis || 'webkitSpeechRecognition' in globalThis
       }
     };
   }

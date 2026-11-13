@@ -28,7 +28,7 @@ import { SharedWork, abortReason } from '../../../utils/abort.js';
 import { onNextMacrotask } from '../../../utils/yield-macrotask.js';
 
 /** Files that mark the root of a Zarr store. */
-export const ROOT_MARKERS = Object.freeze(['zarr.json', '.zgroup', '.zarray', '.zmetadata', '.zattrs']);
+const ROOT_MARKERS = Object.freeze(['zarr.json', '.zgroup', '.zarray', '.zmetadata', '.zattrs']);
 
 /** A first-in first-out queue: O(1) at both ends, however long it grows. */
 class Fifo {
@@ -155,11 +155,7 @@ export function createLimiter(limit) {
  * The longest slice ranges of a file on this computer (a picked folder's
  * file, a kept copy's blob) are merged into. Merging saves a read's
  * fixed cost; a longer slice only delays decoding its first chunk until its
- * last byte has arrived. A scheduling choice, measured in a Chromium worker
- * (Suo, Zarr v3, shards of 64 inner chunks; best of three): 1,000 cell rows
- * (inner chunks of 60 KB) take 744 ms read chunk by chunk, 519 ms merged to
- * 1 MiB, 510 ms to 32 MiB; the neighbor graph (inner chunks of 1 MB) 587,
- * 554 and 687 ms.
+ * last byte has arrived. A scheduling choice (measured: 21_decisions_decoders_and_codecs.md).
  */
 export const LOCAL_MERGED_READ_BYTES = 1024 * 1024;
 

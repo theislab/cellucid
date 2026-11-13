@@ -33,30 +33,25 @@ async function holdCatalog(page) {
   return { release, asked: () => asked };
 }
 
-test('the data controls are live while the sample catalog has not answered', async ({ page }) => {
+test('with the sample catalog held, the data controls are live and a file chosen then is what opens', async ({ page }) => {
   const catalog = await holdCatalog(page);
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect.poll(catalog.asked).toBe(true);
-  await expect(page.locator('#user-data-open-btn')).toBeEnabled();
-  await expect(page.locator('#data-address')).toBeEnabled();
-  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'catalog');
 
-  catalog.release();
-  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-});
+  await test.step('the data controls are live while the sample catalog has not answered', async () => {
+    await expect(page.locator('#user-data-open-btn')).toBeEnabled();
+    await expect(page.locator('#data-address')).toBeEnabled();
+    await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'catalog');
+  });
 
-test('a file chosen while the sample catalog answers is what opens, not the default sample', async ({ page }) => {
-  const catalog = await holdCatalog(page);
-  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await expect.poll(catalog.asked).toBe(true);
-  await chooseFiles(page.locator('#user-data-file-input'), H5AD);
-  await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+  await test.step('a file chosen while the sample catalog answers is what opens, not the default sample', async () => {
+    await chooseFiles(page.locator('#user-data-file-input'), H5AD);
+    await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
 
-  catalog.release();
-  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
-  await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
+    catalog.release();
+    await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
+    await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+    await expect(page.locator('#dataset-cells')).toHaveText('120');
+  });
 });

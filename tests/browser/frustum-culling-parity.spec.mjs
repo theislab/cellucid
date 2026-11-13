@@ -71,9 +71,8 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
     // order, and comparing it with one drawn after measures the adoption,
     // not culling. Culling runs only on an adopted order, so wait for it
     // (the store asks for its own frames once the tree lands), as long as
-    // the worker takes: a count of frames ran out on a slow runner ("The
-    // live store never adopted its tree order", Linux Firefox, push run of
-    // 2026-10-31), and a clock is the same guess in other units.
+    // the worker takes: a count of frames runs out on a slow runner, and a
+    // clock is the same guess in other units.
     await capture(true);
     const adopted = () => viewer.getHPRenderer().getStats('live').frustumCulled === true
       && viewer.isPresentedGeometrySettled();
@@ -106,7 +105,6 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
 
   expect(result.culled).toBe(true);
   expect(result.lit).toBeGreaterThan(1_000);
-  // Same points, same camera, culled or not: the picture may differ only by
-  // the rasterizer's last bit (helpers/pixel-parity.mjs).
+  // Same points, same camera, culled or not: the same pixels.
   expect(pixelParityVerdict(result, 'culled vs unculled')).toBeNull();
 });

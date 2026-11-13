@@ -30,10 +30,10 @@ import {
   findKeptStores,
   holdLock,
   holdTranscodedStore,
-  identityDigest,
   keepDownload,
   openTranscodeSpace,
 } from '../assets/js/data/anndata/transcode/space.js';
+import { identityDigest } from '../assets/js/data/anndata/transcode/kept-format.js';
 import { createLocks, opfsOnDisk } from './helpers/opfs-on-disk.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

@@ -50,8 +50,8 @@ test('the history\'s moves are actions every surface reaches: undo, redo and a j
 
 /**
  * What a person does in the app that an agent, a notebook and a replay do
- * too, through the same action and the same permissions (the closure audit's
- * person-only list of 2026-11-05), each with its actions and how an agent's
+ * too, through the same action and the same permissions (the person-only
+ * list), each with its actions and how an agent's
  * call is asked. No camera-path video is on it: the app makes none, for a
  * person either.
  */
@@ -67,7 +67,7 @@ const PERSON_FEATURES = Object.freeze({
   'Share and Save of the history': { 'history.share': 'writes-file', 'history.save': null, 'history.saved.delete': 'deletes-saved' },
 });
 
-test('no person-only feature of the audit\'s list is left: each is an action, asked of an agent as the plan says', () => {
+test('no person-only feature of the list is left: each is an action, asked of an agent as the list says', () => {
   const catalog = getActionCatalog();
   for (const [feature, actions] of Object.entries(PERSON_FEATURES)) {
     for (const [type, confirm] of Object.entries(actions)) {
@@ -88,9 +88,9 @@ test('every permission kind governs real tools: each confirmation kind is asked 
   assert.deepEqual(publishes, ['annotation.publish', 'dataset.share-link']);
 });
 
-// Bug hunt L21-3 (agent-loop lane): "Pause recording" told the agent "Ask the person first.": a
-// chat model asked in its own words (`ask_person`), its turn ended on the question, and the action was
-// never called, while Cellucid asks the person itself as their settings say (`confirm`).
+// An action's example never tells the agent to "Ask the person first.": a chat model would ask in its
+// own words (`ask_person`), its turn would end on the question, and the action would never be called,
+// while Cellucid asks the person itself as their settings say (`confirm`).
 test('no description tells an agent to ask the person itself: an action Cellucid asks about says so by its confirm', () => {
   const told = getActionCatalog().list()
     .filter(definition => /\b(ask|confirm with|check with)\b[^.]*\b(the person|them)\b[^.]*\bfirst\b/i.test(definition.summary))
@@ -98,9 +98,9 @@ test('no description tells an agent to ask the person itself: an action Cellucid
   assert.deepEqual(told, []);
 });
 
-// Bug hunt L21-5 (agent-loop lane): "Merge two categories" was exemplified as merging "T cells" into
-// "T cells" (both parameters took the label's one example): a model given it merged a category into
-// itself and was refused; the reference docs showed it too. A rename's example renamed to the same name.
+// An example never merges a category into itself (both parameters taking the label's one example): a
+// model given it would merge a category into itself and be refused, and the reference docs would show
+// it too. The same for a rename's example renamed to the same name.
 test('no action\'s example names one value for two of its parameters (a merge into itself, a rename to its own name)', () => {
   const doubled = [];
   for (const definition of getActionCatalog().list()) {

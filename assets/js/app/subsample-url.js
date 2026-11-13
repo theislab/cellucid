@@ -25,8 +25,8 @@
  * opens every cell. Parsing is strict: a malformed value, a parameter of
  * another method, or a method parameter without `cells` is refused by name.
  *
- * This is the one place a feature's state is in the address, by the owner's
- * decision (2026-10-27): the subsample is part of what a link shares.
+ * This is the one place a feature's state is in the address: the subsample is
+ * part of what a link shares.
  *
  * @module subsample-url
  */
@@ -162,8 +162,8 @@ export function subsampleUrlEntries(spec) {
  * specification no longer gives. A progressive opening's step is not what
  * was asked for: what it grows to is (`cell-subset-policy.js` `askedCellsOf`).
  * Read from the step, the address and the Share link of a dataset opened
- * whole kept the first 131,072 cells after it had grown to all (bug hunt
- * F60).
+ * whole would keep only the cells of its first step after it had grown to
+ * all.
  *
  * @param {Object|null} subset
  * @returns {Readonly<import('../data/subsample.js').SubsampleSpec>|null}

@@ -87,8 +87,8 @@ export function firstSegmentRows(nRows, entriesPerRow) {
  * many rows as are read -- the gene sample, sized to the gene-time target:
  * the first step takes about as long as the first gene did and each later
  * one twice the one before -- and at least one slab of the index's work.
- * Never a first step of a share of every row (a sample of 2,192 of
- * 2,282,447 cells grew by 71,327 rows in its first step: five minutes).
+ * Never a first step of a share of every row (a small sample growing by a
+ * first step of that size takes minutes: measured, 23_decisions_partial_reading.md).
  */
 export function growthSegmentBounds(from, to, entriesPerRow) {
   return segmentBounds(from, to, firstSegmentRows(from, entriesPerRow));
@@ -357,12 +357,9 @@ export class PassRates {
  * a gene places its own (`placeOwn`). A rate not measured yet counts as its
  * counterpart's (the index's as the view's, one placement as the other);
  * neither measured, as many operations an entry as the index's, so a share
- * keeping at least two thirds of the entries reads every stored row's.
- * Measured in Chromium on a 10M-cell store (2026-10-31), a 50% uniform
- * share's first gene and marker genes took 1.3-1.7x on every stored row's
- * index what they took on the share's own (CSR 7.7 / 11.6 s against 6.0 /
- * 8.0 s; Zarr 6.4 / 12.4 against 4.5 / 7.4 s): its genes' placement is the
- * whole's entries, twice the share's.
+ * keeping at least two thirds of the entries reads every stored row's. A
+ * gene's placement over every stored row's index is the whole's entries,
+ * twice the share's (measured: 23_decisions_partial_reading.md).
  *
  * @param {{keptEntries: number, allEntries: number, rates: PassRates|null}} options
  * @returns {boolean}
@@ -666,8 +663,8 @@ export function restrictedAccess(access, fileRows, positions, start, runs = null
     // Fewer runs than entries (every cell open in a `blocks` order: a run
     // a block): each entry's run found walking both in stored order, the
     // entries put in open order run by run, with no lookup of a row
-    // scattered through memory and no sort (10M cells in 153 runs, 30,000
-    // genes of 1,333 entries: 1.0 → 0.6 s, Node).
+    // scattered through memory and no sort (measured:
+    // 23_decisions_partial_reading.md).
     const inRuns = storedRuns();
     if (inRuns !== null && inRuns.count < whole.indices.length) return { length: n, ...entriesByRun(whole, inRuns, start, n) };
     const mapped = allocateTypedArray(Uint32Array, whole.indices.length, 'Gene column cells');
@@ -742,8 +739,7 @@ export function segmentedColumns({ nRows, segments, together = () => false }) {
    * Each unbuilt segment's read of `gene`: all at once when their indexes
    * fit the memory budget together (`together`: their reads then go out
    * together and fill the link, instead of one segment's round trips after
-   * another's; on a 150 ms link a 1% subsample's first gene took 2 x its
-   * floor one segment at a time), else each one when the one before it is
+   * another's: measured, 23_decisions_partial_reading.md), else each one when the one before it is
    * done. Answered in row order either way.
    */
   const unbuiltReads = (unbuilt, read) => {
@@ -860,8 +856,9 @@ export function sharedBudgetFactory(base, used) {
  * One read activity for the index pass of every unbuilt segment, as a gene
  * waits for all of them: what it reads is the whole gene's (the rows of
  * every open cell not indexed yet), so its bytes, progress and time left are
- * the whole gene's, never one segment's (a segment's own "~40 s left" was
- * followed by a twice larger one, and the next, so the gene looked endless).
+ * the whole gene's, never one segment's (a segment's own time left would
+ * be followed by a twice larger one, and the next, so the gene would look
+ * endless).
  *
  * `create(label)` makes the activity (null when nothing reports); `bytesFrom(row)`
  * resolves the stored bytes the passes read from `row` to the last row read

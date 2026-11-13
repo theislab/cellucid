@@ -189,7 +189,7 @@ export class PlotFactory {
    *
    * The base layout draws the legend as rows above the plot area, in a top
    * margin of fixed height; entries that wrap to more rows than the margin
-   * holds were drawn over the plot's axis labels. The rows are counted from
+   * holds would be drawn over the plot's axis labels. The rows are counted from
    * the measured entries at the drawn width and the margin is made their
    * height; when that would squeeze the plot below `LEGEND_MIN_PLOT_HEIGHT`,
    * the legend is left out of the automatic placement (as the volcano
@@ -250,11 +250,11 @@ export class PlotFactory {
    * Thin categorical tick labels to the number the rendered box can show.
    *
    * A category axis draws every category it is given, however many there are
-   * and however wide the box is. Measured through the real renderer, eighteen
-   * cell-type names produced ten overlapping pairs of glyphs at 224×180 and
-   * none at 720×380 — so the crowding is a property of the drawn box, and it is
-   * a defect rather than a limit, because a box that cannot show eighteen
-   * labels can still show six of them legibly. Rotation does not solve it:
+   * and however wide the box is. The same names overlap in a narrow box and
+   * not in a wide one (measured through the real renderer:
+   * 37_decisions_analysis.md) — so the crowding is a property of the drawn
+   * box, and it is a defect rather than a limit, because a box that cannot
+   * show eighteen labels can still show six of them legibly. Rotation does not solve it:
    * `tickangle: -45` changes the direction labels collide in, not whether they
    * do.
    *
@@ -265,17 +265,17 @@ export class PlotFactory {
    * the last are always kept so the axis stays anchored at both ends.
    *
    * Anchoring both ends outranks the capacity when the two disagree, which they
-   * do at the narrow end of the range. The published pancreas datasets reach it:
-   * `cell_type` holds eight categories, one short of the rotation threshold in
-   * `configureCategoricalAxes`, so the axis is upright, and `Pre-endocrine`
-   * needs a slot of about 89px against the 149px the sidebar leaves — a capacity
-   * of one, which cannot anchor two ends. Two is drawn instead, and the geometry
-   * is why that is free rather than a compromise: the capacity tiles slots of
-   * the widest label across the whole axis, while the thinner draws at category
-   * positions, so a pair at the ends of an eight-band axis sits (7/8) of the box
-   * apart — 130px there, against the 41px `Ductal` and `Epsilon` need to clear
-   * each other. Only a box narrower than one label can still collide, and that
-   * box has no readable outcome to choose between.
+   * do at the narrow end of the range: an axis one category short of the
+   * rotation threshold in `configureCategoricalAxes` stays upright, and its
+   * longest name can need a slot wider than half the sidebar's box — a
+   * capacity of one, which cannot anchor two ends. Two is drawn instead, and
+   * the geometry is why that is free rather than a compromise: the capacity
+   * tiles slots of the widest label across the whole axis, while the thinner
+   * draws at category positions, so a pair at the ends of an n-band axis sits
+   * (n−1)/n of the box apart, far more than two short names need to clear each
+   * other (worked example: 37_decisions_analysis.md). Only a box narrower than
+   * one label can still collide, and that box has no readable outcome to
+   * choose between.
    *
    * A container without a measurable box (a test double, or a host not yet in
    * the document) leaves the layout exactly as the plot type built it.
@@ -458,6 +458,7 @@ export class PlotFactory {
    * @param {Object[]} pageData
    * @param {Object} options
    * @param {Object} [layoutEngine]
+   * @param {Object} [viewport]
    * @returns {Object} Plotly layout object
    */
   static layoutForTraces(definition, traces, pageData, options, layoutEngine, viewport) {
@@ -544,8 +545,7 @@ export class PlotFactory {
       orientation = 'vertical',
       showPoints = 'outliers',
       jitter = 30,
-      markerSize = 4,
-      showGrid = true
+      markerSize = 4
     } = options;
 
     const numericValues = finiteNumbers(pd.values);

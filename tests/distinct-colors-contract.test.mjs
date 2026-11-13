@@ -1,10 +1,11 @@
 /**
  * One rule for every color the app gives a category or a highlight page of
  * its own choosing (`data/distinct-colors.js`): it is told apart from the
- * colors beside it, else it is the next palette color that is (F111: a
- * grouped field's two groups inherited amber and bright orange from their
- * first categories and read as one; Unassigned after a deletion took a kept
- * category's color; a new highlight page repeated a remaining page's).
+ * colors beside it, else it is the next palette color that is (a
+ * grouped field's two groups must not inherit amber and bright orange from
+ * their first categories and read as one; Unassigned after a deletion must
+ * not take a kept category's color; a new highlight page must not repeat a
+ * remaining page's).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -36,7 +37,7 @@ const rgbAt = (bytes, index) => [bytes[index * 3] / 255, bytes[index * 3 + 1] / 
 const allApart = colors => colors.every((color, index) => isDistinctColor(color, colors.filter((_, other) => other !== index)));
 
 test('the threshold sits between the pairs that read as one and the palettes that read as many', () => {
-  // The finding's pair (Kanemaru: amber from "Fetal atrial cardiomyocyte", bright orange from
+  // A pair that reads as one (Kanemaru: amber from "Fetal atrial cardiomyocyte", bright orange from
   // "Adventitial fibroblast") and the default pages' red and rose read as one.
   assert.ok(colorDistance(hex('#ECB100'), hex('#FF9900')) < MIN_DISTINCT_COLOR_DISTANCE);
   assert.ok(colorDistance(hex('#dc2626'), hex('#e11d48')) < MIN_DISTINCT_COLOR_DISTANCE);
@@ -63,8 +64,8 @@ test('a color is kept when it is told apart, else the first palette color that i
   assert.deepEqual(out, near);
 });
 
-test('a grouped field: each group inherits its first category\'s color only when told apart from the kept ones and the groups before it (F111)', () => {
-  // Kanemaru's cell types, as the S4 turn grouped them: atrial cardiomyocytes, the rest "diğer".
+test('a grouped field: each group inherits its first category\'s color only when told apart from the kept ones and the groups before it', () => {
+  // Kanemaru's cell types, grouped: atrial cardiomyocytes, the rest "diğer".
   const categories = ['Adventitial fibroblast', 'Capillary endothelial', 'Fetal atrial cardiomyocyte', 'Fetal ventricular cardiomyocyte'];
   const colors = bytesOf(['#FF9900', '#0077C8', '#ECB100', '#7080C0']);
   const visible = Uint8Array.of(1, 1, 1, 1);

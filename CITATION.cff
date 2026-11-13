@@ -26,8 +26,8 @@ license: "BSD-3-Clause"
 #   1. set the real `title`, the full `authors` list, `doi`, and `year`, and
 #      change `status` to `preprint`;
 #   2. from the workspace, run
-#        python cellucid-private/scripts/sync_citation.py
-#      then `python cellucid-private/scripts/sync_citation.py --check`;
+#        the citation sync script
+#      then the same script with `--check`;
 #   3. commit every repository it changed.
 preferred-citation:
   type: article

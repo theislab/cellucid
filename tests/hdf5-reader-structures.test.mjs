@@ -601,8 +601,8 @@ test('the first rows of a many-leaf chunked dataset wait for one leaf of its chu
 test('a chunk B-tree is read from its root as reads need it: making its table and pricing the whole dataset read one node, whatever its chunk count', async () => {
   // One request at a time: no level below the root is one wave of the link,
   // so nothing below it is read until a read needs it. (Reading every leaf's
-  // parent with the table cost a 2.26M-chunk atlas X 562 nodes, 13.5 s over
-  // S3, before its first view.)
+  // parent with the table would cost an atlas of millions of chunks hundreds of
+  // nodes and seconds over S3 before its first view; measured: 21_decisions_decoders_and_codecs.md.)
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 1, policy: { concurrency: 1 } });
   const root = await openHdf5(recorder.reader(), { load: [''] });
   const node = root.get('many_chunks/btree_levels');
@@ -642,9 +642,9 @@ test('a gene sample\'s first gene is priced with its chunk-index reads: the pric
   // round trips and no bandwidth limit: its time is its dependent round
   // trips. Each array's index levels not read yet are read one after the
   // other before its chunks, and the entries only once the pointers say
-  // where they lie: four trips, where pricing chunk runs alone said one (on
-  // an 11.4M-cell CELLxGENE atlas, 311 of the first gene's 539 requests were
-  // chunk B-tree nodes, and revisits ran 2-6% past the 20 s target).
+  // where they lie: four trips, where pricing chunk runs alone would say one
+  // (chunk B-tree nodes are most of a large atlas's first gene's requests;
+  // measured: 21_decisions_decoders_and_codecs.md).
   const latencyMs = 100;
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs });
   const file = await openHdf5(recorder.reader(), { load: [''] });
@@ -696,11 +696,10 @@ test('a string column read in pieces loads each piece\'s heap collections as its
   // collections, their references a request each, arriving one after
   // another. With room on the link (a multiplexed one), each piece's
   // collection is asked for as its references arrive: one union after
-  // every piece made the link idle meanwhile (100M cells at a 1% share
-  // over 20 ms HTTP/2: 87.7 s against 71.8 s). With every request queued
+  // every piece would make the link idle meanwhile. With every request queued
   // (six a host over HTTP/1.1, a host's request budget), what arrives
   // meanwhile is gathered into one plan: a request, not one a piece
-  // (10M cells over 150 ms HTTP/1.1: 77.0 s against 84.6 s).
+  // (measured: 21_decisions_decoders_and_codecs.md).
   const perCollection = 65_535;
   const strings = Array.from({ length: 3 * perCollection }, (_, i) => `c${i}`);
   const bytes = new Uint8Array(await writeHdf5(group({}, [['names', stringDataset(strings)]])).arrayBuffer());

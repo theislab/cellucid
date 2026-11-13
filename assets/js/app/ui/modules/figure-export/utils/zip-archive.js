@@ -11,8 +11,8 @@
  * Each entry is checksummed `CRC_SLICE_BYTES` at a time, read from its Blob
  * slice by slice, and the archive takes the entry Blobs themselves as its
  * parts. The bytes are never copied or held whole, and no slice's checksum
- * (about 2 ms on an M1 Pro) keeps the main thread busy: every slice is a
- * separate task.
+ * keeps the main thread busy: every slice is a separate task (measured:
+ * 36_decisions_figure_export.md).
  *
  * @module ui/modules/figure-export/utils/zip-archive
  */

@@ -3,9 +3,9 @@
  * going, and WebKit reports each as an error of that document ("Cannot load
  * <url> due to access control checks.", "Importing a module script
  * failed."). The browser specs count a page's errors, and a spec that
- * navigated while the left document was still loading a worker's modules
- * failed on them (Linux WebKit, run 41307458156: the spatial-tree worker,
- * started when culling turned on 190 ms before the spec's `page.goto`).
+ * navigates while the left document was still loading a worker's modules
+ * (the spatial-tree worker, started when culling turns on shortly before the
+ * spec's `page.goto`) would fail on them.
  *
  * `tests/browser/helpers/leaving-document.mjs` prepares every page of every
  * test context (`helpers/test.mjs`): only those wordings, and only while a

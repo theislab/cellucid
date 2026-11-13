@@ -3,17 +3,16 @@
  * whoever asked for it; disconnecting a source, or an opening that fails,
  * leaves no request in flight.
  *
- * Found under the slow-delivery preload (`scripts/slow-delivery-preload.mjs`,
- * 2026-11-01): a source disconnected while the reader kept a built gene
- * index on disk had that background read (`X/indptr/0` of a Zarr folder
- * over HTTP) go on with no signal of its own, retrying a host that had
- * stopped answering for as long as the worker lived, and the contract
- * suite's process never ended. Every read through an open Zarr store or
- * HDF5 file now runs within the store's lifetime (`utils/abort.js`
- * `withinLifetime`), which `close()` aborts; the reader closes its store on
- * `leave` (`anndata-reader-worker.js`), not only when the worker ends; and
- * a link, remote or viewer-host opening that fails cancels the requests it
- * started beside the one that failed.
+ * Every read through an open Zarr store or HDF5 file runs within the store's
+ * lifetime (`utils/abort.js` `withinLifetime`), which `close()` aborts; the
+ * reader closes its store on `leave` (`anndata-reader-worker.js`), not only
+ * when the worker ends; and a link, remote or viewer-host opening that fails
+ * cancels the requests it started beside the one that failed. Otherwise a
+ * source disconnected while the reader kept a built gene index on disk would
+ * leave that background read (`X/indptr/0` of a Zarr folder over HTTP) going
+ * with no signal of its own, retrying a host that had stopped answering for
+ * as long as the worker lives, and a contract suite's process would never end
+ * (found under `scripts/slow-delivery-preload.mjs`).
  *
  * The host here answers every request after a delay and, once told to
  * hold, answers none: a held request ends only when its signal aborts. So

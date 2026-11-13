@@ -14,15 +14,24 @@ function notFound(name) {
   return new DOMException(`'${name}' was not found.`, 'NotFoundError');
 }
 
-/** A writable stream over one file, as a page's `createWritable()` gives. */
-function writableStream(file) {
+/**
+ * A writable stream over one file, as a page's `createWritable()` gives: it
+ * takes bytes, a Blob, an `ArrayBuffer` or text. `wholeBuffer`: handed a
+ * view, it writes the whole buffer under it, as WebKit's does
+ * (`assets/js/utils/file-writable.js`).
+ */
+function writableStream(file, wholeBuffer) {
   const fd = openSync(file, 'r+');
   ftruncateSync(fd, 0);
   let at = 0;
   let closed = false;
   return {
     async write(data) {
-      const view = data instanceof Uint8Array ? data : new Uint8Array(data);
+      let view;
+      if (data instanceof Blob) view = new Uint8Array(await data.arrayBuffer());
+      else if (typeof data === 'string') view = new TextEncoder().encode(data);
+      else if (ArrayBuffer.isView(data)) view = wholeBuffer ? new Uint8Array(data.buffer) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else view = new Uint8Array(data);
       at += writeSync(fd, view, 0, view.length, at);
     },
     async close() {
@@ -36,7 +45,7 @@ function writableStream(file) {
   };
 }
 
-function fileHandle(file, name, handles) {
+function fileHandle(file, name, { handles, wholeBuffer }) {
   const handle = {
     kind: 'file',
     name,
@@ -70,7 +79,7 @@ function fileHandle(file, name, handles) {
       return new File([blob], name, { lastModified: statSync(file).mtimeMs });
     },
     async createWritable() {
-      return writableStream(file);
+      return writableStream(file, wholeBuffer);
     },
   };
   // A worker has synchronous access handles; a page writable streams; a
@@ -80,7 +89,7 @@ function fileHandle(file, name, handles) {
   return handle;
 }
 
-function directoryHandle(folder, name, handles) {
+function directoryHandle(folder, name, context) {
   return {
     kind: 'directory',
     name,
@@ -93,7 +102,7 @@ function directoryHandle(folder, name, handles) {
         if (!create) throw notFound(child);
         mkdirSync(target);
       }
-      return directoryHandle(target, child, handles);
+      return directoryHandle(target, child, context);
     },
     async getFileHandle(child, { create = false } = {}) {
       const target = path.join(folder, child);
@@ -103,7 +112,7 @@ function directoryHandle(folder, name, handles) {
         if (!create) throw notFound(child);
         closeSync(openSync(target, 'w'));
       }
-      return fileHandle(target, child, handles);
+      return fileHandle(target, child, context);
     },
     async removeEntry(child, { recursive = false } = {}) {
       rmSync(path.join(folder, child), { recursive, force: false });
@@ -111,7 +120,7 @@ function directoryHandle(folder, name, handles) {
     async *entries() {
       for (const entry of readdirSync(folder, { withFileTypes: true })) {
         const target = path.join(folder, entry.name);
-        yield [entry.name, entry.isDirectory() ? directoryHandle(target, entry.name, handles) : fileHandle(target, entry.name, handles)];
+        yield [entry.name, entry.isDirectory() ? directoryHandle(target, entry.name, context) : fileHandle(target, entry.name, context)];
       }
     },
   };
@@ -163,10 +172,12 @@ export function createLocks() {
 /**
  * An environment whose `navigator` has OPFS (on disk) and Web Locks.
  *
- * @param {{handles?: 'worker'|'page'|'none', root?: string|null}} [options] - How its files are
- *   written: synchronous access handles (a dedicated worker, the default),
+ * @param {{handles?: 'worker'|'page'|'none', root?: string|null, wholeBufferWrites?: boolean}} [options] - How
+ *   its files are written: synchronous access handles (a dedicated worker, the default),
  *   writable streams (a page), or neither (a page of Safari before 26);
- *   `root`: the folder the storage is in (else a new temporary one)
+ *   `root`: the folder the storage is in (else a new temporary one);
+ *   `wholeBufferWrites`: its writable streams write the whole buffer under a
+ *   view handed to them, as WebKit's do
  * @returns {{environment: Object, root: string, cleanup: () => void}}
  */
 // The temporary folders made here, removed when the process exits: a test that
@@ -176,7 +187,7 @@ process.on('exit', () => {
   for (const root of madeRoots) rmSync(root, { recursive: true, force: true });
 });
 
-export function opfsOnDisk({ handles = 'worker', root: given = null } = {}) {
+export function opfsOnDisk({ handles = 'worker', root: given = null, wholeBufferWrites = false } = {}) {
   // A folder given is kept (a later process opens the same storage: a later visit).
   const root = given ?? mkdtempSync(path.join(tmpdir(), 'cellucid-opfs-'));
   if (given === null) madeRoots.add(root);
@@ -184,7 +195,7 @@ export function opfsOnDisk({ handles = 'worker', root: given = null } = {}) {
   const environment = {
     navigator: {
       storage: {
-        getDirectory: async () => directoryHandle(root, '', handles),
+        getDirectory: async () => directoryHandle(root, '', { handles, wholeBuffer: wholeBufferWrites }),
         estimate: async () => ({ quota: 1e12, usage: 0 }),
       },
       locks: createLocks(),
@@ -194,7 +205,7 @@ export function opfsOnDisk({ handles = 'worker', root: given = null } = {}) {
   // its reader worker write the same files, one way each.
   const as = other => ({
     navigator: {
-      storage: { ...environment.navigator.storage, getDirectory: async () => directoryHandle(root, '', other) },
+      storage: { ...environment.navigator.storage, getDirectory: async () => directoryHandle(root, '', { handles: other, wholeBuffer: wholeBufferWrites }) },
       get locks() {
         return environment.navigator.locks;
       },

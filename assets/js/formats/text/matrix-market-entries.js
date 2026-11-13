@@ -26,7 +26,7 @@ export class MatrixMarketError extends Error {
 }
 
 /** A decimal number in `bytes[start, end)`. */
-export function parseNumber(bytes, start, end) {
+function parseNumber(bytes, start, end) {
   let i = start;
   let negative = false;
   if (bytes[i] === 0x2d) {
@@ -253,6 +253,6 @@ export function scanEntryBlock({ parts, pattern, rows: nRows, columns: nColumns,
  *
  * @param {number} bytes
  */
-export function entryCapacity(bytes) {
+function entryCapacity(bytes) {
   return (bytes >>> 2) + 1;
 }

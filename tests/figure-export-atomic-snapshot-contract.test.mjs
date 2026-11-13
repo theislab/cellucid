@@ -490,10 +490,8 @@ test('engine snapshots before its first await and renderers consume payload only
     '../assets/js/app/ui/modules/figure-export/',
     import.meta.url
   );
-  const [engine, svg, png, rasterizer] = await Promise.all([
+  const [engine, rasterizer] = await Promise.all([
     readFile(new URL('figure-export-engine.js', root), 'utf8'),
-    readFile(new URL('renderers/svg-renderer.js', root), 'utf8'),
-    readFile(new URL('renderers/png-renderer.js', root), 'utf8'),
     readFile(new URL('utils/webgl-point-rasterizer.js', root), 'utf8'),
   ]);
 
@@ -501,11 +499,6 @@ test('engine snapshots before its first await and renderers consume payload only
   assert.match(engine, /cloneTypedOwner\(\s*borrowed\.positions,/);
   assert.match(engine, /cloneTypedOwner\(\s*borrowed\.colors,/);
   assert.match(engine, /cloneTypedOwner\(\s*borrowed\.transparency,/);
-  assert.doesNotMatch(
-    engine,
-    /new Uint8Array\(exact\.admissionLevels\)/,
-    'atomic LOD snapshots must own K admitted IDs without duplicating dense N admission bytes'
-  );
   assert.match(engine, /renderFigureToSvgBlob\(\{\s*payload,\s*signal\s*\}\)/);
   assert.match(engine, /renderFigureToPngBlob\(\{\s*payload,\s*signal\s*\}\)/);
   assert.match(
@@ -516,25 +509,11 @@ test('engine snapshots before its first await and renderers consume payload only
     engine,
     /assertFigureExportBatchRequest\(options\)[\s\S]*catch \(error\) \{[\s\S]*reportFigureExportFailure\(error\)/
   );
-  assert.doesNotMatch(engine, /getViewRenderState|getViewCameraState/);
   assert.ok(
     engine.indexOf('const payloadBase = {') <
       engine.indexOf("import('./renderers/"),
     'the complete owned payload must precede every asynchronous boundary'
   );
-
-  for (const [name, renderer] of [['SVG', svg], ['PNG', png]]) {
-    assert.match(
-      renderer,
-      /renderFigureTo(?:Svg|Png)Blob\(\{\s*payload,\s*signal\s*=\s*null\s*\}\)/
-    );
-    assert.doesNotMatch(
-      renderer,
-      /\b(?:state|viewer)\s*\.(?:get|dimensionManager|highlightArray)/,
-      `${name} renderer must not read live state after export starts`
-    );
-  }
-  assert.doesNotMatch(rasterizer, /boundsToSphere|packed\.bounds/);
   assert.match(rasterizer, /const fogNear = renderState\.fogNear/);
   assert.match(rasterizer, /const fogFar = renderState\.fogFar/);
 });

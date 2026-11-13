@@ -11,10 +11,10 @@
  *
  * Not one probe alone. A frame also waits for the compositor, which is not
  * the main thread: Linux WebKit composites in software, and there frames
- * came 106 to 461 ms apart during these runs (233 ms with nothing but the
- * run on the page) while Chromium on the same runners reported no long task
- * for the same flows. Each probe's own longest gap is reported with a
- * failure. The dataset is read over HTTP, not through `page.route`
+ * come hundreds of milliseconds apart with nothing but the run on the page,
+ * while Chromium on the same runners reports no long task for the same
+ * flows. Each probe's own longest gap is reported with a failure. The
+ * dataset is read over HTTP, not through `page.route`
  * (`helpers/served-fixture.mjs` says why).
  *
  * WebKit is measured without Playwright attached
@@ -24,30 +24,17 @@
  * the result. Playwright drives WebKit through its Web Inspector, whose
  * network agent works on the page's main thread for every chunk of every
  * response, a worker's included: WebKit carries a worker's loads through
- * its page. Measured on the Linux CI runners (ubuntu-latest, 4 cores), the
- * same page in the same build, two rounds:
- *
- * - the app's runs (that page, both flows): 84 to 115 ms with Playwright
- *   attached, 10 to 16 ms without it;
- * - 15 MB fetched by a bare worker in one request: up to 29 ms attached,
- *   19 ms without; in 15 parallel 1 MB requests: up to 86 ms attached
- *   (115 ms without a timer or a worker message), 7 ms without.
- *
- * The attached hold grows with the requests and chunks the inspector
- * observes, not with anything the app runs: no app task on the page took
- * over 3 ms (every worker message, timer and frame instrumented), starting
- * the analysis workers from their bundles instead of their sources changed
- * nothing (49 and 54 ms attached), and on macOS neither mode holds the page
- * over 13 ms. Measured attached, the bound would be Playwright's.
+ * its page. The attached hold grows with the requests and chunks the
+ * inspector observes, not with anything the app runs, so measured attached
+ * the bound would be Playwright's
+ * (measured: 38_decisions_testing_and_hosted_runners.md).
  *
  * The run starts once the scene is quiet (`sceneQuietness`, and the same
  * test in `unattached.html`), and draws no frame of its own. On Linux WebKit
  * a frame holds the main thread about as long as the frame gap above, so a
  * run started while the viewer still owed the frames of the dataset's
- * opening (its studio fade and settle frames) measured one of them: the
- * heartbeat held 459 ms with frames 457 ms apart, while the run itself
- * draws nothing and changes no DOM (measured in WebKit and Chromium on
- * macOS: no draw call and no mutation during either run).
+ * opening (its studio fade and settle frames) would measure one of them,
+ * while the run itself draws nothing and changes no DOM.
  */
 import { writeFileSync } from 'node:fs';
 

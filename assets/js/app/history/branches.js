@@ -3,8 +3,7 @@
  * finding them by name or id, where a new step goes, and the structural
  * edits (delete a branch, take a step out, squash a run, group a run) as
  * pure changes of the live records (`tree.js`), each told to the edit that
- * journals it (`journal.js`). History v2 §3.3.1, §3.3.3-§3.3.6, §3.15.2.
- * No page: values are never read here, only their hashes.
+ * journals it (`journal.js`). No page: values are never read here, only their hashes.
  *
  * @module app/history/branches
  */
@@ -52,7 +51,7 @@ function requireFreeGroupName(tracker, name, exceptId = null) {
 }
 
 /** The default name of the next branch: "Branch <nextBranch>", skipping names taken. */
-export function nextBranchName(tracker) {
+function nextBranchName(tracker) {
   return defaultName('Branch', tracker.nextBranch, [...tracker.branches.values()].map(branch => branch.name));
 }
 
@@ -90,7 +89,7 @@ export function bookmarked(tracker, name) {
 }
 
 // ---------------------------------------------------------------------------
-// Where a new step goes (§3.3.1)
+// Where a new step goes
 
 /**
  * The branch a step appended at the head goes on: the active branch when the
@@ -135,7 +134,7 @@ export function placeStep(tracker, { branch, made }, step) {
 }
 
 // ---------------------------------------------------------------------------
-// Moves (§3.3.2)
+// Moves
 
 /**
  * The active branch after the head moves to `stepId`: `branchId` (the
@@ -159,7 +158,7 @@ function settleActiveBranch(tracker, edit) {
 }
 
 // ---------------------------------------------------------------------------
-// Renames and flags (§3.3.5, §3.3.6)
+// Renames and flags
 
 export function renameBranch(tracker, edit, branch, text) {
   if (branch.locked) throw refuse(HISTORY_SENTENCES.locked({ name: branch.name }), 'locked');
@@ -214,10 +213,10 @@ export function setBookmark(tracker, edit, step, text) {
 }
 
 // ---------------------------------------------------------------------------
-// Groups (§3.15.2)
+// Groups
 
 /** The steps from `fromId` to `toId` when they are consecutive steps of one branch's own steps, else a refusal. */
-export function runOf(tracker, fromId, toId) {
+function runOf(tracker, fromId, toId) {
   const from = stepNamed(tracker, fromId);
   const to = stepNamed(tracker, toId);
   const fail = () => refuse(HISTORY_SENTENCES.notConsecutive({ from: fromId, to: toId }), 'not-consecutive');
@@ -264,7 +263,7 @@ export function createGroupOver(tracker, edit, { from, to, name: text, by, at })
 }
 
 /** A group's steps, first first (consecutive steps of one branch). */
-export function groupSteps(tracker, groupId) {
+function groupSteps(tracker, groupId) {
   const members = [...tracker.steps.values()].filter(step => step.group === groupId);
   return members.sort((a, b) => idNumber(a.id) - idNumber(b.id));
 }
@@ -397,8 +396,8 @@ export function takeOut(tracker, edit, stepIds) {
 }
 
 /**
- * What deleting branch X would do, from the same rule the delete follows
- * (§3.3.3), with nothing changed: the steps it removes, the branch that
+ * What deleting branch X would do, from the same rule the delete follows,
+ * with nothing changed: the steps it removes, the branch that
  * keeps its shared steps, the branches deleted with it, and where the head
  * would be. Main and locked branches are refused.
  *
@@ -478,7 +477,7 @@ export function applyBranchDelete(tracker, edit, plan) {
 }
 
 /**
- * Check a run to squash (§3.15.2): consecutive steps of one branch, with no
+ * Check a run to squash: consecutive steps of one branch, with no
  * branch starting inside it but at its last step, inside one group or
  * covering whole groups; an agent squashes only its own turn's steps.
  * Returns the run.
@@ -538,7 +537,11 @@ function countOf(run) {
  * moves to it. A run inside one group stays in it; groups it covers whole
  * go. Returns `{step, groupsRemoved}`.
  *
- * @param {(domain: string) => string} domainName - the name a label uses ("Colors")
+ * @param {object} tracker
+ * @param {object} edit
+ * @param {object[]} run
+ * @param {{cause?: string, by: object, domainName: (domain: string) => string}} options -
+ *   `domainName`: the name a label uses ("Colors")
  */
 export function squashRun(tracker, edit, run, { cause = 'steps', by, domainName }) {
   const first = run[0];

@@ -326,8 +326,8 @@ export class AnnDataFileSource {
     structure?.catch(() => {});
     try {
       // Stopped, the opening stops its reads where they are: the first view's embedding above all,
-      // on a reader that stays open when other cells are read again (found 2026-11-10: a superseded
-      // Apply kept reading it for ~15 s on a slow link).
+      // on a reader that stays open when other cells are read again (a superseded
+      // Apply would otherwise keep reading it on a slow link).
       await adapter.initialize({ firstView, signal: opening.signal });
       opening.throwIfStopped();
       this._assertLoadRequest(requestId);

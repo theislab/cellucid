@@ -2,11 +2,10 @@
  * What opened a viewer is named in one place (`VIEWER_HOST_RUNTIMES`,
  * `data/viewer-protocol.js`): every runtime a host may name has its words,
  * label and language there, and every sentence the viewer channel says names
- * the host by those words (L26-11: ending `cellucid mcp --open` froze the page
- * with "The notebook or R session that opened this viewer stopped").
+ * the host by those words (ending `cellucid mcp --open` must not freeze the
+ * page with "The notebook or R session that opened this viewer stopped").
  */
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { FakeHostSocket, host } from './helpers/fake-host-socket.mjs';
@@ -103,14 +102,4 @@ test('a channel ends with its host named as the runtime it was given', async () 
   assert.throws(() => new ViewerChannel({
     serverUrl: 'http://127.0.0.1:8765', viewerId: 'v', viewerToken: 't', onCommand() {}, onEnd() {}, isHostAlive: async () => true,
   }), /runtime is one of/);
-});
-
-test('no viewer sentence names its host as "the notebook or R session"', async () => {
-  for (const file of [
-    'data/viewer-channel.js', 'data/viewer-host-source.js', 'app/main.js',
-    'app/viewer-host/command-handler.js', 'app/ui/modules/highlight/selection-notification.js',
-  ]) {
-    const source = await readFile(new URL(`../assets/js/${file}`, import.meta.url), 'utf8');
-    assert.doesNotMatch(source, /notebook or R session|correct the notebook cell|this notebook gave it|The notebook's viewer/, file);
-  }
 });

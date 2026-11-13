@@ -1,6 +1,6 @@
 /**
- * History v2 §6 test 3: the State panel takes the one path agents, Python and
- * R take (C1). Every operation it does on the history is a `history.*`
+ * The State panel takes the one path agents, Python and
+ * R take. Every operation it does on the history is a `history.*`
  * catalog action, dispatched; a static scan fails on a call of one of the
  * history's mutators from `ui/modules/state/**`; and every operation that
  * loses work asks an agent first (`confirm: 'deletes-saved'`).

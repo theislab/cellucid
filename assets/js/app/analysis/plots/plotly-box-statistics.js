@@ -3,8 +3,9 @@
  * `quartilemethod: 'linear'`, `sdmultiple: 1`) computes them from raw values.
  *
  * Handing Plotly one million raw values makes its box `calc` build a point
- * object per value, bin it, and sort the objects through a comparator — about
- * 0.7 s of main-thread work before anything is drawn. Plotly's precomputed mode
+ * object per value, bin it, and sort the objects through a comparator — main-thread
+ * work that grows with the page, before anything is drawn (measured:
+ * 37_decisions_analysis.md). Plotly's precomputed mode
  * takes the statistics instead, plus only the points it will draw (the
  * outliers, or every value when all points are shown). Given the statistics
  * below it builds the identical calcdata: the same quartiles, fences, mean,
@@ -156,8 +157,8 @@ function statisticsOfSorted(sorted) {
  * Outliers are drawn without jitter, on the box's own axis line, so every copy
  * of a value lands on the same spot: a zero-inflated gene whose quartiles are
  * all zero makes every expressing cell an outlier, and Plotly draws one SVG
- * element per point — 170,000 elements, and a second of main-thread work, for
- * a one-million-cell page. Past a handful of copies a stack is visually
+ * element per point — 170,000 elements for a one-million-cell page, and the
+ * main-thread work of drawing them (measured: 37_decisions_analysis.md). Past a handful of copies a stack is visually
  * complete: each copy is drawn at marker opacity 0.8, so 16 copies leave the
  * stack's interior 0.2^16 short of opaque, far below one 8-bit color step.
  * Only the anti-aliased rim keeps converging with more copies: a rim pixel a

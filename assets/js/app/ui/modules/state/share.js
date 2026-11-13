@@ -12,7 +12,7 @@
  * opens only from the person's click, so it is written as an `.html` file
  * the person receives, or given as text.
  *
- * Pictures in the report (History v2 §3.15.7: none is ever stored): when the
+ * Pictures in the report (none is ever stored): when the
  * page can draw the selected view as a picture (`pictures`: the figure
  * export's own drawing, the read `view.picture`), the person chooses the
  * steps that get one (the bookmarks and the last step of each group by
@@ -95,7 +95,7 @@ export function createHistorySharing({
    * Draw the views after each chosen step; back to the step shown after.
    * `signal` (an agent's `history.report`): stopped, no further step is
    * shown, the jump under way ends, and the step shown before comes back
-   * before the report ends as a cancellation (F147).
+   * before the report ends as a cancellation.
    */
   async function picturesOf(tracker, chosen, signal = null) {
     const out = new Map();

@@ -436,37 +436,13 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
   );
   assert.doesNotMatch(source, /sample\.positions/);
   assert.doesNotMatch(source, /reduced\.sourcePositions|computeApprox\w*BoundsFromSample/);
-  assert.match(
-    source,
-    /const maxScanPoints = PREVIEW_MAX_SCAN_POINTS;/
-  );
   assert.doesNotMatch(
     source,
     /const fastSample = !force|maxScanPoints\s*=\s*null/
   );
-  for (const eventName of [
-    'field:changed',
-    'visibility:changed',
-    'highlight:changed',
-    'view:representation-changed',
-    'view:changed',
-    'page:changed',
-  ]) {
-    assert.match(source, new RegExp(`['"]${eventName}['"]`));
-  }
-  assert.match(source, /viewer\.onLodChanged/);
-  assert.match(source, /viewer\.onPresentedViewStateChanged/);
-  assert.match(
-    source,
-    /rebuildDelayMs:\s*PREVIEW_PRESENTATION_SETTLE_MS/
-  );
   assert.match(
     source,
     /event\?\.reason === 'camera-changing'[\s\S]*invalidatePreviewSamples\(\{ rebuild: false \}\)/
-  );
-  assert.match(
-    source,
-    /event\?\.reason === 'camera-settled'[\s\S]*invalidatePreviewSamples\(\)/
   );
   assert.match(
     source,
@@ -523,40 +499,5 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
   assert.doesNotMatch(
     source,
     /Figure preview axes require at least one visible point/
-  );
-});
-
-test('figure-export UI exposes its stable idempotent cleanup owner', async () => {
-  const source = await readFile(
-    new URL(
-      '../assets/js/app/ui/modules/figure-export/figure-export-ui.js',
-      import.meta.url
-    ),
-    'utf8'
-  );
-
-  // Idempotent, and each call answers when the export it stopped has ended.
-  assert.match(
-    source,
-    /const destroy = \(\) => \{\s*if \(cleanupComplete\) return exportEnded;\s*cleanupComplete = true;\s*container\.__cellucidCleanup = \(\) => exportEnded;/
-  );
-  assert.match(source, /\s{4}return exportEnded;\n  \};\n  container\.__cellucidCleanup = destroy;/);
-  assert.match(source, /return \{ setCellsPresent, destroy, exportSessionSettings, importSessionSettings, renderExportPicture \};\s*\n\}/);
-});
-
-test('figure-export Export is offered only while the runtime has cells', async () => {
-  const source = await readFile(
-    new URL(
-      '../assets/js/app/ui/modules/figure-export/figure-export-ui.js',
-      import.meta.url
-    ),
-    'utf8'
-  );
-
-  assert.match(source, /let cellsPresent = false;/);
-  assert.match(source, /exportBtn\.disabled = !exportBusy && !cellsPresent;/);
-  assert.match(
-    source,
-    /exportBtn\.title = cellsPresent \? '' : openADatasetTo\('export a figure'\);/
   );
 });

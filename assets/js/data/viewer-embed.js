@@ -50,7 +50,7 @@ import { whileWaitingOnPerson } from '../utils/person-wait.js';
 import { isPlainRecord } from '../utils/exact-record.js';
 
 /** The value of the page's `viewer` parameter that makes it an embedded viewer. */
-export const VIEWER_EMBED_MODE = 'embedded';
+const VIEWER_EMBED_MODE = 'embedded';
 
 /** The key every window message of the embedding handshake carries. */
 export const VIEWER_EMBED_KEY = 'cellucidViewerEmbed';

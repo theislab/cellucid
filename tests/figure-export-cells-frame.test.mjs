@@ -1,8 +1,8 @@
 /**
- * Fit the cells (F161) and the preview's shape note (F119): a figure keeps
- * the screen's framing (F62), so a narrow pane gives a narrow plot of a wide
- * embedding; one click frames every cell drawn, and the preview says when a
- * panel is far from the shape asked for.
+ * Fit the cells and the preview's shape note: a figure keeps the screen's
+ * framing, so a narrow pane gives a narrow plot of a wide embedding; one click
+ * frames every cell drawn, and the preview says when a panel is far from the
+ * shape asked for.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -98,7 +98,7 @@ test('several panels share one frame: the union of each panel\'s', () => {
   assert.equal(unionCellsFrames([null, null]), null);
 });
 
-test('the preview says when a panel is far from the shape of its cells (F119, F271)', () => {
+test('the preview says when a panel is far from the shape of its cells', () => {
   assert.equal(SHAPE_FAR, 1.5);
   // One view: a 400 × 800 pane (0.5) of square cells is far, narrower: a tall
   // figure, the cells in a band across it.

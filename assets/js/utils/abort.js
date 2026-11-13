@@ -55,9 +55,9 @@
  * cancelled and reports any other failure; and since a cancellation is never
  * a failure, one that still reaches no handler is not a page error either
  * (`quietUnhandledCancellations`, installed once by the page: a choice
- * superseded by a newer one, found 2026-11-11 when a link was opened right
- * after the start page, showed as `pageerror: Field interaction was
- * superseded by a newer intent.`).
+ * superseded by a newer one, as when a link is opened right after the start
+ * page, would show as `pageerror: Field interaction was superseded by a
+ * newer intent.`).
  *
  * Crossing a thread or a process, a cancellation keeps its kind through
  * `utils/error-wire.js`.

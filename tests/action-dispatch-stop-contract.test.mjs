@@ -1,6 +1,6 @@
 /**
  * A stopped action ends as a cancellation wherever it is, whether or not its
- * implementation watches its signal (bug hunt LB-1): the dispatcher, not each
+ * implementation watches its signal: the dispatcher, not each
  * implementation, keeps the promise its Stop makes.
  *
  * - A change stopped (the person's Stop of an agent turn, the page closing)
@@ -11,7 +11,7 @@
  *   nothing).
  * - A read stopped ends at once (it changes nothing; nothing waits for it).
  * - A change that keeps what it did when stopped (`keepsWhenStopped`: a
- *   camera path stays where the film stopped, F104) answers and keeps its
+ *   camera path stays where the film stopped) answers and keeps its
  *   step; its implementation hears the signal and ends where it is.
  *
  * No timers: each handler is held open by a promise the test releases.
@@ -149,7 +149,7 @@ test('an action not stopped is untouched: its change and its step stay', async (
   assert.equal(history.active.headId, step.id);
 });
 
-test('a change that keeps what it did when stopped (keepsWhenStopped) answers, keeps its change and records its step (F104)', async () => {
+test('a change that keeps what it did when stopped (keepsWhenStopped) answers, keeps its change and records its step', async () => {
   const { page, history, dispatcher, inside } = await pageWithSlowActions();
   const steps = history.active.steps.size;
   const reached = inside();
@@ -171,7 +171,7 @@ test('keepsWhenStopped is a boolean of an action that records a step', () => {
   assert.equal(defineAction({ ...base, touches: ['filters'], reads: [], effect: 'state' }).keepsWhenStopped, false);
 });
 
-test('work an action leaves going (ctx.ongoing) is its turn\'s: that turn\'s Stop ends it, another\'s does not, and released it is no one\'s (R9R-8)', async () => {
+test('work an action leaves going (ctx.ongoing) is its turn\'s: that turn\'s Stop ends it, another\'s does not, and released it is no one\'s', async () => {
   const { dispatcher } = await pageWithSlowActions();
   const stopped = [];
   let release = null;

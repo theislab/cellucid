@@ -1,11 +1,10 @@
 /**
  * @fileoverview The case of a sentence's first letter, written one way: a
  * phrase that starts a sentence (`upperFirst`), and one that continues it
- * (`lowerFirst`, which leaves a name alone: "PCA", "CD3E", "HTTP"). About
- * thirty copies of `text.charAt(0).toUpperCase() + text.slice(1)` and its
- * lower-case twin did this before round 9, some lowering an acronym's first
- * letter ("pCA computed on …"); `tests/one-implementation-contract.test.mjs`
- * refuses a new copy.
+ * (`lowerFirst`, which leaves a name alone: "PCA", "CD3E", "HTTP"). A copy of
+ * `text.charAt(0).toUpperCase() + text.slice(1)` or its lower-case twin would
+ * lower an acronym's first letter ("pCA computed on …");
+ * `tests/one-implementation-contract.test.mjs` refuses a new copy.
  *
  * @module utils/text-case
  */

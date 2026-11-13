@@ -300,7 +300,7 @@ function projectProbe(cell, frame, out) {
  */
 export function readCellSizeMultiplier(probes, frame) {
   if (probes === null) return 1;
-  const { width, height, pointSize, sizeAttenuation, fov, pointSizeMax } = frame;
+  const { height, pointSize, sizeAttenuation, fov, pointSizeMax } = frame;
   const readShare = frame.readShare ?? 1;
   const allCount = probes.all.length;
   if (scratch.x.length < allCount) {

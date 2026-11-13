@@ -3,19 +3,19 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 const mainSource = fs.readFileSync(
-  new URL('../assets/js/app/main.js', import.meta.url),
+  new URL('../assets/js/app/ui/modules/connectivity-controls.js', import.meta.url),
   'utf8'
 );
 
 test('KNN absence uses the exact current warning notification API', () => {
   assert.match(
     mainSource,
-    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?connectivitySummary === null[\s\S]*?notifications\.warning\([\s\S]*?This dataset has no neighbor graph, so KNN drag cannot select by neighbors; use Proximity drag or Lasso\./
+    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?getGraphSummary\(\) === null[\s\S]*?notifications\.warning\([\s\S]*?This dataset has no neighbor graph, so KNN drag cannot select by neighbors; use Proximity drag or Lasso\./
   );
   assert.doesNotMatch(mainSource, /notifications\.warn\(/);
 });
 
-test('KNN with no dataset says so before any graph question (R9E-8)', () => {
+test('KNN with no dataset says so before any graph question', () => {
   assert.match(
     mainSource,
     /setKnnEdgeLoadCallback\(\(\) => \{\s*\/\/[^\n]*\n\s*if \(!\(state\.pointCount > 0\)\) \{\s*notifications\.info\(noDatasetOpenTo\('select cells by their neighbors'\)/
@@ -30,13 +30,13 @@ test('KNN absence is announced once per dataset and graph generation', () => {
   // Behavior is covered by tests/browser/knn-missing-connectivity-warning
   // .spec.mjs; this keeps the fast suite from losing the structure silently.
   const guarded = mainSource.match(
-    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?\n\s*if \(connectivitySummary === null\) \{([\s\S]*?)\n {10}return;/
+    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?\n\s*if \(getGraphSummary\(\) === null\) \{([\s\S]*?)\n {6}return;/
   );
-  assert.notEqual(guarded, null, 'KNN absence guard was not found in main.js');
+  assert.notEqual(guarded, null, 'KNN absence guard was not found in connectivity-controls.js');
   const branch = guarded[1];
   assert.match(
     branch,
-    /const graphGeneration =\s*`\$\{datasetPublicationGeneration\}:\$\{connectivityGraphGeneration\}`;\s*if \(announcedMissingConnectivityGeneration !== graphGeneration\) \{\s*announcedMissingConnectivityGeneration = graphGeneration;/,
+    /const graphGeneration =\s*`\$\{getPublicationGeneration\(\)\}:\$\{connectivityGraphGeneration\}`;\s*if \(announcedMissingConnectivityGeneration !== graphGeneration\) \{\s*announcedMissingConnectivityGeneration = graphGeneration;/,
     'the absence branch must latch the publication and graph generation before it warns'
   );
   const latchIndex = branch.indexOf('announcedMissingConnectivityGeneration =');

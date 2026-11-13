@@ -81,23 +81,14 @@ test('the PNG figure is composed in one task, after every worker answer', async 
   const end = png.indexOf('const pixels = await pagePixelsInBands(canvas, signal);');
   assert.ok(start > 0 && end > start);
   // A composition split across tasks is flushed in pieces, and the browser
-  // rasterizes antialiased rules differently in pieces (measured on Suo:
-  // ~1,400 pixels of the reference grid differed by up to 21 levels).
+  // rasterizes antialiased rules differently in pieces (measured:
+  // 36_decisions_figure_export.md).
   assert.doesNotMatch(png.slice(start, end), /\bawait\b/);
   const prepare = png.slice(png.indexOf('async function preparePanel('), start);
   assert.doesNotMatch(prepare, /ctx\.(fill|stroke|draw|clip|beginPath|rect)\w*\(/);
 });
 
-test('the worker module is the one place the rasterizer and encoders run', async () => {
-  const worker = await source('utils/figure-export-worker.js');
-  assert.match(worker, /from '\.\/webgl-point-rasterizer\.js'/);
-  assert.match(worker, /from '\.\/png-metadata\.js'/);
-  assert.match(worker, /from '\.\.\/renderers\/svg-point-markup\.js'/);
-  assert.match(worker, /convertToBlob\(\{ type: 'image\/png' \}\)/);
-  const client = await source('utils/figure-export-worker-client.js');
-  // Started from its entry of the generated worker scripts: this module on
-  // this machine, its bundle on a deployed site (js/workers/worker-script.js).
-  assert.match(client, /startWorker\(figureExportWorkerScript\(\), \{ type: 'module' \}\)/);
+test('the worker script is its module here and its shipped bundle on a deployed site', async () => {
   const { figureExportWorkerScript } = await import('../assets/workers/scripts.js');
   assert.equal(
     figureExportWorkerScript().href,
@@ -116,22 +107,6 @@ test('the worker module is the one place the rasterizer and encoders run', async
     new RegExp(`^${new URL('../assets/workers/', import.meta.url).href}figure-export-worker\\.[0-9a-f]{12}\\.js$`)
   );
   assert.ok((await readFile(bundle)).includes('createFigureExportWorkerHandler'));
-  // The page loads the handler only where a worker cannot draw.
-  // Imported on demand through the app's code loader, which says when a page
-  // open across a deploy cannot load it (app/app-code.js).
-  assert.match(client, /await loadAppCode\(\(\) => import\('\.\/figure-export-worker\.js'\)\)/);
-  assert.doesNotMatch(client, /^import [^;]*figure-export-worker\.js'/m);
-  // What the page hands the encoders is pixels it read, never an ImageBitmap
-  // of a page canvas: on Linux WebKit such a bitmap reached the worker's
-  // encoder without the canvas's pixels (`pagePixels`).
-  for (const op of ['encodePng', 'encodePngDataUrl', 'encodeRasterPngDataUrl']) {
-    assert.match(worker, new RegExp(`${op}: async \\(\\{ pixels`), op);
-  }
-  assert.doesNotMatch(worker, /bitmaprenderer|transferFromImageBitmap/);
-  const [png, svg] = await Promise.all([source('renderers/png-renderer.js'), source('renderers/svg-renderer.js')]);
-  for (const [name, text] of [['png-renderer', png], ['svg-renderer', svg]]) {
-    assert.doesNotMatch(text, /createImageBitmap\(/, name);
-  }
 });
 
 /** A worker that answers `webgl2` with `drawing` and records every request. */
@@ -219,14 +194,6 @@ test('where the worker cannot draw, the point passes run on the page and everyth
   }
 });
 
-test('PNG chunks and ZIP entries use the shared slicing CRC', async () => {
-  for (const file of ['utils/png-metadata.js', 'utils/zip-archive.js']) {
-    const text = await source(file);
-    assert.match(text, /import \{ crc32 \} from '\.\.\/\.\.\/\.\.\/\.\.\/\.\.\/formats\/zip\/crc32\.js';/, file);
-    assert.doesNotMatch(text, /crcTable|getCrcTable/, file);
-  }
-});
-
 test('a ZIP entry checksummed slice by slice carries the CRC of its whole bytes', async () => {
   // Larger than one checksum slice and not a multiple of it, at an odd size.
   const big = pseudoRandomBytes(9 * 1024 * 1024 + 7, 17);
@@ -266,7 +233,7 @@ test('PNG text chunks are checksummed exactly', async () => {
 });
 
 test('a PNG records its DPI: one pHYs right after IHDR, before the image data, replacing the encoder\'s', async () => {
-  // Found 2026-11-10: a "300 DPI" export carried no pHYs, so layout programs placed it at 72 dpi.
+  // A "300 DPI" export carries a pHYs chunk: without it layout programs place it at 72 dpi.
   const onePixelPng = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
     'base64'

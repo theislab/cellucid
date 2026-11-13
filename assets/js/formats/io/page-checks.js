@@ -15,6 +15,13 @@
  * pages hold (the copy shortened) is damage too. CRC-32 finds every change
  * of up to 32 bits in a page and all but one in 2^32 of any other.
  *
+ * The checksums are part of what every kept directory is, so the code
+ * fingerprint of every kind of kept data covers this module
+ * (`scripts/kept-code-fingerprints.mjs`): a change to its code, the text of
+ * a message included, makes every browser remove what it kept and make it
+ * again (a file downloaded whole is downloaded again). Comments do not
+ * count. Keep here only the checksums.
+ *
  * @module formats/io/page-checks
  */
 

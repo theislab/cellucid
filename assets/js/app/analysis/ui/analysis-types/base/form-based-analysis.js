@@ -499,7 +499,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   /**
    * An option changed (key null: several at once). A display option is
    * re-applied to the shown result; anything else marks it stale.
-   * @private
+   * @protected
    */
   _handleOptionsChanged(key) {
     this._updateRunRow();
@@ -669,7 +669,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * and withdraw a stale result from the derived results. Asked again before
    * an answer arrives, only the latest answer is applied.
    * @returns {Promise<void>}
-   * @private
+   * @protected
    */
   async _updateStale() {
     const check = ++this._staleCheck;
@@ -792,7 +792,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._valuesLine.set(this._valuesNoteNow() ?? '', 'muted');
   }
 
-  /** Disable Run with its reason when the options cannot run. @private */
+  /** Disable Run with its reason when the options cannot run. @protected */
   _updateRunRow() {
     this._updateValuesLine();
     if (this._runRow === null || this._options === null) return;
@@ -1145,9 +1145,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @param {Object} options - The validated options record
    * @param {number} requestId - Current analysis request generation
    * @param {import('../../../../jobs/cancellable-job.js').CancellableJob} job
+   * @param {Object|null} [sample] - The cells of a pass over a sample, when the run is made in passes
    * @returns {Promise<Object|null>} Analysis result object
    */
-  async _runAnalysisImpl(options, requestId, job) {
+  async _runAnalysisImpl(options, requestId, job, sample) {
     throw new Error('_runAnalysisImpl() must be implemented by subclass');
   }
 
@@ -1168,9 +1169,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   /**
    * Get success notification message
    * Override for custom message
+   * @param {Object} [result] - The result shown
    * @returns {string}
    */
-  _getSuccessMessage() {
+  _getSuccessMessage(result) {
     return 'Analysis complete';
   }
 
@@ -1269,13 +1271,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Render an analysis preview and, once it has a plot, the control that opens
    * the full view.
    *
-   * The expand affordance used to be each subclass's own business: DE, Marker
-   * Genes and Gene Signature each appended an identical `.analysis-actions` row
-   * after calling this method, while Correlation asked only for the preview
-   * container's `clickable` shortcut — a bare click listener on a `<div>` with
-   * `tabindex="-1"` and no role. Correlation's expanded view was therefore
-   * unreachable by keyboard and unannounced. The affordance belongs to the
-   * preview, so it is rendered here, once, for every mode.
+   * The expand affordance belongs to the preview, so it is rendered here,
+   * once, for every mode: the preview container's `clickable` shortcut is a
+   * bare click listener on a `<div>` with `tabindex="-1"` and no role, which
+   * leaves the expanded view unreachable by keyboard and unannounced.
    *
    * @param {Object} options
    * @param {Object} options.result - Analysis result to plot: the result
@@ -1380,8 +1379,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     const expandBtn = this._createExpandButton();
     expandBtn.title = 'Open in full view with statistics and export options';
     // The full view shows the published result: its preview is drawn first and the result is
-    // published once its drawing has committed, so Expand waits for that (found 2026-11-10: a
-    // click in between said "Expanded analysis view requires a completed analysis result").
+    // published once its drawing has committed, so Expand waits for that (a click in between
+    // would say "Expanded analysis view requires a completed analysis result").
     const published = this._lastResult === result;
     expandBtn.disabled = !published;
     if (!published) expandBtn.title = 'Opens once the result is drawn';
@@ -1522,7 +1521,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         }
       }
 
-      openModal(modal);
+      // Closed while it opened: its close has begun and its plot owner is
+      // gone, so nothing is drawn into it.
+      if (!openModal(modal)) return;
 
       const rendered = await this._renderExpandedViewContent(modal, result);
       // An unrendered view is closed only when its result was discarded and
@@ -1674,14 +1675,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   /**
    * Publish a completed analysis as this UI's current result.
    *
-   * The overlay used to be bound to whichever result was current when it was
-   * opened, and nothing re-drew it afterwards. Changing the inputs with the
-   * overlay open therefore left the two surfaces showing different science at
-   * the same time — measured on Gene Signature, the sidebar preview moved to
-   * mean 1.448292 while the overlay still showed mean 3.966388 under a title
-   * naming the previous gene set. Detailed analysis already refreshed its open
-   * modal (`_updateModal`); this is that missing counterpart for every
-   * form-based mode.
+   * The overlay follows the result: changing the inputs with it open draws it
+   * again, so the sidebar preview and the overlay never show different
+   * results at the same time. Detailed analysis refreshes its open modal
+   * through `_updateModal`; this is the counterpart for every form-based
+   * mode.
    *
    * @param {Object} result - The newly completed result.
    * @param {number|null} [requestId] - Owning analysis request, when there is one.
@@ -1954,7 +1952,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   /**
    * Handle plot option changes from the modal options panel.
    * Keeps the result as source of truth and re-renders modal + preview.
-   * @private
+   * @protected
    * @param {string} key
    * @param {*} value
    * @returns {Promise<void>|undefined}
@@ -2377,7 +2375,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   async _runFromPerson() {
     const before = this._lastResult;
-    await this._runAnalysis();
+    await this._runForm();
     if (this._lastResult !== null && this._lastResult !== before) this._recordPersonChange('run', {});
   }
 
@@ -2438,14 +2436,14 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     throwIfAborted(signal);
     const before = this._lastResult;
     // Stopped before its job exists (waiting for the open cells to settle)
-    // it never starts; once it runs, its job is cancelled (`_runAnalysis`).
-    await this._runAnalysis({ signal });
+    // it never starts; once it runs, its job is cancelled (`_runForm`).
+    await this._runForm({ signal });
     const job = this._shownJob ?? null;
     if (job !== null && job.state === 'failed') throw new Error(job.message);
     if (this._lastResult !== null && this._lastResult !== before) return true;
     // A run that ended without a result was stopped: by its caller (an
     // agent's Stop), or by a person (Cancel, another run). Said as such, never
-    // as a run that changed nothing (an agent was told "it was so already").
+    // as a run that changed nothing.
     throwIfAborted(signal);
     throw cancelled('user', `${this._getTitle()} was canceled before it finished; nothing was kept.`);
   }
@@ -2512,11 +2510,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * doing with Cancel; the result is shown only once it is complete.
    * `signal` (a caller's: `runNow`): stopped while the run waits to start,
    * it throws why and nothing runs; stopped once it runs, its job is
-   * cancelled, as Cancel does (F147: a run stopped before its job existed
-   * used to run to its end).
+   * cancelled, as Cancel does (a run stopped before its job existed does not
+   * run to its end).
    * @param {{signal?: AbortSignal|null}} [how]
    */
-  async _runAnalysis({ signal = null } = {}) {
+  async _runForm({ signal = null } = {}) {
     if (this._isDestroyed) return;
     const options = structuredClone(this._requireOptions());
     // Run is disabled while a blocker holds; a run started another way (a

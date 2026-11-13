@@ -1,9 +1,9 @@
 /**
  * The orbit anchor shades its compass for the pane's camera: `u_cameraPos`
  * is the eye the viewer orbits with (`viewer.js` `updateCamera`: phi the
- * polar angle from +Y, theta from +X toward +Z). It used a latitude
- * convention instead, which at the horizon (phi = pi/2) put the eye straight
- * overhead, so specular highlights and rim light faced a camera that was not
+ * polar angle from +Y, theta from +X toward +Z). A latitude convention
+ * instead would, at the horizon (phi = pi/2), put the eye straight
+ * overhead, so specular highlights and rim light would face a camera that is not
  * there.
  */
 import assert from 'node:assert/strict';

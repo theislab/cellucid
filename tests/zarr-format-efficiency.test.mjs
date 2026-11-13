@@ -336,8 +336,8 @@ test('a web host store\'s objects are kept in the page for the tab under its met
 test('a web host store asks for an absent object once: a re-read, another opening of the same version and a reader with no page cache take its absence as known', async t => {
   // Zarr writers leave out a chunk that holds only the fill value (a 0-d scalar
   // equal to it, a run of zeros), and a web host answers it 404; the sample
-  // stores' `uns['cellucid']['priority']['seed']` is one. Measured 2026-11-10:
-  // the default sample asked for it 11 times at start, once per growth step.
+  // stores' `uns['cellucid']['priority']['seed']` is one. Without its absence
+  // known, the default sample asks for it again at every growth step.
   const { createByteRangeCache } = await import('../assets/js/data/byte-range-cache.js');
   const { adoptRangeCachePort } = await import('../assets/js/formats/io/range-cache.js');
   const zarray = (shape, chunks) => ({ zarr_format: 2, shape, chunks, dtype: '<i4', compressor: null, fill_value: 0, filters: null, order: 'C' });

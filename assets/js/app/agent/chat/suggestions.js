@@ -6,10 +6,9 @@
  * identity (`identityField`: a cell type, annotation, lineage or cluster
  * name first; never a sample, batch, id or quality flag; one known to have a
  * single category is passed over); comparing that field's two largest
- * groups; and, once the history holds steps, explaining them. (Found
- * 2026-11-10: on Suo it offered "Annotate the clusters of sample_ID", its
- * first categorical field; 2026-11-11: on Pancreas "Annotate the clusters of
- * cell_type", a field that already names the cell types, beside `clusters`.)
+ * groups; and, once the history holds steps, explaining them. The
+ * clustering and the identity field are chosen by name, never as the first
+ * categorical field (that offered "Annotate the clusters of sample_ID").
  *
  * Only what the dataset says of itself is read (`fields.list`, as the
  * person, which records nothing): no field's values are read for a
@@ -20,8 +19,8 @@
  */
 import { clusterField, identityField, isNeverFirstColoring } from '../../utils/field-roles.js';
 
-/** What the empty chat offers with no dataset open: the agent opens one (R9E-8). */
-export const NO_DATASET_SUGGESTION = 'Open a sample dataset and give me a first look at it';
+/** What the empty chat offers with no dataset open: the agent opens one. */
+const NO_DATASET_SUGGESTION = 'Open a sample dataset and give me a first look at it';
 
 /**
  * @param {{identity?: string|null, cluster?: string|null, steps?: number, dataset?: boolean}} facts -

@@ -1,6 +1,6 @@
 /**
- * What a reader says of input it cannot read (round 8, lens-readers lane):
- * whatever the format and source, a failure the person can act on is one
+ * What a reader says of input it cannot read: whatever the format and
+ * source, a failure the person can act on is one
  * sentence written for them (`details.explained`), naming the file and what
  * to do, never only "could not open" with the rule under Details.
  *
@@ -8,10 +8,10 @@
  *   object with its site page (a single-page site: 200 `text/html`) reads
  *   that object as absent, as a 404 does; a link answered with a page, or a
  *   page saved under a data file's name, is said to be one; a catalog file
- *   answered with a page is not found, not a network failure (LA-1, LA-2).
- * - A damaged R file is explained as the HDF5 and Zarr readers' are (LA-3).
+ *   answered with a page is not found, not a network failure.
+ * - A damaged R file is explained as the HDF5 and Zarr readers' are.
  * - A file whose AnnData parts break the format is explained, at opening
- *   and at a read, as the file's problem with what to do (LA-4).
+ *   and at a read, as the file's problem with what to do.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -289,10 +289,10 @@ test('a format presented as AnnData whose parts break its layout is explained in
   ]) } }), explainedAs(/^This Cell Ranger outs\/ folder file is not laid out as its format requires: Variable index length 1 does not match 4\. Read filtered_feature_bc_matrix\.h5 with scanpy/));
 });
 
-test('a file is refused for what it is, never for an embedding a format it is not would have (F115)', async t => {
-  // A Loom or 10x file missing the part its layout needs was read as AnnData
-  // and refused as "has no cell embedding"; so was an HDF5 file or Zarr
-  // store of no format at all, and an AnnData store without obs.
+test('a file is refused for what it is, never for an embedding a format it is not would have', async t => {
+  // A Loom or 10x file missing the part its layout needs is not read as AnnData
+  // and refused as "has no cell embedding"; nor is an HDF5 file or Zarr
+  // store of no format at all, nor an AnnData store without obs.
   const worker = readerWorker();
   t.after(() => worker.close());
   const refusalOf = async file => {

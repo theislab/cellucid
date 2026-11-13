@@ -5,9 +5,9 @@
  * is drawn from the global camera scalars and, with "Link cameras" on, so is
  * every other view that shows the same representation (layout) -- never a view
  * of another representation, since one camera cannot serve a 3D and a 2D view
- * or two embeddings of different shape. That rule is what fixed "the camera
- * sticks to planar": with one shared camera, a 2D view's planar default made
- * every linked 3D view planar.
+ * or two embeddings of different shape. With one shared camera, a 2D view's
+ * planar default would make every linked 3D view planar ("the camera sticks
+ * to planar").
  *
  * The viewer needs a WebGL2 context to construct, so these tests run the
  * viewer's own camera-follower functions, cut verbatim from its source, over a

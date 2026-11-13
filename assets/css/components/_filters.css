@@ -116,7 +116,7 @@
 }
 
 /* Quiet by the secondary text color (a quiet button's), never by opacity (a
-   faded glyph fell below AA contrast, lens-a11y LF-10); on the selected page,
+   faded glyph fell below AA contrast); on the selected page,
    the chip's inverse color. */
 .highlight-page-tab-combine,
 .highlight-page-tab-delete {
@@ -242,7 +242,7 @@
 
 /* The step line's help on combining (highlight/mode-copy.js combineHelpHtml):
    the Alt keys, or, while the panel's Select mode is on, the choice under the
-   tools; it follows the switch at once (R9F-13). */
+   tools; it follows the switch at once. */
 .combine-help-select {
   display: none;
 }

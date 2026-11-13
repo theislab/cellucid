@@ -1,49 +1,50 @@
 /**
  * Shader quality is a look choice, not a speed control, and the application
- * has to say so (CEL-0234, CEL-0235).
+ * has to say so.
  *
- * Measured with GPU timer queries on pose-pinned probes, counterbalanced arms
- * and byte-identical twin noise floors: `Full`, `Light` and `Ultra-light` are
- * within noise at every point size tested, and so is every individual term
- * inside them — fog, lighting, the alpha texture fetch and the round discard.
+ * `Full`, `Light` and `Ultra-light` are within noise at every point size, and
+ * so is every individual term inside them — fog, lighting, the alpha texture
+ * fetch and the round discard (measured: 28_decisions_rendering_layers.md).
  * The reason is structural rather than a property of one GPU: depth writes are
  * on and submission order is uncorrelated with depth, so roughly 95% of
  * rasterized fragments are killed before the fragment shader runs. Only about
  * 5% of the fill is ever shaded, and making that 5% cheaper is not visible.
  *
- * Two surfaces claimed the opposite and both are pinned here.
+ * Two surfaces could claim the opposite and both are pinned here.
  *
- *   - The `Shader quality:` tooltip in the sidebar told users that lowering it
- *     "reduces GPU work for smoother interaction". That is the single sentence
- *     most likely to drift back, because it is the intuitive thing to write.
- *   - The bottleneck analyser computed a `Shader Complexity` figure from a
- *     `full` minus `ultralight` delta and printed it as `Shader overhead:`.
+ *   - The `Shader quality:` tooltip in the sidebar must not tell users that
+ *     lowering it "reduces GPU work for smoother interaction". That is the
+ *     single sentence most likely to drift back, because it is the intuitive
+ *     thing to write.
+ *   - The bottleneck analyser must not compute a `Shader Complexity` figure
+ *     from a `full` minus `ultralight` delta and print it as `Shader overhead:`.
  *
  * One regime is the exception, and the tooltip says so rather than hiding it.
  * A 1-D or 2-D view is drawn without depth, so nothing is killed before the
  * fragment shader: every overlapping fragment is shaded and blended, and with
  * antialiasing on a dense embedding is bound by that blending. There `Light`
  * draws without a discard (HP_FS_LIGHT_NO_DEPTH) and `Light`/`Ultra-light`
- * took about half the frame time of `Full` on the one machine measured. Any
- * frame-time difference the tooltip states must be scoped to 2-D views and
- * name that machine; the claim "shader quality is a speed control" stays out.
+ * take about half the frame time of `Full` there (measured:
+ * 28_decisions_rendering_layers.md). Any frame-time difference the tooltip
+ * states must be scoped to 2-D views and name the machine it was measured on;
+ * the claim "shader quality is a speed control" stays out.
  *
- * That statistic could not measure the effect it named, and no gate rescues it.
+ * That statistic cannot measure the effect it names, and no gate rescues it.
  * `_measureFrameTimes` records the wall-clock interval between
  * `requestAnimationFrame` callbacks: quantised to the display refresh whenever
  * the frame fits its budget, and mixing CPU, GPU, compositor and browser
  * scheduling into one number. A noise floor derived from that same instrument
- * inherits its unreliability — an implementation that measured one quality
- * twice and used the twin difference as a floor was tried, and observed live to
- * pass a 22ms "separation" over a 7.5ms floor on a machine whose frames were
- * 100% janky and whose true effect is zero. There is no regime in which a
- * verdict from this instrument both fires and is trustworthy, so it emits none.
+ * inherits its unreliability — measuring one quality twice and using the twin
+ * difference as a floor still passes a "separation" where the true effect is
+ * zero (tried: 28_decisions_rendering_layers.md). There is no regime in which
+ * a verdict from this instrument both fires and is trustworthy, so it emits
+ * none.
  *
- * What replaces it is the measurement that does discriminate. Point size is the
- * real control: vertex work is flat regardless of size, so the cost is
- * per-sprite rasterization and shrinking points genuinely helps once fill
- * begins to matter. The harness already sweeps point size, so the panel reports
- * that response where the noise delta used to sit.
+ * The measurement that does discriminate is point size. It is the real
+ * control: vertex work is flat regardless of size, so the cost is per-sprite
+ * rasterization and shrinking points genuinely helps once fill begins to
+ * matter. The harness sweeps point size, so the panel reports that response in
+ * place of a noise delta.
  */
 
 import assert from 'node:assert/strict';
@@ -54,12 +55,10 @@ import { BottleneckAnalyzer } from '../assets/js/dev/benchmark.js';
 import { infoTipText } from './helpers/info-tip-text.mjs';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
-const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const BENCHMARK_URL = new URL('../assets/js/dev/benchmark.js', import.meta.url);
 
-const [indexHtml, mainSource, benchmarkSource] = await Promise.all([
+const [indexHtml, benchmarkSource] = await Promise.all([
   readFile(INDEX_URL, 'utf8'),
-  readFile(MAIN_URL, 'utf8'),
   readFile(BENCHMARK_URL, 'utf8'),
 ]);
 
@@ -99,7 +98,7 @@ function cpuPhases() {
 }
 
 // ---------------------------------------------------------------------------
-// The analysis no longer measures, names, or acts on shader quality
+// The analysis does not measure, name, or act on shader quality
 // ---------------------------------------------------------------------------
 
 test('the CPU phase sweep never changes the quality the user is looking at', () => {
@@ -145,7 +144,7 @@ test('no recommendation proposes a shader quality change for performance', () =>
   const analyzer = makeAnalyzer();
   const baseline = { fps: 18, avgFrameTime: 55 };
 
-  // Every branch that used to reach for `ultralight`: GPU bound, fragment
+  // Every branch that could reach for `ultralight`: GPU bound, fragment
   // bound, and a low-core device.
   const cases = [
     {
@@ -192,14 +191,6 @@ test('no recommendation proposes a shader quality change for performance', () =>
       }
     }
   }
-});
-
-test('the reporter never proposes a shader quality to recover frame rate', () => {
-  assert.doesNotMatch(
-    benchmarkSource,
-    /recommendation:\s*'[^']*(?:ultra-?light|shader)[^']*'/i,
-    'a reporter recommendation still reaches for a shader quality'
-  );
 });
 
 test('no bound-type explanation proposes a simpler shader', () => {
@@ -326,46 +317,4 @@ test('a tooltip quoting an absolute figure names the machine it came from', () =
       `${id} quotes an absolute figure without naming the machine`
     );
   }
-});
-
-test('the detailed stats report the point-size response, not a shader overhead', () => {
-  assert.ok(
-    !indexHtml.includes('bn-shader-overhead'),
-    'index.html still carries the shader overhead row'
-  );
-  assert.doesNotMatch(
-    indexHtml,
-    /Shader overhead:/i,
-    'index.html still labels a shader overhead'
-  );
-  assert.ok(
-    indexHtml.includes('id="bn-point-size-response"'),
-    'the detailed stats must report the point-size response'
-  );
-
-  assert.ok(
-    !mainSource.includes('bn-shader-overhead'),
-    'main.js still populates the shader overhead row'
-  );
-  assert.ok(
-    !mainSource.includes('shaderComplexityMs'),
-    'main.js still reads the retired shader overhead figure'
-  );
-  assert.ok(
-    mainSource.includes('bn-point-size-response'),
-    'main.js must populate the point-size response row'
-  );
-});
-
-test('no surface computes or prints a shader complexity figure', () => {
-  assert.doesNotMatch(
-    benchmarkSource,
-    /shaderComplexityMs|fullVsUltralight|fullVsLight|lightVsUltralight|'Shader Complexity'/,
-    'a retired shader delta is still computed or printed'
-  );
-  assert.doesNotMatch(
-    benchmarkSource,
-    /Shader Complexity:\s*\$\{/,
-    'the console report still prints a shader complexity figure'
-  );
 });

@@ -466,7 +466,7 @@ test('while a startup step deadline measures the wait, the opening does not meas
   assert.equal(clock.pending, 0);
 });
 
-test('the rate is of the time the reads ran: a wait on the person is not in it, and none is shown while asked (F76)', t => {
+test('the rate is of the time the reads ran: a wait on the person is not in it, and none is shown while asked', t => {
   let now = 0;
   t.mock.method(performance, 'now', () => now);
   const { log, progress, seen, setWaiting } = stallHarness();
@@ -488,7 +488,7 @@ test('the rate is of the time the reads ran: a wait on the person is not in it, 
   file.end();
 });
 
-test('notices kept until the next opening are handed over once, as it begins (R9U-13)', () => {
+test('notices kept until the next opening are handed over once, as it begins', () => {
   const { progress } = harness();
   // A failure card, a refused file, a sample view not applied: kept by id.
   assert.equal(progress.untilNextOpening('note-1'), 'note-1');
@@ -500,7 +500,7 @@ test('notices kept until the next opening are handed over once, as it begins (R9
   assert.throws(() => progress.untilNextOpening(undefined), TypeError, 'a notice that was never published has no id');
 });
 
-test('an opening\'s question waits for the welcome: asked once it is closed, never on top of it (R9U-14)', async () => {
+test('an opening\'s question waits for the welcome: asked once it is closed, never on top of it', async () => {
   const { progress, seen } = harness();
   const { holdStartupFor } = await import('../assets/js/utils/startup-sequence.js');
   let close;

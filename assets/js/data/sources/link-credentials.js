@@ -20,6 +20,12 @@
  * parameters are never part of either form, nor of the digest, so a link
  * signed again names the same file.
  *
+ * What a link is decides what a kept directory is filed under, so the code
+ * fingerprint of every kind of kept data covers this module
+ * (`scripts/kept-code-fingerprints.mjs`): a change to its code makes every
+ * browser remove what it kept and make it again. Keep here only the two
+ * forms; how a message words a link is `link-text.js`.
+ *
  * @module data/sources/link-credentials
  */
 
@@ -96,48 +102,4 @@ export function linkIdentity(href) {
   if (other.length === 0) return address;
   const digest = sha256HexWithoutWebCrypto(new TextEncoder().encode(JSON.stringify(other)));
   return `${address}#${digest.slice(0, IDENTITY_DIGEST_LENGTH)}`;
-}
-
-/** A web address inside text, up to whitespace or a quote or bracket. */
-const LINK_IN_TEXT = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-
-/** Punctuation that ends a sentence rather than the address before it. */
-const TRAILING_PUNCTUATION = /[.,;:!?)\]]+$/;
-
-/**
- * Text with every web address in it in its public form (`publicLink`): the
- * one rule for what a message, an error, a notification or the console says
- * about a link. An anchor that holds no `=` (a documentation section) is
- * kept; any other fragment is not.
- *
- * @param {string} text
- * @returns {string}
- */
-export function textWithPublicLinks(text) {
-  if (typeof text !== 'string') return text;
-  return text.replace(LINK_IN_TEXT, found => {
-    const trailing = TRAILING_PUNCTUATION.exec(found)?.[0] ?? '';
-    const href = found.slice(0, found.length - trailing.length);
-    const url = parseLink(href);
-    if (url === null) return found;
-    const anchor = url.hash !== '' && !url.hash.includes('=') ? url.hash : '';
-    const shown = `${publicLink(href)}${anchor}`;
-    // A link that loses nothing is said as it was written: its parsed
-    // spelling would change what the person typed (`http://host:8765`
-    // said as `http://host:8765/`, an upper-case host lowered).
-    return `${shown === url.href ? href : shown}${trailing}`;
-  });
-}
-
-/**
- * Whether a link's public form (`publicLink`) leaves something out of it: a
- * user name or password, a fragment, a parameter off the allow-list. Its
- * spelling alone (a trailing slash, the case of its host) is not.
- *
- * @param {string} href
- * @returns {boolean}
- */
-export function linkLeavesOutParts(href) {
-  const url = parseLink(href);
-  return url !== null && publicLink(href) !== url.href;
 }

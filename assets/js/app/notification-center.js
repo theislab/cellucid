@@ -57,10 +57,9 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
  * How long each type stays on screen when its publisher names no duration.
  *
  * The type decides, not the method that published it. `error()` and `fail()`
- * produce the identical ERROR notification, and used to give it 6000 ms and
- * 4000 ms purely because one wrote a literal and the other did not — so the
- * longest, most actionable messages the app produces, the ones routed through
- * `fail()`, got the shortest time to be read (CEL-0220).
+ * produce the identical ERROR notification, so they give it the same time:
+ * the longest, most actionable messages the app produces are the ones routed
+ * through `fail()`, and need the longest time to be read.
  *
  * ERROR is 0: it stays until dismissed. An error names something the user has
  * to do about it, and a dismissed notification cannot be re-opened, so a timer
@@ -305,9 +304,9 @@ class NotificationCenter {
     this.notifications = new Map();
     // Notifications dismissed (a person's ×, or their owner): a later update
     // or completion of one by the work that made it changes nothing, as the
-    // person closed it; an id never made is still an error. (Found
-    // 2026-11-10: a field read completed its progress notice after it was
-    // dismissed, and the read failed: the dataset opened uncolored.)
+    // person closed it; an id never made is still an error. A field read
+    // completing its progress notice after it was dismissed must not fail, or
+    // the dataset would open uncolored.
     this._dismissed = new Set();
     this.notificationId = 0;
     // Cards on screen at once: five, and two on a phone, where each covers
@@ -403,7 +402,7 @@ class NotificationCenter {
    * seen). Padding only the scroll end moves nothing already on screen.
    *
    * The observer reports the first size itself, after the next layout. A
-   * measurement here would force that layout inside startup (~25 ms); and
+   * measurement here would force that layout inside startup; and
    * while the stack is empty it is 0 px, which the stylesheet's default
    * already is.
    */
@@ -430,11 +429,11 @@ class NotificationCenter {
    * the stack. The stack stands on the bottom edge, so a card leaving lets
    * every card above it fall by its height: a person aiming at a card's
    * Dismiss as another card left (an expiry, a dismissal, a card retired to
-   * make room) had the button move from under the pointer between press and
-   * release, and the click landed on the plot behind it (Web app tests run
-   * 42385814622, WebKit, `empty-dataset-state.spec.mjs`: the button fell
-   * 40 px). A card that has left keeps its place, empty, until the pointer
-   * leaves the stack's area, gaps between cards included; then the stack
+   * make room) would have the button move from under the pointer between
+   * press and release, and the click would land on the plot behind it
+   * (`empty-dataset-state.spec.mjs`). A card that has left keeps its place,
+   * empty, until the pointer leaves the stack's area, gaps between cards
+   * included; then the stack
    * closes up at once. A tap holds it until the next press elsewhere. The
    * earlier-messages control under the stack waits the same way
    * (`_evictNonActiveUntil`).
@@ -755,9 +754,9 @@ class NotificationCenter {
    * card on screen retires to the earlier messages; if every card on screen
    * is work in progress, the cap is exceeded for now rather than orphan the
    * work's id. Only cards on screen count: a held-back card of work in
-   * progress (NOTICE_AFTER_MS) took the place of the card a person was
-   * reading, a best-guess notice with its Show, for a field read that ended
-   * in 45 ms unseen (F71, `data-mapping.spec.mjs` "on a phone", WebKit).
+   * progress (NOTICE_AFTER_MS) would take the place of the card a person was
+   * reading, a best-guess notice with its Show, for a field read that ends
+   * before it is seen.
    * @private
    */
   _reveal(notification) {

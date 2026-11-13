@@ -199,7 +199,7 @@ test('view and camera definitions: names in params, sentences a person reads, on
     ['view.cameras.link', { linked: true }, null, 'Linked the cameras of views of one embedding', 'link_cameras(True)'],
     ['view.embedding.set', { view: 'View 1', embedding: { key: 'X_pca', columns: [0, 1] } }, null,
       'Showed obsm["X_pca"] [0, 1] in View 1', 'show_embedding("View 1", "X_pca", [0, 1])'],
-    // Shown, it is named as the picker names it (found 2026-11-10: 'Showed obsm["X_umap_2d"] [0, 1] in View 2').
+    // Shown, it is named as the picker names it, not by its key and columns.
     ['view.embedding.set', { view: 'View 2', embedding: { key: 'X_umap_2d', columns: [0, 1] } }, { view: 'View 2', embedding: 'UMAP · 2D' },
       'Showed UMAP · 2D in View 2', 'show_embedding("View 2", "X_umap_2d", [0, 1])'],
     ['view.embedding.cycle', { view: 'View 2', dimension: 2 }, { embedding: 't-SNE' }, 'Showed t-SNE in View 2', 'next_embedding("View 2", 2)'],

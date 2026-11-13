@@ -3,8 +3,9 @@
  * per point.
  *
  * Plotly draws every point of a box or violin as its own SVG path: a page of
- * half a million cells with all points shown was half a million DOM nodes and
- * 5 s of main-thread work (one 2.5 s task), and each hover move 0.7 s. The
+ * half a million cells with all points shown is half a million DOM nodes,
+ * seconds of main-thread work in one task, and a hover move that takes most
+ * of a second (measured: 37_decisions_analysis.md). The
  * vendored Plotly (see the header of assets/external/plotly.min.js) hands the
  * trace's `_cellucidPointLayer` -- this module -- everything its point loop
  * reads instead. A worker (point-raster-worker.js) lays the points out exactly
@@ -16,7 +17,7 @@
  * SVG an image export serializes. Plotly waits for it (`gd._promises`) before a
  * plot, a relayout or an export resolves. The positions come back to the
  * calcdata (`_cellucidPos`, or each point record's `x`/`y`), from which hover
- * finds the nearest point as before.
+ * finds the nearest point as it does for SVG points.
  *
  * @module plots/point-layer
  */

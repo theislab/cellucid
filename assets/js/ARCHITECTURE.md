@@ -7,7 +7,7 @@ invariants / tests): `formats/README.md`, `formats/io/README.md`,
 `rendering/README.md`, `utils/README.md`, `app/README.md`,
 `app/actions/README.md`, `app/history/README.md`, `app/library/README.md`,
 `app/state/domains/README.md`, `app/session/README.md`, `app/state-serializer/README.md`,
-`app/ui/modules/figure-export/README.md`.
+`app/dataset/README.md`, `app/ui/modules/figure-export/README.md`.
 
 Long-form references live in the shared docs site,
 `cellucid-python/docs/user_guide/web_app/p_developer_docs/`: 01 (codebase
@@ -31,10 +31,17 @@ measured per engine, what was tried and reverted, and the open items, in
 | Served store and notebook widgets (Python, R) | `26_decisions_served_store_and_widgets.md` |
 | Memory model | `27_decisions_memory_model.md` |
 | Rendering layers (unread cells, zero gray, alpha layers, LOD) | `28_decisions_rendering_layers.md` |
+| Actions, state domains and the history | `33_decisions_actions_domains_and_history.md` |
+| Agents (chat bar, permissions, data guard, relay, local agents) | `34_decisions_agents.md` |
+| The interface (sidebar and controls, dialogs, legends, phone layout, keyboard, notices, community annotation) | `35_decisions_interface.md` |
+| Figure export | `36_decisions_figure_export.md` |
+| Analysis | `37_decisions_analysis.md` |
+| Testing, hosted runners, the build and the code cache | `38_decisions_testing_and_hosted_runners.md` |
 
-Update the page in the same change as the code it describes. Pages 23–27
-end with **Known issues (pre-commit)**: the defects, regressions and
-unverified behavior known at the last commit.
+Update the page in the same change as the code it describes. Each decisions
+record (pages 21 to 28 and 33 to 38) ends its text with **Known limits and
+open items**: the defects, unverified measurements and limits known now,
+each removed in the change that fixes or verifies it.
 
 ## Layers (as the tree stands)
 
@@ -50,17 +57,20 @@ L4  app/                                state, UI, sessions, analysis, exports, 
 ```
 
 An import goes from a higher layer to a lower one. There is no static import
-cycle today (measured 2026-10-30). About 90 import edges go the wrong way:
-22 formats → data, 14 data → app, 4 data → rendering, 14 rendering → app or
-data, 31 app/state or app/analysis → app/ui; about 20 of them are new since
-the last commit and are listed in
-`cellucid-private/plans/audit-2026-10-28/tidiness-2026-10-30.md`. Do not add
+cycle. 48 static imports still go the wrong way: 25 formats → data, 11
+data → app, 4 data → rendering, 8 rendering → app. Inside L4, `app/state/`
+and `app/analysis/` import `app/ui/` 52 times (44 from analysis, 8 from
+state). The counts read every `.js` file under `assets/js`, strip comments and
+count each relative `import … from`, `export … from` and bare `import '…'`
+statement whose layer is higher than its file's (a dynamic `import()` is not
+counted); they are as of this writing, not checked by a test. Do not add
 another: pass a callback, or move the shared constant down a layer.
 
-Generated files: `assets/workers/` holds worker bundles and
-`cellucid-web-assets.json` the asset inventory, both written by
-`scripts/generate-web-asset-inventory.mjs`; never edit them by hand, and
-leave `assets/workers/` out of searches.
+Generated files: `assets/workers/` holds worker bundles,
+`cellucid-web-assets.json` the asset inventory, and
+`data/anndata/transcode/kept-code-fingerprints.js` the code fingerprints of
+kept data (below), all written by `scripts/generate-web-asset-inventory.mjs`;
+never edit them by hand, and leave `assets/workers/` out of searches.
 
 ## Glossary: one word per concept
 
@@ -68,11 +78,12 @@ leave `assets/workers/` out of searches.
 | --- | --- | --- |
 | The cells a dataset is open with | **open cells** (`cell-identity.js`) | Inside the app, per-cell arrays are in *subset positions* (`i`-th open cell); everything leaving the app names a cell by its *original position* (its `obs` row). Convert only through `createCellIdentity` (`toOriginal`, `fromOriginal`, `openValues`). |
 | A subsample method and its parameters | **subsample spec** (`data/subsample.js`) | Methods `blocks`, `uniform`, `stratified`, `spatial`; defined by developer doc 19 and implemented identically in Python and R. |
-| The request an opening sends the worker | **cell subset request** (checked by `requireCellSubsetRequest`, `cell-subset-policy.js`; the name `CellSubsetRequest` in comments has no typedef yet) | Modes `auto`, `all`, `subsample`, `kept`, `prefix`, `chunks` (`subsample-plan.js` header). |
+| The request an opening sends the worker | **cell subset request** (`CellSubsetRequest`, checked by `requireCellSubsetRequest`, `cell-subset-policy.js`) | Modes `auto`, `all`, `subsample`, `kept`, `prefix`, `chunks` (`subsample-plan.js` header). |
 | A fraction of the cells, as the owner and the cost rule speak of it | **share** | The UI says "Cells to open"; the cost rule: a share never costs more than a larger share or than every cell. Caution: `share` also names a fraction of the memory allowance (`RESIDENCY_SHARES`, "the `columnIndex` share") and a proportion (`countFromShare`). |
 | The open cells a cell-major gene is read for | **gene sample** (`geneSampleOf`, `subsample-plan.js`; page side `app/state/managers/field/gene-sample.js`) | Grown on the page by the **top-up** (`DataState.topUpGeneSample`) and by **Genes read for** (Session › Open data, `ui/modules/gene-read-control.js`, `readGenesForMoreCells`). Unread cells are drawn faded (`rendering/read-cell-layer.js`). |
 | The one order every "first m cells" uses | **priority order** (`data/cell-priority.js`, `subsample.js` `priorityOrder`) | `openOrder` is the order the open cells are held in (`cell-identity.js`); a priority-ordered file stores rows in priority order (`anndata/priority-layout.js`). `cellOrder` / `CellOrder` (`subsample-plan.js`) is a recipe (`{method, seed, blockSize}`), not a permutation. |
-| Something stored in this browser across visits | **kept** (`transcode/space.js`, the Session panel says **Stored**) | Kept store (converted R/MatrixMarket store), kept parts (bytes of a remote file, `formats/io/kept-parts.js`), kept index (gene index, `anndata/kept-column-index.js`). Caution: `kept` also names the cells a subsample keeps (`cell-identity.js` `kept`: ascending original positions; `views/cell-subset.js` `cellSubsetView({kept})`: file rows in view order) and the recorded set of `{mode: 'kept'}`; read the context. |
+| Something stored in this browser across visits | **kept** (`transcode/space.js`, the Session panel says **Stored**) | Kept store (converted R/MatrixMarket store), kept download (a file a host serves only whole), kept parts (bytes of a remote file, `formats/io/kept-parts.js`), kept index (gene index, `anndata/kept-column-index.js`). Caution: `kept` also names the cells a subsample keeps (`cell-identity.js` `kept`: ascending original positions; `views/cell-subset.js` `cellSubsetView({kept})`: file rows in view order) and the recorded set of `{mode: 'kept'}`; read the context. |
+| The code that wrote a kept directory | **code fingerprint** (`codeFingerprint` in its manifest; `transcode/kept-code-fingerprints.js`, generated) | A digest of the code that decides what a directory of its kind holds, comments and layout aside (`scripts/kept-code-fingerprints.mjs`). A directory stamped by other code is removed, never read. Not the *state fingerprint* of a history step or the *dataset fingerprint* of a session. |
 | A file and the version of it | **identity** (`data/sources/identity.js`) | Only a versioned identity is kept across visits. |
 | The measured connection to one file | **link** (`formats/io/link.js` `LinkMeter`) | *Round trip* (`latencyMs`, the shortest, used for shaping requests), *round trip under load* (`loadedLatencyMs` / `loadedRoundTripMs`, used for prices), *request cost under load* (`loadedRequestMs`), *bandwidth* (`bytesPerMs`). |
 | One embedding a view shows | **representation** / **layout** (`layoutKey`) | `dimension-manager.js`. |
@@ -83,7 +94,7 @@ leave `assets/workers/` out of searches.
 
 | To change… | Start at | Then |
 | --- | --- | --- |
-| What a file or folder is recognized as | `data/input-formats.js` (mirror: `input_formats.json` in Python and R, digest-pinned) | `data/anndata/open.js`, `data/anndata/views/index.js`, `data/anndata/transcode/index.js` |
+| What a file or folder is recognized as | `data/input-formats.js` (mirror: `input_formats.json` in Python and R, byte for byte: `scripts/shared-files.mjs`) | `data/anndata/open.js`, `data/anndata/views/index.js`, `data/anndata/transcode/index.js` |
 | How reads become requests (merging gaps, request size, concurrency) | `formats/io/byte-reader.js` (`planMergeGap`, `requestPieceBytes`) | `formats/io/link.js`, `formats/io/byte-source.js` (`REMOTE_POLICY`, `LOCAL_POLICY`) |
 | The link model (round trip, bandwidth, protocol, stalls) | `formats/io/link.js` | `formats/io/hosts.js` (per host), `data/host-link-memory.js` (earlier visits) |
 | Rate limits and retries of a host | `formats/io/hosts.js` (`createHostBook`: `admit`, `pace`, `budget`) | `formats/io/byte-source.js` (`isTransientFailure`, `retryWaitMs`) |
@@ -91,23 +102,25 @@ leave `assets/workers/` out of searches.
 | The default block size of a `blocks` subsample | `data/anndata/subsample-plan.js` (`defaultBlockSize`, `blockRung`, `BLOCK_CHUNKS`) | `data/host-link-memory.js` |
 | Which cells a subsample keeps | `data/subsample.js` (the specification) | `data/anndata/subsample-plan.js` (`resolveCellSubset`), Python `subsample.py`, R `subsample.R` / `src/subsample.c`, the shared subsample fixture |
 | Auto-fit (how many cells fit this device) | `data/anndata/subsample-plan.js` (`autoFitCount`) | `data/memory-budget.js` (`CELL_WORKING_SET_BYTES`, `memoryAllowanceBytes`) |
-| The gene sample and its top-up | `data/anndata/subsample-plan.js` (`geneSampleOf`, `GENE_READ_TARGET_MS`) | `data/anndata/reader.js` (`geneSampleOf`), `app/state/managers/field/gene-sample.js` (`topUpGeneSample`), `app/ui/modules/gene-read-control.js` (Genes read for, the one control that grows it; the legend's and analyses' lines link to it) |
+| The gene sample and its top-up | `data/anndata/subsample-plan.js` (`geneSampleOf`, `GENE_READ_TARGET_MS`) | `data/anndata/reader/gene-sample.js` (`geneSampleOf`), `app/state/managers/field/gene-sample.js` (`topUpGeneSample`), `app/ui/modules/gene-read-control.js` (Genes read for, the one control that grows it; the legend's and analyses' lines link to it) |
 | Reading a subsample's rows from the store | `data/anndata/views/cell-subset.js` (`gatheredArray`, `KeptPositions`) | `data/anndata/values.js` (`readRowsInStoreOrder`, `readInSourceOrder`), `data/anndata/decoded-chunks.js` |
 | A copy of the open dataset as a Cellucid-ready AnnData `.zarr.zip` (what is copied, the layout, the changes written) | `data/anndata/write/copy.js` (`writeAnnDataCopy`; `README.md`) | `data/anndata/write/layout.js` (chunks and codecs by role), `data/anndata/write/gene-major.js` (cell-major matrices), `formats/zarr/writer.js`, `formats/zip/writer.js`; the page's way in: `BaseAnnDataAdapter.writeAnnDataCopy`; what it is planned against: `data/anndata/write/copy-target.js` (`BaseAnnDataAdapter.readCopyTarget`) |
 | "Save AnnData with this state…": the apply plan, its sink and its progress | `app/history/exports/anndata-copy.js` (the plan Python and R follow, pinned by `history-golden.expected.json`) | `app/history/anndata-copy-save.js` (the action `history.anndata.save`: save dialog or spool, the job, the outcome), `data/anndata/write/copy.js` |
 | Gene indexes of cell-major matrices | `data/sparse-column-index.js` | `data/anndata/prefix-column-index.js` (segments over priority-ordered rows), `data/anndata/kept-column-index.js` (kept across visits), `data/column-store-placement.js` |
 | Progressive opening (first view, growth) | `data/anndata/progressive-open.js` | `app/open-cells-resize.js`, `data/opening-cost.js` |
 | A rate measured of the machine or the link that a plan weighs (and holding it in a test or a benchmark) | `utils/machine.js` (`measureOf`, `holdMachine`; the measures are listed in its module doc) | its readers: `formats/io/link.js` (`plannedLink`), `data/host-link-memory.js`, `data/anndata/progressive-open.js`, `data/anndata/subsample-plan.js`, `data/sparse-column-index.js`, `data/anndata/prefix-column-index.js`, `data/opening-cost.js`; `workers/worker-script.js` (`handToWorkers`); `tests/helpers/machine-at-rest.mjs`, `tests/browser/helpers/device.mjs` |
-| Kept data (what is stored, versions, removal) | `data/anndata/transcode/space.js` (`KEPT_STORE_REVISION`, `KEPT_INDEX_REVISION`: raising one deletes every user's kept data of that kind) | `formats/io/kept-parts.js`, `data/anndata/kept-column-index.js`, `app/ui/modules/kept-stores-dialog.js` |
+| Kept data (what is stored, removal, room) | `data/anndata/transcode/space.js` (keeps the directories: locks, quota, listing, removal; stamps and checks each manifest's code fingerprint, `codeFingerprintOf`) | `formats/io/kept-parts.js`, `data/anndata/kept-column-index.js`, `app/ui/modules/kept-stores-dialog.js` |
+| What a kept directory is on disk (its files' names, what it is filed under, its manifest, the page checksum tables, a journal's records) | `data/anndata/transcode/kept-format.js` (every kind), `data/anndata/transcode/kept-journal.js` (the downloaded parts of files) | `formats/io/page-checks.js`; a change to these is a change of code fingerprint: what browsers kept of that kind is removed and made again |
+| Which code a kind's code fingerprint covers | `scripts/kept-code-fingerprints.mjs` (`KEPT_KINDS`: each kind's entries; `LEFT_OUT`: what never decides kept bytes, each with why) | `node scripts/generate-web-asset-inventory.mjs` writes `kept-code-fingerprints.js`; `tests/kept-code-fingerprints-contract.test.mjs` |
 | Memory (budgets, what is counted, refusals) | `data/memory-budget.js` | `data/memory-census.js`, `app/page-memory.js`, `formats/io/decoded-budget.js` |
 | Decoders (codec choice, WebAssembly, workers) | `formats/io/decode-pool.js` | `formats/io/decoder-choice.js`, `formats/io/wasm-codecs.js` (`scripts/build-wasm-codecs.mjs`), `formats/io/inflate.js` |
 | A link provider | `data/sources/providers/<host>.js` | `data/sources/registry.js`, `data/sources/auth/` |
-| The reader worker's API | `data/anndata-reader-worker.js` | `data/anndata-reader-client.js` (`AnnDataReaderClient`), `data/anndata/reader.js` (`AnnDataReader`) |
+| The reader worker's API | `data/anndata-reader-worker.js` | `data/anndata-reader-client.js` (`AnnDataReaderClient`), `data/anndata/reader.js` (`AnnDataReader`: its state and lifecycle; its method groups are `data/anndata/reader/`, one module a part, `reader/README.md`) |
 | How unread / zero / colored cells are drawn | `rendering/alpha-visibility.js`, `rendering/read-cell-layer.js` | `rendering/high-perf-renderer.js`, `rendering/high-perf/read-cell-index.js` |
 | Points, LOD, frame time | `rendering/high-perf-renderer.js` | `rendering/high-perf/`, `rendering/viewer.js` |
 | What moves under reduced motion (the preference, and each mover drawn by script) | `utils/reduced-motion.js` (`prefersReducedMotion`, `onReducedMotionChange`; CSS: `assets/css/base/_accessibility.css`) | `rendering/viewer.js` (fades, studio surface, camera glide and zoom easing, the overlay context's `reducedMotion`, a redraw on change), `rendering/overlays/velocity/velocity-overlay.js` (`stillFlowTrace`: a still picture of the flow), `rendering/backdrops/backdrop-look-renderer.js`, `app/ui/modules/cinematic-camera/playback-controller.js`, `app/ui/modules/state/tour.js` |
 | Why a control is off (an input or a select turned off says why: its tooltip, a refused `setting.set`) | `ui/core/control-availability.js` (`setControlAvailability`, `unavailableReasonOf`; contract `tests/control-availability-contract.test.mjs`) | every owner that turns one off; `state-serializer/ui-controls.js` (`settingRecordOf`), `ui/core/deferred-control-readiness.js` |
-| What a slider's value reads as, for any value (its readout here and a value of the past in the history: "Grid density: 48³", not a position) | `ui/core/control-readout.js` (`defineControlReadout`, `controlReadout`; contract `tests/settings-describe-readout.test.mjs`) | the slider's owner (`render-controls.js`, `main.js` connectivity) writes its readout with it; `state/domains/settings.js` `describe` |
+| What a slider's value reads as, for any value (its readout here and a value of the past in the history: "Grid density: 48³", not a position) | `ui/core/control-readout.js` (`defineControlReadout`, `controlReadout`; contract `tests/settings-describe-readout.test.mjs`) | the slider's owner (`render-controls.js`, `ui/modules/connectivity-controls.js`) writes its readout with it; `state/domains/settings.js` `describe` |
 | A dialog (every modal: the welcome, the license, a confirmation, Cite, Share, the history's, the community annotation dialogs, agent approvals): opening, focus in and back, Escape, the backdrop, keys kept from the page, stacking, the notification cards over it | `app/ui/components/app-dialog.js` (`wireAppDialog`, `keepAboveModals`: a native `<dialog>` opened with `showModal()`, the only modal implementation; contract `tests/app-dialog-contract.test.mjs`) | `ui/components/confirm-dialog.js` (the one confirmation), `ui/modules/community-annotation/modal-shell.js` and `community-annotation-voting-modal.js` (their shells), CSS `assets/css/components/_modals.css` (App dialogs: `.app-dialog`, `.dialog-layer`) |
 | A keyboard shortcut or key (a page-wide key, a camera key, a keyed widget's keys; who a key belongs to) | `app/ui/onboarding/shortcut-table.js` (the one table: the Keyboard shortcuts panel, the page's key listener `keyboard-shortcuts.js` with `provideShortcut`, and the docs page `scripts/generate-shortcut-reference.mjs` are made from it) | `utils/key-ownership.js` (`isPageKey`: a text field, a dropdown, a menu, a list or a dialog keeps its keys), `rendering/navigation-keys.js` (`NAVIGATION_KEYS`, the held-key ledger), `ui/keyboard-move.js` (`MOVE_KEYS`), `ui/modules/state/graph.js` (the History list); contract `tests/keyboard-shortcut-table-contract.test.mjs` |
 | An action (a new one, its parameters, what it changes, its label and pseudocode) | `app/actions/definitions/<area>.js` (pure; `touches` names every domain it can change) | the module that owns the state provides its implementation (`app/actions/README.md`, Implementations); `tests/action-catalog-contract.test.mjs`; `node scripts/generate-relay-bundle.mjs`; the step by step is developer doc 29 (action layer, state domains and history) |
@@ -117,7 +130,9 @@ leave `assets/workers/` out of searches.
 | Sessions (the history in one file, format 4; Save and Share choices) | `app/session/session-serializer.js`, `app/session/history-file.js` | `app/session/share-scope.js` (what a Save or Share holds), `app/session/app-stamp.js` (what wrote a file), `app/session/published-default.js` (starting views), `app/session/README.md`, developer doc 10 |
 | The history's core: recording, moves, branches, groups, squash, notes, bookmarks, turns, Recently deleted, the recording switch and detail switches, replay, staleness, the history's own actions | `app/history/history.js` | `app/history/actions.js` (the `history.*` actions), `delete-restore.js` (delete with dependants, restore from Recently deleted), `tree.js` (live records and indexes), `branches.js`, `journal.js`, `turns.js`, `provenance.js`, `search.js`, `describe.js`, `replay.js`, `value-pool.js`, `model.js` (the records); page chrome kept outside the history: `state-serializer/ui-controls.js` (`capturePageChrome`, `planPageChrome`); `app/history/README.md`; `tests/history-v2-*.test.mjs`, `tests/history-tree-properties-*.test.mjs` (`history-tree-properties.mjs`) |
 | The history kept in this browser (autosave, saved states, Continue) | `app/history/autosave.js` | `app/history/autosave-store.js`, `app/history/dataset-history.js` (a dataset's history from opening to replacement), `app/history/history-settings.js` |
-| My datasets (the datasets opened in this browser, how each opens again, its menu and All…) | `app/library/my-datasets.js` (`README.md`) | `app/library/local-file-handles.js` (files of this computer), `app/ui/modules/my-datasets/` (the control and the dialog), `app/main.js` (`recordDatasetOpened` on a publication) |
+| My datasets (the datasets opened in this browser, how each opens again, its menu and All…) | `app/library/my-datasets.js` (`README.md`) | `app/library/local-file-handles.js` (files of this computer), `app/ui/modules/my-datasets/` (the control and the dialog), `app/dataset/reload.js` (`recordDatasetOpened` on a publication) |
+| How a dataset change opens, publishes, fails and puts back the dataset shown (startup's dataset, a sample, None, a file, a link, the benchmark) | `app/dataset/reload.js` (the transaction), `app/dataset/publication.js` (stage, commit, restore, settle the interface) (`README.md`) | `app/dataset-reload-outcome.js` (who supersedes whom), `app/dataset/published-state.js` (the catalog's starting view), `ui/modules/benchmark/benchmark-controls.js` (the synthetic run) |
+| What start-up does, and in which order (the link read, every awaited step, the interface, the startup dataset) | `app/main.js` | `app/startup-phase.js` (the deadlines), `app/startup-url-intent.js`, `app/startup-failure.js` |
 | The State panel (Share… and Load…, the branch graph, undo keys, the branch picker and map, trackers, notes, search, Recently deleted, History settings, saved states, tour, pseudocode, methods paragraph, report) | `app/ui/modules/state/` (`README.md`; `history-source.js` the seam to the history) | `app/history/current.js` (the page's history), `app/history/exports/` (the text) |
 | What an agent sees of any action it is about to take that asks first, and which agent is acting (the confirm card, the activity line with Stop and Undo turn) | `app/agent/presence/` (`README.md`) | `app/actions/dispatcher.js` (`setConfirmer`, events, `stop`) |
 | The chat bar (a turn, the context rule, keys, what is kept with the history, the selection attached, a question's choices) | `app/agent/chat/` (`README.md`) | `app/agent/bridge/tool-call.js` (one tool call), `app/agent/instructions.js` |
@@ -125,7 +140,7 @@ leave `assets/workers/` out of searches.
 | A model provider of the chat bar (another API, its models, its failures) | `app/agent/providers/<name>.js` (`contract.js`) | `app/agent/providers/index.js` (the list the page offers) |
 | Python or R viewer, notebook widget | `data/viewer-protocol.js` (mirror: `viewer_protocol.json`) | `data/viewer-channel.js`, `data/viewer-host-source.js`, `app/viewer-host/` |
 | Claude and ChatGPT as a connector (the relay, approving a connection, the Agents panel, the view card in the chat) | `app/agent/bridge/` (`relay-protocol.js`: the wire both ends share; `README.md`) | `app/agent/connect/` (the panel and its dialogs), `relay/` (the Worker; `README.md`, `view-app.js`), `node scripts/generate-relay-bundle.mjs` |
-| An agent app on this computer driving a host viewer (`cellucid mcp` of the Python or R package: the `agent_*` commands and events of the viewer channel, the local connection, its tool list) | `app/agent/bridge/agent-calls.js` (the one engine for agents from outside the tab), `app/agent/bridge/local-agents.js` (what the packages read: `mcp-tools.json`) | `data/viewer-protocol.js` + `data/viewer-host-source.js` (`onAgent`), `app/main.js` (the wiring), `app/agent/presence/` (`questionFor`, `answer`, `onPermissionsChanged`), `node scripts/generate-action-catalog.mjs` (writes `mcp-tools.json` here and in both packages); developer doc 31 |
+| An agent app on this computer driving a host viewer (`cellucid mcp` of the Python or R package: the `agent_*` commands and events of the viewer channel, the local connection, its tool list) | `app/agent/bridge/agent-calls.js` (the one engine for agents from outside the tab), `app/agent/bridge/local-agents.js` (what the packages read: `mcp-tools.json`) | `data/viewer-protocol.js` + `data/viewer-host-source.js` (`onAgent`), `app/viewer-host/host-channel.js` (the wiring), `app/agent/presence/` (`questionFor`, `answer`), `node scripts/generate-action-catalog.mjs` (writes `mcp-tools.json` here and in both packages); developer doc 31 |
 | Community annotation (the panel, Pull and Publish, an agent's read and vote, what is not published, two tabs, renamed fields) | `app/ui/modules/community-annotation-controls.js` (the controller; `annotation.*` actions) | `app/ui/modules/community-annotation/published-baseline.js` (published view, pending changes, a vote alone), `app/community-annotations/runtime-context.js` (scope, paused here), `app/community-annotations/field-names.js` (keys on the dataset's names), `app/community-annotations/session.js`, `github-sync.js`; developer doc of community annotation in `cellucid-python/docs/user_guide/web_app/j_community_annotation/` |
 | Opening a dataset by name (an agent's `dataset.open`) | `app/ui/modules/dataset-open-action.js` | `app/actions/targets/datasets.js` (names), `app/actions/definitions/datasets.js`, `data/whole-download.js` (`setWholeDownloadGate`: asking before a whole download), `app/ui/modules/seen-addresses.js` (asking before a link the person has not seen in this tab: `opensLinks`, `ctx.confirmLink`) |
 | Analysis | `app/analysis/` | developer doc 11 |
@@ -133,19 +148,49 @@ leave `assets/workers/` out of searches.
 
 ## Rules that hold everywhere
 
+- The type check (`npm run check`, `scripts/check-types.mjs`) holds this
+  tree: the TypeScript compiler reads the JavaScript and its JSDoc, and a
+  line fails when it is a defect whatever the typing style (an undefined
+  name, a bad import, a wrong argument count, a `@private` member reached
+  from outside, an unused name: the codes are `DEFECT_FAMILIES` in the
+  script) or when it is any diagnostic in a fully checked folder. The list
+  of fully checked folders is `FULLY_CHECKED` in the script, and only there;
+  a new folder starts in it. No `@ts-ignore` or other directive comment: the
+  JSDoc is made true instead (`CONTRIBUTING.md`, "The type check").
+- A method mixed onto another class's prototype (a method group, applied
+  with `applyMixin`, `utils/apply-mixin.js`) is typed in three parts. The group is a class in its
+  own file. Each of its members says whose `this` it runs with, as the
+  first tag of its JSDoc (`@this {import('../core/data-state.js').DataState}`;
+  after an `@param {Object} name` the compiler takes the tag for a member of
+  that parameter and drops it). One declaration says the owner has the
+  group's members: a line `interface Owner extends GroupMethods {}` for the
+  owner's module in `types/mixins.d.ts`. A member another group reaches
+  keeps its underscore and carries no `@private`, which the compiler holds
+  to the class body it is written in; and a parameter's default does not
+  read `this` (read it in the body). `DataState`'s groups and bags are in
+  this form (`app/state/core` is fully checked; its managers keep typing
+  style of their own).
 - A share never costs more than a larger share or than every cell in what a
-  person meets: time, download, memory, rendering and analysis work (the
-  request count is a means, not a cost: decision 2026-10-30); the ideal is
-  about s/n of every cell's cost.
+  person meets (developer doc 20, "The share-cost rule").
 - Open cells are exact: a subsample is the cells its spec names, never
   raised or rounded; a session restores the recorded cells.
 - Memory that grows with the data is counted in `data/memory-budget.js`.
 - No arbitrary size or count caps: only real platform limits.
 - No feature state in URL parameters (sessions only; a link may name the
   cells to open).
-- Kept-data revision guards digest module source and paths: moving or
-  renaming a guarded module deletes users' kept data. Move files only through
-  the staged plan.
+- Kept data is stamped with the code fingerprint of its kind: a digest,
+  written by the build, of the code that decides what a kept directory of
+  that kind holds (each module by its path and its code, comments and layout
+  aside). The browser removes, and never reads, a directory stamped by other
+  code, and makes it again on the next opening. So changing, moving or
+  renaming a covered module needs no plan and no number: it changes a
+  fingerprint (run `node scripts/generate-web-asset-inventory.mjs`), and what
+  browsers kept of that kind is made again: minutes for a converted store or
+  a gene index, a whole download for a file a host serves only whole. Keep
+  the five modules a download's and a file's parts' fingerprints cover
+  (`kept-format.js`, `kept-journal.js`, `formats/io/page-checks.js`,
+  `sources/identity.js`, `sources/link-credentials.js`) to what a kept
+  directory is; a comment-only change changes no fingerprint.
 - Wait on a signal only through `onAbort(signal, callback)` or
   `awaitWithSignal` (`utils/abort.js`), never `addEventListener('abort', …)`.
   An `abort` event fires once, when the signal aborts. A listener added after

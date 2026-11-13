@@ -333,8 +333,8 @@ test('the measured window carries the upload counters it was given', async () =>
     cancelFrame: scheduler.cancelFrame
   });
 
-  // One element-buffer reallocation per frame is exactly the shape the audit
-  // predicts under camera motion. The renderer draws between two of the
+  // One element-buffer reallocation per frame is exactly the shape expected
+  // under camera motion. The renderer draws between two of the
   // harness callbacks, so the upload is issued when the camera is published
   // and must be attributed to the frame that is measured next.
   const originalSetCameraState = viewer.setCameraState;
@@ -418,7 +418,7 @@ test('a configuration applies every axis and reports what it achieved', async ()
 
 test('a window starts only once every presented view draws from its final geometry', async () => {
   // The trees a toggle asks for land in later frames and re-order their
-  // stores on the GPU; a window that began before that measured the landing.
+  // stores on the GPU; a window that began before that would measure the landing.
   const scheduler = createScheduler();
   const { viewer, ownerDocument, record } = createHarnessDouble({
     geometrySettledAfter: 5

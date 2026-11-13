@@ -51,18 +51,17 @@ import { LOD_FULL_DETAIL_ADMISSION_LEVEL } from './renderer-contracts.js';
  *
  * In 3D the units are the tree's leaves: neighboring points stored next to
  * each other are drawn next to each other, which with the depth test makes a
- * 10M-point full-detail frame about 4x cheaper than source order.
+ * 10M-point full-detail frame several times cheaper than source order
+ * (measured: 28_decisions_rendering_layers.md).
  *
  * A 1D or 2D view draws without depth and blends every point, and there
  * leaf order is the slowest order there is: with multisampling, points drawn
- * back to back over the same pixels serialize their blends, and leaf order
- * drew 10M 2D points in 300-500 ms against 145-195 ms in source order
- * (Chromium, Apple M1 Pro, harness). So 1D and 2D group points only into 64
+ * back to back over the same pixels serialize their blends (measured:
+ * 28_decisions_rendering_layers.md). So 1D and 2D group points only into 64
  * coarse units (a quadtree at depth 3, a binary tree at depth 6) and keep
  * source order inside each, while frustum culling still draws whole unit
- * ranges. In the app that order draws a 10M-point 2D full-detail frame in
- * 21 ms against 67 ms in source order (no vsync, GPU-bound), so a 2D store
- * adopts it whenever its tree exists, as a 3D store does.
+ * ranges; a 2D store adopts that order whenever its tree exists, as a 3D
+ * store does.
  */
 export const DRAW_UNIT_DEPTH_BY_DIMENSION = Object.freeze([0, 6, 3, Infinity]);
 
@@ -79,7 +78,7 @@ export const DRAW_UNIT_DEPTH_BY_DIMENSION = Object.freeze([0, 6, 3, Infinity]);
  * @param {number} dimensionLevel
  * @returns {object[]} The units, by ordinal.
  */
-export function numberDrawUnits(root, dimensionLevel) {
+function numberDrawUnits(root, dimensionLevel) {
   const unitDepth = DRAW_UNIT_DEPTH_BY_DIMENSION[dimensionLevel];
   const units = [];
   const visit = (node, depth) => {

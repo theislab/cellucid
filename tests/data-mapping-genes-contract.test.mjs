@@ -1,6 +1,6 @@
 /**
  * The gene list of a data mapping, read from a real `.h5ad` and Zarr ZIP in
- * the browser readers (Phase F), against the numpy reference for the same
+ * the browser readers, against the numpy reference for the same
  * file (`data-mapping-full.expected.json`, computed by
  * `scripts/generate-data-mapping-fixtures.py` independently of this code):
  * - every expression matrix (`X`, each layer, `raw.X` with its own var axis)

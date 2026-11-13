@@ -7,14 +7,12 @@
  * and apt cannot leave a slow connection. Its only stall guard
  * (`Acquire::http::Timeout`) fires when a connection sends nothing at all; a
  * mirror connection that trickles never trips it. On hosted Ubuntu runners
- * about one runner in twenty-four gets such a connection to
- * `azure.archive.ubuntu.com`'s package pool: 30 to 50 kB/s, while the same
- * runner fetched the package index from the same mirror at 13 MB/s seconds
- * earlier, and every other runner of the run fetched the same packages in 8 to
- * 36 s (run 42274413675 Linux WebKit 8/8 and run 42275099689 Linux Chromium
- * 5/8, 2026-11-06; runs 42180485733 and 42262565061 before them). Every run of
- * 48 Linux browser jobs therefore lost one to a 10-minute step bound, whatever
- * retries and timeouts apt was given.
+ * some connections to `azure.archive.ubuntu.com`'s package pool trickle at
+ * tens of kB/s, while the same runner fetched the package index from the same
+ * mirror at MB/s seconds earlier and other runners fetch the same packages in
+ * seconds. Such a connection holds a job to its 10-minute step bound, whatever
+ * retries and timeouts apt was given (measured:
+ * 38_decisions_testing_and_hosted_runners.md).
  *
  * So the download is taken from apt and apt only installs:
  *

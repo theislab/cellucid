@@ -3,14 +3,12 @@
  * its dataset over HTTP, never through `page.route`.
  *
  * WebKit's Playwright delivers a fulfilled body through the page's own
- * process, on its main thread. The analysis responsiveness spec once routed
- * its 16 MiB fixture and saw WebKit hold the page for about 185 ms on the
- * dataset's first gene read, once per dataset, while Chromium showed nothing.
- * Nothing in the application ran then: the reader worker's one request was
- * in flight, and a bare worker fetch of a routed 16 MiB body, with no
- * application code loaded, holds WebKit's page for about 250 ms. Served over
- * HTTP the same file holds it for none. A routed dataset makes the harness
- * the long task such a spec reports (`helpers/served-fixture.mjs`).
+ * process, on its main thread: a routed 16 MiB fixture holds WebKit's page
+ * for a long task on the dataset's first gene read while Chromium shows
+ * nothing, though no application code runs then (a bare worker fetch of such
+ * a body does it). Served over HTTP the same file holds it for none. A routed
+ * dataset makes the harness the long task such a spec reports
+ * (`helpers/served-fixture.mjs`; measured: 38_decisions_testing_and_hosted_runners.md).
  */
 
 import assert from 'node:assert/strict';

@@ -38,7 +38,7 @@ import { formatCountOf } from '../../utils/format-units.js';
  * The skeleton text, in characters, from which an object or a list is stored
  * as a part. A part's reference is 76 characters and a part costs its name
  * once more where it is stored, so a smaller one gains little when it repeats
- * and costs most of its size when it does not (measured: `tests/stress/RESULTS.md`).
+ * and costs most of its size when it does not.
  */
 export const PART_MIN_CHARS = 512;
 
@@ -373,7 +373,7 @@ export function skeletonArrays(skeleton) {
  * refused.
  *
  * @param {unknown} digest
- * @returns {{type: Function, length: number, sha256: string}}
+ * @returns {{type: import('../../utils/large-arrays.js').TypedArrayConstructor, length: number, sha256: string}}
  */
 export function parseArrayDigest(digest) {
   const match = typeof digest === 'string' ? DIGEST_PATTERN.exec(digest) : null;

@@ -1,7 +1,7 @@
 /**
  * `openExternal` reports whether a window opened. `window.open` with the
- * `noopener` feature always returns null, so the old call reported every
- * successful open as a failure (audit: browser-integration.js:33).
+ * `noopener` feature always returns null, so a call that took the null for a
+ * refusal would report every successful open as a failure.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

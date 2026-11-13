@@ -26,11 +26,10 @@ export class LayoutRefusal extends Error {
 }
 
 /**
- * The refusal of data that has no cell embedding (design decision D4): what
- * the file is, where its embedding may be, and how to compute one in Python
- * and in R (Cellucid computes none; `prepare()` and `cellucid_prepare()`
- * write one that exists, and refuse data without one), or pass coordinates
- * already at hand.
+ * The refusal of data that has no cell embedding: what the file is, where
+ * its embedding may be, and how to compute one in Python and in R (Cellucid
+ * computes none; `prepare()` and `cellucid_prepare()` write one that exists,
+ * and refuse data without one), or pass coordinates already at hand.
  *
  * @param {string} what - The file as the message names it ("This 10x Cell
  *   Ranger matrix", "This Loom file")

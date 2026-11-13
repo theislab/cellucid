@@ -5,10 +5,10 @@
  *   values are the field's own numbers at the field's width (4 bytes a cell for
  *   Float32 instead of a JavaScript number array's 8).
  * - The page-data cache is bounded by the bytes of the values it holds and
- *   by nothing else: no entry count, no age (F123: a count cap evicted small
- *   results while memory was free).
+ *   by nothing else: no entry count, no age (a count cap would evict small
+ *   results while memory is free).
  * - A density curve is computed once per page-values array and bandwidth, and
- *   the narrow/wide bandwidths no longer run (and discard) the auto kernel sum
+ *   the narrow/wide bandwidths do not run (and discard) the auto kernel sum
  *   first; the curves are bit-identical to that double computation.
  */
 import assert from 'node:assert/strict';
@@ -227,7 +227,7 @@ test('the page-data cache keeps any number of small results while its bytes fit 
 });
 
 /**
- * The density plot's KDE as it was before this change, verbatim: the auto
+ * The reference density plot's KDE, verbatim: the auto
  * curve first, then, for a bandwidth multiplier other than 1, a second curve
  * that replaced it.
  */

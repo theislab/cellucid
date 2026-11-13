@@ -6,7 +6,7 @@
  * - **Every change, as it is made** (`createAutosave`): the write of each
  *   change of the history starts within a task of it, to this browser's
  *   IndexedDB (`autosave-store.js`, database `cellucid-history`), and holds
- *   only what changed (History v2 §3.6): the steps an event names (a new step and its
+ *   only what changed: the steps an event names (a new step and its
  *   parent; the steps a delete rewrote, and those it removed), the tracker's
  *   own record (its head, branches, groups, notes, recording switch and
  *   paused draft), the turns and journal entries that changed, the messages
@@ -24,7 +24,7 @@
  *   kept once it holds something of the person's ({@link keepsContent}): a
  *   step, a conversation, a note, another tracker, a paused draft, a loaded
  *   history; one that only opened writes nothing.
- * - **Paused draft** (§3.15.1): while recording is paused the tracker's
+ * - **Paused draft**: while recording is paused the tracker's
  *   record keeps what differs from its head (`Tracker.paused.draft`) and its
  *   values are written, so after a crash Continue brings the changes back
  *   (as one step once recording resumes).
@@ -33,7 +33,7 @@
  *   (Continue) or not to be asked about it again (Start fresh). It is never
  *   loaded by itself. A history continued keeps writing into the same saved
  *   state.
- * - **One page writes a saved state** (§3.7). The page holds a Web Lock on
+ * - **One page writes a saved state**. The page holds a Web Lock on
  *   the saved state it writes (`cellucid-history/<id>`). Continuing one
  *   another tab holds opens a copy here instead (a new saved state), and the
  *   offer says so first. The store refuses a write from a page that is not
@@ -212,7 +212,7 @@ const TRACKER_HEAD_FIELDS = Object.freeze(recordFields('Tracker').filter(field =
  * change in place): the model's `Tracker` fields but its steps, turns,
  * journal and conversations.
  */
-export function trackerHeadRecord(tree) {
+function trackerHeadRecord(tree) {
   const out = {};
   for (const field of TRACKER_HEAD_FIELDS) {
     const value = tree[field];
@@ -257,7 +257,7 @@ function keptOf(trees) {
   };
 }
 
-/** A conversation's messages as stored one each (F1's transcript, `agent/chat/conversation.js`: `{…, messages}`). */
+/** A conversation's messages as stored one each (a transcript of `agent/chat/conversation.js`: `{…, messages}`). */
 function splitTranscript(transcript) {
   if (transcript !== null && typeof transcript === 'object' && Array.isArray(transcript.messages)) {
     const { messages, ...head } = transcript;
@@ -434,7 +434,7 @@ function storedStepRoots(step) {
 
 /**
  * What one saved state holds, record by record, so its size is what a walk
- * of all of it counts (History v2 §6 test 6): each value, part and array it
+ * of all of it counts: each value, part and array it
  * names once, by its stored size, reached from its steps, its Recently
  * deleted and its paused drafts. Each record is counted by the references
  * to it (from those roots and from the values and parts that name it): a
@@ -533,7 +533,7 @@ function batchBytes(batch) {
 
 /**
  * A saved state's record (`entries`): what it is, its dataset and header,
- * the page chrome it carries outside its history (`chrome`, CEL-0249), what
+ * the page chrome it carries outside its history (`chrome`), what
  * wrote it (`app`; `actions` for one kept from a file), its trackers listed,
  * what it keeps.
  */
@@ -774,7 +774,7 @@ export function createAutosave({
       case 'loaded':
         // An offer to continue is moot once a history is loaded here.
         withdrawOffer();
-        // A continued saved state that could not be restored whole (F155: a part this version cannot read)
+        // A continued saved state that could not be restored whole (a part this version cannot read)
         // is not written into: it keeps every part as it was, and the history goes on as a saved state beside it.
         if (adoptNext !== null && (event.unrestored ?? 0) > 0) {
           // Its lock goes (this page's own autosave's goes with the entry below).

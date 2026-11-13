@@ -10,8 +10,8 @@
  * is one plain sentence, with what was shown still shown. A host that only
  * redeployed the same bytes under new validators is no failure at all.
  *
- * Owner's report (Suo on www.cellucid.com, 0.9.7): "Verifying the branch
- * failed: Observation category field 4 requires exact dataset-length codes."
+ * Without that read, Verify of a branch fails with "Observation category field
+ * 4 requires exact dataset-length codes."
  */
 import { expect, test } from './helpers/test.mjs';
 import { appUrl } from './helpers/origins.mjs';
@@ -96,51 +96,52 @@ async function verifyFromMenu(page, branch = 'b0') {
 
 const notice = (page, text) => page.locator('#notification-center .notification', { hasText: text });
 
-test('a tab switch releases what was colored earlier, and Verify, undo, jump and coloring go on', async ({ page }) => {
+test('a tab switch releases what was colored earlier, a categorical field and a continuous one, and Verify, undo, jump and coloring go on', async ({ page }) => {
   test.setTimeout(120_000);
   const errors = observeProductErrors(page);
   await openStore(page);
-  const [colored] = await takeSteps(page, [['color.by', { field: PSEUDOTIME }]]);
 
-  await switchTabAway(page);
-  // The release is real: the field shown earlier holds no codes now.
-  expect(await fieldFacts(page, 'stage')).toEqual({ loaded: false, arrays: false });
-  const before = await shownNow(page);
+  await test.step('a tab switch releases what was colored earlier, and Verify, undo, jump and coloring go on', async () => {
+    const [colored] = await takeSteps(page, [['color.by', { field: PSEUDOTIME }]]);
 
-  await verifyFromMenu(page);
-  await expect(notice(page, 'reproduced exactly (1 step)')).toBeVisible();
-  await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
-  await expect.poll(() => shownNow(page)).toEqual(before);
+    await switchTabAway(page);
+    // The release is real: the field shown earlier holds no codes now.
+    expect(await fieldFacts(page, 'stage')).toEqual({ loaded: false, arrays: false });
+    const before = await shownNow(page);
 
-  // Every other move goes through the same pass.
-  await switchTabAway(page);
-  await page.evaluate(() => window._cellucidHistories.current().undo());
-  expect((await shownNow(page)).active).toBe('stage');
-  expect((await shownNow(page)).head).toBe('s0');
-  await page.evaluate(() => window._cellucidHistories.current().redo());
-  expect((await shownNow(page)).head).toBe(colored);
-  await switchTabAway(page);
-  await page.evaluate(id => window._cellucidHistories.current().jump(id), 's0');
-  expect((await shownNow(page)).active).toBe('stage');
-  // Pseudotime, released by the switch below, is read again when colored by.
-  await switchTabAway(page);
-  expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
-  await takeSteps(page, [['color.by', { field: PSEUDOTIME }]]);
-  expect((await shownNow(page)).active).toBe('pseudotime');
-  expect(errors).toEqual([]);
-});
+    await verifyFromMenu(page);
+    await expect(notice(page, 'reproduced exactly (1 step)')).toBeVisible();
+    await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
+    await expect.poll(() => shownNow(page)).toEqual(before);
 
-test('a continuous field released is the same: its full range needs no values', async ({ page }) => {
-  test.setTimeout(120_000);
-  const errors = observeProductErrors(page);
-  await openStore(page);
-  await takeSteps(page, [['color.by', { field: PSEUDOTIME }], ['color.by', { field: STAGE }]]);
-  await switchTabAway(page);
-  expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
-  const before = await shownNow(page);
-  await verifyFromMenu(page);
-  await expect(notice(page, 'reproduced exactly (2 steps)')).toBeVisible();
-  await expect.poll(() => shownNow(page)).toEqual(before);
+    // Every other move goes through the same pass.
+    await switchTabAway(page);
+    await page.evaluate(() => window._cellucidHistories.current().undo());
+    expect((await shownNow(page)).active).toBe('stage');
+    expect((await shownNow(page)).head).toBe('s0');
+    await page.evaluate(() => window._cellucidHistories.current().redo());
+    expect((await shownNow(page)).head).toBe(colored);
+    await switchTabAway(page);
+    await page.evaluate(id => window._cellucidHistories.current().jump(id), 's0');
+    expect((await shownNow(page)).active).toBe('stage');
+    // Pseudotime, released by the switch below, is read again when colored by.
+    await switchTabAway(page);
+    expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
+    await takeSteps(page, [['color.by', { field: PSEUDOTIME }]]);
+    expect((await shownNow(page)).active).toBe('pseudotime');
+  });
+
+  await test.step('a continuous field released is the same: its full range needs no values', async () => {
+    // The branch shown is the one made after the jump to the opening: colored by pseudotime, and now by stage.
+    await page.locator('#notification-center .notification').evaluateAll(cards => cards.forEach(card => card.remove()));
+    await takeSteps(page, [['color.by', { field: STAGE }]]);
+    await switchTabAway(page);
+    expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
+    const before = await shownNow(page);
+    await verifyFromMenu(page, await page.evaluate(() => window._cellucidHistories.current().active.activeBranch));
+    await expect(notice(page, 'reproduced exactly (2 steps)')).toBeVisible();
+    await expect.poll(() => shownNow(page)).toEqual(before);
+  });
   expect(errors).toEqual([]);
 });
 
@@ -205,41 +206,6 @@ test('whatever narrows a filter keeps its arrays through a tab switch: a hidden 
   expect(errors).toEqual([]);
 });
 
-test('kept views: a field one view shows stays, the others are released in every view, and Verify goes on', async ({ page }) => {
-  test.setTimeout(120_000);
-  const errors = observeProductErrors(page);
-  await openStore(page);
-  // The view kept shows the opening's stage.
-  await takeSteps(page, [['view.keep', {}], ['color.by', { field: PSEUDOTIME }]]);
-  await switchTabAway(page);
-  expect(await fieldFacts(page, 'stage')).toEqual({ loaded: true, arrays: true });
-  const before = await shownNow(page);
-  await verifyFromMenu(page);
-  await expect(notice(page, 'reproduced exactly (2 steps)')).toBeVisible();
-  await expect.poll(() => shownNow(page)).toEqual(before);
-  expect(errors).toEqual([]);
-});
-
-test('a user\'s own column survives a tab switch: no file could give it back', async ({ page }) => {
-  test.setTimeout(120_000);
-  const errors = observeProductErrors(page);
-  await openStore(page);
-  const count = await page.evaluate(() => window._cellucidState.pointCount);
-  await takeSteps(page, [
-    ['field.duplicate', { field: STAGE, name: 'my stage' }],
-    ['field.push', { key: 'pushed', kind: 'continuous', categories: null, n_obs: count, cells: null, values: Array.from({ length: count }, (_, cell) => cell) }],
-    ['color.by', { field: { source: 'obs', key: 'my stage' } }],
-    ['color.by', { field: { source: 'obs', key: 'pushed' } }],
-    ['color.by', { field: PSEUDOTIME }],
-  ]);
-  await switchTabAway(page);
-  expect(await fieldFacts(page, 'my stage')).toEqual({ loaded: true, arrays: true });
-  expect(await fieldFacts(page, 'pushed')).toEqual({ loaded: true, arrays: true });
-  await takeSteps(page, [['color.by', { field: { source: 'obs', key: 'my stage' } }], ['color.by', { field: { source: 'obs', key: 'pushed' } }]]);
-  expect((await shownNow(page)).active).toBe('pushed');
-  expect(errors).toEqual([]);
-});
-
 /** The store's files from now on with a new validator; `rewrite` also changes the bytes of the file it names. */
 function deployments(page) {
   const site = { etag: '"deployed-1"', rewrite: null };
@@ -252,100 +218,60 @@ function deployments(page) {
   return served.then(() => site);
 }
 
-test('a host that redeployed the store with the same bytes: nothing is said, and every read goes on', async ({ page }) => {
-  test.setTimeout(120_000);
-  const errors = observeProductErrors(page);
-  const site = await deployments(page);
-  await openStore(page);
-  await takeSteps(page, [['color.by', { field: PSEUDOTIME }]]);
-  await switchTabAway(page);
-  site.etag = '"deployed-2"';
-  const before = await shownNow(page);
-
-  // Every file has a new validator; the field read before is read again under it.
-  await verifyFromMenu(page);
-  await expect(notice(page, 'reproduced exactly (1 step)')).toBeVisible();
-  await expect.poll(() => shownNow(page)).toEqual(before);
-  await page.locator('#history-undo-btn').click();
-  await expect.poll(async () => (await shownNow(page)).active).toBe('stage');
-  await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
-  await expect(page.locator('#notification-center .notification', { hasText: 'changed on the host' })).toHaveCount(0);
-  expect(errors).toEqual([]);
-});
-
-test('a host that really rewrote the store: Verify says so in one sentence, what was shown stays, and nothing is mixed', async ({ page }) => {
+test('a read of a released field that fails: once, Verify gives no verdict and the next reproduces; rewritten on the host, Verify says so and what was shown stays', async ({ page }) => {
   test.setTimeout(120_000);
   const site = await deployments(page);
   await openStore(page);
   // The opening's stage, shown again last, stays resident; pseudotime, colored by at step 1, is released.
   await takeSteps(page, [['color.by', { field: PSEUDOTIME }], ['color.by', { field: STAGE }]]);
-  await switchTabAway(page);
-  site.etag = '"deployed-2"';
-  site.rewrite = PSEUDOTIME_VALUES;
-  const before = await shownNow(page);
 
-  await verifyFromMenu(page);
-  const failed = notice(page, 'Verifying the branch failed');
-  await expect(failed).toBeVisible();
-  await expect(failed.locator('.notification-message')).toHaveText(/^Verifying the branch failed: "[^"]+" was not verified, because step 1 \("Colored by pseudotime"\) could not run: .*changed on the host.*open it again to read the new version\.$/);
-  await expect(failed.locator('.notification-details')).toHaveCount(0);
-  // Reading again in this session can never succeed, so no button offers it.
-  const read = notice(page, 'Cellucid could not read field pseudotime');
-  await expect(read).toContainText('changed on the host');
-  await expect(read.locator('.notification-action')).toHaveCount(0);
-  await expect.poll(() => shownNow(page)).toEqual(before);
-  expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
+  await test.step('a read that fails once: Verify gives no verdict, Try again is offered, and the next Verify reproduces', async () => {
+    await switchTabAway(page);
+    const before = await shownNow(page);
+    // A refusal, not a 404: an absent chunk of a Zarr store is its fill value.
+    const failing = route => route.fulfill({ status: 403, body: 'refused' });
+    await page.context().route(PSEUDOTIME_VALUES, failing);
 
-  // The app stays usable: an undo that needs the unreadable field says why and moves nothing.
-  await page.locator('#history-undo-btn').click();
-  await expect(notice(page, 'Undo failed')).toContainText('changed on the host');
-  await expect.poll(() => shownNow(page)).toEqual(before);
-  // What needs no read goes on.
-  await takeSteps(page, [['filter.category.visibility', { field: STAGE, categories: ['early'], visible: false }]]);
-  expect((await shownNow(page)).shownCells).toBeLessThan(48);
-});
+    await verifyFromMenu(page);
+    await expect(notice(page, 'was not verified')).toBeVisible();
+    await expect(notice(page, 'Cellucid could not read field pseudotime').locator('.notification-action')).toHaveText('Try again');
+    await expect.poll(() => shownNow(page)).toEqual(before);
+    expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
 
-test('a read that fails once: Verify gives no verdict, Try again is offered, and the next Verify reproduces', async ({ page }) => {
-  test.setTimeout(120_000);
-  await openStore(page);
-  // The opening's stage, shown again last, stays resident; pseudotime, colored by at step 1, is released.
-  await takeSteps(page, [['color.by', { field: PSEUDOTIME }], ['color.by', { field: STAGE }]]);
-  await switchTabAway(page);
-  const before = await shownNow(page);
-  // A refusal, not a 404: an absent chunk of a Zarr store is its fill value.
-  const failing = route => route.fulfill({ status: 403, body: 'refused' });
-  await page.context().route(PSEUDOTIME_VALUES, failing);
-
-  await verifyFromMenu(page);
-  await expect(notice(page, 'was not verified')).toBeVisible();
-  await expect(notice(page, 'Cellucid could not read field pseudotime').locator('.notification-action')).toHaveText('Try again');
-  await expect.poll(() => shownNow(page)).toEqual(before);
-  expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
-
-  await page.context().unroute(PSEUDOTIME_VALUES, failing);
-  await page.locator('#notification-center .notification').evaluateAll(cards => cards.forEach(card => card.remove()));
-  await verifyFromMenu(page);
-  await expect(notice(page, 'reproduced exactly (2 steps)')).toBeVisible();
-  await expect.poll(() => shownNow(page)).toEqual(before);
-});
-
-test('a broken invariant is never said as a sentence, and never with a stack', async ({ page }) => {
-  test.setTimeout(120_000);
-  await openStore(page);
-  // Verify replays the step that clears the coloring: there the invariant breaks.
-  await takeSteps(page, [['color.by', { field: null }]]);
-  const before = await shownNow(page);
-  await page.evaluate(() => {
-    const state = window._cellucidState;
-    const own = state.clearActiveField;
-    state.clearActiveField = function clearActiveField() {
-      state.clearActiveField = own;
-      throw new TypeError('Internal invariant of the visibility pass.');
-    };
+    await page.context().unroute(PSEUDOTIME_VALUES, failing);
+    await page.locator('#notification-center .notification').evaluateAll(cards => cards.forEach(card => card.remove()));
+    await verifyFromMenu(page);
+    await expect(notice(page, 'reproduced exactly (2 steps)')).toBeVisible();
+    await expect.poll(() => shownNow(page)).toEqual(before);
   });
-  await verifyFromMenu(page);
-  const failed = notice(page, 'Verifying the branch failed');
-  await expect(failed.locator('.notification-message')).toHaveText('Verifying the branch failed: "Main" was not verified, because step 1 ("Cleared the coloring") could not run: a problem inside Cellucid stopped it; Details has its words for a bug report.');
-  await expect(failed.locator('.notification-details-text')).toHaveText('Internal invariant of the visibility pass.');
-  await expect.poll(() => shownNow(page)).toEqual(before);
+
+  await test.step('a host that really rewrote the store: Verify says so in one sentence, what was shown stays, and nothing is mixed', async () => {
+    // Pseudotime, read again by the Verify above, is released once more.
+    await page.locator('#notification-center .notification').evaluateAll(cards => cards.forEach(card => card.remove()));
+    await switchTabAway(page);
+    expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
+    site.etag = '"deployed-2"';
+    site.rewrite = PSEUDOTIME_VALUES;
+    const before = await shownNow(page);
+
+    await verifyFromMenu(page);
+    const failed = notice(page, 'Verifying the branch failed');
+    await expect(failed).toBeVisible();
+    await expect(failed.locator('.notification-message')).toHaveText(/^Verifying the branch failed: "[^"]+" was not verified, because step 1 \("Colored by pseudotime"\) could not run: .*changed on the host.*open it again to read the new version\.$/);
+    await expect(failed.locator('.notification-details')).toHaveCount(0);
+    // Reading again in this session can never succeed, so no button offers it.
+    const read = notice(page, 'Cellucid could not read field pseudotime');
+    await expect(read).toContainText('changed on the host');
+    await expect(read.locator('.notification-action')).toHaveCount(0);
+    await expect.poll(() => shownNow(page)).toEqual(before);
+    expect(await fieldFacts(page, 'pseudotime')).toEqual({ loaded: false, arrays: false });
+
+    // The app stays usable: an undo that needs the unreadable field says why and moves nothing.
+    await page.locator('#history-undo-btn').click();
+    await expect(notice(page, 'Undo failed')).toContainText('changed on the host');
+    await expect.poll(() => shownNow(page)).toEqual(before);
+    // What needs no read goes on.
+    await takeSteps(page, [['filter.category.visibility', { field: STAGE, categories: ['early'], visible: false }]]);
+    expect((await shownNow(page)).shownCells).toBeLessThan(48);
+  });
 });

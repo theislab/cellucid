@@ -1,10 +1,10 @@
 /**
  * An analysis option whose choices are the highlight pages (Differential
  * expression's Group A and Group B) is named by the page's name in the
- * actions, as every action names pages: an agent read `pageA: "restof__page_1"`
- * and was refused "Group A has no choice "PreEndo Arx+"" for the page's name,
- * then guessed "page_2" (lane-analyst L3-7). The record keeps the id; the set,
- * the get and a person's recorded change speak names.
+ * actions, as every action names pages: an agent that reads `pageA:
+ * "restof__page_1"` is not refused "Group A has no choice "PreEndo Arx+"" for
+ * the page's name and left to guess "page_2". The record keeps the id; the
+ * set, the get and a person's recorded change speak names.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

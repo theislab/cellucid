@@ -49,11 +49,11 @@ async function connected() {
  * over. The request's own work before that (its token verified on the thread
  * pool) takes the real time it takes and is simply awaited.
  *
- * The clock was moved on by the whole wait at every turn of the event loop
- * until the request answered: turns pass in microseconds, real work does
- * not, and on a slow runner the mocked clock ran past the access token's
- * hour before the token was read, so the answer was a refused token and not
- * the one under test (Windows, Node 22, nightly run 43141748516).
+ * The clock is not moved on by the whole wait at every turn of the event
+ * loop until the request answers: turns pass in microseconds, real work does
+ * not, and on a slow runner the mocked clock would run past the access
+ * token's hour before the token is read, so the answer would be a refused
+ * token and not the one under test.
  */
 function pastReconnectWait(t, pending) {
   t.mock.timers.tick(TAB_RECONNECT_WAIT_MS);
@@ -367,7 +367,7 @@ test('a tab that closes during a call, or answers too much or nonsense, gets the
   assert.equal(full.content[0].text.length, limit);
 });
 
-test('a call or a status made while the tab reloads waits for it to be back, and runs there (L26-5)', async () => {
+test('a call or a status made while the tab reloads waits for it to be back, and runs there', async () => {
   const { env, token, tab } = await connected();
   await focus(tab.socket);
   tab.socket.close(1001, 'reloading');

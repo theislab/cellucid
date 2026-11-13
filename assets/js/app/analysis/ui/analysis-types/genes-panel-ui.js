@@ -16,7 +16,7 @@
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { GenesPanelController, GROUP_ID_PREFIX, POOLED_GROUP_ID } from '../../genes-panel/genes-panel-controller.js';
-import { markerMatrix, retransformMatrix } from '../../genes-panel/expression-matrix-builder.js';
+import { markerMatrix } from '../../genes-panel/expression-matrix-builder.js';
 import { MARKER_DISPLAY_KEYS, markerDisplayOf, rankGroupGenes, selectMarkers } from '../../genes-panel/marker-selection.js';
 import { HoverContext } from '../components/hover-context.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
@@ -44,6 +44,7 @@ import { failureDetails, sayFailure } from '../../../../utils/errors.js';
 import { GENES_READ_PLACE } from '../../../../data/gene-read-plan.js';
 import { describeValues, isValuesRecord, transformWords } from '../../../../data/expression-transform.js';
 import { copyText } from '../../../utils/clipboard.js';
+import { loadAppCode } from '../../../app-code.js';
 
 /** A marker group in a session: its category, by value. */
 const GROUP_KEY_PREFIX = 'category:';
@@ -419,7 +420,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       this._renderPreviewExpandAction(result);
       return container;
     }
-    await import('../../plots/types/gene-heatmap.js');
+    await loadAppCode(() => import('../../plots/types/gene-heatmap.js'));
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
     const containerId = `genes-panel-plot-${this._instanceId || 'default'}`;
     const rendered = await this._renderPreviewPlot({
@@ -537,7 +538,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** The ranked list: each tested group and its markers, compact. */
   _renderRankedPreview(result) {
-    const { selection, stats, metadata } = result;
+    const { selection } = result;
     const list = document.createElement('div');
     list.className = 'marker-ranked-preview';
     const tested = selection.groups.filter(entry => entry.group.tested);
@@ -574,8 +575,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /**
    * No gene passes the filters: how many were tested, and Relax filters. The
-   * one empty state of a result, in the panel and in the expanded view (it
-   * said there only "No genes pass the filters.", with no way on: R9E-11).
+   * one empty state of a result, in the panel and in the expanded view, each
+   * with a way on (not only "No genes pass the filters.").
    */
   _noGenesPass(result) {
     const { stats, metadata } = result;
@@ -607,7 +608,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (!result) return null;
     const slot = this._ensureModalPlotSlot(modal);
     // The heatmap draws a result with no matrix as its empty state itself.
-    await import('../../plots/types/gene-heatmap.js');
+    await loadAppCode(() => import('../../plots/types/gene-heatmap.js'));
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) throw new RangeError(`Unknown plot type: ${result.plotType}`);
     const merged = PlotRegistry.mergeOptions(result.plotType, result.options || {});
@@ -715,7 +716,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     copy.className = buttonClassName('quiet');
     copy.textContent = 'Copy genes';
     copy.addEventListener('click', () => {
-      // Said either way (it was silent, copied or not).
+      // Said either way, copied or not.
       void copyText(shown.map(i => stats.genes[i]).join('\n'), {
         what: formatCountOf(shown.length, 'gene'),
         success: `Copied ${formatCountOf(shown.length, 'gene')}.`,
@@ -742,7 +743,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     summary.textContent = `${formatCount(order.length)} of ${formatCount(stats.genesTestedByGroup[groupIndex])} tested genes pass the filters`;
     container.appendChild(summary);
 
-    const columns = [
+    const columns = /** @type {const} */ ([
       ['Gene', i => stats.genes[i], null],
       ['Score', i => stats.scoresByGroup[groupIndex][i], 2],
       ['log2FC', i => stats.log2FoldChangeByGroup[groupIndex][i], 2],
@@ -750,7 +751,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       ['% in', i => stats.pctInByGroup[groupIndex][i], 0],
       ['% ref', i => stats.pctRefByGroup[groupIndex][i], 0],
       ['AUROC', i => stats.aurocByGroup[groupIndex][i], 3]
-    ];
+    ]);
     const table = document.createElement('table');
     table.className = 'de-genes-table modal-de-genes';
     const thead = document.createElement('thead');
@@ -1124,8 +1125,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /**
    * How the markers were tested, as the expanded view's Statistics say it,
-   * with each tested group's cells (an agent weighed "a marker of 23
-   * cells" without knowing it was 23) and what each group is compared with.
+   * with each tested group's cells (the weight of a marker's evidence) and
+   * what each group is compared with.
    */
   _resultAbout(result, top) {
     const metadata = result?.metadata;

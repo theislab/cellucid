@@ -456,7 +456,7 @@ test('a host\'s data mapping is one transaction whose origin is the notebook\'s'
   const [[mapping, { heavy, signal, ...options }]] = calls;
   assert.deepEqual([mapping, options], [{ ...SHOWN_MAPPING, expression: 'raw' }, { origin: 'notebook' }]);
   assert.equal(typeof heavy, 'function');
-  // And the action's Stop (F147).
+  // And the action's Stop.
   assert.ok(signal instanceof AbortSignal);
   // Refused, nothing changes and the host is told why.
   refuse = true;

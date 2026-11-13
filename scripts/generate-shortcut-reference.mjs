@@ -14,31 +14,25 @@
  * `user_guide/web_app/o_accessibility_privacy_security/03_keyboard_shortcuts.md`.
  * `tests/keyboard-shortcut-table-contract.test.mjs` fails while it differs
  * from what this writes, so a key added to the table cannot leave the docs
- * behind (round 9, R9K-4).
+ * behind.
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { pythonDocsRoot } from './shared-files.mjs';
 import { SHORTCUT_GROUPS } from '../assets/js/app/ui/onboarding/shortcut-table.js';
 import { NAVIGATION_KEY_MODES } from '../assets/js/rendering/navigation-keys.js';
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Where the page is, inside the docs tree. */
 export const SHORTCUT_REFERENCE_PAGE = path.join(
   'user_guide', 'web_app', 'o_accessibility_privacy_security', '03_keyboard_shortcuts.md',
 );
 
-/** The docs tree this checkout's page is written into. */
-export function docsRoot(env = process.env) {
-  return env.CELLUCID_PYTHON_DOCS ?? path.resolve(ROOT, '..', 'cellucid-python', 'docs');
-}
-
 /** The page's path for `env`. */
 export function shortcutReferencePath(env = process.env) {
-  return path.join(docsRoot(env), SHORTCUT_REFERENCE_PAGE);
+  return path.join(pythonDocsRoot(env), SHORTCUT_REFERENCE_PAGE);
 }
 
 const MODE_WORDS = Object.freeze({ orbit: 'Orbit', planar: 'Planar', free: 'Free-fly' });

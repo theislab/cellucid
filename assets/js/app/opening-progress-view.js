@@ -26,14 +26,14 @@
  * one plain sentence, the failure's own message folded under Details, and
  * its actions (Try again, Open without this link). The app around it works;
  * a newer opening replaces it. So does a failure said as a card while a
- * dataset was shown: the next opening withdraws it as it begins (found
- * 2026-11-10: a refused file's card stayed through thirteen later openings,
- * reading as if the dataset shown had failed).
+ * dataset was shown: the next opening withdraws it as it begins, so a
+ * refused file's card does not stay through later openings, reading as if the
+ * dataset shown had failed.
  *
  * With no opening shown and no dataset on screen (None chosen, a link opened
  * without, an opening canceled), the same panel says so and where to open
- * one, with a button that shows that place (R9E-10: the viewer was a blank
- * plane that said nothing). `refreshEmptyViewer` re-reads it when the cells
+ * one, with a button that shows that place (the viewer would otherwise be a
+ * blank plane that says nothing). `refreshEmptyViewer` re-reads it when the cells
  * on screen come or go.
  *
  * @module app/opening-progress-view
@@ -48,7 +48,7 @@ import { describeHostFault, isExplainedFailure } from '../data/data-source.js';
 import { formatBytes, formatDuration } from '../utils/format-units.js';
 import { debounce } from '../utils/debounce.js';
 
-/** Updates are drawn at most this often; a second's tick keeps the elapsed time live. */
+/** A running opening's figures are drawn at most this often (its name and its end at once); a second's tick keeps the elapsed time live. */
 const UPDATE_EVERY_MS = 200;
 const TICK_MS = 1000;
 
@@ -172,7 +172,7 @@ export function refreshEmptyViewer() {
 const EMPTY_AFTER_MS = 250;
 
 /** What the empty viewer says. */
-export const EMPTY_VIEWER_SENTENCE =
+const EMPTY_VIEWER_SENTENCE =
   `Choose a sample, open a file or folder, or paste a link in ${OPEN_DATASET_PLACE}; a file can also be dropped here.`;
 
 export function showOpeningProgress({
@@ -185,7 +185,7 @@ export function showOpeningProgress({
   const overlay = buildOverlay(documentOwner, () => progress.cancel());
   documentOwner.body.appendChild(overlay.root);
 
-  /** @type {{id: number, mode: 'overlay'|'notification', notificationId: string|null}|null} */
+  /** @type {{id: number, mode: 'overlay'|'notification', notificationId: string|null, title: string|null}|null} The opening shown, and the name it was last drawn with */
   let shown = null;
   let latest = null;
   let drawTimer = null;
@@ -429,8 +429,10 @@ export function showOpeningProgress({
     drawTimer = null;
     const snapshot = latest;
     if (snapshot === null || shown === null || snapshot.id !== shown.id) return;
-    if (snapshot.state === 'running') drawRunning(snapshot);
-    else drawEnded(snapshot);
+    if (snapshot.state === 'running') {
+      shown.title = snapshot.title;
+      drawRunning(snapshot);
+    } else drawEnded(snapshot);
   }
 
   const stop = progress.subscribe(snapshot => {
@@ -454,7 +456,7 @@ export function showOpeningProgress({
       drawEmptySoon.cancel();
       for (const id of progress.takeEarlierNotices()) notifications.dismiss(id);
       // From its first moment: the first state is drawn at once.
-      shown = { id: snapshot.id, mode: hasDataset() ? 'notification' : 'overlay', notificationId: null };
+      shown = { id: snapshot.id, mode: hasDataset() ? 'notification' : 'overlay', notificationId: null, title: null };
       tick = setInterval(() => {
         latest = progress.snapshot();
         draw();
@@ -462,7 +464,11 @@ export function showOpeningProgress({
       draw();
       return;
     }
-    if (snapshot.state !== 'running') {
+    // The end is drawn at once, and so is a new name: what is opened is said
+    // from the moment it is known, however soon the next name or the end
+    // follows (a catalog's name for a sample, then the file's own). Only the
+    // figures of a running opening wait for the next drawing.
+    if (snapshot.state !== 'running' || snapshot.title !== shown.title) {
       clearTimeout(drawTimer);
       draw();
       return;

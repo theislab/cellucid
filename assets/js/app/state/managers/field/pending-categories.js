@@ -43,11 +43,6 @@ export function holdPendingCategoryState(field, { visibility, colors }) {
   return labels.size;
 }
 
-/** Forget what was held for `field` (its filters were restored or reset anew). */
-export function forgetPendingCategoryState(field) {
-  PENDING.delete(field);
-}
-
 /**
  * What is held for `field`, in the order it was held: the hidden labels and
  * the colors (channels from 0 to 1) of labels its open cells do not hold yet.

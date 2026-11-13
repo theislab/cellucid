@@ -27,16 +27,14 @@ import {
  *
  * `gl_PointSize = 0.0` does not do that. `ALIASED_POINT_SIZE_RANGE` starts at
  * 1.0 on the ANGLE/Metal driver this ships against, so a zero-size point is
- * clamped up to one pixel, assembled, rasterized, and only then thrown away —
- * measured directly: a shipped-shader point with alpha 0 lit 1 pixel with MSAA
- * off and 4 with MSAA on, while the same point moved outside the clip volume
- * lit none.
+ * clamped up to one pixel, assembled, rasterized, and only then thrown away
+ * (measured: 28_decisions_rendering_layers.md).
  *
- * Two consequences, both observed at ten million points:
+ * Two consequences, both at ten million points:
  *
- *  - Cost. With everything hidden the GPU frame was 12x more expensive than it
- *    needed to be, and hiding 90% of the dataset made rendering *no faster*
- *    than showing all of it.
+ *  - Cost. With everything hidden the GPU frame costs many times what it
+ *    needs to, and hiding 90% of the dataset renders *no faster* than showing
+ *    all of it.
  *  - Correctness. `HP_FS_ULTRALIGHT` has no `discard`, so in that quality a
  *    hidden point still writes depth and occludes visible points behind it —
  *    filtered-out cells silently delete cells the user asked to see.
@@ -44,55 +42,38 @@ import {
  * So the rejection belongs in the vertex shader, on `gl_Position`, for every
  * vertex shader a live program uses.
  *
- * CEL-0225 — why this file stopped grepping for one string.
+ * The sweep is about the *assignment*, not a spelling: it starts from every
+ * `gl_PointSize = 0.0` in every module in the tree that carries GLSL, finds the
+ * branch that guards it whatever the condition says (a single-statement branch
+ * with any variable included), and requires that branch to also put
+ * `gl_Position` outside the clip volume — checked numerically against
+ * `-w <= c <= w` rather than against a particular constant, because the velocity
+ * overlay rejects with `vec4(0.0, 0.0, -2.0, 1.0)` and is just as correct as the
+ * point shaders' `vec4(2.0, 2.0, 2.0, 1.0)`.
  *
- * The sweep used to be `/if \(alpha < 0\.01\)/` over one module. That is a
- * spelling, not the rule. A texture-fetch shader in the same file hid points
- * with `if (col.a < 0.01) gl_PointSize = 0.0;` — same defect, different
- * variable, single-statement branch — and was invisible to the sweep for its
- * whole life; it was deleted in `255791eb7` for being unreachable, not for
- * being wrong. The rule is about the *assignment*, so the sweep now starts from
- * every `gl_PointSize = 0.0` in every module in the tree that carries GLSL,
- * finds the branch that guards it whatever the condition says, and requires
- * that branch to also put `gl_Position` outside the clip volume — checked
- * numerically against `-w <= c <= w` rather than against a particular constant,
- * because the velocity overlay rejects with `vec4(0.0, 0.0, -2.0, 1.0)` and is
- * just as correct as the point shaders' `vec4(2.0, 2.0, 2.0, 1.0)`.
- *
- * CEL-0241 — the last two offenders, and why the rule now has no exceptions.
- *
- * Generalizing the sweep found two live shaders it could never have seen:
- * `HP_VS_HIGHLIGHT` and `CENTROID_VS`. Both were recorded as exceptions on the
- * ground that their fragment shaders discard, so neither could write depth over
- * a visible point. That reasoning was sound, and it was still the wrong thing
- * to rest on — it explains why neither was an emergency, never why the
- * construct should stay:
+ * The rule has no exceptions, for `HP_VS_HIGHLIGHT` and `CENTROID_VS` too. Their
+ * fragment shaders discard, so neither could write depth over a visible point;
+ * that explains why neither is an emergency, never why the construct should
+ * stay:
  *
  *  - `CENTROID_VS`'s branch is **live**. `state/managers/field/summary.js` sets
  *    a centroid's alpha to 0 for every category with no visible cells, so an
  *    ordinary filter drives it, and the centroid pass draws on the renderer's
  *    `depthMask(true)` (`viewer.js`, `drawCentroids`). One `discard` in another
- *    file was the whole of the protection.
+ *    file is the whole of the protection.
  *  - `HP_VS_HIGHLIGHT`'s branch is **dead**. `MIN_VISIBLE_ALPHA_BYTE` is 3, and
  *    3/255 = 0.01176 > 0.01, so no vertex either producer packs can satisfy
- *    `a_color.a < 0.01`. It read as a safety net while being unable to fire.
+ *    `a_color.a < 0.01`. It reads as a safety net while being unable to fire.
  *
- * Both now carry the rejection. It was measured before it was applied, on
- * ANGLE Metal / Apple M1 Pro, 1024x768 single-sample, 4096 visible points with
- * 4096 hidden points placed in front of them:
- *
- *  - The picture does not move. Framebuffer digest with the shipped fragment
- *    shaders is identical with and without the rejection, for both shaders,
- *    against a twin arm that re-measured the first one last.
- *  - Rasterized fragments, counted before any discard, fall by exactly 4096 —
- *    one per hidden vertex, which is `ALIASED_POINT_SIZE_RANGE[0] = 1.0`
- *    clamping the zero-size point back up to a pixel.
- *  - With the fragment discard removed — the state either shader reaches the
- *    day someone decides the discard is redundant — hidden points take 4096
- *    pixels away from visible ones without the rejection, and 0 with it.
+ * Both carry the rejection, and the picture does not move: the framebuffer
+ * digest with the shipped fragment shaders is identical with and without it,
+ * rasterized fragments (counted before any discard) fall by one per hidden
+ * vertex, and with the fragment discard removed hidden points take pixels away
+ * from visible ones without the rejection and none with it (measured:
+ * 28_decisions_rendering_layers.md).
  *
  * So the exception list is gone rather than empty: there is no shader in the
- * tree that hides a point by shrinking it, and this file no longer has a place
+ * tree that hides a point by shrinking it, and this file has no place
  * to record one.
  */
 
@@ -437,9 +418,8 @@ test('no shader in the tree hides a point by shrinking it alone', async () => {
       + '(four point shaders and the velocity overlay), so this sweep would '
       + 'otherwise assert nothing',
   );
-  // No exception list. There was one, for HP_VS_HIGHLIGHT and CENTROID_VS; both
-  // now reject, so the rule is unconditional and a new offender has nowhere to
-  // be recorded as tolerable.
+  // No exception list: HP_VS_HIGHLIGHT and CENTROID_VS reject too, so the rule
+  // is unconditional and a new offender has nowhere to be recorded as tolerable.
   assert.deepEqual(
     offenders,
     [],
@@ -475,10 +455,10 @@ test('no point shader hides a point outside the per-shader contract above', asyn
   );
 });
 
-test('the sweep catches the construct the old one missed', () => {
-  // The exact body of the texture-fetch shader deleted in 255791eb7, which hid
-  // points with a different variable name in a single-statement branch and so
-  // was invisible to a sweep that grepped for `if (alpha < 0.01)`.
+test('the sweep catches a single-statement branch with another variable name', () => {
+  // The body of a texture-fetch shader that hides points with a different
+  // variable name in a single-statement branch, which a sweep that greps for
+  // `if (alpha < 0.01)` cannot see.
   const reintroduced = `export const HP_VS_TEXTURE = \`#version 300 es
 precision highp float;
 

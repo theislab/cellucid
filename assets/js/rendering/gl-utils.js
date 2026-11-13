@@ -165,7 +165,7 @@ export function deleteProgramReleasingUse(gl, program) {
  * TEXTURE_3D or TEXTURE_2D_ARRAY on a unit is not cleared from that unit when
  * the unit is beyond the last one it counts as holding a 2D or cube-map
  * texture, so `getParameter(TEXTURE_BINDING_3D)` keeps returning the deleted
- * texture (measured: bind a 3D texture on unit 4, bind null to TEXTURE_2D on
+ * texture (bind a 3D texture on unit 4, bind null to TEXTURE_2D on
  * unit 4, delete it -- unit 4 still reports it). An owner that saved that
  * binding and restores it passes a deleted object to `bindTexture`:
  * INVALID_OPERATION (0x502), read by whichever owner reads the error queue
@@ -381,11 +381,9 @@ export function configureStraightAlphaBlending(gl) {
  * an unsignalled fence made without it (`getSyncParameter(SYNC_STATUS)`
  * included) and warns at the hundredth ("called 100 times without
  * SYNC_FLUSH_COMMANDS_BIT"), whatever `flush` followed the fence: a GPU that
- * takes seconds a frame reaches it (the macOS Firefox runner, nightly run
- * 41269083996; reproduced on an Apple M1 Pro with a frame of slow fragment
- * work, where the flagged poll stays silent). The flag flushes only what is
- * queued. `WAIT_FAILED` (a lost context, a deleted fence) counts as passed:
- * nothing is left to wait for.
+ * takes seconds a frame reaches it (28_decisions_rendering_layers.md). The
+ * flag flushes only what is queued. `WAIT_FAILED` (a lost context, a deleted
+ * fence) counts as passed: nothing is left to wait for.
  *
  * @param {WebGL2RenderingContext} gl
  * @param {WebGLSync} fence
@@ -400,8 +398,8 @@ export function fenceHasPassed(gl, fence) {
  *
  * Firefox refuses any draw over 30,000,000 vertex ids
  * (`webgl.max-vert-ids-per-draw`) with `INVALID_OPERATION` and draws nothing;
- * 30,000,000 is accepted, 30,000,001 is not (probed on all three engines,
- * scale plan section 3.1). Chromium and WebKit drew 200M points in one call.
+ * 30,000,000 is accepted, 30,000,001 is not (probed on Chromium, Firefox and
+ * WebKit). Chromium and WebKit accept 200M points in one call.
  * Every draw whose vertex count grows with the data therefore goes through
  * `drawPointsInSegments`, on every engine, so one code path draws every size.
  *

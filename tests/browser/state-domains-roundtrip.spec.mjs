@@ -161,9 +161,8 @@ async function roundTrip(page, { name, domain, first, second }) {
   // Each change is made through the interface, as an action, and is done
   // when the dispatcher says so (a field chosen is read first): the domains
   // are captured and restored directly below, outside the dispatcher's
-  // order, so a restore made while the second change was still being applied
-  // was overtaken by it (WebKit, 1 run in 14: the state named `cell_type`,
-  // and the select, the legend and the colors showed none).
+  // order, so a restore made while the second change is still being applied
+  // is overtaken by it.
   await first(page);
   await whenActionsDone(page);
   await waitForPageAtRest(page);

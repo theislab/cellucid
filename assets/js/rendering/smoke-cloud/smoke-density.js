@@ -1618,10 +1618,9 @@ export function smokeOccupancyGridSize(gridSize) {
  * published density volume and light direction:
  *
  * - lighting (RG16F, half the grid): the density integrated toward the key
- *   light and over the sky (LIGHT_VOLUME_FS). It replaces the shadow ray the
- *   march used to cast from every sample of every frame: one filtered fetch
- *   instead of a loop, and the shadow now crosses the whole cloud rather than
- *   the first few voxels;
+ *   light and over the sky (LIGHT_VOLUME_FS). It replaces a shadow ray cast
+ *   from every sample of every frame: one filtered fetch instead of a loop,
+ *   and the shadow crosses the whole cloud rather than the first few voxels;
  * - occupancy (R8, one texel per 4³ block): the largest density a sample in
  *   each block can read (OCCUPANCY_FS), so the march crosses empty blocks in
  *   one step.

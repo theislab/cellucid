@@ -1,7 +1,12 @@
-// @ts-check
-
 import { StyleManager } from '../../../utils/style-manager.js';
 import { bytesOfHex } from '../../../utils/hex-color.js';
+
+/**
+ * A Plotly container (`div.js-plotly-plot`): the element, with the layout it
+ * was given and the one Plotly computed, which Plotly attaches once it draws.
+ *
+ * @typedef {HTMLElement & {layout?: any, _fullLayout?: any}} PlotlyElement
+ */
 
 /**
  * @typedef {Object} PlotTheme
@@ -220,7 +225,7 @@ export function invalidatePlotThemeCache() {
  * Build a Plotly `relayout` update map that applies the current CSS theme.
  * Includes all x/y axes present on the plot element.
  *
- * @param {HTMLElement} plotElement - A Plotly container (div.js-plotly-plot)
+ * @param {PlotlyElement} plotElement - A Plotly container (div.js-plotly-plot)
  * @param {PlotTheme} [theme]
  * @returns {Record<string, any>}
  */
@@ -244,7 +249,6 @@ function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
     throw new TypeError('A rendered Plotly element is required');
   }
   // Plotly owns its rendered axis set on `_fullLayout`.
-  // @ts-ignore - Plotly attaches these properties at runtime.
   const layout = plotElement._fullLayout;
   if (!layout || typeof layout !== 'object' || Array.isArray(layout)) {
     throw new TypeError('Rendered Plotly element._fullLayout is required');
@@ -260,7 +264,6 @@ function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
   }
 
   // Update annotations created by plot definitions to match the active theme.
-  // @ts-ignore - Plotly attaches `layout` at runtime.
   const baseAnnotations = plotElement?.layout?.annotations;
   if (Array.isArray(baseAnnotations) && baseAnnotations.length > 0) {
     update.annotations = baseAnnotations.map((ann) => {
@@ -290,7 +293,6 @@ function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
   }
 
   // Update dashed guide/threshold lines (common across plots) to match the theme.
-  // @ts-ignore - Plotly attaches `layout` at runtime.
   const baseShapes = plotElement?.layout?.shapes;
   if (Array.isArray(baseShapes) && baseShapes.length > 0) {
     update.shapes = baseShapes.map((shape) => {
@@ -311,7 +313,7 @@ function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
  * Apply the current Plotly theme to a rendered plot element.
  * Safe no-op if Plotly is not loaded.
  *
- * @param {HTMLElement} plotElement
+ * @param {PlotlyElement} plotElement
  * @returns {Promise<void>}
  */
 async function applyThemeToPlotlyPlot(plotElement) {
@@ -351,12 +353,11 @@ export async function applyThemeToAllPlots(root) {
   }
 
   // Plotly marks plot divs with this class.
-  const plots = Array.from(queryRoot.querySelectorAll('.js-plotly-plot'));
+  const plots = Array.from(/** @type {NodeListOf<PlotlyElement>} */ (queryRoot.querySelectorAll('.js-plotly-plot')));
   if (plots.length === 0) return;
 
   // Run sequentially to avoid spamming relayout; plots are typically few.
   for (const el of plots) {
-    // @ts-ignore - querySelectorAll returns Element.
     await applyThemeToPlotlyPlot(el);
   }
 }

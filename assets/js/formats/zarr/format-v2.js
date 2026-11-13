@@ -7,10 +7,11 @@
  * Shared by every Zarr writer of the app: the transcoders' kept stores
  * (`data/anndata/transcode/zarr-writer.js`, uncompressed) and the streamed
  * stores of a copy (`writer.js`). What lives here decides the bytes of a
- * kept store, so it is in the transcoders' revision guards
- * (`tests/transcode-cache-contract.test.mjs`); what only a copy writes
- * (codecs, the streamed store, the archive) lives in `writer.js`, outside
- * them. Every value is little-endian (`<`), as every host a browser runs on.
+ * kept store, so the code fingerprint of converted stores covers it
+ * (`scripts/kept-code-fingerprints.mjs`: a change here makes browsers
+ * convert their kept files again); what only a copy writes (codecs, the
+ * streamed store, the archive) lives in `writer.js`, which no fingerprint
+ * covers. Every value is little-endian (`<`), as every host a browser runs on.
  *
  * @module formats/zarr/format-v2
  */

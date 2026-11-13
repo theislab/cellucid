@@ -204,11 +204,11 @@ test('read again with other cells, what is derived from the file takes the newly
 });
 
 test('a category group made on the cells read again before their take-in runs keeps each cell once, and is left as it was', async () => {
-  // The HLCA journey: Apply raised the share back (read again, not in place);
-  // while its restore ran, a category was clicked as a highlight (on every
-  // cell open now); the take-in then added the newly open cells of that
-  // category again. Each was listed twice: the highlight draft refused the
-  // cells ('strictly ascending'), and the page changed under the signature run.
+  // Apply raises the share back (read again, not in place); while its restore
+  // runs, a category is clicked as a highlight (on every cell open now); the
+  // take-in then adds the newly open cells of that category again. Each is
+  // listed once: listed twice, the highlight draft would refuse the cells
+  // ('strictly ascending'), and the page would change under the signature run.
   const before = BEFORE;
   const earlier = await sceneOf(before, [...before].reverse(), fileFields);
   earlier.ensureHighlightPage();

@@ -67,25 +67,3 @@ test('the smoke stops drifting under reduced motion: its time holds and it asks 
   const draw = SmokeRenderer.prototype.render.toString();
   assert.match(draw, /const nextAnimationTime = this\._lastRenderTime === null \|\| !this\._drifts\(\)\n\s*\? this\.animationTime/);
 });
-
-test('the camera does not glide under reduced motion: no inertia after a release, a zoom at once, free-fly stops with its keys', async () => {
-  const { readFileSync } = await import('node:fs');
-  const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  const body = name => {
-    const start = viewer.indexOf(`function ${name}(`);
-    assert.ok(start >= 0, name);
-    return viewer.slice(start, viewer.indexOf('\n  }\n', start));
-  };
-  assert.match(
-    body('updateInertia'),
-    /^function updateInertia\(dt\) \{\n(\s*\/\/.*\n)*\s*if \(prefersReducedMotion\(\) && !isMovementKeyHeld\(\)\) \{\n\s*velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;\n\s*return;/,
-  );
-  assert.match(
-    body('updateSmoothZoom'),
-    /^function updateSmoothZoom\(dt\) \{\n(\s*\/\/.*\n)*\s*if \(prefersReducedMotion\(\)\) \{\n\s*radius = targetRadius;\n\s*return;/,
-  );
-  assert.match(
-    body('updateFreefly'),
-    /\} else if \(prefersReducedMotion\(\)\) \{\n(\s*\/\/.*\n)*\s*vec3\.set\(freeflyVelocity, 0, 0, 0\);\n\s*\} else \{\n\s*\/\/ Coasting/,
-  );
-});

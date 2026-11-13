@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { DATA_LOAD_METHODS } from '../assets/js/app/data-load-methods.js';
@@ -858,12 +857,12 @@ test('a new address of the open connection\'s kind replaces it only once its dat
 });
 
 test('a typed address the source cannot read is refused before any connection starts', async t => {
-  // A malformed GitHub path used to start a connection, fail inside the source,
-  // and come back classified as unreadable data: "what is published there is
-  // not in a format Cellucid can read. Re-export it with cellucid prepare" -
-  // advice that cannot help someone who mistyped a path. Empty input asked to
-  // "Enter one remote server". Both are now refused with one sentence about
-  // the input itself, and no candidate is created.
+  // A malformed GitHub path must not start a connection that fails inside the
+  // source and comes back classified as unreadable data ("what is published
+  // there is not in a format Cellucid can read. Re-export it with cellucid
+  // prepare"), advice that cannot help someone who mistyped a path; nor may
+  // empty input ask to "Enter one remote server". Both are refused with one
+  // sentence about the input itself, and no candidate is created.
   const cases = [
     ['remote', '', /^Type an address first: /],
     ['remote', 'localhost:99999', /^99999 is not a port: a port is a number from 1 to 65535, as in localhost:8765\.$/],
@@ -1295,23 +1294,4 @@ test('connection teardown disables DOM owners', async t => {
   assert.deepEqual(harness.activations, []);
   assert.deepEqual(harness.clearCalls, []);
   assert.deepEqual(harness.populationCalls, []);
-});
-
-test('the address bar ships the label it keeps', async () => {
-  // `index.html` paints the bar long before `initUI` runs, so whatever the
-  // markup says is on screen for the whole of startup. Its Open button is
-  // never relabeled: a connection is shown on its own line under the bar.
-  const [indexHtml, connectionsSource] = await Promise.all([
-    readFile(new URL('../index.html', import.meta.url), 'utf8'),
-    readFile(
-      new URL('../assets/js/app/ui/modules/dataset-connections.js', import.meta.url),
-      'utf8'
-    ),
-  ]);
-  assert.match(
-    indexHtml,
-    /<button[^>]*id="data-address-open-btn"[^>]*>Open<\/button>/
-  );
-  assert.doesNotMatch(connectionsSource, /(addressOpenButton|dataAddressOpenBtn)\.textContent\s*=/);
-  assert.doesNotMatch(connectionsSource, /Reconnect/);
 });

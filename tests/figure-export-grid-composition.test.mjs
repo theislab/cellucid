@@ -1,18 +1,14 @@
 /**
- * F86 (2026-11-11): a multi-panel figure is a composed figure.
+ * A multi-panel figure is a composed figure.
  *
- * The figure of two side-by-side views (cell_type and Ins1, cameras linked)
- * came out with panels of different heights, tall strips in the middle of a
- * mostly empty 1400 × 800 canvas, legend frames stretched to the plot's height
- * around a few entries, and X/Y rulers on a 3-D orbit view. Each panel's plot
- * was fitted inside a cell cut from the requested size after its own legend
- * had taken its width, and the figure was the requested size whatever its
- * panels needed.
- *
- * Now every panel's plot has one height and its view's shape, the figure is
+ * Every panel's plot has one height and its view's shape, the figure is
  * exactly the composition of its panels, legends and labels at the largest
  * plot height that fits the requested box, axis margins exist only where a
- * panel has axes, and a legend's box is the box its entries need.
+ * panel has axes, and a legend's box is the box its entries need. Fitting each
+ * plot inside a cell cut from the requested size, after its own legend has
+ * taken its width, gives panels of different heights, tall strips in the
+ * middle of a mostly empty canvas, legend frames stretched to the plot's
+ * height around a few entries, and X/Y rulers on a 3-D orbit view.
  */
 
 import assert from 'node:assert/strict';
@@ -122,8 +118,8 @@ test('the two-view figure: equal panels, legends hugging their entries, no axes 
   assert.ok(layout.totalHeight >= 800 - 1 || layout.totalWidth >= 1400 - 2, `${layout.totalWidth} × ${layout.totalHeight}`);
   assert.ok(layout.totalWidth - extent.right <= OUTER + PADDING + 1, 'no band right of the content');
   assert.ok(layout.totalHeight - extent.bottom <= OUTER + PADDING + 1, 'no band below the content');
-  // The plots are the figure: before the fix they were 108 × 255 and
-  // 140 × 325 px in a 1400 × 800 figure.
+  // The plots are the figure, not strips in the middle of a mostly empty
+  // 1400 × 800 figure.
   assert.ok(a.plotRect.height > 600, `plot ${a.plotRect.width} × ${a.plotRect.height}`);
 });
 
@@ -232,14 +228,13 @@ test('a grid figure is refused panels without an axes decision', () => {
   );
 });
 
-test('the panel legends stand where the plots get the most room, and the figure keeps to the box (F113)', () => {
-  // He, two views (live pass 3, L12-6): LVL2 kept to the epithelial cells
-  // (11 of 42 types with cells: the legend lists those) and LVL0. Decided
-  // against the plot the grid has without legends, each legend stayed beside
-  // a plot the legends then shrank, and was planned again beside the shorter
-  // plot in more columns: 800 × 600 of wide views drew 182 × 114 strips
-  // beside 862 px legends in a 1550 px figure; a portrait box of tall views
-  // drew 137 × 315 strips in a figure wider than the box.
+test('the panel legends stand where the plots get the most room, and the figure keeps to the box', () => {
+  // He, two views: LVL2 kept to the epithelial cells (11 of 42 types with
+  // cells: the legend lists those) and LVL0. Decided against the plot the grid
+  // has without legends, a legend would stand beside a plot the legends then
+  // shrink, and be planned again beside the shorter plot in more columns:
+  // strips beside legends wider than the figure's box, and a figure wider
+  // than the box.
   const lvl2 = Array.from({ length: 42 }, (_, i) => (i < 11 ? `Lung_epithelial_type_${i}` : `Other_type_${i}`));
   const lvl2Model = { ...categoryModel(lvl2), counts: { available: lvl2.map((_, i) => (i < 11 ? 10 : 0)), visible: lvl2.map((_, i) => (i < 11 ? 10 : 0)) } };
   const views = [view('LVL2', lvl2Model), view('LVL0', categoryModel(['Endothelial', 'Epithelial', 'Haematopoeitic_lineage', 'Neuronal_and_Glial', 'Stromal']))];

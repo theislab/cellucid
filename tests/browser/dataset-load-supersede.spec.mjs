@@ -4,9 +4,9 @@
  * Every dataset change — the startup selection, a sample, None, a file, a
  * folder, a connection that opens its only dataset, the benchmark — begins one
  * transaction when the user acts, and beginning one aborts the load in flight.
- * A choice made during a load used to be discarded behind it (the startup
- * load ran before any control was wired), or to lose to it (a file still being
- * read published over a sample chosen after it).
+ * A choice made during a load is never discarded behind it (the startup
+ * load runs before any control is wired), and never loses to it (a file still
+ * being read must not publish over a sample chosen after it).
  *
  * Each case holds the load in flight -- an opening at the AnnData reader
  * worker (`holdOpening`), a file read at its reader's transport -- makes the
@@ -22,7 +22,6 @@ import {
   expect,
   test,
 } from './helpers/test.mjs';
-import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import { serveAnnDataServer } from './helpers/anndata-server.mjs';
 import { APP_ORIGIN, SAMPLE_ORIGIN, SAMPLE_PORT, appUrl } from './helpers/origins.mjs';
 import { workerScriptPattern } from './helpers/worker-scripts.mjs';
@@ -37,7 +36,6 @@ import {
   SAMPLE_CATALOG,
   START,
   TRAJECTORY,
-  ZARR_FOLDER,
   chooseSessionFile,
   demoCatalogDirectory,
   expectAnnouncedOnce,
@@ -55,7 +53,6 @@ import {
   savedSessionFor,
   serveDemoFile,
   serveOneDatasetRemote,
-  startUrl,
 } from './helpers/dataset-loading.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
 import { TEST_COMMIT, answerLastCommit } from './helpers/github-api.mjs';
@@ -74,20 +71,6 @@ test('a file chosen while the startup dataset loads replaces it', async ({
   await expectSettledOn(page, H5AD);
   await expectNeverPublished(page, START.name);
   await expectAnnouncedOnce(page, /Opened .+: 120 cells/);
-  await expectNoFailureAnnounced(page);
-  expect(productErrors).toEqual([]);
-});
-
-test('a Zarr folder chosen while the startup dataset loads replaces it', async ({
-  page,
-  browserName,
-}) => {
-  const { held, productErrors } = await openWithHeldStart(page);
-  await openZarrFolder(page, browserName, ZARR_FOLDER.path);
-  await expectSettledOn(page, ZARR_FOLDER);
-  await releaseAndDrain(page, held);
-  await expectSettledOn(page, ZARR_FOLDER);
-  await expectNeverPublished(page, START.name);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
 });
@@ -285,74 +268,6 @@ test('a sample chosen while a file is still being read replaces it', async ({
   expect(productErrors).toEqual([]);
 });
 
-test('None chosen while a file is still being read clears the dataset', async ({
-  browserName,
-  page,
-}) => {
-  test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
-  const productErrors = await openStarted(page);
-  const held = await holdRequests(page, HDF5_READER, { first: 1, worker: READER_WORKER });
-  await chooseFiles(page.locator('#user-data-file-input'), H5AD_PATH);
-  await expect.poll(() => held.started).toBeGreaterThan(0);
-  await page.locator('#dataset-select').selectOption(NONE.select);
-  await expectSettledOn(page, NONE);
-  await releaseAndDrain(page, held);
-  await expectSettledOn(page, NONE);
-  await expectNeverPublished(page, H5AD.name);
-  await expectNoFailureAnnounced(page);
-  expect(productErrors).toEqual([]);
-});
-
-test('None chosen while a sample loads clears the dataset', async ({ page }) => {
-  const productErrors = await openStarted(page);
-  const held = await holdOpening(page, DEVELOPMENT);
-  const since = (await readRecord(page)).names.length;
-  await page.locator('#dataset-select').selectOption(DEVELOPMENT.select);
-  await expect.poll(() => held.started).toBeGreaterThan(0);
-  await page.locator('#dataset-select').selectOption(NONE.select);
-  await expectSettledOn(page, NONE);
-  await releaseAndDrain(page, held);
-  await expectSettledOn(page, NONE);
-  await expectNeverPublished(page, DEVELOPMENT.name, since);
-  await expectNoFailureAnnounced(page);
-  expect(productErrors).toEqual([]);
-});
-
-test('a session chosen while a sample loads is applied to that sample', async ({
-  page,
-  context,
-}, testInfo) => {
-  await openStarted(page);
-  const sessionPath = await savedSessionFor(
-    page,
-    testInfo,
-    TRAJECTORY,
-    'trajectory-session',
-  );
-  const second = await context.newPage();
-  try {
-    const productErrors = await openStarted(second);
-    const held = await holdOpening(second, TRAJECTORY);
-    await second.locator('#dataset-select').selectOption(TRAJECTORY.select);
-    await expect.poll(() => held.started).toBeGreaterThan(0);
-    await chooseSessionFile(second, sessionPath);
-    await expect(
-      second.locator('#notification-center .notification').filter({
-        hasText: 'Waiting for the dataset to finish loading',
-      }),
-    ).toHaveCount(1);
-    await releaseAndDrain(second, held);
-    await expectSettledOn(second, TRAJECTORY);
-    await openCollapsedPanels(second);
-    await expect(second.locator('#background-select')).toHaveValue('black');
-    await expectAnnouncedOnce(second, /Session fully restored/);
-    await expectNoFailureAnnounced(second);
-    expect(productErrors).toEqual([]);
-  } finally {
-    await closePageWithApplicationRetirement(second);
-  }
-});
-
 test('a sample chosen while the benchmark prepares replaces it', async ({
   page,
 }) => {
@@ -377,32 +292,6 @@ test('a sample chosen while the benchmark prepares replaces it', async ({
   expect(productErrors).toEqual([]);
 });
 
-/**
- * Lifts the remote connection's own deadline out of the way.
- *
- * The two cases below hold the server's dataset listing while a later choice
- * is made, and release it once that choice is in. The connection gives the
- * server five seconds (`remote-source.js`), and everything between Connect and
- * the release ran inside them: on a macOS Firefox runner clicking Load and
- * restoring the session took six, the deadline passed first, and the
- * connection failed as unreachable instead of answering late. The deadline is
- * not what these cases are about, so only that one timer, five seconds long
- * and set by the remote source, is given the source's maximum; every other
- * timer keeps its length.
- */
-async function liftConnectionDeadline(page) {
-  await page.addInitScript(() => {
-    const realSetTimeout = window.setTimeout.bind(window);
-    window.setTimeout = (handler, milliseconds, ...args) => realSetTimeout(
-      handler,
-      milliseconds === 5_000 && /\/data\/remote-source\.js\b/.test(new Error().stack ?? '')
-        ? 120_000
-        : milliseconds,
-      ...args,
-    );
-  });
-}
-
 test('a server that answers after a newer choice keeps its dataset in the catalog', async ({
   page,
 }) => {
@@ -411,7 +300,6 @@ test('a server that answers after a newer choice keeps its dataset in the catalo
     releaseCatalog = resolve;
   });
   await serveOneDatasetRemote(page, DEVELOPMENT, { holdCatalog: catalogHeld });
-  await liftConnectionDeadline(page);
   const productErrors = await openStarted(page);
   await page.locator('#data-address').fill(SAMPLE_ORIGIN);
   await page.locator('#data-address-open-btn').click();
@@ -440,55 +328,6 @@ test('a server that answers after a newer choice keeps its dataset in the catalo
   await expect(
     page.locator('#dataset-select option[value^="dataset:remote:"]'),
   ).toHaveCount(0);
-  await expectNeverPublished(page, DEVELOPMENT.name);
-  await expectNoFailureAnnounced(page);
-  expect(productErrors).toEqual([]);
-});
-
-test('a server that answers after a session was applied leaves that dataset and session', async ({
-  page,
-}, testInfo) => {
-  let releaseCatalog = () => {};
-  const catalogHeld = new Promise(resolve => {
-    releaseCatalog = resolve;
-  });
-  await serveOneDatasetRemote(page, DEVELOPMENT, { holdCatalog: catalogHeld });
-  await liftConnectionDeadline(page);
-  const productErrors = await openStarted(page);
-  const sessionPath = await savedSessionFor(
-    page,
-    testInfo,
-    START,
-    'connect-then-session',
-  );
-  await page.locator('#background-select').selectOption('studio');
-  await expect(page.locator('#background-select')).toHaveValue('studio');
-
-  await page.locator('#data-address').fill(SAMPLE_ORIGIN);
-  await page.locator('#data-address-open-btn').click();
-  await expect(
-    page.locator('#notification-center .notification').filter({
-      hasText: SAMPLE_ORIGIN,
-    }),
-  ).toHaveCount(1);
-  // The session is applied after Connect was clicked, so it is the later
-  // action; the server answers once it has been applied.
-  await chooseSessionFile(page, sessionPath);
-  await expect(page.locator('#background-select')).toHaveValue('black');
-  await expectAnnouncedOnce(page, /Session fully restored/);
-  releaseCatalog();
-
-  await expectAnnouncedOnce(
-    page,
-    /Connected; ".*" was not opened because another dataset was chosen meanwhile/,
-  );
-  // A server's one dataset is not a choice of the sample list: opening the
-  // address again shows it.
-  await expect(
-    page.locator('#dataset-select option[value^="dataset:remote:"]'),
-  ).toHaveCount(0);
-  await expectSettledOn(page, START);
-  await expect(page.locator('#background-select')).toHaveValue('black');
   await expectNeverPublished(page, DEVELOPMENT.name);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);

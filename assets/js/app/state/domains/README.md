@@ -5,14 +5,15 @@
 (`installStateDomains`); the state fingerprint (`fingerprint.js`); the shared
 rules every owner follows: cells by original position (`cell-positions.js`),
 fields by name (`fields.js`), views by position (`view-list.js`), value
-equality (`same-value.js`). Each per-view owner (`filters`, `visibility`,
-`active-field`, `colors`, `camera`, `views`) gives `readPart`
+equality (`same-value.js`); and the line that says which saved settings a restore
+could not use (`unread-settings.js`, `reportUnreadSettings`). Each per-view owner
+(`filters`, `visibility`, `active-field`, `colors`, `camera`, `views`) gives `readPart`
 (`view-list.js` `viewReadPart`): the entry of the view a step acted in, which
-staleness compares (F156).
+staleness compares.
 
 **Entry points:** `installStateDomains({state, viewer, sidebar, refreshUi,
-cinematicCamera, figureExport, analysis, getDockable, openCells,
-sidebarLayout})` (`index.js`, returns the uninstaller); `stateFingerprint(domains)`, `captureEveryDomain(domains)`,
+cinematicCamera, figureExport, analysis, analysisArrived, getDockable,
+openCells, sidebarLayout})` (`index.js`, returns the uninstaller); `stateFingerprint(domains)`, `captureEveryDomain(domains)`,
 `fingerprintOf(values)`, `differingDomains(a, b)` (`fingerprint.js`). The
 history (`app/history/history.js`), the session file and the agents' reads use
 the owners through the registry (`getStateDomains()` in `app/actions/index.js`).
@@ -46,7 +47,7 @@ Each module's header gives its value in full.
   the focused view's own flags), every other control `settings'`. The
   inventory is every stable `input`, `select` and section; a button group is
   never in it.
-- Page chrome is in no domain (History v2 §3.3.8): the phone sheet open or
+- Page chrome is in no domain: the phone sheet open or
   closed (on the phone layout the sidebar's toggle, peek bar and H key open
   and close the sheet with no step, and `layout.sidebar.open` is the choice
   the sidebar's owner keeps, which the sheet does not change, so Undo inside
@@ -78,12 +79,10 @@ Each module's header gives its value in full.
   position (`data/cell-identity.js`), so a value applies to whatever cells are
   open (cells not open are left out; columns give a newly open cell the missing
   marker).
-- A value is never changed after capture. Arrays the app replaces rather than
-  writes (highlight groups, user codes and values) are taken by reference and
-  conversions are cached by the array and the open cells; the visibility mask,
-  written in place, is copied and cached by its write count. Capturing an
-  unchanged domain again returns the same arrays, whose content hashes the
-  value pool caches by identity.
+- A value is never changed after capture: arrays the app replaces are taken by reference, the
+  visibility mask, written in place, is copied, and capturing an unchanged domain again returns
+  the same arrays (developer doc 29, `cellucid-python/docs/user_guide/web_app/p_developer_docs/29_action_layer_domains_and_history.md`,
+  "The owner contract").
 - A kept view's field objects are shallow copies of its source's
   (`managers/view-context-core.js` `_cloneFieldState`) and share the category
   list and its originals, the centroid tables and their records, category
@@ -92,10 +91,9 @@ Each module's header gives its value in full.
   `_syncCentroidCategoryLabels`), so restoring one view's fields never
   changes another's. A user field's copies share its one definition, which
   an edit replaces in the registry and in every copy at once.
-- A value records only what differs from the dataset's opening state where
-  opening fills defaults in lazily (filters, colors): opening a field changes
-  no value. A color range is measured against the data, never the filter, so
-  each change belongs to one domain.
+- A value records only what differs from the dataset's opening state where opening fills
+  defaults in lazily (filters, colors), so opening a field changes no value (developer doc 29,
+  "Invariants").
 - `restore(value)` puts the value back through the state methods the app's own
   controls use (never by dispatching actions), changes only what differs, and
   is idempotent: `restore(v)` then `capture()` gives `v` again. Per-view state
@@ -127,24 +125,22 @@ Each module's header gives its value in full.
 - Async restores load what they need first (a field's values or categories, a
   gene once the gene list is read, the analysis code), as choosing it does.
 
-**Records of before.** A value saved by an earlier version must still read:
-the samples' starting views and every older session hold the records of the
-day they were written. A key added to a domain's record is an *added key*
+**Records of before.** A key added to a domain's record is an *added key*
 (`record-keys.js`): written only when it differs from the value its absence
 means, filled with that value when read, so a record that does not use it is
-the record of before, byte for byte (no hash changes, no step); a key a record
-no longer holds is *dropped* (read and left out). Only a missing required key
-or an unknown one is refused. Every domain's records are declared once in
-`records.js` (required, optional, added and dropped keys, and the shape of
+the record of before, byte for byte (no hash changes, no step; the samples'
+starting views stay as published). Only a missing
+required key or an unknown one is refused (a key a record no longer holds is
+unknown). Every domain's records are declared once in
+`records.js` (required, optional and added keys, and the shape of
 each nested record), and `installStateDomains` reads every value a domain
 restores or describes through its declaration and writes what it captures as
 before (`index.js` `readingRecords`); a record another module owns (the Camera
-Path's own state, R9R-13; the settings, read one control at a time, F181; the
+Path's own state; the settings, read one control at a time; the
 data mapping; a camera state's parts; the analyses' windows and modes) is that
 module's to read. Test: `tests/state-record-added-keys.test.mjs` (every
-domain reads every sample's published starting view, saved states written by
-0.9.7 and during 0.9.8, and the history goldens; each starting view restores
-its camera path).
+domain reads every sample's published starting view and the history goldens;
+each starting view restores its camera path).
 
 **Tests:** `tests/state-domains-contract.test.mjs` (every domain owned, value
 shapes, cells, equality, describe lines, fingerprint), and

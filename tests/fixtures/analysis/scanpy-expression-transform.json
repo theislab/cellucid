@@ -1,5 +1,5 @@
 {
- "about": "scanpy normalize_total(target_sum=1e4) and/or log1p of the 8x5 X of tests/expression-transform.test.mjs, then rank_genes_groups(groups=[A], reference=B, tie_correct=False) wilcoxon and t-test, and per-group means; script in cellucid-private lane-expression.md Step 2; lfc kept for the log1p variants only (scanpy undoes log1p, meaningless on values that are not log1p)",
+ "about": "scanpy normalize_total(target_sum=1e4) and/or log1p of the 8x5 X of tests/expression-transform.test.mjs, then rank_genes_groups(groups=[A], reference=B, tie_correct=False) wilcoxon and t-test, and per-group means; lfc kept for the log1p variants only (scanpy undoes log1p, meaningless on values that are not log1p)",
  "scanpy": "1.11.5",
  "scipy": "1.16.3",
  "variants": {

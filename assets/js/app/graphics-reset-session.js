@@ -5,7 +5,7 @@
  * When the browser takes the WebGL context away, the viewer fences its GPU
  * owners, waits for the context back and tells its listeners each phase
  * (`viewer.onGraphicsReset`, `rendering/viewer.js`, "Lost and restored
- * graphics"); the renderer builds no UI of its own (F146). This module shows
+ * graphics"); the renderer builds no UI of its own. This module shows
  * it: an app dialog (`#graphics-reset-dialog`, `wireAppDialog`) that says the
  * graphics are being restored, offers the session captured at the loss
  * (Save session) and, only once restoring failed, Reload. Nothing behind it
@@ -28,7 +28,7 @@ import { cancel } from '../utils/abort.js';
 import { wireAppDialog } from './ui/components/app-dialog.js';
 
 /** What the dialog says in each phase. */
-export const GRAPHICS_RESET_WORDS = Object.freeze({
+const GRAPHICS_RESET_WORDS = Object.freeze({
   lost: 'The graphics were reset by the browser. Restoring them; your filters, selections, kept views and analyses are kept.',
   failed: 'The graphics could not be restored. Save the session, then reload the page to continue.',
 });

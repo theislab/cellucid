@@ -10,12 +10,11 @@
  * it, with nothing read in between (a read after a write throws). The
  * browser commits a transaction as soon as it has no request left to run. A
  * page that goes away while its work waits on a request never makes the
- * next one, so writes made one at a time, each awaited, were committed as
- * far as they had got: Firefox kept 98 and 252 of 400 such writes of one
- * transaction when its tab closed (3 closes in 30), and a history's saved
- * state came back with a conversation's count and not its messages ("This
- * saved state is missing messages of a conversation; it cannot be opened",
- * hosted macOS Firefox, Web contracts run 42202865024). Written at once, the
+ * next one, so writes made one at a time, each awaited, are committed only as
+ * far as they had got: a browser may keep some of the writes of one
+ * transaction when its tab closes, and a history's saved state would come
+ * back with a conversation's count and not its messages (measured:
+ * 33_decisions_actions_domains_and_history.md). Written at once, the
  * writes are all in the transaction before any has run: the browser runs
  * them all and commits, or the page was gone first and it keeps none. The
  * transaction is then told to commit (`IDBTransaction.commit`), so the

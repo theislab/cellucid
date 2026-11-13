@@ -184,14 +184,17 @@ function readDatasetGeneration(owner) {
 export class FieldOverlayPublicMethods {
   // --- Existing API -------------------------------------------------------------
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getFields() {
     return requireInventory(this, FieldSource.OBS, { allowAbsent: true });
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getVarFields() {
     return requireInventory(this, FieldSource.VAR, { allowAbsent: true });
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getActiveField() {
     if (this.activeFieldSource === null) {
       if (
@@ -257,13 +260,17 @@ export class FieldOverlayPublicMethods {
 
   // --- Field operations (rename / delete / user-defined) ----------------------
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getRenameRegistry() { return this._renameRegistry; }
+  /** @this {import('../../core/data-state.js').DataState} */
   getDeleteRegistry() { return this._deleteRegistry; }
+  /** @this {import('../../core/data-state.js').DataState} */
   getUserDefinedFieldsRegistry() { return this._userDefinedFields; }
 
   /**
    * Apply rename/delete overlays stored in registries to the currently loaded field metadata.
    * This is safe to call during view switching because it does not touch render buffers.
+   * @this {import('../../core/data-state.js').DataState}
    */
   applyFieldOverlays() {
     const obsFields = this.obsData === null
@@ -285,11 +292,13 @@ export class FieldOverlayPublicMethods {
     this._syncActiveContext();
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getVisibleFields(source) {
     requireSource(source);
     return getFieldRegistry().getVisibleFields(source);
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   isFieldDeleted(source, fieldIndex) {
     const { field } = requireFieldAt(this, source, fieldIndex);
     if (
@@ -301,6 +310,7 @@ export class FieldOverlayPublicMethods {
     return field._isDeleted === true;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   renameField(source, fieldIndex, newKey) {
     const src = requireSource(source);
     const { fields, field } = requireFieldAt(this, src, fieldIndex);
@@ -316,7 +326,7 @@ export class FieldOverlayPublicMethods {
       requireUserDefinedOwner(this);
     }
     const previousKey = field.key;
-    // A field the person made has no original name to go back to (R9F-8): it
+    // A field the person made has no original name to go back to: it
     // is named by its id (`state/domains/fields.js`), its name is whatever
     // it is called now, so it shows no `*` and offers no "Put name back",
     // in the page and after a session's round trip alike.
@@ -367,6 +377,7 @@ export class FieldOverlayPublicMethods {
 
   /**
    * Revert a field rename back to its original key (if renamed).
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} source - 'obs' | 'var'
    * @param {number} fieldIndex
    * @returns {boolean}
@@ -379,6 +390,7 @@ export class FieldOverlayPublicMethods {
     return this.renameField(src, fieldIndex, field._originalKey);
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   renameCategory(source, fieldIndex, categoryIndex, newLabel) {
     const src = requireSource(source);
     const { field } = requireFieldAt(this, src, fieldIndex);
@@ -476,6 +488,7 @@ export class FieldOverlayPublicMethods {
     return true;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   deleteField(source, fieldIndex) {
     const src = requireSource(source);
     const { field } = requireFieldAt(this, src, fieldIndex);
@@ -522,6 +535,7 @@ export class FieldOverlayPublicMethods {
    * This is intentionally destructive and should only be called from a user
    * confirmation flow (e.g., the Deleted Fields "Confirm" button).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {'obs'|'var'} source
    * @param {number} fieldIndex
    * @returns {boolean}
@@ -562,6 +576,7 @@ export class FieldOverlayPublicMethods {
    * Restoration never substitutes another name. A visible-key conflict is a
    * public error that must be resolved explicitly before retrying.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} source - 'obs' | 'var'
    * @param {number} fieldIndex
    * @returns {{ok: true, originalKey: string, key: string, userDefinedId: string|null}}
@@ -650,6 +665,7 @@ export class FieldOverlayPublicMethods {
    * This handles the case where the field exists only in the UserDefinedFieldsRegistry
    * (not yet injected into the fields array).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} userDefinedId
    * @param {'obs'|'var'} source
    * @returns {{ok: true, key: string, userDefinedId: string}}
@@ -740,6 +756,7 @@ export class FieldOverlayPublicMethods {
    * This handles the case where the field exists only in the UserDefinedFieldsRegistry
    * (not yet injected into the fields array).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} userDefinedId
    * @param {'obs'|'var'} source
    * @returns {boolean}
@@ -824,6 +841,7 @@ export class FieldOverlayPublicMethods {
    *
    * This is a non-destructive operation (the source field remains intact).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {'obs'|'var'} source
    * @param {number} fieldIndex
    * @param {object} [options]
@@ -1080,6 +1098,7 @@ export class FieldOverlayPublicMethods {
     throw new TypeError(`Unsupported duplicate field kind "${field.kind}"`);
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   deleteUserDefinedField(fieldId, source) {
     const src = requireSource(source);
     const exactFieldId = requireIdentifier(
@@ -1137,6 +1156,7 @@ export class FieldOverlayPublicMethods {
     return true;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   isUserDefinedField(source, fieldIndex) {
     const { field } = requireFieldAt(this, source, fieldIndex);
     if (
@@ -1160,6 +1180,7 @@ export class FieldOverlayPublicMethods {
    * If a non-user-defined field already exists with the requested key, a unique
    * key is generated and returned.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {object} options
    * @param {string} options.key
    * @param {string[]} options.categories
@@ -1344,6 +1365,7 @@ export class FieldOverlayPublicMethods {
    * same key. A field of that key the notebook did not push is never
    * replaced: the push is refused instead.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {{key: string, values: Float32Array, operation: {type: string}}} options
    *   `values`: one per open cell, NaN where a cell has none
    * @returns {{fieldIndex: number, fieldId: string, key: string, updatedInPlace: boolean}}

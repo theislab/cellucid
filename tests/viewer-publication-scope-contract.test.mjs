@@ -25,23 +25,6 @@ function publicMethod(name) {
   return viewer.slice(start, viewer.indexOf('\n    },\n', start));
 }
 
-/** The body of one function of the viewer's closure. */
-function closureFunction(name) {
-  const start = viewer.indexOf(`\n  function ${name}(`);
-  assert.ok(start > 0, name);
-  return viewer.slice(start, viewer.indexOf('\n  }\n', start));
-}
-
-test('publishing another dataset clears the smoke volume built from the previous one', () => {
-  // A new dataset and cells added or removed in place publish the live
-  // points the same way (`publishLiveData`); only the camera differs.
-  assert.match(publicMethod('setData'), /publishLiveData\(payload, \{ keepView: false \}\)/);
-  assert.match(publicMethod('resizeLiveCells'), /publishLiveData\(payload, \{ keepView: true, capacity \}\)/);
-  const body = closureFunction('publishLiveData');
-  assert.match(body, /hpRenderer\.loadData\(/);
-  assert.match(body, /smokeRenderer\.clearVolume\(\);\s*publishSmokeSourceChange\(\);/);
-});
-
 test('the live view respawns vector field particles only when visibility moved', () => {
   const body = publicMethod('updateTransparency');
   assert.match(body, /alphaGenerationMoved = hpRenderer\.updateAlphas\(alphaArray\)/);

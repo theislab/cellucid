@@ -3,9 +3,9 @@
  * every sidebar state: open, closed, and open again.
  *
  * On a phone the open sidebar is a full-screen sheet with a strip at its top
- * for the close control. That strip lay outside the sheet's scroll area, which
- * is what paints the sheet, so it was transparent and showed a band of the
- * live plot above the menu. Each state here measures the canvas against the
+ * for the close control. That strip lies outside the sheet's scroll area, which
+ * is what paints the sheet, so unless it is painted itself it is transparent and
+ * shows a band of the live plot above the menu. Each state here measures the canvas against the
  * viewport, its drawing buffer against the device pixels, the toggle's place,
  * and the paint of the strip; a rotation and a two-finger gesture follow.
  */
@@ -177,111 +177,111 @@ for (const phone of [
       hasTouch: true,
     });
 
-    test('the sheet covers the plot whole, and closed the plot fills the screen', async ({
+    test('the sheet covers the plot whole and closed the plot fills the screen; turned, the plot redraws at the new size and keeps its gestures', async ({
       page,
     }) => {
       await openDataset(page);
-      await sidebarSettled(page);
 
-      for (const state of ['open', 'closed', 'open again']) {
-        if (state === 'closed') await toggleSidebar(page, { hidden: true });
-        if (state === 'open again') await toggleSidebar(page, { hidden: false });
-        const geometry = await measure(page);
+      await test.step('the sheet covers the plot whole, and closed the plot fills the screen', async () => {
+        await sidebarSettled(page);
+
+        for (const state of ['open', 'closed', 'open again']) {
+          if (state === 'closed') await toggleSidebar(page, { hidden: true });
+          if (state === 'open again') await toggleSidebar(page, { hidden: false });
+          const geometry = await measure(page);
+          expectCanvasFillsViewport(geometry);
+          expectToggleOnScreen(geometry);
+
+          if (state === 'closed') {
+            expect(geometry.sidebar.right, 'the closed sheet is off screen')
+              .toBeLessThanOrEqual(0);
+            expect(geometry.plotAtCentre, `the plot is at the centre, not ${geometry.centre}`).toBe(true);
+            // Closed, the sheet is its peek bar along the foot of the screen.
+            expect(geometry.toggle).toMatchObject({
+              left: 0,
+              right: geometry.viewport.width,
+              bottom: geometry.viewport.height,
+            });
+            continue;
+          }
+
+          // The open sheet is the whole screen, painted edge to edge in the
+          // sidebar's paper, the close-control strip included: no band of the
+          // plot shows through above the menu.
+          expect(geometry.sidebar).toEqual(geometry.canvas);
+          expect(geometry.plotAtCentre, `the sheet covers the centre, not ${geometry.centre}`).toBe(false);
+          expect(geometry.sidebarPaint, `${state}: the strip is painted`)
+            .toBe(geometry.paperPaint);
+          expect(alphaOf(geometry.sidebarPaint)).toBe(1);
+          // The close control sits in the strip, top right, above the menu.
+          expect(geometry.toggle).toMatchObject({
+            top: 0,
+            right: geometry.viewport.width,
+          });
+          expect(geometry.scrollTop).toBeGreaterThanOrEqual(geometry.toggle.bottom);
+        }
+      });
+
+      await test.step('the plot redraws at the new size on rotation and keeps its gestures', async () => {
+        await toggleSidebar(page, { hidden: true });
+
+        // Turned on its side the phone is past the sheet breakpoint: the
+        // sidebar floats beside the plot instead, shown as it was chosen (the
+        // sheet closed on the phone is page chrome, not that choice).
+        await page.setViewportSize({ width: phone.height, height: phone.width });
+        await expectBufferFollows(page);
+        await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
+        await sidebarSettled(page);
+        let geometry = await measure(page);
         expectCanvasFillsViewport(geometry);
         expectToggleOnScreen(geometry);
+        expect(geometry.sidebar.right).toBeLessThan(geometry.viewport.width / 2);
+        expect(geometry.toggle.left).toBeGreaterThanOrEqual(geometry.sidebar.right);
 
-        if (state === 'closed') {
-          expect(geometry.sidebar.right, 'the closed sheet is off screen')
-            .toBeLessThanOrEqual(0);
-          expect(geometry.plotAtCentre, `the plot is at the centre, not ${geometry.centre}`).toBe(true);
-          // Closed, the sheet is its peek bar along the foot of the screen.
-          expect(geometry.toggle).toMatchObject({
-            left: 0,
-            right: geometry.viewport.width,
-            bottom: geometry.viewport.height,
-          });
-          continue;
-        }
-
-        // The open sheet is the whole screen, painted edge to edge in the
-        // sidebar's paper, the close-control strip included: no band of the
-        // plot shows through above the menu.
+        await page.setViewportSize({ width: phone.width, height: phone.height });
+        await expectBufferFollows(page);
+        geometry = await measure(page);
         expect(geometry.sidebar).toEqual(geometry.canvas);
-        expect(geometry.plotAtCentre, `the sheet covers the centre, not ${geometry.centre}`).toBe(false);
-        expect(geometry.sidebarPaint, `${state}: the strip is painted`)
-          .toBe(geometry.paperPaint);
-        expect(alphaOf(geometry.sidebarPaint)).toBe(1);
-        // The close control sits in the strip, top right, above the menu.
-        expect(geometry.toggle).toMatchObject({
-          top: 0,
-          right: geometry.viewport.width,
-        });
-        expect(geometry.scrollTop).toBeGreaterThanOrEqual(geometry.toggle.bottom);
-      }
-    });
+        expectToggleOnScreen(geometry);
 
-    test('the plot redraws at the new size on rotation and keeps its gestures', async ({
-      page,
-    }) => {
-      await openDataset(page);
-      await toggleSidebar(page, { hidden: true });
-
-      // Turned on its side the phone is past the sheet breakpoint: the
-      // sidebar floats beside the plot instead, shown as it was chosen (the
-      // sheet closed on the phone was page chrome, not that choice).
-      await page.setViewportSize({ width: phone.height, height: phone.width });
-      await expectBufferFollows(page);
-      await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
-      await sidebarSettled(page);
-      let geometry = await measure(page);
-      expectCanvasFillsViewport(geometry);
-      expectToggleOnScreen(geometry);
-      expect(geometry.sidebar.right).toBeLessThan(geometry.viewport.width / 2);
-      expect(geometry.toggle.left).toBeGreaterThanOrEqual(geometry.sidebar.right);
-
-      await page.setViewportSize({ width: phone.width, height: phone.height });
-      await expectBufferFollows(page);
-      geometry = await measure(page);
-      expect(geometry.sidebar).toEqual(geometry.canvas);
-      expectToggleOnScreen(geometry);
-
-      // After every toggle and turn, two fingers still pinch the plot.
-      await toggleSidebar(page, { hidden: true });
-      const cameraOf = () => page.evaluate(
-        () => JSON.stringify(window._cellucidViewer.getCameraState()),
-      );
-      const before = await cameraOf();
-      // The camera is at rest, so a change below is the gesture's.
-      await page.evaluate(() => new Promise(resolve => {
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      }));
-      expect(await cameraOf()).toBe(before);
-      await page.evaluate(() => {
-        const canvas = document.getElementById('glcanvas');
-        const midY = innerHeight / 2;
-        const fire = (type, index, x, y) => canvas.dispatchEvent(new PointerEvent(type, {
-          bubbles: true,
-          cancelable: true,
-          composed: true,
-          pointerId: 60 + index,
-          pointerType: 'touch',
-          isPrimary: index === 0,
-          button: type === 'pointermove' ? -1 : 0,
-          buttons: type === 'pointerup' ? 0 : 1,
-          clientX: x,
-          clientY: y,
+        // After every toggle and turn, two fingers still pinch the plot.
+        await toggleSidebar(page, { hidden: true });
+        const cameraOf = () => page.evaluate(
+          () => JSON.stringify(window._cellucidViewer.getCameraState()),
+        );
+        const before = await cameraOf();
+        // The camera is at rest, so a change below is the gesture's.
+        await page.evaluate(() => new Promise(resolve => {
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
         }));
-        const midX = innerWidth / 2;
-        fire('pointerdown', 0, midX - 30, midY);
-        fire('pointerdown', 1, midX + 30, midY);
-        for (let step = 1; step <= 12; step++) {
-          fire('pointermove', 0, midX - 30 - step * 8, midY + step * 3);
-          fire('pointermove', 1, midX + 30 + step * 8, midY + step * 3);
-        }
-        fire('pointerup', 0, midX - 126, midY + 36);
-        fire('pointerup', 1, midX + 126, midY + 36);
+        expect(await cameraOf()).toBe(before);
+        await page.evaluate(() => {
+          const canvas = document.getElementById('glcanvas');
+          const midY = innerHeight / 2;
+          const fire = (type, index, x, y) => canvas.dispatchEvent(new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            pointerId: 60 + index,
+            pointerType: 'touch',
+            isPrimary: index === 0,
+            button: type === 'pointermove' ? -1 : 0,
+            buttons: type === 'pointerup' ? 0 : 1,
+            clientX: x,
+            clientY: y,
+          }));
+          const midX = innerWidth / 2;
+          fire('pointerdown', 0, midX - 30, midY);
+          fire('pointerdown', 1, midX + 30, midY);
+          for (let step = 1; step <= 12; step++) {
+            fire('pointermove', 0, midX - 30 - step * 8, midY + step * 3);
+            fire('pointermove', 1, midX + 30 + step * 8, midY + step * 3);
+          }
+          fire('pointerup', 0, midX - 126, midY + 36);
+          fire('pointerup', 1, midX + 126, midY + 36);
+        });
+        await expect.poll(cameraOf).not.toBe(before);
       });
-      await expect.poll(cameraOf).not.toBe(before);
     });
   });
 }

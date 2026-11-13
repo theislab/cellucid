@@ -304,9 +304,8 @@ async function exportFigure(page, format) {
   await expect(page.locator('#figure-export-btn')).toHaveText('Export');
   expect(await download.failure()).toBeNull();
   const bytes = await readFile(await download.path());
-  // The SVG is compared as bytes; the PNG as pixels, so a raster that
-  // differs only by the rasterizer's last bit is told apart from one whose
-  // points, colors or visibility changed (helpers/pixel-parity.mjs).
+  // The SVG is compared as bytes; the PNG as pixels, so a failure says
+  // where and by how much the two rasters differ.
   return format === 'png' ? decodePng(bytes) : exportFingerprint(bytes, format);
 }
 

@@ -2,9 +2,9 @@
  * Categorical tick labels are thinned to the drawn box, and only ever dropped.
  *
  * A category axis draws every category it is handed. In the sidebar preview
- * that put eighteen cell-type names on top of one another; measured through the
- * real renderer, ten pairs of labels genuinely overlapped at 224×180 while the
- * same eighteen fitted at 720×380 (`tests/browser/analysis-plot-label-collisions.spec.mjs`).
+ * that puts eighteen cell-type names on top of one another: through the real
+ * renderer, ten pairs of labels genuinely overlap at 224×180 while the same
+ * eighteen fit at 720×380 (`tests/browser/analysis-plot-label-collisions.spec.mjs`).
  * So the crowding is a function of the box, and the fit belongs where the box
  * is known — `PlotFactory.render`, not `buildLayout`.
  *

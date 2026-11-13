@@ -1,6 +1,6 @@
 /**
- * History settings (`assets/js/app/history/history-settings.js`, History v2
- * §3.15.5): every switch on by default, the name unset; a browser's choices
+ * History settings (`assets/js/app/history/history-settings.js`):
+ * every switch on by default, the name unset; a browser's choices
  * kept in localStorage and told to every listener; the detail switches name
  * the domains the history leaves out.
  */

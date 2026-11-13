@@ -147,7 +147,7 @@ export function createPulseSampleMask(gl) {
     /**
      * Start compiling the reset program, so the first pane drawn over its
      * kept samples only reads its status (a program compiled at first use
-     * holds that frame for the whole compile: about 100 ms).
+     * holds that frame for the whole compile).
      */
     prepare() {
       if (lost || program !== null || started !== null) return;

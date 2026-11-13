@@ -1,9 +1,8 @@
 /**
  * The inline editor (`ui/components/inline-editor.js`) names a field, a
  * category and a saved state in place. Leaving the box names it, as Enter
- * does, like a view's and a highlight page's names (R9F-6: leaving dropped
- * what was typed); a name refused is said on the box as the browser says a
- * refused entry, and goes as the name is changed (it was only a hover title).
+ * does, like a view's and a highlight page's names; a name refused is said on
+ * the box as the browser says a refused entry, and goes as the name is changed.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -53,7 +52,7 @@ async function editor(options) {
   return { input, target, blur };
 }
 
-test('leaving the box names it, as Enter does; Escape leaves it as it was (R9F-6)', async () => {
+test('leaving the box names it, as Enter does; Escape leaves it as it was', async () => {
   const saved = [];
   const left = await editor({ onSave: value => saved.push(value) });
   left.input.value = ' after ';
@@ -71,7 +70,7 @@ test('leaving the box names it, as Enter does; Escape leaves it as it was (R9F-6
   assert.equal(cancelled, 1);
 });
 
-test('a refused name is said on the box until it is changed, and the box stays open (R9F-6)', async () => {
+test('a refused name is said on the box until it is changed, and the box stays open', async () => {
   const saved = [];
   const { input, blur } = await editor({
     onSave: value => saved.push(value),

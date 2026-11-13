@@ -164,9 +164,9 @@ function ensureObserver() {
 
   // Plotly's notifier is a container appended directly to <body>, with one
   // note per message appended directly to it. Only those two levels are
-  // watched: observing the whole document subtree ran a subtree query for
-  // every element anything inserted anywhere — every SVG point of every plot
-  // included, 170,000 queries for one box plot of a million-cell page.
+  // watched: observing the whole document subtree would run a subtree query
+  // for every element anything inserted anywhere — every SVG point of every
+  // plot included, 170,000 queries for one box plot of a million-cell page.
   observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {

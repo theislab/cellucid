@@ -61,6 +61,7 @@ export function showFigureExportModal({ title, content, onClose }) {
     dialog.remove();
     throw error;
   }
-  active = true;
+  // Closed while it opened (`wireAppDialog`): its onClose has run already.
+  active = dialog.open;
   return { close: owner.close };
 }

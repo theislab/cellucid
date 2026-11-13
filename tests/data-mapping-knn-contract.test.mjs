@@ -1,6 +1,6 @@
 /**
  * The neighbor graph of a data mapping, read from a real `.h5ad` and Zarr
- * ZIP in the browser readers (Phase E).
+ * ZIP in the browser readers.
  *
  * - Every square `obsp` matrix is listed; any of them is read by key, through
  *   its `obsp/{p}` route.

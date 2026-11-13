@@ -131,8 +131,8 @@ function assertFiniteFloat32Array(value, expectedLength, label) {
  * publication, so it is proven once: scanned the first time it is published,
  * or already proven where it was made (an embedding the reader worker
  * checked, `publishPositionBounds`). A representation switch back to a
- * layout the viewer has shown costs no O(N) pass (a full scan is 30-60 ms at
- * 10M 3D).
+ * layout the viewer has shown costs no O(N) pass (a full scan of 10M 3D
+ * cells is tens of milliseconds; measured: 28_decisions_rendering_layers.md).
  */
 function assertCellPositions(value, expectedLength, dimension, label) {
   const exact = assertExactFloat32Array(value, expectedLength, label);

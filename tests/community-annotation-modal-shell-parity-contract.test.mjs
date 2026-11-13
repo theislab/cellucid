@@ -91,19 +91,6 @@ test('no community annotation dialog brings back a hand-built modal', () => {
   }
 });
 
-test('the voting dialog closes the details dialog over it first', () => {
-  requireClause(
-    VOTING_SOURCE,
-    /const close = \(\) => \{\s*closeSecondary\(\);\s*owner\.close\(\);\s*\};/,
-    'closing the voting dialog must close the details dialog before it hands focus back'
-  );
-  requireClause(
-    VOTING_SOURCE,
-    /\['secondary modal', closeSecondary\],\s*\['owned modal lifecycle', onClose\],\s*\['modal dialog', \(\) => dialog\.remove\(\)\]/,
-    'the voting render lifecycle must retire before the dialog leaves the page'
-  );
-});
-
 test('the voting shell keeps the rerender focus behaviour the cluster shell has no need for', () => {
   requireClause(
     VOTING_SOURCE,

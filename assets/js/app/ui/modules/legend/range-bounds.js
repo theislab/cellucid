@@ -105,7 +105,7 @@ export function parseBound(text, { min, max }) {
 /**
  * The characters a bound's number box shows whole (`.slider-number`: 7ch).
  */
-export const BOUND_TEXT_CHARS = 7;
+const BOUND_TEXT_CHARS = 7;
 
 /**
  * How a number box writes a bound: its shortest round-trip decimal when that

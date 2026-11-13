@@ -12,7 +12,7 @@
  * control a person used). Floating analysis windows are the analysis's
  * (`definitions/analysis.js`).
  *
- * Page chrome is no action (History v2 §3.3.8): the phone sheet opening and
+ * Page chrome is no action: the phone sheet opening and
  * closing, the sidebar's scroll and focus, which panel is in front. On the
  * phone layout `layout.sidebar.show` sets whether the sidebar shows beside
  * the plot on a wider window, and leaves the sheet as it is.

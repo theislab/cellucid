@@ -160,7 +160,7 @@ test('malformed columns and colors are refused', () => {
   );
 });
 
-test('a gene\'s cells at the scale floor are drawn neutral; the rest keep the colormap (UX-8)', () => {
+test('a gene\'s cells at the scale floor are drawn neutral; the rest keep the colormap', () => {
   const colormap = CONTINUOUS_COLORMAPS[0];
   const values = Float32Array.of(0, 0, 0.5, 3, 0, NaN);
   const domain = { min: 0, max: 3, scale: 'linear' };

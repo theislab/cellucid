@@ -3,7 +3,7 @@
  * definitions/{fields,coloring,filters,mapping}.js`): their definitions,
  * the parameters they name things by, the pure helpers that convert a data
  * mapping, the category that keeps only some of its cells
- * (`state/managers/category-cell-sample.js`, request §3.1), and the
+ * (`state/managers/category-cell-sample.js`), and the
  * handlers the state alone implements (`state/actions/field-actions.js`)
  * resolving names and refusing with a sentence.
  */
@@ -389,7 +389,7 @@ test('the consensus column is a step that names the outcome of each category: it
   assert.equal(definition.code(params), 'consensus_column("community_cell_type", of="Cell type", mapping={"T": "T cell", "B": "disputed"})');
 });
 
-test('grouping categories is one step making a new field of groups; a category no group lists keeps its name or joins rest (F89)', async t => {
+test('grouping categories is one step making a new field of groups; a category no group lists keeps its name or joins rest', async t => {
   const source = {
     kind: 'category', key: 'clusters', categories: ['Ductal', 'Ngn3 low EP', 'Alpha', 'Beta', 'Delta'],
     codes: Uint8Array.from([0, 1, 2, 3, 4, 255, 2]), loaded: true,
@@ -437,9 +437,9 @@ test('grouping categories is one step making a new field of groups; a category n
   const definition = getActionCatalog().get('field.group');
   assert.equal(definition.describe({ field, groups: lineage, rest: null }, { name: 'lineage' }), 'Grouped clusters into Progenitor and Endocrine as lineage');
   assert.equal(definition.describe({ field, groups: lineage, rest: 'Other' }, null), 'Grouped clusters into Progenitor, Endocrine and Other as clusters (grouped)');
-  // The rest joins a group it names: listed once (L11-3).
+  // The rest joins a group it names: listed once.
   assert.equal(definition.describe({ field, groups: lineage, rest: 'Endocrine' }, null), 'Grouped clusters into Progenitor and Endocrine as clusters (grouped)');
-  // Past three, the groups are counted as groups (L11-3: was "into 4 categories and non-epithelial").
+  // Past three, the groups are counted as groups ("into 4 groups and non-epithelial", not "into 4 categories ...").
   const four = ['airway', 'distal tip', 'stalk', 'alveolar'].map(label => ({ label, categories: [label] }));
   assert.equal(definition.describe({ field, groups: four, rest: 'non-epithelial', name: 'compartment' }, { name: 'compartment' }), 'Grouped clusters into 4 groups and non-epithelial as compartment');
   assert.equal(definition.code({ field, groups: lineage, rest: null, name: 'lineage' }),
@@ -463,7 +463,7 @@ test('the grouping of categories: codes by group, the others kept or joined, eac
   assert.deepEqual(intoGroup.membersOf, [[2, 3, 0, 1, 4]]);
   assert.throws(() => buildGroupCategoriesTransform(categories, [{ label: 'A', members: [0] }, { label: 'B', members: [0] }], null), /in two groups/);
   assert.throws(() => buildGroupCategoriesTransform(categories, [{ label: 'Delta', members: [0] }], null), /kept under a label a group takes/);
-  // Colors (each told apart from the others, F111): Endocrine as Beta (its first), Progenitor
+  // Colors (each told apart from the others): Endocrine as Beta (its first), Progenitor
   // as Ductal, Delta its own; shown while any of its categories was.
   const colors = Uint8Array.of(230, 25, 75, 60, 180, 75, 255, 225, 25, 0, 130, 200, 245, 130, 48);
   const visible = Uint8Array.from([0, 1, 0, 0, 1]);
@@ -473,20 +473,18 @@ test('the grouping of categories: codes by group, the others kept or joined, eac
 });
 
 test('the open cells as the cells domain names them: the subsample asked for, never a step of its growth', () => {
-  assert.equal(openCellsValueOf(null), null);
   assert.equal(openCellsValueOf({ nObs: 100, kept: null, spec: null }), null);
   const spec = Object.freeze({ method: 'uniform', nObs: 100, k: 20, seed: 3 });
   assert.deepEqual(openCellsValueOf({ nObs: 100, kept: Uint32Array.of(1, 2), spec }), { method: 'uniform', k: 20, seed: 3 });
   // Growing toward 40 cells: the share it grows to; toward every cell: every cell.
   assert.deepEqual(openCellsValueOf({ nObs: 100, kept: Uint32Array.of(1), spec, chunks: { target: 40 } }).k, 40);
   assert.equal(openCellsValueOf({ nObs: 100, kept: Uint32Array.of(1), spec, chunks: { target: 100 } }), null);
-  assert.deepEqual(requestOfOpenCellsValue(null), { mode: 'all' });
   assert.deepEqual(requestOfOpenCellsValue({ method: 'blocks', k: 20, seed: 0, blockSize: 64 }),
     { mode: 'subsample', method: 'blocks', k: 20, seed: 0, blockSize: 64, strict: true });
 });
 
-// Bug hunt R9A-8: a rename made "Alpha\nnewline" (an agent's call; the legend's box trims and is one
-// line), which the legend drew on two lines and the community annotation cannot key. One rule for a
+// A rename to "Alpha\nnewline" (an agent's call; the legend's box trims and is one line) would be drawn
+// by the legend on two lines and could not be keyed by the community annotation. One rule for a
 // category label given now, in every action that takes one: rename, merge, group, Create categorical.
 test('a category label given now is one line with no space at its ends, in every action that takes one', async t => {
   const source = {
@@ -530,14 +528,14 @@ test('a category label given now is one line with no space at its ends, in every
   assert.equal(StateValidator.validateCategoryLabel('read\nas it is'), true, 'a label a dataset brings is read as it is');
 });
 
-test('a color map step names the palette as the legend does (R9F-5)', () => {
+test('a color map step names the palette as the legend does', () => {
   const definition = getActionCatalog().get('color.continuous.colormap');
   const field = { source: 'var', key: 'Ins1' };
   assert.equal(definition.describe({ field, colormap: 'plasma' }), 'Drew gene Ins1 in Plasma');
   assert.equal(definition.describe({ field, colormap: 'rdbu' }).endsWith(' in RdBu'), true);
 });
 
-test('a range step writes its bounds as the Filters list does, not as float32 widened to double (R9F-11)', () => {
+test('a range step writes its bounds as the Filters list does, not as float32 widened to double', () => {
   const catalog = getActionCatalog();
   const field = { source: 'obs', key: 'G2M_score' };
   const min = Math.fround(-0.4487030208);

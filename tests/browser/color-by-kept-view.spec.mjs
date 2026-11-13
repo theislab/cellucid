@@ -1,11 +1,11 @@
 /**
- * F95 (2026-11-11): coloring a kept view by a gene did nothing, and
- * `color.by` answered null. Every view holds its own copies of the field
- * objects (`_cloneVarData`), and the gene search's entries held the objects
- * of the view the list was built in, so a gene chosen on another view was
- * "no longer on the gene list" and was not shown. A field of any kind is now
- * shown on any view, by the action and by the gene search alike, and a choice
- * that ends unshown is refused with a sentence, never answered with null.
+ * Coloring a kept view by a gene works, and `color.by` never answers null for
+ * it. Every view holds its own copies of the field objects (`_cloneVarData`),
+ * so the gene search's entries must not hold the objects of the view the list
+ * was built in: a gene chosen on another view would be "no longer on the gene
+ * list" and not shown. A field of any kind is shown on any view, by the
+ * action and by the gene search alike, and a choice that ends unshown is
+ * refused with a sentence, never answered with null.
  */
 import { expect, test } from './helpers/test.mjs';
 

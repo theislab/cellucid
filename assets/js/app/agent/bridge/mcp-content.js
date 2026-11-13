@@ -175,8 +175,8 @@ function liftPictures(json, schema, images) {
 /**
  * Why a change made no step, as the agent is told it after the result (the
  * dispatcher's `unrecorded`): a change asked for what was so already must
- * not be reported to the person as done (bug hunt F80: "Color by
- * cell_type" on a dataset that opens colored by it). One note per reason of
+ * not be reported to the person as done ("Color by cell_type" on a
+ * dataset that opens colored by it). One note per reason of
  * the closed set (`data/viewer-protocol.js` `VIEWER_ACTION_UNRECORDED`, what a
  * notebook hears; a test keeps the two the same).
  */

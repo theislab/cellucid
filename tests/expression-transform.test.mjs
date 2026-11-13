@@ -6,8 +6,7 @@
  * threads (`analysis/compute/task-values.js`) and the tests on them, held to
  * scanpy 1.11.5: `normalize_total(target_sum=1e4)`, `log1p` and both, then
  * `rank_genes_groups` (Wilcoxon and t-test) on the 8 × 5 matrix below
- * (`fixtures/analysis/scanpy-expression-transform.json`; the script is in
- * cellucid-private `lane-expression.md`, Step 2).
+ * (`fixtures/analysis/scanpy-expression-transform.json`).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

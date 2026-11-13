@@ -1,11 +1,11 @@
 /**
- * History v2's core on fake domains (`assets/js/app/history/`): the recording
- * switch and the detail switches (§3.15.1, §3.15.5), groups, squash and
- * "clear, keep the state" (§3.15.2), branches as objects and their delete
- * (§3.3.3), Recently deleted (§3.3.9), notes and bookmarks, turns and their
- * binding (§3.3.10), provenance (§3.4), search, the paged read and the
+ * The history's core on fake domains (`assets/js/app/history/`): the recording
+ * switch and the detail switches, groups, squash and
+ * "clear, keep the state", branches as objects and their delete,
+ * Recently deleted, notes and bookmarks, turns and their
+ * binding, provenance, search, the paged read and the
  * summary, replay with versions and a name mapping, branch without a step,
- * applying a branch here, verify, revert, and loading beside (§3.3.7).
+ * applying a branch here, verify, revert, and loading beside.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -104,7 +104,7 @@ function valid(history) {
 }
 
 // ---------------------------------------------------------------------------
-// Recording switch (§3.15.1)
+// Recording switch
 
 test('paused: changes apply without a step; resuming adds one squashed step for what differs, by everyone who acted', async () => {
   const { page, history, act, step } = await makePage();
@@ -189,9 +189,9 @@ test('detail switches: an off domain is not recorded, not moved by the history, 
 });
 
 test('a gesture brought back to where it began leaves no step: no Undo that does nothing', async () => {
-  // Found 2026-11-10 on Suo: the outlier filter moved 100 → 99 → 100 in one
-  // drag left "Showed every outlier of cell_type" (touching nothing) in the
-  // history; Undo then changed nothing on screen.
+  // On Suo: the outlier filter moved 100 → 99 → 100 in one
+  // drag must not leave "Showed every outlier of cell_type" (touching nothing) in the
+  // history; Undo would then change nothing on screen.
   const { page, history, act, step } = await makePage();
   const before = await step('a.set', { v: 1 });
   await act('cam.set', { v: 5 });
@@ -216,7 +216,7 @@ test('a gesture brought back to where it began leaves no step: no Undo that does
 });
 
 // ---------------------------------------------------------------------------
-// Groups, squash, clear (§3.15.2)
+// Groups, squash, clear
 
 test('groups: a named run of whole steps, renamed, extended and removed, each undoable exactly', async () => {
   const { history, act, step } = await makePage();
@@ -247,8 +247,8 @@ test('a group holds whole turns: a run that splits one is refused, naming the ru
     error => error.code === 'splits-turn' && /"Tidy".*steps 1 to 2/.test(error.message));
 });
 
-// L21-8 (agent-loop lane, live sweep): a turn's step after its group joins the group by itself; extending the
-// group to that step was refused "Steps 2 to 4 are not consecutive steps of one branch", which they were.
+// A turn's step after its group joins the group by itself; extending the
+// group to that step is not refused "Steps 2 to 4 are not consecutive steps of one branch", which they are.
 test('extending a group to a step it holds already (a turn\'s later step joins its group) says so, not "not consecutive"', async () => {
   const { act, step } = await makePage();
   const agent = { origin: 'agent', agent: 'Claude', turn: 'turn-1', turnLabel: 'Tidy' };
@@ -324,7 +324,7 @@ test('clear, keep the state: a branch "Fresh start" with one squashed step from 
 });
 
 // ---------------------------------------------------------------------------
-// Branches and Recently deleted (§3.3.3, §3.3.9)
+// Branches and Recently deleted
 
 test('deleting a branch: only its own steps after the last fork go; the shared ones join the branch forking there', async () => {
   const { page, history, act, step } = await makePage();
@@ -392,7 +392,7 @@ test('a locked branch takes no new step: a change at its tip starts another', as
 });
 
 // ---------------------------------------------------------------------------
-// Notes, turns (§3.3.10, §3.13)
+// Notes, turns
 
 test('notes: authored and undoable; an agent edits only its own', async () => {
   const { history, act, step } = await makePage();
@@ -409,7 +409,7 @@ test('notes: authored and undoable; an agent edits only its own', async () => {
   valid(history);
 });
 
-test('the summary gives every note on the tracker, a branch, a group and a turn in full: a received session\'s account is readable (L25-9)', async () => {
+test('the summary gives every note on the tracker, a branch, a group and a turn in full: a received session\'s account is readable', async () => {
   const { history, act, step } = await makePage();
   const meta = { origin: 'agent', agent: 'Claude', turn: 'turn-9', turnLabel: 'Compare the tips' };
   const s1 = await step('a.set', { v: 1 }, meta);

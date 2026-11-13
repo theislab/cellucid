@@ -1,9 +1,9 @@
 /**
  * Differential expression resolves its two groups (a pass over every cell)
  * to say whether Run can start, and Run's state is asked on every option,
- * highlight and page change, several times each (8 ms a pass at 2M cells).
- * The answer is kept while the options choosing the groups, the highlights
- * and the fields they read are the same (0.01 ms).
+ * highlight and page change, several times each. The answer is kept while the
+ * options choosing the groups, the highlights and the fields they read are the
+ * same (measured: 37_decisions_analysis.md).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

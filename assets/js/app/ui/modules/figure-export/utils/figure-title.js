@@ -10,15 +10,14 @@ import { categoryVisibilityText } from '../../../../utils/category-visibility-te
  * "Dataset • field", and, when some of the field's categories are hidden,
  * which ones as the filter list says it, the smaller side named ("Dataset •
  * cell_type: hiding B1 cells", "… : showing only B cells, T cells"); with
- * every one shown the field says it (found 2026-11-10: "cell_type: AXL+ and
- * SIGLEC6+ DCs, B1 cells +67" over all 69 cell types). A category no cell
+ * every one shown the field says it, not a list of them. A category no cell
  * passing the other filters falls in is on neither side.
  *
  * `otherFilters`: the filters on other fields, as the filter list says them
  * ("LVL0: showing only Epithelial"), each after the field as the view's own
  * label names them ("He • LVL2 • LVL0: showing only Epithelial"). The legend
  * lists no category those filters leave without cells (`legendEntries`), so
- * the title is where the figure says why (F113).
+ * the title is where the figure says why.
  *
  * `viewName`: the name the view was given (`view.rename`): a named view's
  * figure is titled "Dataset • <name>", the name the person chose for what it
@@ -54,8 +53,8 @@ export function figureAutoTitle({ datasetName, fieldLabel, legendModel, otherFil
 
 /**
  * Whether a grid export's panels are colored by different fields: then the
- * figure is titled by the dataset alone and each panel names its own field
- * (found 2026-11-10: a grid of cell_type and organ panels titled "… • organ").
+ * figure is titled by the dataset alone and each panel names its own field:
+ * one field's name over panels colored by another would misname them.
  * The panels are the live view (unless hidden) and every kept view, as the
  * export draws them.
  *

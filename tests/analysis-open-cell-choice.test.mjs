@@ -1,5 +1,5 @@
 /**
- * Every analysis result says how the open cells were chosen (audit F-2):
+ * Every analysis result says how the open cells were chosen:
  * the identity of the open cells carries the subsample's specification
  * (`createCellIdentity({choice})`, made by `AnnDataFileSource.getCellIdentity`
  * from the opening), and `describeOpenCellChoice` names the method and share,

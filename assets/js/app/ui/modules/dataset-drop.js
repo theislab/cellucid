@@ -12,7 +12,7 @@
  * one-click reopen (`app/library/local-file-handles.js`). A library file of
  * My datasets (`.cellucid-library`, `CELLUCID_FILES`) goes to its Import; a
  * session file (`.cellucid-session`) loads as Load… › Open a session file…
- * loads one, its dataset opened with it (bug hunt L25-8). Anything else is
+ * loads one, its dataset opened with it. Anything else is
  * refused with a message that says what can be dropped.
  *
  * The browser's own reaction to a dropped file is to navigate to it, which
@@ -33,7 +33,7 @@ import { formatCountOf } from '../../../utils/format-units.js';
  * Set on the root element while a drop opens a dataset. The guard reads it to
  * decide whether a file drag is offered as a copy or refused.
  */
-export const DATASET_DROP_READY_ATTRIBUTE = 'datasetDrop';
+const DATASET_DROP_READY_ATTRIBUTE = 'datasetDrop';
 const DATASET_DROP_READY_VALUE = 'ready';
 
 /** How long a drag may go without a `dragover` before the overlay retires. */
@@ -135,8 +135,7 @@ export function describeDatasetDrop(dataTransfer) {
     // reader, which says what it lacks. Chromium lists a dropped folder
     // faster through its handle than through its entries, whose calls its
     // file system answers one at a time however many are asked at once
-    // (measured on real drops, medians of five: 22,023 files in 2.7 s
-    // against 4.4 s, `suo.zarr`'s 6,272 in 0.63 s against 1.2 s), so its
+    // (measured: 23_decisions_partial_reading.md), so its
     // handle is read where the drop gave one.
     return Object.freeze({
       kind: 'folder',

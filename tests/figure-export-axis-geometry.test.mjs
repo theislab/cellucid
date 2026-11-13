@@ -1,14 +1,12 @@
 /**
- * F158 (L24-6, 2026-11-11): a figure's axes are laid out once, from their
- * measured text, and both formats draw that one plan.
+ * A figure's axes are laid out once, from their measured text, and both
+ * formats draw that one plan.
  *
- * Before the fix the y-axis label stood a fixed `5 + 8 + 1.15 × label` px
- * left of the axis, whatever the tick labels' width: at 17 px ticks and a
- * 20 px label "UMAP 2" ran into "-0.5" (the S1b export picture), and at
- * larger sizes it ran over them. The axis margins were a fixed 62 px at any
- * text size (1–500 px), so large text was cut at the figure's edge or ran
- * into the legend. And the two formats placed the y tick labels differently:
- * the PNG 2 px from the tick, the SVG 8 px.
+ * The y-axis label stands past the widest tick label, whatever the tick
+ * labels' width and the text size (1–500 px): a fixed offset runs the label
+ * into the ticks, and fixed axis margins cut large text at the figure's edge
+ * or run it into the legend. Both formats place the y tick labels alike, not
+ * one 2 px from the tick and the other 8 px.
  */
 
 import assert from 'node:assert/strict';
@@ -77,7 +75,7 @@ function assertAxesClear(axes, label) {
   }
 }
 
-test('the y-axis label stands past the widest tick label at every text size (L24-6)', () => {
+test('the y-axis label stands past the widest tick label at every text size', () => {
   // The S1b export picture: ticks 17 px, axis labels 20 px, "UMAP 2" touched "-0.5".
   const s1b = planFigureAxes({
     bounds: BOUNDS, plotWidth: 600, plotHeight: 400, xLabel: 'UMAP 1', yLabel: 'UMAP 2',
@@ -205,7 +203,7 @@ function recordingContext() {
   return { ctx, record };
 }
 
-test('the PNG and the SVG draw one axes plan: every line and text at the same place (L24-6)', () => {
+test('the PNG and the SVG draw one axes plan: every line and text at the same place', () => {
   const plotRect = { x: 94.5, y: 30, width: 600, height: 400 };
   for (const [tickFontPx, labelFontPx] of [[12, 12], [17, 20], [64, 30]]) {
     const axes = planFigureAxes({

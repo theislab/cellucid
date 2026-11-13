@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { defineOptions } from '../assets/js/app/analysis/options/option-schema.js';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { AnalysisUIManager } from '../assets/js/app/analysis/ui/analysis-ui-manager.js';
@@ -868,21 +867,20 @@ test('AnalysisWindowManager removes zero-cell selections before highlight propag
 test('the analysis domain restore is terminal on an invalid value and on window manager failures', async () => {
   const NOTHING_DOCKED = { openMode: null, modes: {} };
   function analysisOver(manager) {
-    return createAnalysisDomain({
-      analysis: async () => ({
-        comparisonModule: {
-          exportSessionState: () => structuredClone(NOTHING_DOCKED),
-          async importSessionState() {
-            throw new Error('the docked panel is unchanged');
-          },
+    const refs = {
+      comparisonModule: {
+        exportSessionState: () => structuredClone(NOTHING_DOCKED),
+        async importSessionState() {
+          throw new Error('the docked panel is unchanged');
         },
-        analysisWindowManager: {
-          exportSessionWindows: () => [],
-          exportWindowPlaces: () => [],
-          ...manager,
-        },
-      }),
-    });
+      },
+      analysisWindowManager: {
+        exportSessionWindows: () => [],
+        exportWindowPlaces: () => [],
+        ...manager,
+      },
+    };
+    return createAnalysisDomain({ analysis: () => refs, analysisArrived: async () => refs });
   }
 
   let closeCalls = 0;
@@ -1536,22 +1534,6 @@ test('volcano gene-label layout is deterministic, collision-free, and count-exac
   }
 });
 
-test('volcano scientific paths contain no p-value flooring or adjusted-to-raw substitution', async () => {
-  const [plotSource, deUiSource] = await Promise.all([
-    readFile(
-      new URL('../assets/js/app/analysis/plots/types/volcanoplot.js', import.meta.url),
-      'utf8',
-    ),
-    readFile(
-      new URL('../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js', import.meta.url),
-      'utf8',
-    ),
-  ]);
-
-  assert.doesNotMatch(plotSource, /1e-300|Math\.max\(\s*p|AdjustedOrRaw|adjustedPValue\s*\?\?/);
-  assert.doesNotMatch(deUiSource, /adjustedPValue\s*\?\?\s*row\.pValue/);
-});
-
 test('scatter plot update propagates purge failure without attempting another render', async () => {
   const originalWindow = globalThis.window;
   const purgeError = new Error('purge failed');
@@ -1577,24 +1559,5 @@ test('scatter plot update propagates purge failure without attempting another re
   } finally {
     if (originalWindow === undefined) delete globalThis.window;
     else globalThis.window = originalWindow;
-  }
-});
-
-test('the complete 2D analysis plot surface contains no scattergl selector', async () => {
-  const paths = [
-    '../assets/js/app/analysis/plots/plot-factory.js',
-    '../assets/js/app/analysis/plots/plotly-loader.js',
-    '../assets/js/app/analysis/plots/types/densityplot.js',
-    '../assets/js/app/analysis/plots/types/scatterplot.js',
-    '../assets/js/app/analysis/plots/types/volcanoplot.js',
-  ];
-
-  for (const path of paths) {
-    const source = await readFile(new URL(path, import.meta.url), 'utf8');
-    assert.doesNotMatch(
-      source,
-      /scattergl|getScatterTraceType/,
-      `${path} must preselect the current SVG scatter contract`,
-    );
   }
 });

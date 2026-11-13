@@ -12,7 +12,7 @@ import { ignoreEmulatedFileChooserCancel } from './file-chooser-cancel.mjs';
 import { setAsideLeavingReports } from './leaving-document.mjs';
 import { expectNoOutsideRequests, watchOutsideRequests } from './outside-requests.mjs';
 import { expectNoSplitClicks, forgetSplitClicks, watchSplitClicks } from './split-clicks.mjs';
-import { annotateNonFinitePointerEvents, watchNonFinitePointerEvents } from './non-finite-pointer-events.mjs';
+import { annotateMacWindowTransitions, annotateNonFinitePointerEvents, watchNonFinitePointerEvents } from './non-finite-pointer-events.mjs';
 
 export async function retirePageApplication(page) {
   if (page.isClosed()) return;
@@ -125,9 +125,9 @@ const contextsWatchedForLoss = new WeakSet();
 /**
  * Note every WebGL context a page of `context` is handed already lost. A
  * browser whose graphics process was reset gives every later context lost
- * (WebKit after a GPU reset on a hosted macOS runner: WebKit bug 328185, run
- * 42274413675), and the test that asked for one then failed on a shader that
- * does not compile, naming nothing of the cause. A failed test names it
+ * (WebKit after a GPU reset on a hosted macOS runner: WebKit bug 328185),
+ * and the test that asks for one then fails on a shader that does not
+ * compile, naming nothing of the cause. A failed test names it
  * (`annotateContextsLostAtCreation`). Only what the browser itself handed
  * back is noted: a spec that loses a context on purpose does so after.
  */
@@ -259,7 +259,8 @@ export const test = playwrightTest.extend({
   // A context a spec opens itself (`browser.newContext`) runs on the same
   // device as the test's own, or on the one it names:
   // `browser.newContext({ device: { openingMsPerCell: 2 } })`.
-  deviceForNewContexts: [async ({ browser, browserName, device }, use) => {
+  deviceForNewContexts: [async ({ browser, browserName, device }, use, testInfo) => {
+    const started = Date.now();
     const newContext = browser.newContext;
     browser.newContext = async function newContextOnDevice({ device: own, ...options } = {}) {
       const context = await newContext.call(this, options);
@@ -283,7 +284,18 @@ export const test = playwrightTest.extend({
     } finally {
       browser.newContext = newContext;
     }
-    expectNoSplitClicks();
+    // A failed test, or one whose click was split, names the times macOS
+    // moved WebKit's windows meanwhile (`non-finite-pointer-events.mjs`).
+    let splitClicks = null;
+    try {
+      expectNoSplitClicks();
+    } catch (error) {
+      splitClicks = error;
+    }
+    if (splitClicks !== null || testInfo.status !== testInfo.expectedStatus) {
+      await annotateMacWindowTransitions(testInfo, browserName, started);
+    }
+    if (splitClicks !== null) throw splitClicks;
   }, { auto: true }],
   context: async ({ context, browserName, persistentStorage, device, playwright }, use, testInfo) => {
     if (!persistentStorage || browserName !== 'webkit') {
@@ -310,8 +322,8 @@ export const test = playwrightTest.extend({
       viewport, userAgent, deviceScaleFactor, isMobile, hasTouch, baseURL, headless: headless ?? true, locale,
     });
     // WebKit keeps a persistent context's origin storage outside its
-    // profile folder (measured: one test's kept stores were found by the
-    // next): every test starts and ends with the origin's storage empty.
+    // profile folder, so one test's kept stores would be found by the next:
+    // every test starts and ends with the origin's storage empty.
     try {
       await clearOriginStorage(persistent, baseURL);
       await installDevice(persistent, device);

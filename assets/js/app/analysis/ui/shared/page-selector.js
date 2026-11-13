@@ -101,7 +101,8 @@ export class PageSelectorComponent {
    * @param {Object} options
    * @param {Object} options.dataLayer - Data layer instance for page info
    * @param {HTMLElement} options.container - Container element to render into
-   * @param {Function} [options.onSelectionChange] - Callback when selection changes (receives pageIds array)
+   * @param {Function} [options.onSelectionChange] - Callback when selection changes (receives pageIds array and
+   *   `{byPerson}`: true when a person's click changed it, false when the selector did, as pages changed)
    * @param {Function} [options.onColorChange] - Callback when color changes (receives pageId, color)
    * @param {boolean} [options.showColorPicker=true] - Whether to show color picker
    * @param {boolean} [options.showCellCounts=true] - Whether to show cell counts
@@ -124,6 +125,8 @@ export class PageSelectorComponent {
     this.container = options.container;
     this.onSelectionChange = options.onSelectionChange;
     this.onColorChange = options.onColorChange;
+    /** Whether a person's click is being handled (what `onSelectionChange` hears as `byPerson`). */
+    this._personActing = false;
 
     // Options with defaults
     this.showColorPicker = options.showColorPicker ?? true;
@@ -483,6 +486,16 @@ export class PageSelectorComponent {
    * @param {MouseEvent} event
    */
   _handleTabsClick(event) {
+    this._personActing = true;
+    try {
+      this._applyTabsClick(event);
+    } finally {
+      this._personActing = false;
+    }
+  }
+
+  /** What a click on the chips or the select-all button does. */
+  _applyTabsClick(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (target === null) return;
     if (this._selectAllButton !== null && this._selectAllButton.contains(target)) {
@@ -700,7 +713,7 @@ export class PageSelectorComponent {
    */
   _notifySelectionChange() {
     if (this.onSelectionChange) {
-      this.onSelectionChange(this.getEffectivePageIds());
+      this.onSelectionChange(this.getEffectivePageIds(), { byPerson: this._personActing });
     }
   }
 
@@ -1119,9 +1132,7 @@ export class PageSelectorComponent {
    * The color every page this selector offers is drawn in, as its swatch
    * shows it (`_resolvePageColor`: one chosen here, else the page's own, else
    * its place among the pages): what a plot colors the pages by, so a plot
-   * and its swatches agree whatever order the pages were picked in (found
-   * 2026-11-10: plots colored pages whose color was not chosen here by
-   * their pick order).
+   * and its swatches agree whatever order the pages were picked in.
    * @returns {Map<string, string>}
    */
   getPageColors() {

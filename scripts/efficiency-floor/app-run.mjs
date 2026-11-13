@@ -18,7 +18,7 @@
  * after another (a revisit: what the first visit kept in this browser
  * counts), each visit's steps under `visits[i]` (the first also as `steps`).
  *
- * Run it alone (`heavy.sh`): it starts a browser on the machine's GPU
+ * Run it alone: it starts a browser on the machine's GPU
  * (`lib/browser-launch.mjs`; the renderer it drew with is in the result, and a software one
  * refuses the run) and the app's test server on `--port` and the next one.
  */

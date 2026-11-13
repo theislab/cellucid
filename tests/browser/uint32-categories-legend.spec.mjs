@@ -43,7 +43,7 @@ test('a field with more categories than uint16 carries loads, and its legend bui
   const rowCount = await page.locator('.legend-item').count();
   expect(rowCount).toBeGreaterThan(0);
   expect(rowCount).toBeLessThan(200);
-  // The rows run in the field's own category order (F124): gamma (code 0)
+  // The rows run in the field's own category order: gamma (code 0)
   // first, beta (code 69,999) last.
   await expect(page.locator('.legend-item .legend-label-main').first()).toHaveText('gamma');
 
@@ -65,7 +65,7 @@ test('a field with more categories than uint16 carries loads, and its legend bui
 
   // A scroll of a few rows keeps the rows still in view as they are: the same
   // nodes, never detached, so whatever is focused or open in one (a checkbox,
-  // a rename) survives the scroll. Rebuilding the window replaced every row,
+  // a rename) survives the scroll. Rebuilding the window would replace every row,
   // dropping the focus to the page. (The rows past the three used categories
   // hold no cells, so their controls are disabled and take no focus here;
   // the row's identity is what the focus depends on.)
@@ -94,10 +94,10 @@ test('a field with more categories than uint16 carries loads, and its legend bui
   expect(await page.evaluate(() => window.__keptLegendRow.textContent)).toBe(before);
 
   // A redraw of the field shown keeps the list where it was scrolled: each
-  // redraw builds the list anew, and the new list started at its top, so a
-  // rename far down a long legend threw the person back to row 1 (and a
-  // redraw a moment after a scroll lost the scroll: Firefox on CI, run
-  // 43120770230). Renaming a category redraws the legend.
+  // redraw builds the list anew, and a new list that starts at its top would
+  // throw the person back to row 1 on a rename far down a long legend (or lose a
+  // scroll made a moment before the redraw). Renaming a category redraws the
+  // legend.
   const place = await list.evaluate(async (element, pitch) => {
     element.scrollTop = 40_000 * pitch;
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));

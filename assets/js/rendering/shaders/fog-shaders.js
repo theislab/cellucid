@@ -2,11 +2,9 @@
  * Atmospheric fog: the one model every fogged layer draws with.
  *
  * Points, highlight rings, connectivity edges, the orbit anchor and the
- * velocity overlay all used to restate the fog law inline, each with slightly
- * different terms (one by eye depth instead of distance, one squared, one with
- * its own alpha floor), so the layers of one scene faded at different rates.
- * They now splice in `FOG_GLSL` and read the same two uniforms, which the CPU
- * derives once per pane with `writeFogUniforms`.
+ * velocity overlay all splice in `FOG_GLSL` and read the same two uniforms,
+ * which the CPU derives once per pane with `writeFogUniforms`, so the layers
+ * of one scene fade at the same rate.
  *
  * Fog depends only on the distance from the camera. That is constant across a
  * point sprite and linear enough along an edge's segment, so every shader
@@ -29,10 +27,10 @@
  */
 
 /** `extinction = density^2 * FOG_EXTINCTION_SCALE`, per unit of the fog span. */
-export const FOG_EXTINCTION_SCALE = 0.6;
+const FOG_EXTINCTION_SCALE = 0.6;
 
 /** The fog span never collapses below this, in world units. */
-export const MIN_FOG_SPAN = 0.0001;
+const MIN_FOG_SPAN = 0.0001;
 
 /**
  * GLSL for every fogged shader. Declares `u_fogNear` and `u_fogScale`; splice

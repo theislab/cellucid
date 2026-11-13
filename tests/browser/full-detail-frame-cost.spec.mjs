@@ -21,11 +21,11 @@ import { expectPerformance, performanceState, recordFrameCost } from './helpers/
  * frame's GPU time exactly, whatever the runner's own GPU takes. A flat
  * time (every frame `GPU_MS`) gains nothing from drawing fewer cells; a
  * time that follows the cells the live view drew (`perThousandCellsMs`)
- * does. Every verdict is therefore exact, the same on every runner: before
- * the fixture, fences that signaled at a simulated time still let the
- * runner's software GL and late polls decide (a frame measured 150 ms
- * faster was called no faster, Web contracts run 41307458156; a flat 60 ms
- * measured faster on Linux and not on a Mac, run 41255961977).
+ * does. Every verdict is therefore exact, the same on every runner: with
+ * fences that signal at a simulated time, the runner's software GL and late
+ * polls would decide (a frame measured 150 ms faster called no faster; a flat
+ * 60 ms measured faster on Linux and not on a Mac;
+ * measured: 38_decisions_testing_and_hosted_runners.md).
  */
 
 const DATASET_URL =
@@ -45,14 +45,13 @@ test.describe(`on a GPU that takes ${GPU_MS} ms a frame`, () => {
     // 120 cells are below the ladder's first count (every level is every
     // cell), and the opening's framing holds every cell: nothing the page
     // could turn on would draw fewer, so no frame is asked for to measure it
-    // (on a GPU that takes seconds a frame those frames were most of an
-    // opening's time: macOS Firefox, Web contracts run 41269083996).
+    // (on a GPU that takes seconds a frame those frames are most of an
+    // opening's time).
     await expect.poll(reports, { timeout: 60_000 }).toContain('nothing-fewer');
     expect(await reports()).not.toContain('too-slow');
     // The opening done, its published view applied, before the camera is
-    // set: a camera set while the sample's own view was still to come was
-    // undone by it, and the zoomed framing never measured (WebKit, full
-    // suite, 2026-11-01).
+    // set: a camera set while the sample's own view is still to come is
+    // undone by it, and the zoomed framing is never measured.
     await waitForPageAtRest(page);
     expect(await performanceState(page)).toEqual({ lod: false, culling: false, tip: '' });
     // Zoomed in, cells leave the view: the framing is measured, culling is

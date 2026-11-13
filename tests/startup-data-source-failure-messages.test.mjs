@@ -4,7 +4,7 @@
  *
  * The four catalog failures a user actually meets — a wrong address, a private
  * repository, an address that answers with a web page, and a dropped
- * connection — used to arrive as one sentence blaming the network. They are
+ * connection — must not arrive as one sentence blaming the network. They are
  * distinguishable before the UI sees them: `DataSourceError` carries a `code`,
  * and a transport failure carries the HTTP status the server answered with.
  */

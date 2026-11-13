@@ -279,7 +279,7 @@ test('an embedding that fails its load check changes nothing and stays unusable'
   );
   assert.equal(
     state.describeDataMappingRefusal(next),
-    // One sentence, as the other groups' (L21-7: "X_gone is enabled, but this dataset does not have." named nothing it lacked).
+    // One sentence, as the other groups' (a sentence such as "X_gone is enabled, but this dataset does not have." names nothing it lacks).
     "This mapping enables obsm['X_pca'] columns [0, 1], which this dataset cannot plot (NaN at cell 2)."
   );
   const pcaChoice = state.getRepresentationChoices().find(choice => choice.ref.key === 'X_pca');
@@ -1157,7 +1157,7 @@ test('an Apply whose open cells grow meanwhile is still this dataset\'s: it says
   assert.equal(panel.status().textContent, 'Applied.');
 });
 
-test('a dimension the mapping names no default for marks the embedding its key shows first, and an edit elsewhere writes none (R9M-5)', async t => {
+test('a dimension the mapping names no default for marks the embedding its key shows first, and an edit elsewhere writes none', async t => {
   // A mapping naming only the 2D default (a session saved so, an agent's
   // mapping.set): two 3-column arrays are on with no 3D default named.
   const panel = mountPanel(t, { obsm: { X_umap: 2, X_spatial: 3, X_phate: 3, X_pca: 6, velocity_umap: 2 } });

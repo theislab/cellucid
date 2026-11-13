@@ -26,7 +26,7 @@ import { isSingleCellExperiment, isSummarizedExperiment, sceModel } from './sce.
 import { writeModel } from './anndata-model.js';
 import { RObjectRefusal, noEmbeddingRefusal } from './refusals.js';
 import { transcodeOnce } from './session.js';
-import { keptAbout } from './space.js';
+import { keptAbout } from './kept-format.js';
 import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
 
 /** Slots whose large vectors are never needed (the small ones are: `misc$cellucid`). */
@@ -37,8 +37,8 @@ const DROPPED = new Set(SEURAT_DROPPED_SLOTS);
  * The numeric payloads of a sparse matrix (`dgCMatrix`, a Seurat `Graph`).
  * Their `names` attribute is never read: arithmetic on `@x` in R (`rep()`
  * of a named `colSums()`) leaves one name per stored value on it, and
- * decoding those strings cost a 100,000-cell SingleCellExperiment 7 of its
- * 10.7 s pass.
+ * decoding those strings would take most of a pass (measured:
+ * 23_decisions_partial_reading.md).
  */
 const SPARSE_PAYLOADS = new Set(['@x', '@i', '@p']);
 
@@ -48,11 +48,11 @@ const SPARSE_PAYLOADS = new Set(['@x', '@i', '@p']);
  *
  * Seurat, SingleCellExperiment and SummarizedExperiment objects are all S4
  * objects, which an object's first word says: an `.rds` whose object is not
- * one is refused from the file's first bytes (a GEO count data frame of
- * 604 MB was refused only after its whole download, 194 s), and an object
- * of a `save()` file that is not one is passed over as it streams, nothing
- * of it kept. An S4 object that is none of them (a `dgCMatrix`) names its
- * class after its slots: it is read on.
+ * one is refused from the file's first bytes (a count data frame of
+ * hundreds of MB would otherwise be refused only after its whole download),
+ * and an object of a `save()` file that is not one is passed over as it
+ * streams, nothing of it kept. An S4 object that is none of them (a
+ * `dgCMatrix`) names its class after its slots: it is read on.
  *
  * @param {string} fileName
  */

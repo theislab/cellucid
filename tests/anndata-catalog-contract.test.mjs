@@ -89,7 +89,7 @@ test('every other malformed catalog is refused before anything is read', () => {
     [catalog([]), /datasets must list one dataset or more/],
     [{ schema: 2, default: 'he', datasets: [entry] }, /default "he" must be the id of a listed dataset/],
     [catalog([{ ...entry, title: 'Suo' }]), /must contain id, path and may also contain name, session \(unexpected: title\)/],
-    // A catalog's name for a dataset is a trimmed nonempty text (round 9 close).
+    // A catalog's name for a dataset is a trimmed nonempty text.
     [catalog([{ ...entry, name: ' Suo' }]), /datasets\[0\]\.name must be the dataset's name, a trimmed nonempty text/],
     [catalog([{ ...entry, name: '' }]), /datasets\[0\]\.name must be the dataset's name/],
     [catalog([{ id: 'a/b', path: 'a.h5ad' }]), /1 to 180 ASCII letters/],

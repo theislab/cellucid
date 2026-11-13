@@ -4,8 +4,8 @@
  * An annotation gesture is read on the pane it lands in and never moves view
  * focus, so whether a press can start, and which cursor the armed tool shows,
  * is a question about that pane's field — not the focused view's. The renderer
- * used to hold one `highlightMode` cached from the focused view's field and
- * discarded every Alt press in every pane while it read `'none'`. It now asks a
+ * holds no `highlightMode` cached from the focused view's field (it would
+ * discard every Alt press in every pane while it read `'none'`): it asks a
  * source, per view and at the moment it needs the answer, and highlight
  * controls wire that source straight to `state.getFieldForView`. Each test
  * here pins one half of that: the answer is per view, it follows a field
@@ -408,8 +408,8 @@ test('a retired panel stops the viewer reading its state', () => {
 });
 
 test('no single highlight mode survives anywhere', async () => {
-  // A cached mode is the defect this contract replaces: it was derived from
-  // the focused view and gated every pane. Nothing may publish or read one.
+  // A cached mode, derived from the focused view, would gate every pane.
+  // Nothing may publish or read one.
   for (const name of ['setHighlightMode', 'getHighlightMode']) {
     assert.equal(name in HighlightTools.prototype, false, name);
   }

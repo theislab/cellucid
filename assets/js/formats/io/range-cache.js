@@ -24,9 +24,9 @@
  * read asks it only for ranges it is known to hold: the worker asks once a
  * file which ranges the page holds of it (`holds`), and adds the ranges it
  * hands the page itself; a read that touches none of them is fetched at
- * once (opening a file nothing read before waited a round trip for the page
- * at each of its dependent reads -- 99 of HLCA's 245 first reads, the page
- * busy opening). A read that touches them waits for the page's pieces no
+ * once (opening a file nothing read before would wait a round trip for the
+ * page at each of its dependent reads, the page busy opening). A read that
+ * touches them waits for the page's pieces no
  * longer than one round trip of the file's link (asking the page is never
  * to cost more than asking the host; before the link is measured, no longer
  * than the host is given to answer), and fetches the whole range when they
@@ -133,11 +133,6 @@ function endChannel(own) {
   } catch {
     // The page's end is gone already.
   }
-}
-
-/** Whether this realm reaches a range cache. */
-export function hasRangeCache() {
-  return channel !== null;
 }
 
 /**

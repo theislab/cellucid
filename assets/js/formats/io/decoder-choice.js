@@ -6,8 +6,8 @@
  * A family with more than one decoder lists them in `DECODERS`, the first
  * the reference. An engine whose decoder is fast on one core can be the
  * slowest at eight (Firefox's `DecompressionStream` on small DEFLATE
- * chunks: one worker 292-310 MB/s, eight 159-160 MB/s in total, the
- * per-stream cost contending across threads), so a choice made on one core,
+ * chunks: the per-stream cost contends across threads; measured:
+ * 21_decisions_decoders_and_codecs.md), so a choice made on one core,
  * or by name, is wrong somewhere: names only seed the first guess.
  *
  * - **Keys**: a decoder is chosen per family and size class of the decoded
@@ -15,7 +15,7 @@
  *   (a stream's fixed cost against its inflate).
  * - **Before a decision** every chunk is decoded with the engine's prior
  *   (`ENGINE_PRIORS`: the decoder measured fastest on that engine at every
- *   width, measured on 2026-10-30 with `scripts/efficiency-floor/cpu-browser.mjs`; the reference where
+ *   width, measured with `scripts/efficiency-floor/cpu-browser.mjs`; the reference where
  *   the engine is not known), never with a decoder untested here: a
  *   person's reads are not where decoders are tried.
  * - **Probe** (`DecoderProbe`, in the thread that runs the decode pool):
@@ -72,18 +72,14 @@ export const DECODERS = Object.freeze({
 /**
  * Each engine's prior: the decoder of each family measured fastest on it,
  * at one core and at every pool width, on the real chunks of the corpus
- * (M1 Pro, 2026-10-30, `cpu-browser.mjs`; the probe picked the same in
- * 21 of 21 engine x codec cases). Firefox (Gecko) runs the JavaScript
- * decoders faster than its WebAssembly (zstd 1,653 against 532 MB/s for
- * the pool, LZ4 3,606 against 2,938, Blosc-LZ4 1,935 against 902) and
- * fflate faster than its own DEFLATE stream on small chunks (620 against
- * 115); WebKit runs the references fastest. Chromium (Blink) runs
- * WebAssembly fastest once V8 has optimized it, but a read of a gene finds
- * it cold in each decode worker (compiled there, still in its baseline
- * tier): the first gene of a 10M-cell store, same tree, JavaScript against
- * WebAssembly, zstd 175-244 against 386-678 ms, bit-shuffled Blosc-LZ4
- * 111-360 against 357-488 (LZ4 319 against 196: WebAssembly even cold), so
- * Chromium starts Zstandard and Blosc from JavaScript (2026-10-30, r4). A
+ * (`cpu-browser.mjs`; the probe picks the same in every engine x codec case;
+ * measured: 21_decisions_decoders_and_codecs.md). Firefox (Gecko) runs the JavaScript
+ * decoders faster than its WebAssembly and fflate faster than its own
+ * DEFLATE stream on small chunks; WebKit runs the references fastest.
+ * Chromium (Blink) runs WebAssembly fastest once V8 has optimized it, but a
+ * read of a gene finds it cold in each decode worker (compiled there, still
+ * in its baseline tier), so Chromium starts Zstandard and Blosc from
+ * JavaScript (LZ4 stays WebAssembly, faster even cold). A
  * family an engine does not name, or an engine not known, starts from the
  * reference. Only a first guess: the probe measures, and its decision wins.
  */

@@ -5,7 +5,7 @@ or R host, a session and a replay can make, each defined once with a parameter s
 domains it touches, a timeline label and a pseudocode line), the parameter schema subset
 (`schema.js`), the state domain list and registry (`domains.js`), and the dispatcher
 (`dispatcher.js`: checks, orders, passes every change of an agent to the person's permissions
-(the confirmer, with the owner's estimate of its work), records through the history, rolls a
+(the confirmer, with the estimate its implementation provides of its work), records through the history, rolls a
 failed action back), and an outcome as the JSON an agent's tool result
 and a host's answer carry (`outcome.js`).
 
@@ -27,9 +27,9 @@ notification).
 
 **Meta** of a dispatch: `origin`, `agent`, `connection`, `host`, `turn`, and for a turn the
 history's turn record keeps: `model` (an agent's), `conversation`, `message` and `turnLabel`
-(what the turn was asked); `signal`. The history alone passes `rewrite` (a deleted step's
-dependant applied again into its own record), `replayOf` (the step a replay applies) and
-`internal` (a pass through its own gate).
+(what the turn was asked); `signal`. The history alone passes `rewrite`, `replayOf` and `internal`;
+each field and who may set it is developer doc 29, "Who dispatches, and with which origin"
+(`cellucid-python/docs/user_guide/web_app/p_developer_docs/29_action_layer_domains_and_history.md`).
 
 **Names → current objects** (`targets/`, every action and read resolves through these, never a copy
 of its own): `fields.js` (a field or gene by `{source, key}`, a category by its label, a deleted
@@ -88,7 +88,7 @@ data controls (`ui/modules/dataset-open-action.js`: `datasets.list`, `dataset.op
 (`ui/modules/community-annotation-controls.js`: `annotation.suggestions`, `annotation.publish`); each
 calls the same function its controls call.
 
-**Versions of parameters** (History v2 §3.8): an action whose steps are recorded (effect `state`,
+**Versions of parameters**: an action whose steps are recorded (effect `state`,
 `view`, `layout`) has a `version` (1 when left out) and `upgrade: {<from>: params => params}` for each
 earlier version; a read or a move of the history has none (`version: null`). A step records the
 version (`Step.v`); a replay upgrades a copy of its params before it dispatches (`upgradeParams`).
@@ -113,10 +113,9 @@ parameters, and on a file whose bytes are not the pinned ones.
 - Every state change a person can make is an action; a control calls `dispatch`, never a
   mutating state method. Settings controls and camera gestures are recorded by observation
   (`recordObserved`), synchronously from their change event. A camera gesture (a drag, a wheel,
-  keys) is recorded when the viewer says it settled; an action on the cameras that starts while
-  it still moves, or a move of the history, ends it first (`ui/modules/camera-controls.js`), so
-  no camera motion is ever met as a change made outside an action. Page chrome is no action and
-  no state: the phone sheet open or closed, scroll, focus, which panel is in front, and input
+  keys) is recorded when the viewer says it settled, and is ended first by an action on the
+  cameras or a move of the history (`ui/modules/camera-controls.js`; developer doc 29, "Observed
+  changes"). Page chrome is no action and no state: the phone sheet open or closed, scroll, focus, which panel is in front, and input
   modes (the selection tool, Select mode). A key reaching the page only through a global
   shortcut records what that shortcut's action records; a chord with Ctrl, ⌘ or Alt and a held
   key's repeats are no shortcut (`ui/onboarding/keyboard-shortcuts.js`). A change that set off more work
@@ -158,33 +157,23 @@ every global key shortcut, the movement keys, keys no shortcut uses and chords, 
 that changes state with more or fewer than one step or keeps an outside change; it proves a
 keyboard camera gesture is one step, and that the phone sheet changes nothing in the history.
 `tests/browser/action-catalog-coverage.spec.mjs` fails
-when an action of the catalog has no implementation on a page with a dataset open
-(`unprovided()`), a domain has no owner (`missing()`), or a method of the live state or viewer is
-not classified. `tests/action-reference-contract.test.mjs` fails while the docs' action reference
-(`scripts/generate-action-reference.mjs`) differs from the catalog.
+when the catalog, the domains' owners and the live state's methods disagree, and
+`tests/action-reference-contract.test.mjs` while the docs' action reference
+(`scripts/generate-action-reference.mjs`) differs from the catalog; what makes each guard fail is
+developer doc 14, "Drift guards for actions, state domains and the history".
 
 **Declared inputs.** Every definition declares `reads` (required, empty for none, and empty for an
 action that records no step): its **result inputs**, what its result is computed from beyond its
-parameters and the domains it touches (`ACTION_READ_INPUTS`: state domains, and `history` for
-another branch's tip): the open cells, the data mapping, the pages a field is made from, the cells
-the filters leave. It may declare `context` (none by default): its **name context**, the state its
-parameters' names resolve in and its result does not follow (a field's name in `field-overlays`,
-the view in focus in `views`, a gene's name in `mapping`, a step's id in `history`). Shared sets are
-named once: `VISIBLE_CELLS_READS` (what decides which cells the view in focus shows, a result
-input) and `SHOWN_FIELD_READS` (where a setting of the colored field resolves, context) in
-`definitions/params.js`, an analysis's result and opening inputs in `definitions/analysis.js`. A
-step records the value hash of each result input (`app/history/model.js` `Step.reads`): a step of
-any action whose result input differs later is stale (`app/history/provenance.js`), and a rename
-or a focus change stales nothing. Result inputs and name context together decide a deleted step's
-dependent re-apply. `rerun: true` (false by default) says that the same params dispatched again
-bring a stale step's own result up to date (`analysis.run`; `highlight.category` and
-`highlight.range`, which give a group already on the page the cells the view shows now). Only
-those stale steps get Run again in the State panel (`ui/modules/state/step-details.js`). An
-action that adds another of what it made, or only sets options, does not. `tests/action-reads-contract.test.mjs` checks the declarations (distinct,
-known, never a touched domain, never both, empty for a stepless action, every name a parameter
-gives resolved in one of them) and `tests/browser/action-reads.spec.mjs` the property they promise
-on the real page: an action applied in two states that differ only in domains it neither touches,
-reads nor resolves names in gives the same after-values.
+parameters and the domains it touches (`ACTION_READ_INPUTS`); it may declare `context`, the state
+its parameters' names resolve in and its result does not follow. A step records the value hash of
+each result input (`app/history/model.js` `Step.reads`): a step whose result input differs later is
+stale (`app/history/provenance.js`), and a rename or a focus change stales nothing. Shared sets are
+named once in `definitions/params.js` (`VISIBLE_CELLS_READS`, `SHOWN_FIELD_READS`) and an analysis's
+in `definitions/analysis.js`. `rerun: true` marks the actions whose same params dispatched again
+bring a stale step's own result up to date; only those stale steps get Run again in the State panel
+(`ui/modules/state/step-details.js`). The rules, the declarations and the properties that
+`tests/action-reads-contract.test.mjs` and `tests/browser/action-reads.spec.mjs` check are developer
+doc 29, "Declared inputs: reads and context".
 
 **Tests:** `tests/action-history-core.test.mjs`, `tests/history-actions-contract.test.mjs`, `tests/action-catalog-contract.test.mjs` (every
 action of every area), `tests/action-reads-contract.test.mjs` (declared inputs), the area tests (`action-fields-contract`, `action-highlights`,

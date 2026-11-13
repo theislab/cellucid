@@ -1,7 +1,7 @@
 /**
  * Min annotators is bounded only by what the contract carries (a JSON safe
- * integer): an author's 100 stays 100 (audit B8: the panel clamped every value
- * to 50 and republished it), and input the field cannot mean keeps the value
+ * integer): an author's 100 stays 100 (the panel does not clamp a value
+ * to 50 and republish it), and input the field cannot mean keeps the value
  * in force instead of rewriting it.
  */
 import assert from 'node:assert/strict';

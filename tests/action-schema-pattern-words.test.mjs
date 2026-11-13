@@ -1,7 +1,7 @@
 /**
- * A parameter refused for its form says the form in words (R9R-5): "the
- * expected form" left a person and an agent to guess what a keyframe label,
- * a view name or a color must look like. Every `pattern` of the catalog's
+ * A parameter refused for its form says the form in words, not "the expected
+ * form", which leaves a person and an agent to guess what a keyframe label, a
+ * view name or a color must look like. Every `pattern` of the catalog's
  * parameters is said by `PATTERN_WORDS` or by a string example of its schema.
  */
 import test from 'node:test';

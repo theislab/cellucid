@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import {
@@ -20,9 +19,6 @@ import {
   resolveVectorFields,
 } from '../assets/js/data/vector-field-manager.js';
 import { mappingProbes } from './helpers/anndata-mapping-mocks.mjs';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(HERE, '..');
 
 /**
  * The registered layouts of the dimension manager stand-in: each is keyed by
@@ -587,29 +583,6 @@ test('a replaced direct AnnData dataset cannot publish delayed vector data', asy
     dataSourceManager.activeSource = previous.activeSource;
     dataSourceManager.activeDatasetId = previous.activeDatasetId;
   }
-});
-
-test('vector loading source contains no coercion, repair, or magnitude substitution', () => {
-  const managerSource = fs.readFileSync(
-    path.join(ROOT, 'assets/js/data/vector-field-manager.js'),
-    'utf8'
-  );
-  const overlaySource = fs.readFileSync(
-    path.join(
-      ROOT,
-      'assets/js/rendering/overlays/velocity/velocity-overlay.js'
-    ),
-    'utf8'
-  );
-  assert.doesNotMatch(managerSource, /setBaseUrl|setMetadata/);
-  assert.doesNotMatch(managerSource, /Math\.max\(1,\s*Math\.min/);
-  assert.doesNotMatch(managerSource, /Number\.parseInt|parseInt|parseFloat/);
-  assert.doesNotMatch(managerSource, /Number\.isFinite\(value\)\s*\?\s*value\s*:\s*0/);
-  assert.doesNotMatch(managerSource, /maxMagnitude\s*=\s*1/);
-  assert.match(
-    overlaySource,
-    /field\.maxMagnitude === 0 \? 0 : 1\.0 \/ field\.maxMagnitude/
-  );
 });
 
 test('a load under way is shared only by callers of the same open cells, and is work on them', async () => {

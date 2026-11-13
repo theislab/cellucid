@@ -40,7 +40,7 @@ const corpusDir = path.resolve(argument('--corpus'));
  * A picked file's cost of one more read (Blob slices, as the app reads it),
  * measured here: the floor's best plan joins gaps cheaper to read than this,
  * as the app's own link measure does (`formats/io/link.js`). A local read is
- * never free: counting it so made reading a small gap look like waste.
+ * never free: counting it as free would make reading a small gap look like waste.
  */
 async function localReadMs() {
   const files = readdirSync(corpusDir).filter(file => /\.(h5ad|loom|h5|h5mu)$/.test(file));

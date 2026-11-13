@@ -11,7 +11,7 @@
  * later visits, for the tab, or in memory: `transcode/space.js`), and what
  * is read in parts instead. One module, so the opening, the Dataset box and
  * the documentation (`cellucid-python/docs/user_guide/web_app/b_data_loading/
- * 08_which_formats_stream.md`) cannot drift apart.
+ * 01_loading_options_overview.md`, "Which formats are read in parts") cannot drift apart.
  *
  * @module data/whole-read-notice
  */

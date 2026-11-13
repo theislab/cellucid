@@ -123,7 +123,7 @@ const dismissEveryNotification = page => page.evaluate(async () => {
 });
 
 test(
-  'a dataset with no neighbour graph says so once, not once per gesture',
+  'a dataset with no neighbour graph says so once, not once per gesture, and the next dataset once again',
   async ({ page }) => {
     const pageErrors = [];
     page.on('pageerror', error => pageErrors.push(error.message));
@@ -173,81 +173,30 @@ test(
     expect(await visibleMissingGraphToasts(page)).toBe(0);
     expect(await publishedWarnings(page)).toEqual([MISSING_GRAPH_MESSAGE]);
 
-    expect(pageErrors).toEqual([]);
-  },
-);
+    await test.step('the next dataset arms the missing neighbour graph warning again', async () => {
+      // A new dataset is a new generation, even when it also lacks the graph.
+      await chooseFiles(page.locator('#user-data-file-input'), h5adFixturePath);
+      await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+      await expect(page.locator('#connectivity-controls')).toBeHidden();
+      // Clear the board so the toast counted below can only be a new one.
+      await dismissEveryNotification(page);
 
-test(
-  'the next dataset arms the missing neighbour graph warning again',
-  async ({ page }) => {
-    const pageErrors = [];
-    page.on('pageerror', error => pageErrors.push(error.message));
+      await enterKnnMode(page);
+      await expect.poll(() => publishedWarnings(page)).toEqual([
+        MISSING_GRAPH_MESSAGE,
+        MISSING_GRAPH_MESSAGE,
+      ]);
+      expect(await visibleMissingGraphToasts(page)).toBe(1);
 
-    await openPreparedDataset(page);
-    await recordPublishedWarnings(page);
-
-    await enterKnnMode(page);
-    await expect.poll(() => publishedWarnings(page)).toEqual([
-      MISSING_GRAPH_MESSAGE,
-    ]);
-    const firstPoints = await findCellPoints(page, 1);
-    await altClick(page, firstPoints[0]);
-    expect(await publishedWarnings(page)).toEqual([MISSING_GRAPH_MESSAGE]);
-
-    // A new dataset is a new generation, even when it also lacks the graph.
-    await chooseFiles(page.locator('#user-data-file-input'), h5adFixturePath);
-    await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
-    await expect(page.locator('#connectivity-controls')).toBeHidden();
-    // Clear the board so the toast counted below can only be a new one.
-    await dismissEveryNotification(page);
-
-    await enterKnnMode(page);
-    await expect.poll(() => publishedWarnings(page)).toEqual([
-      MISSING_GRAPH_MESSAGE,
-      MISSING_GRAPH_MESSAGE,
-    ]);
-    expect(await visibleMissingGraphToasts(page)).toBe(1);
-
-    // ...and it is once per generation on the new dataset too.
-    const nextPoints = await findCellPoints(page, 2);
-    await altClick(page, nextPoints[0]);
-    await altClick(page, nextPoints[1]);
-    expect(await publishedWarnings(page)).toEqual([
-      MISSING_GRAPH_MESSAGE,
-      MISSING_GRAPH_MESSAGE,
-    ]);
-
-    expect(pageErrors).toEqual([]);
-  },
-);
-
-test(
-  'a reload starts the missing neighbour graph warning over',
-  async ({ page }) => {
-    const pageErrors = [];
-    page.on('pageerror', error => pageErrors.push(error.message));
-
-    await openPreparedDataset(page);
-    await recordPublishedWarnings(page);
-    await enterKnnMode(page);
-    await expect.poll(() => publishedWarnings(page)).toEqual([
-      MISSING_GRAPH_MESSAGE,
-    ]);
-
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await dismissWelcome(page);
-    await openCollapsedPanels(page);
-    await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI fixture',
-    );
-    await recordPublishedWarnings(page);
-    expect(await publishedWarnings(page)).toEqual([]);
-
-    await enterKnnMode(page);
-    await expect.poll(() => publishedWarnings(page)).toEqual([
-      MISSING_GRAPH_MESSAGE,
-    ]);
-    expect(await visibleMissingGraphToasts(page)).toBe(1);
+      // ...and it is once per generation on the new dataset too.
+      const nextPoints = await findCellPoints(page, 2);
+      await altClick(page, nextPoints[0]);
+      await altClick(page, nextPoints[1]);
+      expect(await publishedWarnings(page)).toEqual([
+        MISSING_GRAPH_MESSAGE,
+        MISSING_GRAPH_MESSAGE,
+      ]);
+    });
 
     expect(pageErrors).toEqual([]);
   },

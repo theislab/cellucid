@@ -3,7 +3,7 @@
 // viewer draws with (45° on the shorter side, the view's own shape): each
 // group centered, filling about the share of the frame asked for, hidden cells
 // left out, a 2D view framed flat (planar) and a 3D one from the direction
-// asked for (lane-director L2-1).
+// asked for.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 

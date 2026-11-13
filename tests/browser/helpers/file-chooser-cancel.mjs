@@ -16,12 +16,12 @@
  * `cancel`, and `fileChooser.setFiles` later sets the files and fires
  * `input` and `change`. Up to 1.64 (r1538, Firefox 153) a docShell flag
  * stopped the input before any picker opened, and nothing fired before
- * `change`, as in Chromium and WebKit, then and now. Measured, a fresh
- * `<input type=file>` clicked, its chooser intercepted, a file set:
- * Firefox 159 `cancel` 14 ms after the click, then `input`, `change`;
- * Firefox 153, Chromium 158, WebKit 27.2: `input`, `change`. The session
- * picker settled on that `cancel`, and every spec that loaded a session
- * file through Load… › Open a session file… saw nothing loaded.
+ * `change`, as in Chromium and WebKit. A fresh `<input type=file>` clicked,
+ * its chooser intercepted, a file set, fires in Firefox 159 `cancel`, then
+ * `input`, `change`; in Firefox 153, Chromium 158 and WebKit 27.2 `input`,
+ * `change`. Without the guard the session picker settles on that `cancel`,
+ * and a spec that loads a session file through Load… › Open a session
+ * file… sees nothing loaded.
  *
  * In a person's Firefox the picker is the real one and `cancel` means they
  * dismissed it: nothing for the application to change. Under Playwright no

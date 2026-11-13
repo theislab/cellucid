@@ -22,7 +22,7 @@ import {
   resolveExactGene,
   resolveTypedGene,
 } from '../../utils/gene-lookup.js';
-import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { requireExactKeys } from '../../../utils/exact-record.js';
 import { isReported } from '../../../utils/errors.js';
 import { useOpenCells } from '../../../data/open-cells-work.js';
 import { PLACES, placePath } from '../place-names.js';
@@ -134,28 +134,6 @@ function requireActiveIndex(value, label) {
     throw new TypeError(`${label} must be -1 or a non-negative safe integer`);
   }
   return value;
-}
-
-function parseIndex(value, label) {
-  if (
-    typeof value !== 'string'
-    || !/^(0|[1-9][0-9]*)$/.test(value)
-  ) {
-    throw new TypeError(`${label} must be a canonical non-negative integer`);
-  }
-  return requireIndex(Number(value), label);
-}
-
-function requireField(field, label) {
-  if (
-    field === null
-    || typeof field !== 'object'
-    || Array.isArray(field)
-  ) {
-    throw new TypeError(`${label} must be one field metadata object`);
-  }
-  StateValidator.validateFieldKey(field.key);
-  return field;
 }
 
 /**
@@ -429,8 +407,7 @@ export function initGeneExpressionSelector(options) {
   /**
    * Report a gene that could not be shown, with the reason it could not be.
    *
-   * Kept apart from `reportTaskFailure` because this one failure has a diagnosis
-   * worth writing out. `Failed to load gene: X` names the symptom and nothing
+   * This failure has a diagnosis worth writing out. `Failed to load gene: X` names the symptom and nothing
    * else — not whether the payload never arrived or arrived unusable, not what
    * was wrong with it, and not what to do. `explainContinuousPayloadFailure`
    * knows all three, and the notification center renders the newlines it uses.
@@ -639,11 +616,10 @@ export function initGeneExpressionSelector(options) {
    * Every view holds its own copies of the field objects (`_cloneVarData`;
    * `setActiveView` swaps them in), so the entries listed for the search name
    * a gene by position and key, never as the field to read: the field is
-   * taken from the inventory in use when the gene is chosen. (Found
-   * 2026-11-11, F95: the entries' fields were the objects of the view the
-   * list was built in, so after `view.keep` a gene chosen on the kept view
-   * was "no longer on the gene list" (`locateVarField` found no such
-   * object), was not shown, and `color.by` answered null.)
+   * taken from the inventory in use when the gene is chosen: a field of the
+   * view the list was built in would, after `view.keep`, make a gene chosen on
+   * the kept view "no longer on the gene list" (`locateVarField` finds no such
+   * object), not shown, and `color.by` would answer null.
    *
    * @param {number} originalIdx
    * @returns {{field: object, originalIdx: number}}
@@ -747,10 +723,10 @@ export function initGeneExpressionSelector(options) {
    *
    * The choice is work on the open cells (`data/open-cells-work.js`): one
    * made while a progressive opening's step or Apply changes them starts on
-   * the cells after it, and no change commits under it. (It used to take the
-   * dataset generation when it was made, then wait for the step under way
-   * and find the generation the step advanced: the gene was read and never
-   * shown, with nothing said.) Whatever keeps it from being shown is said,
+   * the cells after it, and no change commits under it. (Taking the dataset
+   * generation when it is made, then waiting for the step under way, would find
+   * the generation the step advanced: the gene would be read and never shown,
+   * with nothing said.) Whatever keeps it from being shown is said,
    * except a newer choice, Cancel or another dataset.
    *
    * It is the implementation of the action `color.by` for a gene (the

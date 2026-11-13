@@ -2,14 +2,14 @@
  * Community annotation as a person and an agent meet it, against a stateful
  * stand-in for the GitHub Worker and repository
  * (`helpers/community-annotation-github.mjs`: every write recorded with its
- * content). The walks of the UI audit of 2026-11-05, kept:
+ * content). The walks:
  *
  * - a vote in the dialog shows as not published, and Publish writes it;
  * - without write access and without a fork, Publish links to forking on
  *   GitHub (Cellucid never creates a fork); forked, it opens the pull request;
  * - an agent's votes and suggestions publish only themselves (never the
  *   person's drafts or an author's staged settings), all of a call as one
- *   commit asked once (F145: one agent turn, one commit), with what they are
+ *   commit asked once (one agent turn, one commit), with what they are
  *   and where they go; one refused, none is published and nothing is asked;
  *   nothing is published when nothing changes, and no dialog opens;
  * - Stop while a vote is written says honestly what happened, and the next
@@ -271,7 +271,7 @@ test.describe('community annotation walk', () => {
   });
 
   test('an agent reading a repository this browser never pulled reads it pulled, not empty; pull: false reads what is kept', async ({ page }) => {
-    // L18-6 (live pass 5): connected, never pulled, the read said "no suggestions" of a repository full of them.
+    // Connected, never pulled: the read does not say "no suggestions" of a repository full of them.
     await signedIn(page);
     const repository = await installAnnotationRepository(page, { config: config({ minAnnotators: 2 }), users: communityUsers() });
     await openConnected(page);
@@ -279,7 +279,7 @@ test.describe('community annotation walk', () => {
     expect(read, JSON.stringify(read)).toHaveProperty('outcome');
     expect(read.outcome.pulled_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(read.outcome.categories[0].suggestions.map(entry => entry.label)).toEqual(expect.arrayContaining(['Alpha cell', 'Alpha (immature)']));
-    // The rule each consensus follows, as the repository sets it for the field (L18-7).
+    // The rule each consensus follows, as the repository sets it for the field.
     expect(read.outcome.consensus_rule).toEqual({ voters_needed: 2, threshold: 0.5 });
     // Another contributor's suggestion lands on GitHub: kept as read until a pull is asked for.
     const users = communityUsers();
@@ -331,7 +331,7 @@ test.describe('community annotation walk', () => {
     expect(again.message).toContain('ghid_51_alpha-1');
   });
 
-  test('one agent turn is one commit: its votes and suggestions in one call, asked once; one refused, none published (F145)', async ({ page }) => {
+  test('one agent turn is one commit: its votes and suggestions in one call, asked once; one refused, none published', async ({ page }) => {
     await page.addInitScript(installScriptedModel);
     await signedIn(page);
     const repository = await installAnnotationRepository(page, { config: config(), users: communityUsers() });
@@ -464,7 +464,7 @@ test.describe('community annotation walk', () => {
     await expect(dialog).toContainText('Alpha cell');
     await expect(dialog).toContainText('Alpha (immature)');
     await expect(dialog).toContainText('in the repository: cell_type • alpha');
-    // The leader first, as the consensus line names it (R9A-2), and no "0 characters" under empty boxes (R9A-7).
+    // The leader first, as the consensus line names it, and no "0 characters" under empty boxes.
     await expect(dialog.locator('.community-annotation-vote-btn.vote-up').first()).toHaveAttribute('aria-label', /^Upvote Alpha cell;/);
     await expect(dialog).not.toContainText('0 characters');
     const comment = dialog.getByRole('textbox', { name: 'Comment' }).first();
@@ -651,7 +651,7 @@ test.describe('community annotation walk', () => {
     modal = await syncModal(page);
     await modal.getByRole('button', { name: 'Publish', exact: true }).click();
     await expect(root).toContainText('Your GitHub sign-in expired or was revoked');
-    // Said once, in its own words: no raw "GitHub PUT … failed with HTTP 401" card beside it (R9A-6).
+    // Said once, in its own words: no raw "GitHub PUT … failed with HTTP 401" card beside it.
     const messages = page.locator('.notification-center .notification-message');
     await expect(messages.filter({ hasText: 'Your GitHub sign-in expired or was revoked' })).toHaveCount(1);
     await expect(messages.filter({ hasText: /HTTP 401/ })).toHaveCount(0);

@@ -1,7 +1,5 @@
-// @ts-check
-
 /**
- * @typedef {keyof typeof StyleManager.zIndex} ZIndexLayerName
+ * @typedef {keyof typeof Z_INDEX} ZIndexLayerName
  * @typedef {import('../../../types/design-tokens').DesignToken} DesignToken
  */
 
@@ -25,23 +23,25 @@ function normalizeVarName(property) {
   return property.startsWith('--') ? property : `--${property}`;
 }
 
+// Z-index management (mirrors tokens/_z-index.css semantics).
+const Z_INDEX = {
+  below: -1,
+  base: 0,
+  raised: 1,
+  dropdown: 100,
+  sticky: 200,
+  overlay: 300,
+  sidebar: 400,
+  floating: 500,
+  modal: 600,
+  popover: 700,
+  tooltip: 800,
+  notification: 900,
+  max: 9999,
+};
+
 export const StyleManager = {
-  // Z-index management (mirrors tokens/_z-index.css semantics).
-  zIndex: {
-    below: -1,
-    base: 0,
-    raised: 1,
-    dropdown: 100,
-    sticky: 200,
-    overlay: 300,
-    sidebar: 400,
-    floating: 500,
-    modal: 600,
-    popover: 700,
-    tooltip: 800,
-    notification: 900,
-    max: 9999,
-  },
+  zIndex: Z_INDEX,
 
   /**
    * Set a CSS custom property on an element.
@@ -174,7 +174,6 @@ export const StyleManager = {
   setState(element, key, value = true) {
     if (!isHTMLElement(element)) return;
     if (value === false || value === null || value === undefined) {
-      // @ts-ignore - dataset is a string map at runtime.
       delete element.dataset[key];
       return;
     }
@@ -188,7 +187,6 @@ export const StyleManager = {
    */
   removeState(element, key) {
     if (!isHTMLElement(element)) return;
-    // @ts-ignore - dataset is a string map at runtime.
     delete element.dataset[key];
   },
 
@@ -200,7 +198,6 @@ export const StyleManager = {
    */
   hasState(element, key) {
     if (!isHTMLElement(element)) return false;
-    // @ts-ignore - dataset is a string map at runtime.
     return key in element.dataset;
   },
 };

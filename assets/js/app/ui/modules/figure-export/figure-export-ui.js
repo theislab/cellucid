@@ -83,6 +83,7 @@ import {
 } from './utils/overlay-fidelity.js';
 import { assertCameraState } from '../../../../rendering/camera-state-contract.js';
 import { cancel, onAbort } from '../../../../utils/abort.js';
+import { promiseWithResolvers } from '../../../../utils/promise-resolvers.js';
 import { openADatasetTo } from '../../no-dataset.js';
 import { debounce } from '../../../../utils/debounce.js';
 
@@ -369,7 +370,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const cropResetBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn' }, ['Reset']);
   const cropConfirmBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn', ariaPressed: 'false' }, ['Confirm']);
   const cropAspectHint = createElement('span', { className: 'figure-export-crop-aspect' }, ['Aspect: —']);
-  // One click frames every cell drawn (F161): the plot takes the cells' shape,
+  // One click frames every cell drawn: the plot takes the cells' shape,
   // not the pane's, and nobody rearranges the screen for a figure.
   const fitCellsBtn = createElement('button', {
     type: 'button',
@@ -418,10 +419,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ].forEach((f) => fontSelect.appendChild(createElement('option', { value: f.value }, [f.label])));
 
   // Every text size is in points and has one range, the settings' (`FIGURE_EXPORT_SETTING_RANGES.fontSize`,
-  // whole or half points): the control's, the reader's and `figure-export.set`'s. The controls once allowed
-  // 6–24 (axis and centroid 36, title 48) while the reader and an agent's set allowed 1–500, so a size an
-  // agent set drew in the picture and left its control invalid, and Export blamed it for another refusal (L24-7).
-  // Points keep their printed size at any width and resolution (F271): no one converts pixels to points.
+  // whole or half points): the control's, the reader's and `figure-export.set`'s. A control with a
+  // narrower range than the reader's would let a size an agent set draw in the picture and leave its
+  // control invalid, and Export would blame it for another refusal.
+  // Points keep their printed size at any width and resolution: no one converts pixels to points.
   const fontSizeInput = createDecimalInput({
     id: 'figure-export-font-size',
     className: 'obs-select figure-input-sm',
@@ -462,7 +463,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Centroid label size (pt)',
   });
 
-  // Point radius removed - export now uses viewer's pointSize directly (WYSIWYG)
+  // There is no point radius control: the export draws the viewer's pointSize (WYSIWYG).
 
   const autoTextToggleRow = createElement('div', { className: 'figure-export-style-row figure-export-auto-text-toggle' }, [
     createElement('label', {
@@ -700,7 +701,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Figure export preview',
     tabIndex: -1,
   });
-  // Said when a panel is far from the shape asked for (F119): a narrow pane
+  // Said when a panel is far from the shape asked for: a narrow pane
   // (the chat open, a grid) gives a narrow plot of a wide embedding.
   const shapeNoteText = createElement('span', {}, ['']);
   const shapeNoteFitBtn = createButton({
@@ -756,9 +757,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   });
   dpiSelect.value = '300';
 
-  // Full vector by default (every point, editable), as a person and an agent
-  // chose every time when the panel asked first (F160); never changed for
-  // them afterwards.
+  // Full vector by default (every point, editable), the choice a person or an
+  // agent made whenever the panel asked first; never changed for them afterwards.
   const strategySelect = createElement('select', { className: 'obs-select', ariaLabel: 'SVG point strategy' });
   strategySelect.appendChild(createElement('option', { value: 'full-vector' }, ['Full vector']));
   strategySelect.appendChild(createElement('option', { value: 'optimized-vector' }, ['Optimized vector']));
@@ -1340,7 +1340,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Seed title once after init (before any state updates arrive).
   syncAutoTitle();
 
-  // Point radius is now taken directly from viewer's renderState (WYSIWYG)
+  // The point size is the viewer's renderState pointSize (WYSIWYG).
 
   // A figure of no cells is empty, so Export follows the runtime's cells as
   // well as the export in flight.
@@ -1429,6 +1429,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     syncAnnotationUi();
     drawPreview();
   }, 80);
+  /** @type {import('../../../../utils/debounce.js').Debounced<[delayMs: number]>} */
   const rebuildPreviewSoon = debounce(() => {
     if (
       cleanupComplete ||
@@ -1926,7 +1927,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       invalidatePreviewSamples({ rebuild: false });
     }
 
-    const visibleCount = inferVisiblePointCount();
+    // The viewer's and the state's cell counts must be exact before a preview is built.
+    inferVisiblePointCount();
     // Refresh bypasses cache ownership only. It never removes the bounded scan
     // contract and therefore cannot turn a preview request into an O(N) pass.
     const maxScanPoints = PREVIEW_MAX_SCAN_POINTS;
@@ -2109,8 +2111,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const sampleCount = candidate.reduced.x.length;
     const emptyNote =
       sampleCount === 0 ? ' • no visible cells' : '';
-    // One short line; how the sample was drawn is its detail (found 2026-11-10: "250,000 of
-    // 561,947 source IDs scanned" on the line).
+    // One short line; how the sample was drawn is its detail, not part of the line.
     previewStatus.textContent =
       `${label}: ${formatCountOf(sampleCount, 'cell')}${emptyNote}`;
     previewStatus.title = cappedSample
@@ -3124,10 +3125,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const abortController = new AbortController();
     activeExportAbortController = abortController;
     const stopWithCaller = signal === null ? () => {} : onAbort(signal, () => cancel(abortController, 'user', 'Figure export was canceled.'));
-    let ended;
-    exportEnded = new Promise(resolve => {
-      ended = resolve;
-    });
+    const { promise: exportEnd, resolve: ended } = promiseWithResolvers();
+    exportEnded = exportEnd;
     setBusy(true);
     try {
       const written = await exportFigureFromUi(abortController.signal, { forAction });
@@ -3168,7 +3167,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
    * while Export all views is on), whatever Download's format. `notes`: what
    * the figure cannot reproduce of what the view shows (the person's dialog
    * before a download). An agent previewing its figure sees what the person
-   * will get (`view.picture` source "export", L24-1).
+   * will get (`view.picture` source "export").
    *
    * @param {{signal: AbortSignal}} how The caller's Stop
    * @returns {Promise<{blob: Blob, notes: string[], plot: {width: number, height: number}|null}>}
@@ -3276,7 +3275,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       centroidLabelFontSizePx,
       crop: getCropOptionForExport(),
       referenceGrid: resolveExportReferenceGrid(),
-      // pointRadiusPx removed - export now uses viewer's pointSize directly (WYSIWYG)
+      // No point radius is passed: the export draws the viewer's pointSize (WYSIWYG).
       showOrientation: showOrientationCheckbox.checked,
       depthSort3d: depthSortCheckbox.checked,
       emphasizeSelection: emphasizeSelectionCheckbox.checked,
@@ -3711,8 +3710,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }));
 
   // The settings as an agent, a notebook or a script reads them back, by the
-  // names `figure-export.set` takes (an agent set them and, after the history
-  // or a session put them back, could not check them: L14-4).
+  // names `figure-export.set` takes, so an agent can check what it set after the
+  // history or a session put the settings back.
   cleanupFns.push(getActions().provide('figure-export.get', () => {
     let settings;
     try {

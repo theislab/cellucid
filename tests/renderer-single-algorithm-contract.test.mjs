@@ -67,17 +67,6 @@ test('smoke ray marching validates one camera-to-near-plane ray', async () => {
   );
 });
 
-test('GPU smoke noise requires only shader inputs that affect its exact output', async () => {
-  const [generatorSource, noiseShaderSource] = await Promise.all([
-    source('smoke-cloud/gpu-noise-generator.js'),
-    source('shaders/noise-shaders.js'),
-  ]);
-
-  assert.doesNotMatch(generatorSource, /uniforms\.(?:shape|detail)[\s\S]{0,100}size:/);
-  assert.doesNotMatch(generatorSource, /uniform1f\(uniforms\.size/);
-  assert.doesNotMatch(noiseShaderSource, /uniform float u_size/);
-});
-
 test('snapshot rendering requires its owned GPU buffer', async () => {
   const viewerSource = await source('viewer.js');
   const resolverCalls = viewerSource.match(

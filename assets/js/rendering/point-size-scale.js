@@ -4,12 +4,11 @@
  * The one point-size scale: the slider curve, its bounds, and the size a
  * dataset opens at.
  *
- * This existed twice before, as a `0.25` in the sidebar module that was the base
- * of the logarithmic slider curve and a second `0.25` in the viewer's
- * `setPointSize` bound. Two copies of one number is one copy too many when the
- * number is load-bearing at both ends: lowering the reachable minimum in the UI
- * without lowering the viewer's bound makes the slider throw at its own new low
- * end, and there is no version of that failure a user can act on.
+ * One number is the base of the logarithmic slider curve and the bound of the
+ * viewer's `setPointSize`. Two copies of it would be one copy too many when it
+ * is load-bearing at both ends: lowering the reachable minimum in the UI
+ * without lowering the viewer's bound makes the slider throw at its own new
+ * low end, and there is no version of that failure a user can act on.
  *
  * ## Why the slider runs below zero
  *
@@ -24,9 +23,8 @@
  * stop meaning 0.75 and start meaning 0.2.
  *
  * Extending the domain below zero instead leaves the curve alone, and the reach
- * below 0.25 is added where there was none. The top anchor moved once, from 200
- * to the sprite cap (R9R-9, 2026-11-11, before any installed base): a position
- * stored before means a size at most 3.4% smaller.
+ * below 0.25 is added where there was none. The top anchor is the sprite cap
+ * (`MAXIMUM_POINT_SIZE`).
  *
  * ## Why a dataset gets a size rather than a constant
  *
@@ -47,9 +45,8 @@ const POINT_SIZE_AT_SLIDER_ZERO = 0.25;
  * The point size at slider position 100: the largest sprite a cell is drawn
  * at (`POINT_SPRITE_MAX_PX`, rendering/point-sprite.js). A size above it draws
  * the cap for every cell nearer the camera than the perspective scale (all of
- * them in practice), so slider travel past it was dead and its readout untrue:
- * position 96.5 to 100 all drew 160 px while reading up to 200 (R9R-9). The
- * top of the slider is the cap itself. (The bottom differs: a size under the
+ * them in practice), so slider travel past it would be dead and its readout
+ * untrue: the top of the slider is the cap itself. (The bottom differs: a size under the
  * 0.5-pixel floor is lifted back above it by perspective size scaling as the
  * camera nears, so that reach is live.)
  */
@@ -67,9 +64,8 @@ const POINT_SIZE_SLIDER_STEP = 0.5;
 /**
  * The cell count and size that fix the automatic curve.
  *
- * 100,000 cells at 1.5 reproduces the size this control shipped with — 0.75 —
- * for a dataset of around 400,000 cells, and scales in both directions from
- * there.
+ * 100,000 cells at 1.5 gives a size of 0.75 for a dataset of around 400,000
+ * cells, and scales in both directions from there.
  */
 const POINT_SIZE_REFERENCE_CELLS = 100_000;
 const POINT_SIZE_REFERENCE_SIZE = 1.5;

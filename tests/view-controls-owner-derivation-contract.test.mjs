@@ -1,7 +1,7 @@
 /**
- * View controls must read their owners, never mirror them (CEL-0239).
+ * View controls must read their owners, never mirror them.
  *
- * `view-controls.js` used to keep private `activeViewId` and `liveViewHidden`
+ * `view-controls.js` keeps no private `activeViewId` and `liveViewHidden`
  * copies of state the DataState and the viewer own. Both owners reconcile
  * themselves when the snapshot inventory empties — `view-context-core.js`
  * returns the active view to `live` (`removeView`, `syncSnapshotContexts`), and
@@ -10,11 +10,11 @@
  * (`clearPublishedSnapshotViews`, which Clear views and a dataset change run)
  * and putting back a views value with fewer kept views (the `views` state
  * domain, `state/domains/views.js`, retires the views past its count) empty the
- * inventory, so the very next badge render read a view that no longer existed
- * and threw.
+ * inventory, so with a copy the very next badge render would read a view that
+ * no longer exists and throw.
  *
- * The throw arrived on an animation frame the same rebuild scheduled, which is
- * why it was only ever seen as an uncaught `RangeError` in a browser log. These
+ * The throw would arrive on an animation frame the same rebuild schedules, and
+ * be seen only as an uncaught `RangeError` in a browser log. These
  * tests do not wait for a frame: they call the exact function that frame calls
  * (`renderSplitViewBadges`, scheduled at `ui-coordinator.js`
  * `scheduleVisibilityUiUpdate`) at the exact point the inventory moved, and the
@@ -699,7 +699,7 @@ async function removeRow(dom, index) {
   await settle();
 }
 
-test('a row\'s × removes the view that row shows, with one, two or three kept views (F144)', async t => {
+test('a row\'s × removes the view that row shows, with one, two or three kept views', async t => {
   for (const kept of [1, 2, 3]) {
     const names = ['Base', 'Early', 'Mid', 'Late'].slice(0, kept + 1);
     // The × of the live row: the live view goes, every kept view stays with its name.
@@ -838,7 +838,7 @@ test('each row names what its view shows, with the coloring field under it', asy
   ]);
 });
 
-test('a view given a name shows it in its row, on its pane chip and to the picker; view.rename and view.keep name views (F130)', async t => {
+test('a view given a name shows it in its row, on its pane chip and to the picker; view.rename and view.keep name views', async t => {
   const owners = createOwners();
   const { controls, dom } = mountViewControls(t, owners);
   const actions = getActions();
@@ -921,7 +921,7 @@ test('Link cameras is offered only between views that show one representation', 
   );
 });
 
-test('smoke leaves the views\' layout as it is: only the selector says one view (F59)', t => {
+test('smoke leaves the views\' layout as it is: only the selector says one view', t => {
   const owners = createOwners();
   const { controls, dom, renderDom } = mountViewControls(t, owners);
   assert.equal(owners.layoutMode(), 'grid');
@@ -935,7 +935,7 @@ test('smoke leaves the views\' layout as it is: only the selector says one view 
   assert.equal(dom.layoutModeSelect.value, 'grid');
 });
 
-test('while views are kept the smoke choice is off and says why; cleared, it is on again (R9R-4)', async t => {
+test('while views are kept the smoke choice is off and says why; cleared, it is on again', async t => {
   const owners = createOwners();
   const { controls, dom, renderDom } = mountViewControls(t, owners);
   const smoke = renderDom.renderModeSelect.options.find(option => option.value === 'smoke');

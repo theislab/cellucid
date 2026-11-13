@@ -10,15 +10,12 @@
  * one that will be). A gesture made before either is read by another tool,
  * or picks nothing.
  *
- * These specs used to repeat the gesture until its tool armed, and called
- * one dropped when no step controls had appeared three seconds later: on a
- * runner that took longer to arm, a second gesture landed on top of the
- * first and the tool held something else (`select-bar`, macOS Chromium,
- * nightly run of 2026-11-04; `uint32-categories-end-to-end`, Linux WebKit
- * and Firefox). The gesture is now made once, after what it depends on:
- * every action asked so far is done (`getActions().idle()`) and the page is
- * at rest (`waitForPageAtRest`). A gesture the page then does not take is a
- * defect, and fails the spec.
+ * A gesture repeated until its tool armed would, on a runner that takes
+ * longer to arm, land a second time on top of the first, and the tool would
+ * hold something else. So the gesture is made once, after what it depends
+ * on: every action asked so far is done (`getActions().idle()`) and the page
+ * is at rest (`waitForPageAtRest`). A gesture the page then does not take is
+ * a defect, and fails the spec.
  */
 import { waitForPageAtRest, whenActionsDone } from './dataset-ready.mjs';
 import { expect } from './test.mjs';

@@ -640,8 +640,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
    * summary's own link. The rows are the agent's result table
    * (`compositionTable`) whole, with what a file read alone needs besides:
    * the statistic, the samples each condition's mean is over and, paired,
-   * the pairs the test took (F108: the file once gave every sample as the
-   * test's and left out the per-sample proportions).
+   * the pairs the test took, so the file reads without the screen.
    */
   tableFile() {
     const composition = this._lastResult?.composition;
@@ -660,9 +659,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
    * and pooled proportion, its proportion in each sample (or condition: each
    * unit of the bars), and when tested its mean proportion per condition,
    * ratio, test and p values, the most significant first, else the most
-   * abundant (top `top`). Before, without a condition the rows held only the
-   * names: no number an agent could read, and the per-sample shares a
-   * donor-level argument needs were never given.
+   * abundant (top `top`).
    * @override
    */
   _resultTable(result, top) {

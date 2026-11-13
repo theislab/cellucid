@@ -4,17 +4,14 @@
  * WebKit does not hold DOMContentLoaded for a stylesheet (Chromium and
  * Firefox do, through the deferred scripts at the end of the page). The page
  * boot starts the code at DOMContentLoaded, so on a link where the stylesheet
- * came after the document (measured with its response held 4 s) WebKit
- * started the code 0.3 s in, in a page with no styles: no design token had a
- * value, and the analysis tools failed to load on one that resolved to
- * nothing. Markup hidden by a class (the welcome dialog was then a `div`
- * with `class="welcome-modal hidden"`) was displayed, so a spec that navigated
- * and waited for the welcome dialog to be visible saw the markup, pressed
- * Escape before any listener existed, and the page showed the dialog
- * afterwards over a page the spec believed free of it (Web contracts run
- * 42180485733 and earlier, Linux WebKit: history-graph, highlight-pulse,
- * knn-missing, my-datasets). The welcome is now a `<dialog>`, which is not
- * displayed until opened in any page, styled or not.
+ * comes after the document, WebKit starts the code in a page with no styles:
+ * no design token has a value, and the analysis tools fail to load on one that
+ * resolves to nothing. Markup hidden by a class (a welcome dialog that is a
+ * `div` with `class="welcome-modal hidden"`) is displayed, so a spec that
+ * navigates and waits for the welcome dialog to be visible sees the markup,
+ * presses Escape before any listener exists, and the page shows the dialog
+ * afterwards over a page the spec believes free of it. The welcome is a
+ * `<dialog>`, which is not displayed until opened in any page, styled or not.
  *
  * The style gate (index.html, CELLUCID_STYLE_GATE) is a script straight after
  * the stylesheet link: a script waits for the stylesheets before it in every
@@ -29,7 +26,7 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 const START_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&acceptance=style-gate`;
 
 // How long the stylesheet is kept from the page: the slow link is the
-// subject. Without the gate WebKit reached DOMContentLoaded and started the
+// subject. Without the gate WebKit reaches DOMContentLoaded and starts the
 // code a few hundred milliseconds in; with it, nothing does before the
 // stylesheet is released, however long that takes.
 const HELD_MS = 2500;
@@ -77,7 +74,7 @@ for (const [name, held] of [
       code: { welcomeMarkup: 'flex', tokens: true },
     });
 
-    // What the unstyled start broke: the dialog is dismissed once and stays so.
+    // What the unstyled start breaks: the dialog is dismissed once and stays so.
     await dismissWelcome(page);
     await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
     await expect(page.locator('#welcome-modal')).not.toHaveAttribute('open');

@@ -1,6 +1,6 @@
 /**
  * A row cut to one line shows its whole text on a click or a tap
- * (`app/ui/components/full-text-reveal.js`; bug hunt F8, owner 2026-11-10).
+ * (`app/ui/components/full-text-reveal.js`).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

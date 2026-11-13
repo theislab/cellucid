@@ -2,7 +2,7 @@
  * An in-memory dataset (a synthetic benchmark cloud, an injected array) is
  * published as given, so its layout's normalization is the identity -- and it
  * must say so: figure export, centroids and vectors read every layout's
- * transform through `getNormTransform`, and a missing one made figure export
+ * transform through `getNormTransform`, and a missing one makes figure export
  * refuse every synthetic cloud ("normalization for view live is incomplete").
  */
 import assert from 'node:assert/strict';

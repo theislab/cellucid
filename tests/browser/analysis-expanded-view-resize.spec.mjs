@@ -75,127 +75,158 @@ function layout(content) {
   }));
 }
 
-test('every edge and corner resizes by mouse; the header moves it; the least size is the content\'s', async ({ page }) => {
+// One opening. Each step opens the view, reads the size it starts from (the view opens at the
+// size last given) and closes it again.
+test('the expanded view is resized by mouse, finger and keyboard, opens again at the size given, and stays inside a smaller window', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openDataset(page);
-  const content = await openView(page);
-  await expect(content.locator('> .analysis-modal-edge-resize')).toHaveCount(8);
-  const start = await layout(content);
 
-  const drag = async (edge, dx, dy) => {
-    const handle = await content.locator(`> .analysis-modal-edge-resize-${edge}`).boundingBox();
-    const x = handle.x + handle.width / 2;
-    const y = handle.y + handle.height / 2;
-    await page.mouse.move(x, y);
+  await test.step("every edge and corner resizes by mouse; the header moves it; the least size is the content's", async () => {
+    const content = await openView(page);
+    await expect(content.locator('> .analysis-modal-edge-resize')).toHaveCount(8);
+    const start = await layout(content);
+
+    const drag = async (edge, dx, dy) => {
+      const handle = await content.locator(`> .analysis-modal-edge-resize-${edge}`).boundingBox();
+      const x = handle.x + handle.width / 2;
+      const y = handle.y + handle.height / 2;
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x + dx, y + dy, { steps: 6 });
+      await page.mouse.up();
+    };
+    await drag('nw', -40, -30);
+    const grown = await layout(content);
+    expect(grown.left).toBe(start.left - 40);
+    expect(grown.top).toBe(start.top - 30);
+    expect(grown.width).toBe(start.width + 40);
+    expect(grown.height).toBe(start.height + 30);
+
+    // Shrinking stops at the content's least size, not at a fixed 600 × 500.
+    await drag('se', -2000, -2000);
+    const least = await layout(content);
+    expect(least.width).toBeLessThan(600);
+    expect(least.width).toBeGreaterThanOrEqual(450);
+    expect(least.height).toBeLessThan(500);
+
+    // The header moves it.
+    const header = await content.locator('.analysis-modal-header').boundingBox();
+    await page.mouse.move(header.x + 40, header.y + header.height / 2);
     await page.mouse.down();
-    await page.mouse.move(x + dx, y + dy, { steps: 6 });
+    await page.mouse.move(header.x + 140, header.y + header.height / 2 + 60, { steps: 6 });
     await page.mouse.up();
-  };
-  await drag('nw', -40, -30);
-  const grown = await layout(content);
-  expect(grown.left).toBe(start.left - 40);
-  expect(grown.top).toBe(start.top - 30);
-  expect(grown.width).toBe(start.width + 40);
-  expect(grown.height).toBe(start.height + 30);
+    const moved = await layout(content);
+    expect(moved.left).toBe(least.left + 100);
+    expect(moved.top).toBe(least.top + 60);
 
-  // Shrinking stops at the content's least size, not at a fixed 600 × 500.
-  await drag('se', -2000, -2000);
-  const least = await layout(content);
-  expect(least.width).toBeLessThan(600);
-  expect(least.width).toBeGreaterThanOrEqual(450);
-  expect(least.height).toBeLessThan(500);
-
-  // The header moves it.
-  const header = await content.locator('.analysis-modal-header').boundingBox();
-  await page.mouse.move(header.x + 40, header.y + header.height / 2);
-  await page.mouse.down();
-  await page.mouse.move(header.x + 140, header.y + header.height / 2 + 60, { steps: 6 });
-  await page.mouse.up();
-  const moved = await layout(content);
-  expect(moved.left).toBe(least.left + 100);
-  expect(moved.top).toBe(least.top + 60);
-
-  // A double-click on the header fills the window; again restores.
-  await content.locator('.analysis-modal-header').dblclick();
-  const viewport = page.viewportSize();
-  const full = await layout(content);
-  expect([full.left, full.top, full.width, full.height]).toEqual([8, 8, viewport.width - 16, viewport.height - 16]);
-  await content.locator('.analysis-modal-header').dblclick();
-  expect(await layout(content)).toEqual(moved);
-  expect(errors).toEqual([]);
-});
-
-test('a finger moves the view and resizes it (pointer events)', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  const content = await openView(page);
-  const start = await layout(content);
-  await content.locator('> .analysis-modal-edge-resize-e').evaluate(element => {
-    const rect = element.getBoundingClientRect();
-    const fire = (type, dx) => element.dispatchEvent(new PointerEvent(type, {
-      bubbles: true, cancelable: true, pointerId: 21, pointerType: 'touch', isPrimary: true,
-      button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
-      clientX: rect.left + rect.width / 2 + dx, clientY: rect.top + rect.height / 2,
-    }));
-    fire('pointerdown', 0);
-    for (let step = 1; step <= 4; step++) fire('pointermove', step * 15);
-    fire('pointerup', 60);
+    // A double-click on the header fills the window; again restores.
+    await content.locator('.analysis-modal-header').dblclick();
+    const viewport = page.viewportSize();
+    const full = await layout(content);
+    expect([full.left, full.top, full.width, full.height]).toEqual([8, 8, viewport.width - 16, viewport.height - 16]);
+    await content.locator('.analysis-modal-header').dblclick();
+    expect(await layout(content)).toEqual(moved);
+    await closeView(page);
+    expect(errors).toEqual([]);
   });
-  await expect.poll(async () => (await layout(content)).width).toBe(start.width + 60);
-  expect(errors).toEqual([]);
-});
 
-test('keyboard: the corner and the splitters move by arrow keys and report their values', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  const content = await openView(page);
-  const start = await layout(content);
-  const corner = content.locator('> .analysis-modal-edge-resize-se');
-  await expect(corner).toHaveAttribute('tabindex', '0');
-  await expect(corner).toHaveAttribute('role', 'separator');
-  await corner.focus();
-  await page.keyboard.press('ArrowRight');
-  await page.keyboard.press('Shift+ArrowDown');
-  const keyed = await layout(content);
-  expect(keyed.width).toBe(start.width + 16);
-  expect(keyed.height).toBe(start.height + 64);
-  await expect(corner).toHaveAttribute('aria-valuetext', `${keyed.width} × ${keyed.height} pixels`);
-
-  const splitter = content.locator('.analysis-modal-body > .analysis-modal-resizer-vertical');
-  await expect(splitter).toHaveAttribute('aria-orientation', 'vertical');
-  await splitter.focus();
-  await page.keyboard.press('ArrowLeft');
-  expect((await layout(content)).options).toBe(keyed.options + 16);
-  await expect(splitter).toHaveAttribute('aria-valuenow', String(keyed.options + 16));
-  const footer = content.locator('> .analysis-modal-resizer-horizontal');
-  await footer.focus();
-  await page.keyboard.press('ArrowUp');
-  expect((await layout(content)).footer).toBe(keyed.footer + 16);
-  expect(errors).toEqual([]);
-});
-
-test('the next view of the same analysis opens at the size and splits last given', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  let content = await openView(page);
-  const corner = content.locator('> .analysis-modal-edge-resize-se');
-  await corner.focus();
-  await page.keyboard.press('Shift+ArrowRight');
-  await page.keyboard.press('Shift+ArrowDown');
-  await content.locator('.analysis-modal-body > .analysis-modal-resizer-vertical').focus();
-  await page.keyboard.press('Shift+ArrowLeft');
-  const given = await layout(content);
-  const remembered = await page.evaluate(async () => {
-    const { analysisViewSizes } = await import('/assets/js/app/analysis/shared/analysis-view-sizes.js');
-    return analysisViewSizes.expandedViewSize('detailed');
+  await test.step('a finger moves the view and resizes it (pointer events)', async () => {
+    const content = await openView(page);
+    const start = await layout(content);
+    await content.locator('> .analysis-modal-edge-resize-e').evaluate(element => {
+      const rect = element.getBoundingClientRect();
+      const fire = (type, dx) => element.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, pointerId: 21, pointerType: 'touch', isPrimary: true,
+        button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
+        clientX: rect.left + rect.width / 2 + dx, clientY: rect.top + rect.height / 2,
+      }));
+      fire('pointerdown', 0);
+      for (let step = 1; step <= 4; step++) fire('pointermove', step * 15);
+      fire('pointerup', 60);
+    });
+    await expect.poll(async () => (await layout(content)).width).toBe(start.width + 60);
+    await closeView(page);
+    expect(errors).toEqual([]);
   });
-  expect(remembered).toMatchObject({ width: given.width, height: given.height, optionsWidth: given.options });
-  await closeView(page);
-  content = await openView(page);
-  const reopened = await layout(content);
-  expect([reopened.width, reopened.height, reopened.options, reopened.footer])
-    .toEqual([given.width, given.height, given.options, given.footer]);
-  expect(errors).toEqual([]);
+
+  await test.step('keyboard: the corner and the splitters move by arrow keys and report their values', async () => {
+    const content = await openView(page);
+    const start = await layout(content);
+    const corner = content.locator('> .analysis-modal-edge-resize-se');
+    await expect(corner).toHaveAttribute('tabindex', '0');
+    await expect(corner).toHaveAttribute('role', 'separator');
+    await corner.focus();
+    await page.keyboard.press('ArrowRight');
+    await page.keyboard.press('Shift+ArrowDown');
+    const keyed = await layout(content);
+    expect(keyed.width).toBe(start.width + 16);
+    expect(keyed.height).toBe(start.height + 64);
+    await expect(corner).toHaveAttribute('aria-valuetext', `${keyed.width} × ${keyed.height} pixels`);
+
+    const splitter = content.locator('.analysis-modal-body > .analysis-modal-resizer-vertical');
+    await expect(splitter).toHaveAttribute('aria-orientation', 'vertical');
+    await splitter.focus();
+    await page.keyboard.press('ArrowLeft');
+    expect((await layout(content)).options).toBe(keyed.options + 16);
+    await expect(splitter).toHaveAttribute('aria-valuenow', String(keyed.options + 16));
+    const footer = content.locator('> .analysis-modal-resizer-horizontal');
+    await footer.focus();
+    await page.keyboard.press('ArrowUp');
+    expect((await layout(content)).footer).toBe(keyed.footer + 16);
+    await closeView(page);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step('the next view of the same analysis opens at the size and splits last given', async () => {
+    let content = await openView(page);
+    const corner = content.locator('> .analysis-modal-edge-resize-se');
+    await corner.focus();
+    await page.keyboard.press('Shift+ArrowRight');
+    await page.keyboard.press('Shift+ArrowDown');
+    await content.locator('.analysis-modal-body > .analysis-modal-resizer-vertical').focus();
+    await page.keyboard.press('Shift+ArrowLeft');
+    const given = await layout(content);
+    const remembered = await page.evaluate(async () => {
+      const { analysisViewSizes } = await import('/assets/js/app/analysis/shared/analysis-view-sizes.js');
+      return analysisViewSizes.expandedViewSize('detailed');
+    });
+    expect(remembered).toMatchObject({ width: given.width, height: given.height, optionsWidth: given.options });
+    await closeView(page);
+    content = await openView(page);
+    const reopened = await layout(content);
+    expect([reopened.width, reopened.height, reopened.options, reopened.footer])
+      .toEqual([given.width, given.height, given.options, given.footer]);
+    await closeView(page);
+    expect(errors).toEqual([]);
+  });
+
+  await test.step('a view sized on a large window stays inside a smaller one, and gets its size back', async () => {
+    // A view given a size keeps a cap: in a smaller window it must not reach
+    // past the screen's edges, with its header and close button out of reach.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const content = await openView(page);
+    const corner = content.locator('> .analysis-modal-edge-resize-se');
+    await corner.focus();
+    await page.keyboard.press('End');
+    const large = await layout(content);
+    expect(large.left + large.width).toBeGreaterThan(1000);
+    expect(large.top + large.height).toBeGreaterThan(700);
+
+    for (const size of [{ width: 1000, height: 700 }, { width: 900, height: 520 }]) {
+      await page.setViewportSize(size);
+      await expect.poll(async () => {
+        const box = await content.boundingBox();
+        return box.x >= 8 - 0.5 && box.y >= 8 - 0.5
+          && box.x + box.width <= size.width - 8 + 0.5 && box.y + box.height <= size.height - 8 + 0.5;
+      }, { message: `the view is inside ${size.width} × ${size.height}` }).toBe(true);
+    }
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await expect.poll(async () => {
+      const { width, height } = await layout(content);
+      return { width, height };
+    }).toEqual({ width: large.width, height: large.height });
+    expect(errors).toEqual([]);
+  });
 });
 
 test.describe('on a phone', () => {
@@ -214,35 +245,4 @@ test.describe('on a phone', () => {
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
     expect(errors).toEqual([]);
   });
-});
-
-test('a view sized on a large window stays inside a smaller one, and gets its size back', async ({ page }) => {
-  // F126 (bug hunt): a view given a size lost its cap (`max-*: none`) and kept
-  // its place, so a smaller window left it past the screen's edges, its
-  // header and close button out of reach.
-  const errors = observeProductErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await openDataset(page);
-  const content = await openView(page);
-  const corner = content.locator('> .analysis-modal-edge-resize-se');
-  await corner.focus();
-  await page.keyboard.press('End');
-  const large = await layout(content);
-  expect(large.left + large.width).toBeGreaterThan(1000);
-  expect(large.top + large.height).toBeGreaterThan(700);
-
-  for (const size of [{ width: 1000, height: 700 }, { width: 900, height: 520 }]) {
-    await page.setViewportSize(size);
-    await expect.poll(async () => {
-      const box = await content.boundingBox();
-      return box.x >= 8 - 0.5 && box.y >= 8 - 0.5
-        && box.x + box.width <= size.width - 8 + 0.5 && box.y + box.height <= size.height - 8 + 0.5;
-    }, { message: `the view is inside ${size.width} × ${size.height}` }).toBe(true);
-  }
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await expect.poll(async () => {
-    const { width, height } = await layout(content);
-    return { width, height };
-  }).toEqual({ width: large.width, height: large.height });
-  expect(errors).toEqual([]);
 });

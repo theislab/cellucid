@@ -172,10 +172,9 @@ export function collectionLoads(file, needs, { cache = false, complete = false, 
     // elements need, so an object lying past them costs no second round trip.
     // Not more: an object's attributes, a dataframe's columns and a string
     // array's collections are each read at once, and padding each read to a
-    // round trip's worth of the link (bandwidth x latency) fetched that many
-    // times the link's round trip -- on CELLxGENE's HLCA (S3), 3.4 MB of the
-    // 20 MB an opening read, for 4 KB collections. A larger collection whose
-    // object lies past what was read is completed by a second read.
+    // round trip's worth of the link (bandwidth x latency) would fetch many
+    // times the bytes the collections hold (measured:
+    // 23_decisions_partial_reading.md). A larger collection whose
     // Bytes held already (a file's head) are read only as far as they go
     // when they hold what the elements need.
     const next = i + 1 < sorted.length ? sorted[i + 1] : Infinity;
@@ -206,7 +205,7 @@ export function collectionLoads(file, needs, { cache = false, complete = false, 
  * @param {{cache?: boolean, complete?: boolean, signal?: AbortSignal|null, held?: Map<number, Collection>|null}} [options]
  * @returns {Promise<Map<number, Collection>>}
  */
-export async function loadCollections(file, needs, options = {}) {
+async function loadCollections(file, needs, options = {}) {
   const loads = collectionLoads(file, needs, options);
   const result = new Map();
   await Promise.all([...loads].map(([address, load]) => load.then(collection => { result.set(address, collection); })));

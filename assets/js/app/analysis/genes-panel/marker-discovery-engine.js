@@ -178,7 +178,7 @@ export class MarkerDiscoveryEngine {
    * @param {string|null} [options.readOwner]
    * @param {string} [options.matrix='mapped'] - The expression matrix the
    *   genes are read from (`DataLayer.readGeneColumn`)
-   * @param {import('../data/data-layer.js').RunValues|null} [options.values] -
+   * @param {import('../compute/task-values.js').RunValues|null} [options.values] -
    *   The run's values (`DataLayer.runValues`, the expression transform):
    *   genes read here come in them, and delivered genes are put in them by
    *   the workers (normalized by the cells' factors, which each worker

@@ -9,13 +9,11 @@
  * the rest: in Firefox and WebKit `isEnabled`, `getParameter` of
  * `ACTIVE_TEXTURE`, `VIEWPORT`, `SCISSOR_BOX`, `COLOR_WRITEMASK`, the blend
  * functions and equations and `COLOR_CLEAR_VALUE` are round trips to the GPU
- * process that first run every command queued before them (measured: 6–8 ms
- * in Firefox and 16–24 ms in WebKit after one 64 MB texture upload; 0 ms for
- * a binding). The backdrop look asked three of them per pane per frame.
- * Chromium answers `getVertexAttrib(CURRENT_VERTEX_ATTRIB)` the same way: the
- * GPU permute pass asked it once a pass and waited for the frame before it
- * (2.3 s over a 100M-point adoption), so a generic attribute value is
- * shadowed too (`genericAttribute`).
+ * process that first run every command queued before them, so a frame that
+ * asks for a few of them waits for the GPU (a binding costs nothing)
+ * (measured: 28_decisions_rendering_layers.md). Chromium answers
+ * `getVertexAttrib(CURRENT_VERTEX_ATTRIB)` the same way, so a generic
+ * attribute value is shadowed too (`genericAttribute`).
  *
  * The shadow is installed once per context: the context's setters for that
  * state are wrapped on the instance, so every change, by any caller, lands in
@@ -27,11 +25,9 @@
  * value back at its initial one, as a new context has them. The wrapped
  * setters survive the loss; what the shadow knew does not: `primeGlState` on
  * the restored context forgets it and reads every value again. Without that
- * the shadow went on answering the values from before the loss while the
- * context had its initial ones (measured in Firefox 159 after
- * `WEBGL_lose_context`: the shadow's clear color was the background, the
- * context's own transparent black, and the pulse's sample reset drew the
- * former where whole frames cleared to the latter).
+ * the shadow would go on answering the values from before the loss while the
+ * context has its initial ones (a clear color of the old background where the
+ * context's own is transparent black).
  *
  * What it does not do: validate. A setter given a value WebGL refuses (an
  * unknown enum, which records an error and changes nothing) is recorded as if
@@ -197,8 +193,8 @@ function createShadow(gl) {
  * Read every value of `gl`'s shadow from the context now (`glStateOf`),
  * forgetting what it knew: where the context is made and nothing is queued
  * yet, instead of the first time a pass asks for one (a first read during a
- * frame of a large view waits for that whole frame: 0.2 s for `colorMask`,
- * first read by the GPU permute's source draw during a 100M-point adoption),
+ * frame of a large view waits for that whole frame, measured in a 100M-point
+ * adoption: 28_decisions_rendering_layers.md),
  * and again where the browser restores a lost context, whose every value is
  * back at its initial one.
  *

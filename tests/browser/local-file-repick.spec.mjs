@@ -60,10 +60,12 @@ async function readyAnnouncements(page, cells) {
  */
 async function pickTwice(page, file, { name, cells, afterFirst = async () => {} }) {
   const input = page.locator('#user-data-file-input');
+  // Files picked earlier on the page said theirs: these two openings are counted from there.
+  const said = await readyAnnouncements(page, cells);
   await chooseFiles(input, file);
   await expect(page.locator('#dataset-name')).toHaveText(name);
   await expect(page.locator('#dataset-cells')).toHaveText(String(cells));
-  await expect.poll(() => readyAnnouncements(page, cells)).toBe(1);
+  await expect.poll(() => readyAnnouncements(page, cells)).toBe(said + 1);
   await page.evaluate(() => {
     const highlight = new Uint8Array(window._cellucidState.pointCount);
     highlight[0] = 255;
@@ -73,7 +75,7 @@ async function pickTwice(page, file, { name, cells, afterFirst = async () => {} 
   await afterFirst();
 
   await chooseFiles(input, file);
-  await expect.poll(() => readyAnnouncements(page, cells)).toBe(2);
+  await expect.poll(() => readyAnnouncements(page, cells)).toBe(said + 2);
   await expect(page.locator('#dataset-name')).toHaveText(name);
   await expect(page.locator('#dataset-cells')).toHaveText(String(cells));
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPointCount())).toBe(cells);
@@ -81,26 +83,27 @@ async function pickTwice(page, file, { name, cells, afterFirst = async () => {} 
   await expectNoFailureAnnounced(page);
 }
 
-test('the .h5ad that is open, picked again, opens again', async ({ page }) => {
+test('the file that is open, picked again, opens again: an .h5ad, then an .rds from what the tab kept', async ({ page }, testInfo) => {
   const errors = await start(page);
-  await pickTwice(page, H5AD, { name: 'current-ui-smoke', cells: 120 });
-  expect(errors).toEqual([]);
-});
 
-test('the .rds that is open, picked again, opens again from what the tab kept', async ({ page }, testInfo) => {
-  const errors = await start(page);
-  const file = testInfo.outputPath('seurat5_gzip.rds');
-  await writeFile(file, await corpusFile('rds/seurat5_gzip.rds'));
-  let kept = null;
-  await pickTwice(page, file, {
-    name: 'Corpus Seurat object',
-    cells: 120,
-    afterFirst: async () => { kept = await keptStores(page); },
+  await test.step('the .h5ad that is open, picked again, opens again', async () => {
+    await pickTwice(page, H5AD, { name: 'current-ui-smoke', cells: 120 });
   });
-  // The second opening read the store the first one kept, and kept no other.
-  if (kept !== null) {
-    expect(kept).toHaveLength(1);
-    expect(await keptStores(page)).toEqual(kept);
-  }
+
+  await test.step('the .rds that is open, picked again, opens again from what the tab kept', async () => {
+    const file = testInfo.outputPath('seurat5_gzip.rds');
+    await writeFile(file, await corpusFile('rds/seurat5_gzip.rds'));
+    let kept = null;
+    await pickTwice(page, file, {
+      name: 'Corpus Seurat object',
+      cells: 120,
+      afterFirst: async () => { kept = await keptStores(page); },
+    });
+    // The second opening read the store the first one kept, and kept no other.
+    if (kept !== null) {
+      expect(kept).toHaveLength(1);
+      expect(await keptStores(page)).toEqual(kept);
+    }
+  });
   expect(errors).toEqual([]);
 });

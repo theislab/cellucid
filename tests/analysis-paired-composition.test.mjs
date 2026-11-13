@@ -3,8 +3,7 @@
  * t-test and signed-rank test they use (`stats/statistical-tests.js`), held
  * to SciPy 1.16.3: logit and CLR proportions with `ttest_rel`, proportions
  * with `scipy.stats.wilcoxon` (exact; and the normal approximation with
- * `correction=True`, R `wilcox.test(paired = TRUE)`'s). The script:
- * cellucid-private `simulation_bughunt_improvements/lane-analyses.md`, L8-3.
+ * `correction=True`, R `wilcox.test(paired = TRUE)`'s).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -65,7 +64,7 @@ test('the signed-rank test is R wilcox.test(paired = TRUE): exact without ties b
   assert.deepEqual(pairedTTest([1, 2], [1, 2]), { statistic: NaN, pValue: NaN, n: 2 });
 });
 
-test('paired, the mean proportions and their ratio are over the pairs the test reads, never a sample in one condition (L25-12)', () => {
+test('paired, the mean proportions and their ratio are over the pairs the test reads, never a sample in one condition', () => {
   // Units: three donors in both conditions (0, 1), and donor 3 in condition 0 only, with 2 cells all of type 0.
   // Type 0 is more frequent in condition 1 in every pair; donor 3's unpaired unit (100% type 0) would flip
   // the mean of condition 0 above condition 1.

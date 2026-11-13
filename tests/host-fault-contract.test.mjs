@@ -7,12 +7,12 @@
  * address (404/410), or this computer offline; named with the provider the
  * host serves, with the status, and Try again first where it may help.
  *
- * Measured on NCBI GEO on 2026-10-31 (16:47-17:07 CET): every file under
- * `ftp.ncbi.nlm.nih.gov/geo/` answered HTTP 500 (`geo/README.txt` and every
- * `filelist.txt` included), while its folder listings answered 200 with no
- * files, or only some. The live app then said "GEO GSE327505 has no
- * supplementary file Cellucid opens." and "GEO GSE336826 has no file named
- * GSM9843410_12hpf_scRNA_matrix.mtx.gz.", and for a file link
+ * The fixture is NCBI GEO's answers during an outage: every file under
+ * `ftp.ncbi.nlm.nih.gov/geo/` answers HTTP 500 (`geo/README.txt` and every
+ * `filelist.txt` included), while its folder listings answer 200 with no
+ * files, or only some. The app then says the host failed, not "GEO GSE327505
+ * has no supplementary file Cellucid opens." or "GEO GSE336826 has no file
+ * named GSM9843410_12hpf_scRNA_matrix.mtx.gz.", and for a file link
  * "ftp.ncbi.nlm.nih.gov failed to give ….h5ad. Try again later.".
  */
 
@@ -88,7 +88,7 @@ function silenceNotifications(t) {
   });
 }
 
-/** NCBI's answers during its 2026-10-31 outage: folders listed (`listing`), every file HTTP 500. */
+/** NCBI's answers during an outage: folders listed (`listing`), every file HTTP 500. */
 const NCBI_ERROR = '<html><head><title>Server error!</title></head><body>The server encountered an internal error</body></html>';
 function ncbiOutage(listing = '<html><body><h1>Index of /geo/series/GSE327nnn/GSE327505/suppl</h1><hr></body></html>') {
   return url => (url.endsWith('/')
@@ -268,7 +268,7 @@ test('every provider says a host failing on its side as that host\'s, named with
 test('a refusal is the link\'s permissions, except from a provider whose files are all public; a missing file says so', async t => {
   silenceNotifications(t);
   const source = new LinkDataSource();
-  // GEO and the Census serve only public files: a 403 is their host refusing this network (NCBI, 2026-10-31).
+  // GEO and the Census serve only public files: a 403 is their host refusing this network.
   installFetch(t, () => ({ status: 403, text: 'Forbidden' }));
   await assert.rejects(source.connect('geo:GSE350831/GSE350831_Flex.h5ad'), error => {
     assert.match(error.message, /^NCBI GEO \(ftp\.ncbi\.nlm\.nih\.gov\) is refusing requests from this network for now \(HTTP 403, forbidden\) for GSE350831_Flex\.h5ad, which it gives everyone: a problem on NCBI GEO's side/);
@@ -339,7 +339,7 @@ test('a link whose host fails names the provider, and keeps the requests under D
 });
 
 test('a Retry-After on a successful answer is a budget header, never a wait (Zenodo sends one on every 200)', async () => {
-  // zenodo.org answered its record (HTTP 200) with `Retry-After: 60` on 2026-10-31.
+  // zenodo.org answers its record (HTTP 200) with `Retry-After: 60`.
   const hosts = createHostBook({});
   const url = 'https://zenodo.org/api/records/13255338';
   const answer = () => new Response('{"id":13255338}', { status: 200, headers: { 'Retry-After': '60', 'Content-Type': 'application/json' } });
@@ -369,7 +369,7 @@ test('a request no answer arrived for says whose problem it is where that is kno
   assert.equal(unansweredFault(lost(false), quiet), null, 'a host never answered: a typo or a site others may not read');
   assert.equal(unansweredFault(lost(false), { connectionDown: () => true, online: () => true }).kind, 'connection');
   assert.equal(unansweredFault(Object.assign(lost(true), { code: BYTE_SOURCE_FAILURES.HTTP }), quiet), null);
-  // Said in the samples' notice by its fault, never by its address (F51, F58).
+  // Said in the samples' notice by its fault, never by its address.
   const error = Object.assign(lost(true), { details: { ...lost(true).details, hostFault: unansweredFault(lost(true), quiet) } });
   const sentence = describeDataSourceFailure('Sample datasets', 'could not be loaded', error);
   assert.match(sentence, /^Sample datasets could not be loaded: 127\.0\.0\.1:54683 stopped answering this site, which it answered before \(garcia\.zarr\/\.zmetadata\)/);

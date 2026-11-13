@@ -2,27 +2,23 @@
  * @fileoverview The static server the browser suite runs against must outlive
  * anything a client does to it.
  *
- * What prompted this: a whole bounded batch of community-annotation specs
- * failed with `net::ERR_CONNECTION_REFUSED` after the twenty-eighth test in it
- * had already passed. Nothing was wrong with those specs — the server process
- * was gone, and it left no message saying why.
- *
- * That silence is the thing to fix. `serve()` was an `async` function handed
- * straight to `createServer()`, so a rejection from it had nowhere to go but
- * `unhandledRejection`, which ends a Node process; the response object had no
- * `error` listener, so a write to a reset socket raised an unhandled stream
- * error; and the bind-failure handler was registered permanently rather than
- * for the bind, so any later server error reached `process.exit(1)` through it.
- * Three ways for a client to end the server, none of which prints anything a
- * reader could act on.
+ * A server process that ends silently makes a whole bounded batch of specs
+ * fail with `net::ERR_CONNECTION_REFUSED` in a spec unrelated to the cause,
+ * with no message saying why. Three ways a client could end it, none of which
+ * prints anything a reader could act on: `serve()` handed straight to
+ * `createServer()` as an `async` function has nowhere to send a rejection but
+ * `unhandledRejection`, which ends a Node process; a response object with no
+ * `error` listener raises an unhandled stream error on a write to a reset
+ * socket; and a bind-failure handler registered permanently rather than for
+ * the bind lets any later server error reach `process.exit(1)` through it.
  *
  * This holds the server to surviving the abort shapes the suite actually
- * produces, and to still refusing a port it cannot take — the one exit that
- * must remain. A failure that reports as `ERR_CONNECTION_REFUSED` in a spec
- * unrelated to its cause is worse than the failure itself.
+ * produces, and to still refusing a port it cannot take - the one exit that
+ * must remain.
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { connect, createServer } from 'node:net';
@@ -191,9 +187,56 @@ test('every asset of the inventory is served whole, an empty one too', async t =
   assert.deepEqual(server.stderr.filter(line => /request failed/.test(line)), []);
 });
 
+test('the application origin serves one asset of every declared content type with that type and length', async t => {
+  const server = await startServer();
+  t.after(() => {
+    server.child.kill('SIGKILL');
+  });
+  const origin = `http://${HOST}:${server.port}`;
+  const inventoryResponse = await fetch(`${origin}/cellucid-web-assets.json`, { cache: 'no-store' });
+  assert.equal(inventoryResponse.status, 200);
+  assert.equal(inventoryResponse.headers.get('content-type'), 'application/json; charset=utf-8');
+  const inventory = await inventoryResponse.json();
+  assert.equal(inventory.version, 1);
+  assert.ok(Array.isArray(inventory.assets));
+  assert.equal(inventory.assets.some(asset => asset.path === 'assets/img/og-preview.jpg'), false);
+
+  const representativeByContentType = new Map();
+  for (const asset of inventory.assets) {
+    if (!representativeByContentType.has(asset.content_type)) {
+      representativeByContentType.set(asset.content_type, asset);
+    }
+  }
+  assert.ok(representativeByContentType.size > 0);
+  for (const asset of representativeByContentType.values()) {
+    const response = await fetch(`${origin}/${asset.path}`, { method: 'HEAD', cache: 'no-store' });
+    assert.equal(response.status, 200, asset.path);
+    assert.equal(response.headers.get('content-type'), asset.content_type, asset.path);
+    assert.equal(response.headers.get('content-length'), String(asset.bytes), asset.path);
+  }
+});
+
+// The suite's server rewrites the page it serves (it names the suite's own sample catalog), and a web
+// cache given this origin as its source (the Python and R packages' `--web-source-url`) verifies every
+// byte it fetches against the inventory fetched from the same origin: the page must be what the
+// inventory says.
+test('the page the application origin serves is the one its inventory declares', async t => {
+  const server = await startServer();
+  t.after(() => {
+    server.child.kill('SIGKILL');
+  });
+  const origin = `http://${HOST}:${server.port}`;
+  const inventory = await (await fetch(`${origin}/cellucid-web-assets.json`, { cache: 'no-store' })).json();
+  const declared = inventory.assets.find(asset => asset.path === 'index.html');
+  assert.ok(declared, 'the inventory declares index.html');
+  const page = Buffer.from(await (await fetch(`${origin}/index.html`, { cache: 'no-store' })).arrayBuffer());
+  assert.equal(page.length, declared.bytes);
+  assert.equal(createHash('sha256').update(page).digest('hex'), declared.sha256);
+});
+
 test('the CORS port serves every file of a dataset as its bytes; the application port types only the site', async t => {
-  // Found 2026-11-10: `npm run serve`'s CORS port, documented for datasets opened by link, answered a
-  // .loom, an .rds, an .h5mu and a MatrixMarket folder's files with 415 (no web type of their own).
+  // `npm run serve`'s CORS port, documented for datasets opened by link, must not answer a
+  // .loom, an .rds, an .h5mu or a MatrixMarket folder's files with 415 (no web type of their own).
   const server = await startServer();
   t.after(() => {
     server.child.kill('SIGKILL');

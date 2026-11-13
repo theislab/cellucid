@@ -22,7 +22,7 @@
  *   fields pivot at their first value: `math-utils.js` `centredMoments`).
  * - A centered sum of squares is `Σ(v − mean)²` over the non-zero entries plus
  *   the zeros' `zeros · mean²` in one product, where adding it cell by cell
- *   was as many roundings as there are zeros: the dense two-pass sum to its
+ *   is as many roundings as there are zeros: the dense two-pass sum to its
  *   last bits (summation order). A constant sample's is exactly 0 and its
  *   mean its value, as `math-utils.js` `centredMoments` gives.
  *

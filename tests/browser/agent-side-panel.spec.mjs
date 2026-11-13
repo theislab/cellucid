@@ -1,7 +1,7 @@
 /**
  * The open chat is a side panel on a wide window, and the plot gives it its
- * width (`app/agent/dock.js`): no cell is under the chat. Found 2026-11-11:
- * the chat over the bottom of the plot hid the cells the agent was changing.
+ * width (`app/agent/dock.js`): no cell is under the chat: a chat over
+ * the bottom of the plot would hide the cells the agent is changing.
  */
 import { expect, test } from './helpers/test.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -36,43 +36,72 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(installScriptedModel);
 });
 
-test('on a wide window the open chat is a full-height side panel the plot leaves room for; collapsed, the plot has the window again', async ({ page }) => {
+// One opening on a wide window. The first step leaves the chat collapsed; the second opens it
+// again on a narrow window and ends wide, with the chat open for the third.
+test('the chat on a wide window, on a narrow one, and its prompt cache setting', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openAgentDataset(page);
-  const closed = await geometry(page);
-  expect(closed.layout).toBe('bar');
-  expect(closed.inset).toBe(0);
-  expect(closed.canvasRight).toBe(closed.windowWidth);
 
-  await openChat(page);
-  const open = await geometry(page);
-  expect(open.layout).toBe('side');
-  expect(open.inset).toBe(400);
-  expect([open.panelTop, open.panelBottom]).toEqual([0, open.windowHeight]);
-  expect(open.panelLeft).toBe(open.windowWidth - 400);
-  // The canvas ends where the panel begins: no cell is drawn under the chat.
-  expect(open.canvasRight).toBe(open.panelLeft);
-  // What is anchored to the window's right moves in with it.
-  if (open.notificationsRight !== null) expect(open.notificationsRight).toBeLessThanOrEqual(open.panelLeft);
-  // The views are laid out in what is left (the viewer's presented area).
-  const presented = await page.evaluate(() => {
-    const area = window._cellucidViewer?.getPresentedLayout?.()?.presentedArea ?? null;
-    return area === null ? null : area.cssLeft + area.cssWidth;
+  await test.step('on a wide window the open chat is a full-height side panel the plot leaves room for; collapsed, the plot has the window again', async () => {
+    const closed = await geometry(page);
+    expect(closed.layout).toBe('bar');
+    expect(closed.inset).toBe(0);
+    expect(closed.canvasRight).toBe(closed.windowWidth);
+
+    await openChat(page);
+    const open = await geometry(page);
+    expect(open.layout).toBe('side');
+    expect(open.inset).toBe(400);
+    expect([open.panelTop, open.panelBottom]).toEqual([0, open.windowHeight]);
+    expect(open.panelLeft).toBe(open.windowWidth - 400);
+    // The canvas ends where the panel begins: no cell is drawn under the chat.
+    expect(open.canvasRight).toBe(open.panelLeft);
+    // What is anchored to the window's right moves in with it.
+    if (open.notificationsRight !== null) expect(open.notificationsRight).toBeLessThanOrEqual(open.panelLeft);
+    // The views are laid out in what is left (the viewer's presented area).
+    const presented = await page.evaluate(() => {
+      const area = window._cellucidViewer?.getPresentedLayout?.()?.presentedArea ?? null;
+      return area === null ? null : area.cssLeft + area.cssWidth;
+    });
+    if (presented !== null) expect(presented).toBeLessThanOrEqual(open.panelLeft + 0.5);
+
+    // A turn's rows: the agent's name once for calls one after another.
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { calls: [{ name: 'fields_list', args: {} }] }, { text: 'Done.' }]);
+    await say(page, 'Color by score.');
+    await expect(page.locator('#agent-chat-log .agent-msg-agent .agent-msg-who:visible')).toHaveCount(1);
+    await expect(page.locator('#agent-chat-log .agent-msg-agent[data-continued="true"]')).toHaveCount(2);
+
+    await page.locator('#agent-chat-collapse').click();
+    const collapsed = await geometry(page);
+    expect(collapsed.layout).toBe('bar');
+    expect(collapsed.canvasRight).toBe(collapsed.windowWidth);
+    await expect(page.locator('#agent-chat-toggle')).toBeVisible();
+    expect(errors).toEqual([]);
   });
-  if (presented !== null) expect(presented).toBeLessThanOrEqual(open.panelLeft + 0.5);
 
-  // A turn's rows: the agent's name once for calls one after another.
-  await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { calls: [{ name: 'fields_list', args: {} }] }, { text: 'Done.' }]);
-  await say(page, 'Color by score.');
-  await expect(page.locator('#agent-chat-log .agent-msg-agent .agent-msg-who:visible')).toHaveCount(1);
-  await expect(page.locator('#agent-chat-log .agent-msg-agent[data-continued="true"]')).toHaveCount(2);
+  await test.step("on a narrow window the open chat stays a bar over the plot's foot, and becomes the side panel when the window widens", async () => {
+    await page.setViewportSize({ width: 900, height: 800 });
+    await page.locator('#agent-chat-toggle').click();
+    await expect(page.locator('#agent-chat-panel')).toBeVisible();
+    const narrow = await geometry(page);
+    expect(narrow.layout).toBe('bar');
+    expect(narrow.inset).toBe(0);
+    await expect(page.locator('#agent-dock-grip')).toBeHidden();
+    await page.setViewportSize(WIDE);
+    await expect.poll(async () => (await geometry(page)).layout).toBe('side');
+    expect(errors).toEqual([]);
+  });
 
-  await page.locator('#agent-chat-collapse').click();
-  const collapsed = await geometry(page);
-  expect(collapsed.layout).toBe('bar');
-  expect(collapsed.canvasRight).toBe(collapsed.windowWidth);
-  await expect(page.locator('#agent-chat-toggle')).toBeVisible();
-  expect(errors).toEqual([]);
+  await test.step('the prompt cache is offered for a provider that has a choice of cache length, and is remembered', async () => {
+    await page.locator('#agent-chat-settings-btn').click();
+    // The scripted model caches nothing: no choice to offer.
+    await expect(page.locator('#agent-chat-cache-row')).toBeHidden();
+    await page.locator('#agent-chat-provider').selectOption('anthropic');
+    await expect(page.locator('#agent-chat-cache-row')).toBeVisible();
+    await expect(page.locator('#agent-chat-cache')).toHaveValue('5m');
+    await page.locator('#agent-chat-cache').selectOption('1h');
+    expect(await page.evaluate(() => JSON.parse(localStorage.getItem('cellucid:agent-chat')).cache)).toBe('1h');
+  });
 });
 
 test('the panel\'s edge sets its width: by keys and by dragging (taken on release), remembered across a reload, reset by a double click', async ({ page }) => {
@@ -114,31 +143,4 @@ test('the panel\'s edge sets its width: by keys and by dragging (taken on releas
   await page.locator('#agent-dock-grip').dblclick();
   await expect.poll(async () => (await geometry(page)).inset).toBe(400);
   expect(errors).toEqual([]);
-});
-
-test('on a narrow window the open chat stays a bar over the plot\'s foot, and becomes the side panel when the window widens', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await page.setViewportSize({ width: 900, height: 800 });
-  await openAgentDataset(page);
-  await openChat(page);
-  const narrow = await geometry(page);
-  expect(narrow.layout).toBe('bar');
-  expect(narrow.inset).toBe(0);
-  await expect(page.locator('#agent-dock-grip')).toBeHidden();
-  await page.setViewportSize(WIDE);
-  await expect.poll(async () => (await geometry(page)).layout).toBe('side');
-  expect(errors).toEqual([]);
-});
-
-test('the prompt cache is offered for a provider that has a choice of cache length, and is remembered', async ({ page }) => {
-  await openAgentDataset(page);
-  await openChat(page);
-  await page.locator('#agent-chat-settings-btn').click();
-  // The scripted model caches nothing: no choice to offer.
-  await expect(page.locator('#agent-chat-cache-row')).toBeHidden();
-  await page.locator('#agent-chat-provider').selectOption('anthropic');
-  await expect(page.locator('#agent-chat-cache-row')).toBeVisible();
-  await expect(page.locator('#agent-chat-cache')).toHaveValue('5m');
-  await page.locator('#agent-chat-cache').selectOption('1h');
-  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('cellucid:agent-chat')).cache)).toBe('1h');
 });

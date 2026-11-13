@@ -327,6 +327,7 @@ function adoptTextColumn(state, fieldIndex, descriptor, asText) {
 }
 
 export class FieldLoadingMethods {
+  /** @this {import('../../core/data-state.js').DataState} */
   setFieldLoader(loaderFn) {
     this.fieldLoader = loaderFn;
   }
@@ -337,6 +338,7 @@ export class FieldLoadingMethods {
    * the matrix's own loader (a dataset just published: its values as
    * stored, the transform off).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {Function|null} loaderFn
    */
   setVarFieldLoader(loaderFn) {
@@ -351,6 +353,7 @@ export class FieldLoadingMethods {
    * of a loader that is not installed yet (a transform's cells' totals,
    * `expression-values.js`) waits on.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {{priority?: string, signal?: AbortSignal|null, start: (signal: AbortSignal, priority: string) => Promise<*>}} read
    * @returns {Promise<*>}
    */
@@ -358,10 +361,12 @@ export class FieldLoadingMethods {
     return fetchSchedulerOf(this).run({ key: {}, priority, signal: requireSignalOrNull(signal ?? null, 'Field loading signal'), start });
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getDatasetGeneration() {
     return readDatasetGeneration(this);
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   initVarData(geneList) {
     if (!geneList) return;
     const geneFields = geneList?.fields || [];
@@ -383,6 +388,7 @@ export class FieldLoadingMethods {
 
   /**
    * Ensure a field is loaded before use.
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex - Index of the field in obsData.fields
    * @param {Object} [options] - Options
    * @param {boolean} [options.silent=false] - If true, suppress notifications (for batch operations)
@@ -631,6 +637,7 @@ export class FieldLoadingMethods {
 
   /**
    * Ensure a var field (gene) is loaded before use.
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex - Index of the field in varData.fields
    * @param {Object} [options] - Options
    * @param {boolean} [options.silent=false] - If true, suppress notifications (for batch operations)
@@ -948,6 +955,7 @@ export class FieldLoadingMethods {
    * already loaded). Scheduled at `priority` (data/fetch-scheduler.js);
    * `owner` is the job the read is for (`app/jobs/cancellable-job.js`).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
    * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}|null>}
@@ -980,6 +988,7 @@ export class FieldLoadingMethods {
    * mapped one (`openExpressionMatrix`), scheduled as `readVarSparseColumn`.
    * The caller owns the arrays.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
    * @param {number} gene - The gene's position in `matrix.fields`
    * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
@@ -1005,6 +1014,7 @@ export class FieldLoadingMethods {
    * Some genes of an expression matrix other than the mapped one
    * (`openExpressionMatrix`) in some cells, as `readVarCellSubset` reads them.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
    * @param {number[]} genes - Distinct positions in `matrix.fields`
    * @param {ArrayLike<number>} cells - Distinct cell positions
@@ -1039,6 +1049,7 @@ export class FieldLoadingMethods {
    * field is a user-defined copy (which has no payload of its own). One of a
    * long run's reads: the user's own loads go first (data/fetch-scheduler.js).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number[]} fieldIndices - Distinct var field positions
    * @param {ArrayLike<number>} cells - Distinct cell positions
    * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options] -
@@ -1074,6 +1085,7 @@ export class FieldLoadingMethods {
    * gene route (`data/gene-delivery.js`): its reader runs in a worker. The
    * genes an analysis computes in its workers then never cross this thread.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {boolean}
    */
   deliversGenes() {
@@ -1085,6 +1097,7 @@ export class FieldLoadingMethods {
    * Whether var field `fieldIndex` is read from the source, and so can be
    * delivered: a user-defined copy has no payload of its own.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @returns {boolean}
    */
@@ -1097,6 +1110,7 @@ export class FieldLoadingMethods {
    * Open gene route `id` in this dataset's reader: `ports`, one per
    * analysis worker, are the reader's ends of its channels.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} id
    * @param {MessagePort[]} ports
    * @returns {Promise<void>}
@@ -1109,6 +1123,7 @@ export class FieldLoadingMethods {
   /**
    * The new port of route `id`'s worker `worker`, which the pool replaced.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {Promise<void>}
    */
   replaceGeneRoutePort(id, worker, port, generation) {
@@ -1119,6 +1134,7 @@ export class FieldLoadingMethods {
   /**
    * Let route `id` go; a dataset that no longer delivers holds none.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} id
    * @returns {Promise<void>}
    */
@@ -1132,6 +1148,7 @@ export class FieldLoadingMethods {
    * route (`data/gene-delivery.js`): what returns is only each gene's bytes.
    * Scheduled at `priority` like `readVarSparseColumn`.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number[]} fieldIndices - Deliverable var fields (`isVarFieldDeliverable`)
    * @param {Object} delivery
    * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
@@ -1148,6 +1165,7 @@ export class FieldLoadingMethods {
    * `deliverVarSparseColumns` from an expression matrix other than the
    * mapped one (`openExpressionMatrix`).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
    * @param {number[]} genes - Positions in `matrix.fields`
    * @param {Object} delivery
@@ -1165,6 +1183,7 @@ export class FieldLoadingMethods {
    * Some genes in some cells (`readVarCellSubset`), each run of genes
    * delivered to its analysis worker. One of a long run's reads.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number[]} fieldIndices - Deliverable var fields
    * @param {ArrayLike<number>} cells
    * @param {Object} delivery
@@ -1181,6 +1200,7 @@ export class FieldLoadingMethods {
   /**
    * `deliverVarCellSubset` from an expression matrix other than the mapped one.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @returns {Promise<{bytes: number}>}
    */
   async deliverMatrixCellSubset(matrix, genes, cells, delivery, options = {}) {
@@ -1190,7 +1210,7 @@ export class FieldLoadingMethods {
       (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner, runGenes: options.runGenes ?? null }));
   }
 
-  /** The descriptors of deliverable var fields. @private */
+  /** The descriptors of deliverable var fields. @this {import('../../core/data-state.js').DataState} @private */
   _deliverableDescriptors(fieldIndices) {
     return fieldIndices.map(index => {
       if (!this.isVarFieldDeliverable(index)) {
@@ -1200,7 +1220,7 @@ export class FieldLoadingMethods {
     });
   }
 
-  /** One delivery, through the download scheduler. @private */
+  /** One delivery, through the download scheduler. @this {import('../../core/data-state.js').DataState} @private */
   _deliverWith(loader, descriptors, options, signal, start) {
     if (typeof loader?.deliverSparseColumns !== 'function') {
       throw new Error('This dataset cannot deliver genes to analysis workers.');
@@ -1219,6 +1239,7 @@ export class FieldLoadingMethods {
    * Note: Genes loaded for bulk analyses (e.g., differential expression) can otherwise
    * accumulate in memory because loaded arrays are referenced from `varData.fields`.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex - Index of the field in varData.fields
    * @param {Object} [options]
    * @param {boolean} [options.preserveActive=true] - If true, do not unload an active gene field
@@ -1290,6 +1311,7 @@ export class FieldLoadingMethods {
     return true;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   setActiveField(fieldIndex) {
     const nextField = this.obsData?.fields?.[fieldIndex];
     if (!nextField || nextField._isDeleted === true) return null;
@@ -1345,6 +1367,7 @@ export class FieldLoadingMethods {
     };
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   setActiveVarField(fieldIndex) {
     const nextField = this.varData?.fields?.[fieldIndex];
     if (!nextField || nextField._isDeleted === true) return null;
@@ -1388,6 +1411,7 @@ export class FieldLoadingMethods {
    * sees partial values -- and once it is loaded whole, showing it
    * (`setActiveVarField`) writes every color again.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {number} fieldIndex
    * @param {Float32Array|import('../../../../data/column-forms.js').ColumnForm} column -
    *   The cells read so far: their sparse form (`readRows` the cells read),
@@ -1409,6 +1433,7 @@ export class FieldLoadingMethods {
   /**
    * Write the colors of the field shown again: a gene's partial colors
    * (`showPartialVarField`) were drawn and its load stopped or failed.
+   * @this {import('../../core/data-state.js').DataState}
    */
   restoreActiveFieldColors() {
     if (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0) return this.setActiveVarField(this.activeVarFieldIndex);
@@ -1416,6 +1441,7 @@ export class FieldLoadingMethods {
     return this.clearActiveField();
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   getContinuousFieldRef(fieldIndex) {
     if (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0) {
       const field = this.varData?.fields?.[this.activeVarFieldIndex];

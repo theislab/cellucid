@@ -1,5 +1,5 @@
 /**
- * @fileoverview Recently deleted (History v2 §3.3.9): every edit of the
+ * @fileoverview Recently deleted: every edit of the
  * history that can still be undone, newest first, across the trackers of
  * this dataset (a removed tracker's removal included): what it did, who did
  * it and when, Restore (`history.journal.undo`) and Empty for one entry or

@@ -7,7 +7,7 @@
  * data and reduces every hit's page location to origin and path; this checks
  * that what the property adds stays within the privacy model. Enhanced
  * measurement (page changes, scrolls, outbound clicks, site search, video,
- * file downloads, form interactions) is on by the owner's choice and is not
+ * file downloads, form interactions) is on by design and is not
  * checked.
  *
  * Fails (exit 1, naming each setting) when the container has

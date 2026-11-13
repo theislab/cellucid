@@ -13,7 +13,7 @@ import { formatCountOf } from '../../utils/format-units.js';
 import { createBy, createNote, FRESH_START_BRANCH_NAME, HISTORY_SENTENCES, idNumber, idOf, nameKey, suffixedName } from './model.js';
 import { branchOf, branchSteps, isOnPath, orderedDomains, pathBetween, pathTo, stepOf, valuesAt } from './tree.js';
 import { applyBranchDelete, archiveBranch, bookmarked, branchNamed, checkedName, createGroupOver, extendGroup, groupNamed, lockBranch, planBranchDelete, removeGroup, renameBranch, renameGroup, setBookmark, setMainBranch, squashableRun, squashRun, stepNamed, authorsOf } from './branches.js';
-import { beginEdit, commitEdit, purgeEntries } from './journal.js';
+import { purgeEntries } from './journal.js';
 import { staleOnPath, staleReasons } from './provenance.js';
 import { sameValue } from '../state/domains/same-value.js';
 import { describeStep, historyPage, historySummary } from './describe.js';
@@ -36,7 +36,7 @@ function unverifiedSentence(branch, { step, error }) {
  */
 export function createHistoryActions(h) {
   const {
-    appendRecord, beginTracker, byOf, carryTurn, catalog, dataset, domains, exclusive, journaled, jumpNow, liveTrackers, notify, now, off, openSaved, person, pool, prune, putBack, replayAsBranch, replaySteps, requireStarted, restoreEntry, restoreTo, sameCanonical, settleBeforeMove, show, startTracker, trackerNamed, trackerOf, trackers, use, useTrackerNow, withoutOff,
+    appendRecord, beginTracker, byOf, carryTurn, catalog, dataset, domains, exclusive, journaled, jumpNow, liveTrackers, notify, now, off, openSaved, pool, prune, putBack, replayAsBranch, replaySteps, requireStarted, restoreEntry, restoreTo, sameCanonical, settleBeforeMove, show, startTracker, trackerNamed, trackerOf, trackers, use, useTrackerNow, withoutOff,
   } = h;
 
   /** Whether a kept view's branch has moved on since it was kept (or is gone). */
@@ -53,7 +53,7 @@ export function createHistoryActions(h) {
    * Whether an input a step read is still what it read although its hash
    * differs (`staleOnPath`'s `sameRead`): a per-view input whose owner gives
    * the part the view the step acted in reads (`readPart(value, views)`, the
-   * `views` value it ran with), compared by content (F156). Any other input
+   * `views` value it ran with), compared by content. Any other input
    * differs.
    */
   function sameRead(input, recorded, current, views) {
@@ -302,7 +302,7 @@ export function createHistoryActions(h) {
       const rootValues = { ...path[0].after };
       // Nothing has moved when this fails: what was shown is put back, on the same tracker. A state
       // that cannot be shown (a read failing) gives no verdict, said as a step that could not run is
-      // (found 2026-11-10: the read's own error, with its address, was the notice).
+      // (never the read's own error, with its address).
       try {
         await restoreTo(withoutOff(rootValues), { signal });
       } catch (error) {
@@ -706,7 +706,7 @@ export function createHistoryActions(h) {
         return { ms: path.reduce((sum, step) => sum + (step.ms ?? 0), 0), bytes: null, what: `replays ${formatCountOf(path.length - 1, 'step')}` };
       } catch { return null; }
     }],
-    // Priced by the time its steps took when recorded (F166), as an apply and a verify are: a replay
+    // Priced by the time its steps took when recorded, as an apply and a verify are: a replay
     // of a step that summed the cells' totals is heavy before it starts. Only the saved state's steps
     // are read (its first chunks); a saved state or branch the replay would refuse is its to say.
     ['history.replay', async (params, { signal }) => {

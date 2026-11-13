@@ -66,7 +66,7 @@ test('without genes a gene-expression mode refuses before its pages', () => {
 });
 
 test('with no dataset open every mode says so, not that a kind of data is missing', () => {
-  // R9E-8: "Requires gene expression data." with no dataset open (None).
+  // Not "Requires gene expression data." with no dataset open (None).
   for (const UiClass of [...GENE_MODES, ...OTHER_MODES]) {
     const ui = uiOver(UiClass, [], undefined, 0);
     ui.dataLayer.getAvailableVariables = () => [];

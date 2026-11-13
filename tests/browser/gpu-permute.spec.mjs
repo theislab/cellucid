@@ -229,7 +229,7 @@ test('a recolor of an ordered live store holds the new colors in draw order', as
     const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
     viewer.setAdaptiveLOD(true);
     // The tree is built in a worker and its order adopted over frames: as
-    // long as the machine takes (240 frames were four seconds).
+    // long as the machine takes (a count of frames runs out on a slow one).
     while (renderer._liveOrder === null) await frame();
     const record = renderer._liveOrder;
     if (record === null) return { ordered: false };

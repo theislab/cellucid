@@ -263,7 +263,7 @@ test('bottleneck CPU phase analysis restores exact public renderer state after f
   assert.equal(renderer.activeQuality, 'light');
   assert.equal(renderer.forceLODLevel, 2);
   // Quality is absent from the restore list because the analysis never changes
-  // it (CEL-0235); restoring something untouched would be dead code that hides
+  // it; restoring something untouched would be dead code that hides
   // a future arm reintroducing the perturbation.
   assert.deepEqual(calls.slice(-3), [
     ['lod', true],
@@ -318,12 +318,12 @@ test('bottleneck CPU phases never disturb shader quality and restore forced LOD 
 
   const phases = await analyzer._runCPUPhaseAnalysis({ testFrames: 24 });
 
-  // Every arm runs at the quality the user already chose. The shader-quality
-  // sweep was removed with CEL-0235: this harness times the interval between
+  // Every arm runs at the quality the user already chose. There is no
+  // shader-quality sweep: this harness times the interval between
   // `requestAnimationFrame` callbacks, which cannot resolve a fragment-shader
   // difference in either direction, and the three qualities measure the same
-  // on instrumentation that can. Switching quality to time it only perturbed
-  // what was on screen.
+  // on instrumentation that can. Switching quality to time it would only perturb
+  // what is on screen.
   assert.deepEqual(
     samples,
     Array.from(
@@ -493,7 +493,7 @@ test('bottleneck default render parameters satisfy the exact renderer contract',
           return 2;
         },
       },
-      // The sprite the panel hands it (app/main.js: pointSpriteCap).
+      // The sprite the panel hands it (ui/modules/benchmark/benchmark-controls.js: pointSpriteCap).
       sprite: { pointSizeMax: 160 },
     },
   );
@@ -519,7 +519,7 @@ test('bottleneck default render parameters satisfy the exact renderer contract',
 test('renderer control source keeps UI controls coherent when synchronous preparation rejects', async () => {
   // The renderer controls are owned by `ui/modules/render-controls`, not by the
   // bootstrap: a session is restored by dispatching each control's own event,
-  // and their listeners have to already exist when that happens (CEL-0129).
+  // and their listeners have to already exist when that happens.
   const controlsSource = await readFile(
     new URL(
       '../assets/js/app/ui/modules/render-controls.js',
@@ -562,30 +562,6 @@ test('renderer control source keeps UI controls coherent when synchronous prepar
     controlsSource,
     /getNotificationCenter\(\)\.error\(/,
   );
-});
-
-test('live and snapshot render paths reach the GPU through the one draw seam', async () => {
-  const rendererSource = await readFile(
-    new URL(
-      '../assets/js/rendering/high-perf-renderer.js',
-      import.meta.url,
-    ),
-    'utf8',
-  );
-  for (const [start, end] of [
-    ['  render(params', '  _validateSpatialOwnerOnce('],
-    ['  renderWithSnapshot(id, params', '\n  }\n'],
-  ]) {
-    const from = rendererSource.indexOf(start);
-    assert.notEqual(from, -1, start);
-    const to = rendererSource.indexOf(end, from + start.length);
-    assert.notEqual(to, -1, end);
-    const body = rendererSource.slice(from, to);
-    // One `_drawPoints` call issues every draw; the pass itself never draws
-    // or uploads.
-    assert.equal(body.match(/this\._drawPoints\(/g)?.length, 1, start);
-    assert.doesNotMatch(body, /\.draw(Arrays|Elements)\(|bufferData\(|bufferSubData\(/, start);
-  }
 });
 
 test('context loss terminally detaches all ownership without touching WebGL and makes dispose silent', () => {

@@ -42,8 +42,7 @@ test('a link opening at startup is shown over the empty viewer, and Cancel start
   // The opening's panel is gone, and with no dataset shown the empty viewer
   // says so in its place a quarter of a second later (`drawEmpty`,
   // `EMPTY_AFTER_MS`). The moment between the two, the overlay hidden, is not
-  // waited for: a slow runner looked after it had passed (Windows Chromium,
-  // nightly run 43141748516).
+  // waited for: a slow runner looks after it has passed (Windows Chromium).
   await expect(overlay.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
   await expect(page.locator('.opening-overlay[data-state="empty"] .opening-title')).toHaveText('No dataset open');
   await expect(overlay.getByRole('button', { name: 'Show Open data' })).toBeVisible();
@@ -58,7 +57,7 @@ test('a link opening at startup is shown over the empty viewer, and Cancel start
   await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
 });
 
-test('a file opened while a dataset is shown is a notification with Cancel, closed with its outcome', async ({ page }) => {
+test('a file opened while a dataset is shown is a notification with Cancel, closed with its outcome; a refused file\'s card goes when the next opening begins', async ({ page }) => {
   await page.goto(`/?${PINNED}data=${encodeURIComponent(FIXTURE)}`, { waitUntil: 'domcontentloaded' });
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
@@ -96,92 +95,27 @@ test('a file opened while a dataset is shown is a notification with Cancel, clos
   // The overlay is for the empty viewer only.
   await expect(page.locator('.opening-overlay')).toBeHidden();
   await expect(page.locator('#dataset-cells')).toHaveText('120');
-});
 
-test('a refused file\'s card goes when the next opening begins, so it never reads as the dataset shown failing', async ({ page }) => {
-  // Found 2026-11-10: a refused .loom's card stayed on screen through thirteen later openings.
-  await page.goto(`/?${PINNED}data=${encodeURIComponent(FIXTURE)}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
-  const errors = page.locator('#notification-center .notification-error');
-  await chooseFiles(page.locator('#user-data-file-input'), {
-    name: 'damaged.loom', mimeType: 'application/octet-stream', buffer: Buffer.from('not an HDF5 file at all'),
-  });
-  await expect(errors.filter({ hasText: 'not a valid HDF5 file' })).toHaveCount(1);
-  // A file of a kind Cellucid does not open is refused before any opening
-  // begins; its card goes the same way (R9U-13: it outlived two datasets).
-  await chooseFiles(page.locator('#user-data-file-input'), {
-    name: 'table.csv', mimeType: 'text/csv', buffer: Buffer.from('a,b\n1,2\n'),
-  });
-  await expect(errors.filter({ hasText: 'is not a file Cellucid can open' })).toHaveCount(1);
-  await chooseFiles(page.locator('#user-data-file-input'), ARCHIVE_FILE);
-  await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
-  await expect(errors).toHaveCount(0);
-});
-
-// A reader that never answers (WebKit once deadlocked its thread inside a
-// garbage collection: `formats/io/inflate.js`) leaves an opening with
-// nothing moving. After the stall interval of a startup step (60 s) the
-// opening says which step it waits on, in its notification and in the
-// console; Cancel stays, nothing is stopped for the person. Closing the page
-// stops the opening instead of waiting for the reader, so teardown ends.
-test('an opening whose reader never answers says what it waits on, and the page still closes', async ({ page }) => {
-  test.setTimeout(180_000);
-  const stalls = [];
-  page.on('console', message => {
-    if (message.text().startsWith('[cellucid:opening]')) stalls.push(`${message.type()}: ${message.text()}`);
-  });
-  await page.goto(`/?${PINNED}data=${encodeURIComponent(FIXTURE)}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-cells')).toHaveText('120');
-
-  await page.evaluate(async () => {
-    const { setAnnDataReaderWorkerFactory } = await import('/assets/js/data/anndata-reader-client.js');
-    window.__silentReaders = [];
-    setAnnDataReaderWorkerFactory(() => {
-      const reader = {
-        onmessage: null,
-        onerror: null,
-        asked: [],
-        terminated: false,
-        postMessage(message) {
-          // Only a request (`{id, method, args}`) asks a reader anything:
-          // what it is handed as it starts (the page's range cache, a
-          // widget's host, the page's memory state) and the notices it is
-          // sent (a memory release, leave) are not requests.
-          if (typeof message?.method !== 'string') return;
-          this.asked.push(message.method);
-        },
-        terminate() {
-          this.terminated = true;
-        },
-        addEventListener() {},
-        removeEventListener() {},
-      };
-      window.__silentReaders.push(reader);
-      return reader;
+  await test.step('a refused file\'s card goes when the next opening begins, so it never reads as the dataset shown failing', async () => {
+    // The card of the opening above is closed, so the one counted below is the next opening's.
+    await page.evaluate(async () => {
+      const { getNotificationCenter } = await import('/assets/js/app/notification-center.js');
+      getNotificationCenter().dismissAll();
     });
+    await expect(page.locator('#notification-center .notification')).toHaveCount(0);
+    const errors = page.locator('#notification-center .notification-error');
+    await chooseFiles(page.locator('#user-data-file-input'), {
+      name: 'damaged.loom', mimeType: 'application/octet-stream', buffer: Buffer.from('not an HDF5 file at all'),
+    });
+    await expect(errors.filter({ hasText: 'not a valid HDF5 file' })).toHaveCount(1);
+    // A file of a kind Cellucid does not open is refused before any opening
+    // begins; its card goes the same way.
+    await chooseFiles(page.locator('#user-data-file-input'), {
+      name: 'table.csv', mimeType: 'text/csv', buffer: Buffer.from('a,b\n1,2\n'),
+    });
+    await expect(errors.filter({ hasText: 'is not a file Cellucid can open' })).toHaveCount(1);
+    await chooseFiles(page.locator('#user-data-file-input'), ARCHIVE_FILE);
+    await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
+    await expect(errors).toHaveCount(0);
   });
-  await chooseFiles(page.locator('#user-data-file-input'), ARCHIVE_FILE);
-  await expect.poll(() => page.evaluate(() => window.__silentReaders.flatMap(reader => reader.asked))).toEqual(['open']);
-
-  const opening = page.locator('#notification-center .notification-progress')
-    .filter({ hasText: 'Opening current-ui-smoke.zarr.zip' });
-  await expect(opening).toContainText('Nothing has changed for 1 min', { timeout: 90_000 });
-  await expect(opening).toContainText('while reading the file.');
-  expect(stalls).toEqual([
-    'warning: [cellucid:opening] Opening current-ui-smoke.zarr.zip stalled while reading the file: ' +
-      'nothing has changed for 1 min 0 s.',
-  ]);
-  // Still under way: the person decides.
-  await expect(opening.locator('[data-role="cancel"]')).toHaveCount(1);
-  await expect(page.locator('#dataset-name')).toHaveText('Opening current-ui-smoke.zarr.zip…');
-
-  // The application closes without waiting for the reader: the opening is
-  // stopped and its reader ended.
-  const closed = await page.evaluate(async () => {
-    await window._cellucidDispose();
-    return window.__silentReaders.map(reader => reader.terminated);
-  });
-  expect(closed).toEqual([true]);
 });

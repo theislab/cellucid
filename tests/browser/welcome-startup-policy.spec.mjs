@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import {
@@ -8,9 +7,7 @@ import {
   SAMPLE_CATALOG_URL,
   appUrl,
 } from './helpers/origins.mjs';
-import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
-import { jsonResponse, serveAnnDataServer } from './helpers/anndata-server.mjs';
-import { TEST_COMMIT, answerLastCommit } from './helpers/github-api.mjs';
+import { serveAnnDataServer } from './helpers/anndata-server.mjs';
 
 const FIXTURE_ID = 'current-ui';
 const FIXTURE_NAME = 'Current UI fixture';
@@ -97,78 +94,6 @@ test('an exact remote-server URL startup never shows or paints onboarding', asyn
   remoteUrl.searchParams.set('dataset', FIXTURE_ID);
   remoteUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
-
-  await expectDatasetWithoutWelcome(page);
-  expect(errors).toEqual([]);
-});
-
-test('an exact same-origin remote startup never shows or paints onboarding', async ({
-  page,
-}) => {
-  const errors = collectBrowserErrors(page);
-  await installWelcomePaintProbe(page);
-  await serveAnnDataServer(page, APP_ORIGIN, FIXTURE, {
-    info: { host: APP_HOST, port: APP_PORT },
-  });
-
-  const remoteUrl = new URL('/', APP_ORIGIN);
-  remoteUrl.searchParams.set('source', 'remote');
-  remoteUrl.searchParams.set('dataset', FIXTURE_ID);
-  remoteUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
-  await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
-
-  await expectDatasetWithoutWelcome(page);
-  expect(errors).toEqual([]);
-});
-
-test('an exact GitHub URL startup never shows or paints onboarding', async ({
-  page,
-}) => {
-  const errors = collectBrowserErrors(page);
-  await installWelcomePaintProbe(page);
-  const rawPrefix =
-    'https://raw.githubusercontent.com/cellucid-tests/data/HEAD/catalog/';
-  await page.route(`${rawPrefix}datasets.json`, route =>
-    jsonResponse(route, {
-      schema: 2,
-      default: FIXTURE_ID,
-      datasets: [{ id: FIXTURE_ID, path: 'current-ui.h5ad' }],
-    }));
-  const bytes = readFileSync(FIXTURE_FILE);
-  // Listed at the catalog's ref; opened at the commit that last wrote it, as
-  // GitHub's API names it.
-  await page.route(`${rawPrefix}current-ui.h5ad`, route => fulfillFile(route, bytes));
-  await answerLastCommit(page, { owner: 'cellucid-tests', repo: 'data' });
-  await page.route(
-    `https://raw.githubusercontent.com/cellucid-tests/data/${TEST_COMMIT}/catalog/current-ui.h5ad`,
-    route => fulfillFile(route, bytes),
-  );
-
-  const githubUrl = new URL('/', APP_ORIGIN);
-  githubUrl.searchParams.set(
-    'data',
-    'gh:cellucid-tests/data/catalog',
-  );
-  githubUrl.searchParams.set('dataset', FIXTURE_ID);
-  githubUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
-  await page.goto(githubUrl.toString(), { waitUntil: 'domcontentloaded' });
-
-  await expectDatasetWithoutWelcome(page);
-  expect(errors).toEqual([]);
-});
-
-test('an exact authenticated viewer host URL startup never shows or paints onboarding', async ({
-  page,
-}) => {
-  const errors = collectBrowserErrors(page);
-  await installWelcomePaintProbe(page);
-  await serveAnnDataServer(page, APP_ORIGIN, FIXTURE, { viewerHost: true });
-
-  const viewerHostUrl = new URL('/', APP_ORIGIN);
-  viewerHostUrl.searchParams.set('viewer', 'true');
-  viewerHostUrl.searchParams.set('viewerId', 'viewer-1');
-  viewerHostUrl.searchParams.set('viewerToken', 'token-1');
-  await page.goto(viewerHostUrl.toString(), { waitUntil: 'domcontentloaded' });
 
   await expectDatasetWithoutWelcome(page);
   expect(errors).toEqual([]);

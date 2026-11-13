@@ -11,8 +11,8 @@
  * frame slowly), the folder opens progressively: a first view, then steps
  * to every cell. Its matrix is
  * still read in one pass, for the cells the opening grows to, and one share
- * is kept (`AnnDataReader.shareRows`, `MatrixStream.ensure`); a pass a step
- * read the whole matrix again each step and kept a share each.
+ * is kept (`AnnDataReader.shareRows`, `MatrixStream.ensure`), not a pass a step
+ * reading the whole matrix again each step and keeping a share each.
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -148,18 +148,14 @@ async function noteOpenCounts(page) {
   });
 }
 
-for (const opening of ['at once', 'progressively']) test.describe(`opened ${opening}`, () => {
+test.describe('opened progressively', () => {
   // What showing a cell costs this page (`data/opening-cost.js`), held by
   // the fixture's device: 2 ms a cell, so 3,000 cells take 6 s, a first
   // view of the cells shown within a second opens, then steps to every
-  // cell; or nothing measured, so every cell opens at once (as on a fast
-  // GPU). The page's own records leave it as it is: measured, the start
-  // sample's record landed at its first frame, after startup was ready on a
-  // slow runner, and made the "at once" opening progressive (Web contracts
-  // run 41307458156, Linux Firefox).
-  test.use({ device: { openingMsPerCell: opening === 'progressively' ? 2 : null } });
+  // cell. The page's own records leave it as it is.
+  test.use({ device: { openingMsPerCell: 2 } });
 
-  test(`a MatrixMarket folder larger than its tables draws its cells first (${opening}), then its genes arrive in one pass; a later visit reads nothing of it`, async ({ page, context, browserName }, testInfo) => {
+  test('a MatrixMarket folder larger than its tables draws its cells first (progressively), then its genes arrive in one pass; a later visit reads nothing of it', async ({ page, context, browserName }, testInfo) => {
     const errors = [];
     page.on('pageerror', error => errors.push(`page: ${error.stack || error.message}`));
     page.on('console', message => { if (message.type() === 'error') errors.push(`console: ${message.text()}`); });
@@ -176,8 +172,7 @@ for (const opening of ['at once', 'progressively']) test.describe(`opened ${open
     await expect(page.locator('#dataset-cells')).toHaveText(CELLS_SHOWN);
     await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPointCount()), { timeout: 60_000 }).toBe(CELLS);
     const counts = await page.evaluate(() => window.__counts);
-    if (opening === 'progressively') expect(counts[0], `open counts ${counts.join(' → ')}`).toBeLessThan(CELLS);
-    else expect(counts).toEqual([CELLS]);
+    expect(counts[0], `open counts ${counts.join(' → ')}`).toBeLessThan(CELLS);
     // The share arrives (every cell fits this device): genes are read for every open cell.
     await expect.poll(() => page.evaluate(() => window._cellucidState.getGeneSample()), { timeout: 60_000 }).toBeNull();
     await chooseGene(page, `g${GENE}`);

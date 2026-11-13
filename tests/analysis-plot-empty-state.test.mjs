@@ -3,8 +3,8 @@
  *
  * Every distribution plot type drops pages it cannot draw: a violin needs two
  * finite values, a density curve needs a non-empty kernel estimate. When that
- * leaves no traces at all, the shared render pipeline used to hand Plotly the
- * normal axis layout, so a single-cell page produced bare 0-6 axes around
+ * leaves no traces at all, the shared render pipeline does not hand Plotly the
+ * normal axis layout, which would give a single-cell page bare 0-6 axes around
  * nothing - indistinguishable from a broken plot.
  *
  * These assertions read the shipped source rather than executing Plotly, which

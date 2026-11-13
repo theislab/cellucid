@@ -5,10 +5,10 @@
  * Firefox on desktop OpenGL then emulates that attribute for every vertex and
  * warns "Drawing without vertex attrib 0 array enabled forces the browser to
  * do expensive emulation work". With the locations left to the linker,
- * attribute 0 was whichever input it chose, and a program drew without it
- * whenever no earlier pass had happened to leave location 0 enabled: the
- * instanced connectivity edges did exactly that once the default background
- * stopped drawing the grid first.
+ * attribute 0 is whichever input it chooses, and a program draws without it
+ * whenever no earlier pass has happened to leave location 0 enabled (the
+ * instanced connectivity edges do exactly that when the default background
+ * does not draw the grid first).
  *
  * So every vertex shader in the tree names a location for every input, one of
  * them is 0, and no two share one. The program's draw path enables every input

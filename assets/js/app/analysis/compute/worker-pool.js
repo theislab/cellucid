@@ -96,11 +96,11 @@ export const ABANDONED_TASK_GRACE_MS = 250;
 
 /**
  * Payload bytes this thread copies into workers within one task. A payload
- * that is not transferred is structured-cloned by `postMessage`, at about
- * 9 GB/s: the density plot of a ten-million-cell page hands each of eight
- * workers its support and weights, about 1 GB in one task (114 ms) when every
- * slice is dispatched at once. Past this budget the next dispatch waits for a
- * task of its own, so no task copies much more than this (about 10 ms).
+ * that is not transferred is structured-cloned by `postMessage` (measured
+ * rate: 37_decisions_analysis.md): the density plot of a ten-million-cell page
+ * hands each of eight workers its support and weights, about 1 GB in one task
+ * when every slice is dispatched at once. Past this budget the next dispatch
+ * waits for a task of its own, so no task copies much more than this.
  */
 export const DISPATCH_CLONE_BYTES_PER_TASK = 96 * 1024 * 1024;
 

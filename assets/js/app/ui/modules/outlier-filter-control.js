@@ -170,9 +170,8 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
   let dragging = false;
   // So is a value given and not committed yet (an `input` whose `change` has
   // not come: keys, a typed value, assistive technology): a render between
-  // the two put the thumb back at the threshold in effect, and the commit
-  // then read that old value and filtered nothing (found 2026-11-12: a
-  // legend redrawn a moment after the field was shown, WebKit, 1 run in 5).
+  // the two would put the thumb back at the threshold in effect, and the commit
+  // would then read that old value and filter nothing.
   let editing = false;
 
   function activeFieldOf(candidate) {
@@ -201,10 +200,9 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
           : `no category has ${formatCountOf(status.minPoints, 'cell')}, the fewest the filter measures`);
       // The thumb is left alone while it is being dragged, holds a value not
       // committed yet, or a committed value is still being applied (its
-      // action waits behind another, a coloring: drawn then, the thumb
-      // jumped back to the threshold still in effect, and a second commit
-      // read that one; measured 2026-11-12, WebKit: the redraw 20 ms after
-      // the commit, the action 30 ms later). `onSettled` draws it once done.
+      // action waits behind another, a coloring: drawn then, the thumb would
+      // jump back to the threshold still in effect, and a second commit would read
+      // that one) (measured: 35_decisions_interface.md). `onSettled` draws it once done.
       if (!(dragging || editing || thresholdDispatch.pending) || !usable) {
         const pct = usable ? Math.round((field._outlierThreshold ?? 1) * 100) : 100;
         input.value = String(pct);

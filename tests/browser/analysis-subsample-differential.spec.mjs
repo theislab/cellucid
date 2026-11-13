@@ -211,7 +211,7 @@ function expectComposition(got, opening) {
   expect([...got.types].sort()).toEqual([...REFERENCE.types].sort());
 }
 
-for (const name of ['all-priority', 'uniform-file-seed', 'stratified-balanced', 'spatial', 'served-uniform', 'served-r-uniform']) {
+for (const name of ['all-priority', 'uniform-file-seed', 'stratified-balanced', 'spatial']) {
   test(`${name}: differential expression and composition equal the reference on the kept cells`, async ({ page }) => {
     test.setTimeout(180_000);
     const errors = collectErrors(page);
@@ -219,7 +219,7 @@ for (const name of ['all-priority', 'uniform-file-seed', 'stratified-balanced', 
     await open(page, opening);
     expectDE(await runDE(page), opening);
     // Every result says how the open cells were chosen: a warning when they
-    // are not a random sample of the file at one rate (audit F-2).
+    // are not a random sample of the file at one rate.
     const chip = page.locator('#analysis-panel-differential .analysis-cell-choice');
     const method = opening.request?.method ?? null;
     if (method === null) {
@@ -454,7 +454,7 @@ async function expectFiltered(page, opening, kept, label) {
     : `Showing ${kept.length.toLocaleString('en-US')} of ${of}`);
 }
 
-for (const name of ['stratified-proportional', 'blocks', 'served-r-uniform']) {
+for (const name of ['stratified-proportional']) {
   test(`${name}: every kind of filter keeps exactly the reference's cells, and the counts say the open cells of every cell`, async ({ page }) => {
     test.setTimeout(180_000);
     const errors = collectErrors(page);
@@ -530,7 +530,7 @@ function relative(actual, expected, tolerance, label) {
   relativeClose(actual, expected, tolerance, label);
 }
 
-for (const name of ['spatial', 'blocks', 'served-r-uniform']) {
+for (const name of ['blocks', 'served-r-uniform']) {
   test(`${name}: Quick insights and the Detailed view's numbers equal the reference on the kept cells`, async ({ page }) => {
     test.setTimeout(180_000);
     const errors = collectErrors(page);

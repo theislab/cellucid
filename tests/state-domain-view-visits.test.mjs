@@ -5,9 +5,9 @@
  * under way the focused view is its cursor — possibly a live view the person
  * removed — and what draws the view list and the sidebar from the focused
  * view waits for its end (`visitingViews`; `ui-coordinator.js`,
- * `view-controls.js`). L14-3: reopening a saved lung analysis whose live
- * view was removed threw "A hidden live view cannot be the active view" from
- * a frame drawn mid-visit.
+ * `view-controls.js`). Reopening a saved analysis whose live view was removed
+ * must not throw "A hidden live view cannot be the active view" from a frame
+ * drawn mid-visit.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

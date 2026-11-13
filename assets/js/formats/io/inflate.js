@@ -9,8 +9,8 @@
  * gzip codec (`'gzip'`), ZIP entries (`'deflate-raw'`). Native inflation is
  * fast on one core, but each stream carries a fixed cost (its stream
  * objects, the pipe, a promise per read), and on small chunks in some
- * engines that cost contends across threads: eight Firefox workers inflate
- * h5py's 34 KB chunks at 160 MB/s in total, one at 300. fflate inflates a
+ * engines that cost contends across threads (in Firefox, eight workers inflate
+ * small chunks slower in total than one). fflate inflates a
  * whole chunk in one synchronous call, so it is a candidate only where the
  * decoded size is known (the output is allocated at it, one byte more to
  * catch a stream that runs past it) and the whole compressed chunk is in
@@ -26,8 +26,8 @@
  * memory past what the format declared. The input is fed to the decompressor
  * in slices (`createSlicedInputStream`), so that bound holds while it
  * decodes: WebKit's decompressor inflates everything written to it at once,
- * and a whole chunk written in one piece expanded a 60 MB bomb past a
- * 1024-byte declared size before the reader could stop it. The session
+ * and a whole chunk written in one piece would expand a bomb far past its
+ * declared size before the reader could stop it. The session
  * codec (`app/session/codecs/gzip.js`) paces its input the same way, both
  * ways: a session chunk is compressed from the same slices. The slices also
  * hand the thread back (`NATIVE_CODEC_SLICE_MS`), so a long payload is never
@@ -39,7 +39,7 @@
  * the reader, so a collection that starts during the release never finishes,
  * and every later collection in the tab waits behind it — the page's too
  * (WebKit 314030@main, `ReadableStreamDefaultReader::releaseLock`). A
- * dataset whose structure reads a compressed chunk then hung for good on
+ * dataset whose structure reads a compressed chunk would then hang for good on
  * opening (`tests/browser-stream-reader-release-contract.test.mjs`).
  *
  * @module formats/io/inflate
@@ -86,10 +86,10 @@ export const NATIVE_INFLATE_INPUT_SLICE_BYTES = 32 * 1024;
  * by {@link createSlicedInputStream} holds its thread before the stream hands
  * the event loop back: below one 60 Hz frame. Every engine runs the native
  * transform on the thread that feeds it, and a stream pumped by promises
- * never leaves the task it started in, so however finely the input was
- * sliced a whole payload was one task: saving a session whose marker
- * statistics covered 230 groups x 45,525 genes (215 MB, gzip at about
- * 40 MB/s) held the main thread for 4.9 s.
+ * never leaves the task it started in, so however finely the input is
+ * sliced a whole payload is one task: gzip runs at tens of MB/s, so a session
+ * of hundreds of MB would hold the main thread for seconds (measured:
+ * 21_decisions_decoders_and_codecs.md).
  */
 export const NATIVE_CODEC_SLICE_MS = 12;
 

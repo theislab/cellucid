@@ -15,6 +15,11 @@ import {
   assertSafeInteger,
 } from '../schema-contract.js';
 import { createSlicedInputStream } from '../../../formats/io/inflate.js';
+
+// A compression stream takes the bytes of any buffer that is not shared
+// between threads, and the bytes given here never are: the streams below are
+// typed by the chunks they are given (`Uint8Array`), which the platform's
+// own declaration narrows to one kind of buffer.
 import { requireExactKeys } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { throwIfAborted, requireSignalOrNull } from '../../../utils/abort.js';
@@ -229,7 +234,7 @@ export async function gzipDecompress(compressed, options) {
   }
 
   const decompressedStream = createSlicedInputStream([compressed])
-    .pipeThrough(new DecompressionStream('gzip'));
+    .pipeThrough(/** @type {ReadableWritablePair<Uint8Array, Uint8Array>} */ (new DecompressionStream('gzip')));
   try {
     return await streamToUint8Array(decompressedStream, {
       maxBytes: maxOutputBytes,
@@ -271,6 +276,6 @@ export async function gzipCompress(uncompressed, options) {
   // chunk of hundreds of megabytes (an analysis's marker statistics) is
   // compressed over many tasks, not one that holds the page for seconds.
   const compressedStream = createSlicedInputStream([uncompressed])
-    .pipeThrough(new CompressionStream('gzip'));
+    .pipeThrough(/** @type {ReadableWritablePair<Uint8Array, Uint8Array>} */ (new CompressionStream('gzip')));
   return streamToUint8Array(compressedStream, { maxBytes: null, signal });
 }

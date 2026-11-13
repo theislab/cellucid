@@ -10,8 +10,8 @@
  * - `src/cellucid/history_model.schema.json` in cellucid-python,
  * - `inst/history_model.schema.json` in cellucid-r,
  *
- * byte for byte the same, each pinned by SHA-256 in its repository's tests
- * (`tests/history-model-schema.test.mjs` here; the session reader tests of
+ * byte for byte the same (`tests/shared-files-contract.test.mjs` compares the
+ * copies; `tests/history-model-schema.test.mjs` here and the session reader tests of
  * the two packages, which also fail on a field of the schema their reading
  * model does not expose).
  *
@@ -20,46 +20,25 @@
  *
  * The sibling repositories are found next to this one, or where
  * `CELLUCID_PYTHON_ROOT` and `CELLUCID_R_ROOT` say; one that is not there is
- * named and skipped. After writing, put the printed digest in the three
- * tests. Canonical as the action catalog is: object keys sorted, two-space
- * indent, one trailing newline.
+ * named and skipped (`scripts/shared-files.mjs` lists the copies). Canonical
+ * as the action catalog is: object keys sorted, two-space indent, one
+ * trailing newline.
  */
 
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { historyModelDocument } from '../assets/js/app/history/model.js';
 import { sortedKeys } from './generate-action-catalog.mjs';
+import { copyPaths, sharedFile } from './shared-files.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const HISTORY_MODEL_PATH = path.join(ROOT, 'tests', 'fixtures', 'history-model.schema.json');
 
-/** Where each package keeps its copy, relative to its repository. */
-export const HISTORY_MODEL_MIRRORS = Object.freeze([
-  Object.freeze({ repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', file: 'src/cellucid/history_model.schema.json' }),
-  Object.freeze({ repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', file: 'inst/history_model.schema.json' }),
-]);
-
 /** The model document's canonical text, as this checkout's model makes it. */
 export function renderHistoryModel() {
   return `${JSON.stringify(sortedKeys(historyModelDocument()), null, 2)}\n`;
-}
-
-/** The SHA-256 of the canonical text (what the three tests pin). */
-export function historyModelDigest(text = renderHistoryModel()) {
-  return createHash('sha256').update(text).digest('hex');
-}
-
-/** Each mirror's absolute path, or null when its repository is not there. */
-export function historyModelMirrorPaths(env = process.env) {
-  return HISTORY_MODEL_MIRRORS.map(mirror => {
-    const root = env[mirror.env] ?? path.join(ROOT, '..', mirror.repository);
-    const target = path.join(root, mirror.file);
-    return { ...mirror, path: existsSync(path.dirname(target)) ? target : null };
-  });
 }
 
 async function readOrNull(file) {
@@ -78,7 +57,7 @@ async function main() {
   const text = renderHistoryModel();
   const targets = [
     { repository: 'cellucid', path: HISTORY_MODEL_PATH },
-    ...historyModelMirrorPaths(),
+    ...copyPaths(sharedFile('tests/fixtures/history-model.schema.json')),
   ];
   let stale = 0;
   for (const target of targets) {
@@ -99,9 +78,8 @@ async function main() {
     await writeFile(target.path, text);
     console.log(`wrote   ${path.relative(path.join(ROOT, '..'), target.path)}`);
   }
-  console.log(`sha256  ${historyModelDigest(text)}`);
   if (stale > 0) {
-    console.log('Run node scripts/generate-history-model.mjs and pin the digest above in the three repositories.');
+    console.log('Run node scripts/generate-history-model.mjs and update both packages\' reading models.');
     process.exitCode = 1;
   }
 }

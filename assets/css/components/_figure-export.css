@@ -239,7 +239,7 @@
   margin: 0;
 }
 
-/* A panel far from the shape asked for, and Fit the cells (F119): one line. */
+/* A panel far from the shape asked for, and Fit the cells: one line. */
 .figure-export-shape-note {
   margin: 0;
   display: flex;

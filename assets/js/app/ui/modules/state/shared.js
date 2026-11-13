@@ -100,7 +100,7 @@ let lastEditToast = null;
 
 /**
  * Tell the person an edit of the history happened, with Undo for a while
- * (History v2 §3.15.6: "Squashed 6 steps · Undo", 8 s; Recently deleted keeps
+ * ("Squashed 6 steps · Undo", 8 s; Recently deleted keeps
  * it after that). Each edit's toast replaces the one before, so a run of
  * edits (and a phone's narrow stack) shows one card: the latest, whose Undo
  * is the one that applies.

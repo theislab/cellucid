@@ -29,6 +29,7 @@ import { DataStateExpressionMethods } from '../managers/expression-values.js';
 import { RAW_VALUES } from '../../../data/expression-transform.js';
 import { inactiveFieldBytes, releaseInactiveFieldsOverBudget } from '../managers/field/residency.js';
 import { registerResidentHolder, setOpenCells, setWorkingSet } from '../../../data/memory-budget.js';
+import { applyMixin } from '../../../utils/apply-mixin.js';
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -192,12 +193,6 @@ export class DataState extends EventEmitter {
   }
 }
 
-function applyMixin(targetProto, mixinProto) {
-  const descriptors = Object.getOwnPropertyDescriptors(mixinProto);
-  delete descriptors.constructor;
-  Object.defineProperties(targetProto, descriptors);
-}
-
 Object.defineProperty(DataState.prototype, 'pointCount', {
   configurable: true,
   /** The open cells of the shown dataset. */
@@ -235,7 +230,7 @@ applyMixin(DataState.prototype, DataStateExpressionMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);
-Object.defineProperties(DataState.prototype, Object.getOwnPropertyDescriptors(highlightStateMethods));
+applyMixin(DataState.prototype, highlightStateMethods);
 
 Object.defineProperties(DataState.prototype, {
   getDerivedResults: {

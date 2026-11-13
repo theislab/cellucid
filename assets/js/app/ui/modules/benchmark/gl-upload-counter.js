@@ -28,7 +28,7 @@
  * - `getError`, `finish`, `flush`, `readPixels` and `getBufferSubData` are the
  *   synchronous points. On Chrome/ANGLE `getError` drains the command buffer
  *   to the GPU process; two of them per view per frame is a pipeline stall
- *   twice a frame, and until now nothing counted them.
+ *   twice a frame, which is why they are counted.
  *
  * The wrappers are fixed-arity and dispatch on `arguments.length`, so a
  * counted call allocates nothing and the measurement window stays clean.

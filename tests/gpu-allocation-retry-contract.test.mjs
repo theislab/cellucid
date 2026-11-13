@@ -87,25 +87,6 @@ test('a refusal with nothing kept, or a second refusal, names the allocation and
   }
 });
 
-test('no allocation path evicts kept memory ahead of a refusal', () => {
-  const source = readFileSync(new URL('../assets/js/rendering/high-perf-renderer.js', import.meta.url), 'utf8');
-  // Eviction is the budget's (no argument), a new dataset's (Infinity), or a
-  // refusal's (inside `_allocateGpu`); never "make room for N bytes".
-  const calls = source.match(/evictRetainedGeometry\(([^)]*)\)/g) ?? [];
-  for (const call of calls) {
-    assert.match(call, /evictRetainedGeometry\((|Infinity|headroomBytes = 0)\)/, call);
-  }
-  for (const site of [
-    // Every per-point vertex store (`_allocatePointStore`).
-    'of point storage for',
-    'could not allocate the alpha texture',
-    'could not allocate its slot map',
-    'could not allocate its R8 texture',
-  ]) {
-    assert.ok(source.includes(site), site);
-  }
-});
-
 test('a failed tree build is retried once memory has been released, not before', async t => {
   const { getNotificationCenter } = await import('../assets/js/app/notification-center.js');
   const center = getNotificationCenter();

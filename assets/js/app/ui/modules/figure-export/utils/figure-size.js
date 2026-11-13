@@ -17,8 +17,8 @@
  *   millimetres and pixels.
  *
  * Nobody converts pixels to points by hand: the settings hold millimetres
- * and points, and this module turns them into figure pixels (an agent once
- * set 1800 px for "180 mm" and got a figure 476 mm wide; live-7 L25-10).
+ * and points, and this module turns them into figure pixels (an agent that
+ * set 1800 for "180 mm" would get a figure 476 mm wide).
  *
  * @module ui/modules/figure-export/utils/figure-size
  */

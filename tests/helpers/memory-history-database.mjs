@@ -103,7 +103,7 @@ export function memoryDatabase() {
  * Writes run when the test says (`await writes.run()`), as the page's next
  * task would run them, and `run` ends when they have ended: a write digests
  * its arrays on other threads, so no count of event-loop turns is enough for
- * it (CI run 42129386525: a million-cell array not yet stored after 40 turns).
+ * it (a million-cell array is not yet stored after dozens of turns).
  */
 export function manualSchedule() {
   const queue = [];

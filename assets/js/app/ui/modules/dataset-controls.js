@@ -32,7 +32,7 @@ import {
   describeDataSourceFailure,
   initDatasetConnections
 } from './dataset-connections.js';
-import { isPlainRecord, requireExactKeys, requireKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { requireExactKeys, requireKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 import { formatOpenCells, formatCompactCount } from '../../../utils/format-units.js';
 import { awaitWithSignal, isCancellation, onAbort, settleInBackground } from '../../../utils/abort.js';
 import { NO_DATASET_OPEN } from '../no-dataset.js';
@@ -746,7 +746,7 @@ export function initDatasetControls(options) {
   /**
    * What a listed option says: its label (name and cells), or, the one
    * chosen while the picker is at rest, its name alone (the Dataset card
-   * above says its cells: bug hunt F8, owner 2026-11-10); the dataset being
+   * above says its cells); the dataset being
    * opened says so after it. A native select's closed label is its chosen
    * option's text, so the text follows the picker: full while it is reached
    * for (pointer, focus), short once it is left or a choice is made.
@@ -865,6 +865,7 @@ export function initDatasetControls(options) {
         describeFailedSources([{ sourceType: 'local-demo', datasets: [], error: errorFromUnknown(error, 'Sample catalog') }]),
         retryCatalog
       );
+      retryListingWhenOnline([error]);
       return;
     }
     if (!ownsCatalogGeneration(generation)) return;
@@ -991,7 +992,7 @@ export function initDatasetControls(options) {
    * the listing's). A failed dataset opening is retired by the next dataset
    * on screen or None: a listing that was still reading when the person
    * picked a dataset, and settles after that dataset failed, must not take
-   * the failure's explanation and retry off the screen (F71).
+   * the failure's explanation and retry off the screen.
    */
   function clearListingNotice() {
     if (noticeRetry === null || noticeRetry === retryCatalog) clearCatalogNotice();
@@ -1074,6 +1075,21 @@ export function initDatasetControls(options) {
       catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
     };
     void invokeTracked(retry).then(settle, settle);
+  }
+
+  /**
+   * A listing that failed because this browser is offline is asked again
+   * once it is back online, as a read waiting for the connection goes on
+   * (`formats/io/byte-source.js`): its notice's Try again, pressed for the
+   * person while the notice still offers it.
+   *
+   * @param {unknown[]} errors - what the listing failed with
+   */
+  function retryListingWhenOnline(errors) {
+    if (!errors.some(error => describeHostFault(error)?.kind === 'offline')) return;
+    ownerDocument.defaultView?.addEventListener('online', () => {
+      if (noticeRetry === retryCatalog) handleCatalogRetryClick();
+    }, { once: true, signal: lifecycleController.signal });
   }
 
   catalogRetryButton.addEventListener(
@@ -1259,6 +1275,7 @@ async function populateDatasetDropdown(options = {}) {
       if (refresh) showSessionStatus('Dataset list reloaded', false);
     } else {
       setCatalogNotice(failureMessage, retryCatalog);
+      retryListingWhenOnline(allSourceDatasets.map(record => record.error));
       if (refresh) showSessionStatus(failureMessage, true);
     }
 
@@ -1359,10 +1376,11 @@ async function populateDatasetDropdown(options = {}) {
     datasetSelect.replaceChildren(errorOption);
     forgetDatasetOptions();
     setControlAvailability(datasetSelect, 'the list of datasets could not be read; use Try again in its notice');
-    // The whole enumeration failed, so the selector is empty and the only way
-    // back used to be a page reload. The notice carries the retry instead;
+    // The whole enumeration failed, so the selector is empty and a page reload
+    // would be the only way back. The notice carries the retry instead;
     // the notification is one sentence, its raw error under Details.
     setCatalogNotice(CATALOG_TOTAL_FAILURE_MESSAGE, retryCatalog);
+    retryListingWhenOnline([exactError]);
     debug.error('[UI] The dataset list could not be loaded:', exactError);
     showSessionStatus(
       'The dataset list could not be loaded.',
@@ -2189,7 +2207,7 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
    * until the new reading is shown; Cancel keeps it, and so does `signal`
    * (the action or the history move that asked for the reading, stopped):
    * the reading is canceled as Cancel cancels it, so the one who asked is
-   * answered promptly with the cells open before still open (F147).
+   * answered promptly with the cells open before still open.
    *
    * @param {Object} cellSubset
    * @param {{signal?: AbortSignal|null}} [how]
@@ -2223,9 +2241,8 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
           if (isCancellation(error)) return { shown: false, inPlace: false };
           // The cells open before stay open (`app/open-cells-resize.js`
           // reads them back): said once, with the raw error under Details,
-          // never only to the console (Web contracts run 41269083996, Linux
-          // WebKit: the picked file read back failed, and Apply did nothing
-          // the person could see).
+          // never only to the console (a failed read of the picked file would
+          // otherwise leave Apply doing nothing the person could see).
           debug.error('[UI] The open cells could not be read again:', error);
           const name = datasetDisplayName(sourceType, datasetId);
           // One sentence, by the one classification of read failures

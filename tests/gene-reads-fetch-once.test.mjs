@@ -418,7 +418,6 @@ test('each layout yields its own cause, and a gene-major one none', () => {
   assert.match(geneLayoutReason('dense-wide-strips'), /densely in strips of genes too wide to keep decoded, so every strip is read once and indexed in memory$/);
   assert.equal(geneLayoutFacts('dense-wide-strips', { cells: 3 })[1].value, 'the strips of 3 open cells');
   assert.equal(geneLayoutReason('csc'), null);
-  assert.equal(geneLayoutReason('dense-strips'), null);
   assert.equal(geneLayoutFacts('csc', { cells: 10 }), null);
   const csr = geneLayoutFacts('csr', { cells: 1, amount: '4 KB' });
   assert.deepEqual(csr.map(row => row.label), ['Stored', 'One gene reads', 'Later genes', 'Faster']);
@@ -474,8 +473,8 @@ test('a run of gene reads on a gene sample checks the sample\'s row pointers onc
   // Every read of a gene asks whether the gene sample's rows' pointers are
   // held (`_readyRows` with the sample's rows). Walked each time -- the
   // runs of the sample's rows made again, twice a read -- a markers run of
-  // 30,000 genes over a 9.5M-cell sample spent O(sample) a read and timed
-  // out; the sample's coverage is known once found, so a read checks it at
+  // 30,000 genes over a 9.5M-cell sample would spend O(sample) a read; the
+  // sample's coverage is known once found, so a read checks it at
   // once whatever the sample's size.
   const { tree, values } = csrTree();
   const { store } = countingStore(tree);

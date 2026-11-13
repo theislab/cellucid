@@ -50,7 +50,8 @@
  * showing the 3D embedding; with camera path keyframes. A control walked in
  * an earlier scene is not walked again. The walk is split into parts, a
  * test each (`PARTS`: a section of the sidebar each, then everything outside
- * them), spread over the spec files, a share each. Playwright shards by test
+ * them), spread over the spec files, a share each, filled by weight
+ * (`control-walk-parts.mjs`). Playwright shards by test
  * count, so in a shard of the whole suite these few long tests would fall
  * together: CI runs the walk in a job of its own, a share a job
  * (`CELLUCID_CONTROL_WALK=only` and `--shard=<k>/<n>`, a file each; the
@@ -75,16 +76,16 @@ import { dismissWelcome } from './welcome.mjs';
 import { waitForDatasetReady, waitForPageAtRest } from './dataset-ready.mjs';
 import { takeSteps, waitForHistory } from './state-history.mjs';
 import { chooseFiles } from './file-input.mjs';
+import {
+  GRAPH_AND_VECTORS, LEFT_OUT, OUTSIDE_SECTIONS, PARTS, SECTIONS, WALK_TESTS, readWalkWeights, recordWalkWeight, recordsWalkWeights,
+  walkShares,
+} from './control-walk-parts.mjs';
 
 const FIXTURE_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 /** 300 cells with three neighbor graphs and vector fields (`fixtures/README.md`). */
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const GRAPH_AND_VECTORS = path.join(HERE, '..', 'fixtures', 'data-mapping-full.h5ad');
+const GRAPH_AND_VECTORS_FILE = path.join(HERE, '..', 'fixtures', 'data-mapping-full.h5ad');
 const CELLS = 120;
-/** The sidebar's sections, in page order (`details.accordion-section` of index.html). */
-const SECTIONS = [...fs.readFileSync(path.join(HERE, '..', '..', '..', 'index.html'), 'utf8')
-  .matchAll(/<details class="accordion-section"[^>]*\bid="([^"]+)"/g)].map(match => match[1]);
-const OUTSIDE_SECTIONS = 'outside the sections';
 /** The section a control is in (its outermost), or OUTSIDE_SECTIONS. */
 function sectionOf(control) {
   return SECTIONS.find(id => control.places.includes(id)) ?? OUTSIDE_SECTIONS;
@@ -98,9 +99,10 @@ function sectionOf(control) {
  * control's time is the page's own frames (`settle` waits for frames to agree,
  * a Playwright action for its element to stand still), so it follows the
  * renderer: under the CI runners' software GL a frame with the velocity
- * overlay flowing or smoke animating took about half a second, and each such
- * control 15 to 25 s where a GPU takes under one (Web contracts runs
- * 42334173086 and 42334181105, against a fixed budget of 20 s a control).
+ * overlay flowing or smoke animating takes about half a second, and each
+ * such control tens of seconds where a GPU takes under one, so no fixed
+ * budget a control fits both (measured:
+ * 38_decisions_testing_and_hosted_runners.md).
  *
  * What bounds the walk is progress, measured on the page it walks: a wait of
  * the walk (`timed`) that has not ended after `HANG_FACTOR` times the slowest
@@ -190,33 +192,13 @@ function keepPartAlive(testInfo) {
 
 /**
  * Controls the walk does not operate, by what they are (a role), each with
- * why. No control is left out by its id here.
+ * why. No control is left out by its id here; the few left out one by one
+ * are `LEFT_OUT` (`control-walk-parts.mjs`).
  */
 const LEFT_OUT_ROLES = Object.freeze({
   link: 'a link leaves the page or opens another one; it changes no state',
   file: 'a file input opens the system file picker, outside the page',
 });
-
-/**
- * The only controls left out one by one: they replace the dataset (its
- * history is retired and another starts), which the dataset-switch and
- * benchmark specs cover.
- */
-const LEFT_OUT = Object.freeze([
-  { key: '#dataset-select', why: 'opens another sample dataset: this dataset and its history are replaced (dataset-switch specs)' },
-  { place: 'benchmark-section', why: 'generates and opens a synthetic dataset of up to 40M cells, replacing this one (benchmark specs)' },
-  { name: 'Continue with GitHub', why: 'signs in: the page goes to github.com (community-annotation-startup-lifecycle and oauth-worker specs)' },
-  { key: '#kept-stores-remove-all', why: 'deletes everything this browser keeps (stores, parts, saved states), which no history holds (kept-stores-dialog spec)' },
-  { place: 'kept-stores-list', namePrefix: 'Remove', why: 'deletes what this browser keeps of one dataset, which no history holds (kept-stores-dialog spec)' },
-]);
-
-/**
- * The parts the walk is split into, a test each: every section of the sidebar the walk does not leave out whole, then
- * every control outside them (the toolbars, the legend, the floating panels
- * and analysis windows, the canvas, and the sections left out whole, listed
- * as left out). What a control opens is walked in its control's part.
- */
-const PARTS = [...SECTIONS.filter(id => !LEFT_OUT.some(item => item.place === id && item.namePrefix === undefined)), OUTSIDE_SECTIONS];
 
 /** The part a section (or OUTSIDE_SECTIONS) is walked in. */
 function partOfSection(section) {
@@ -775,12 +757,14 @@ async function undoOperation(page, control, memo) {
   }
 }
 
-/** The first line of a Playwright error and why an element could not be operated, when it says. */
+/** The first line of a Playwright error and why an element could not be operated, or else where the action stood when it ran out of time. */
 function errorWords(error) {
-  const text = String(error?.message ?? error);
-  const first = text.split('\n')[0];
-  const why = text.split('\n').find(line => /intercepts pointer events|not visible|not enabled|outside of the viewport|not stable|detached/.test(line));
-  return why === undefined ? first : `${first} (${why.trim()})`;
+  const lines = String(error?.message ?? error).split('\n');
+  const why = lines.find(line => /intercepts pointer events|not visible|not enabled|outside of the viewport|not stable|detached/.test(line))
+    // None of those: what the action was doing when its time ran out (the call log's last step:
+    // a locator that never resolved, a check that never answered, a press not acknowledged).
+    ?? lines.slice(1).reverse().find(line => /^\s*(?:\d+ × )?-?\s*(?:waiting(?! \d+ms)|locator|attempting|performing|scrolling|element)/.test(line));
+  return why === undefined ? lines[0] : `${lines[0]} (${why.trim()})`;
 }
 
 /**
@@ -811,9 +795,13 @@ async function closeTransient(page, scene) {
  * the walk having ended for `hangAfterMs()` (`HANG_FACTOR` times the slowest
  * wait the part has seen end, at least `HANG_FLOOR_MS`). A stalled walk ends
  * the part, naming the control: left running beside the next control, its
- * work would operate, restore and close on that control's page.
+ * work would operate, restore and close on that control's page. The report
+ * says how long the page then takes to answer one read: a page that stood
+ * still itself is the browser's or the machine's (on macOS, Mission Control
+ * or a change of Space during a local run; developer docs, record 38), a
+ * page that answers at once leaves the stall to the walk's own wait.
  */
-async function untilHung(task, what) {
+async function untilHung(page, task, what) {
   PROGRESS.lastAt = performance.now();
   let timer;
   const stalled = new Promise(resolve => {
@@ -830,7 +818,21 @@ async function untilHung(task, what) {
   clearTimeout(timer);
   if (quiet === null) return work;
   const seconds = ms => `${(ms / 1000).toFixed(1)} s`;
-  throw Object.assign(new Error(`${what} made no progress for ${seconds(quiet)} (no wait of its walk ended; the slowest wait seen to end took ${seconds(PROGRESS.slowestMs)}): the walk cannot go on beside it`), { fatal: true });
+  // The read is given as long as the stall itself was: a page that does not
+  // answer by then stands still, and the report goes out without it.
+  const asked = performance.now();
+  let bound;
+  const answeredAt = await Promise.race([
+    page.evaluate(() => true).then(() => performance.now(), () => performance.now()),
+    new Promise(resolve => { bound = setTimeout(() => resolve(null), quiet); }),
+  ]);
+  clearTimeout(bound);
+  const answer = answeredAt === null
+    ? `the page itself did not answer one read in ${seconds(quiet)}, so it stood still, not the walk`
+    : answeredAt - asked > PROGRESS.slowestMs
+      ? `the page itself then took ${seconds(answeredAt - asked)} to answer one read, so it stood still, not the walk`
+      : `the page answered one read in ${seconds(answeredAt - asked)}`;
+  throw Object.assign(new Error(`${what} made no progress for ${seconds(quiet)} (no wait of its walk ended; the slowest wait seen to end took ${seconds(PROGRESS.slowestMs)}; ${answer}): the walk cannot go on beside it`), { fatal: true });
 }
 
 /**
@@ -955,8 +957,7 @@ function createWalk(page) {
     // follows the step shown, are an edit of the history, judged as a history control, not a step
     // made: Clear history keeping the state starts one from the opening, and Branch without this
     // step replays every step after the one left out on a branch from the step before it (as many
-    // steps as followed it on the way to the step shown: 11 on CI, where the walk met it on step 1,
-    // Web contracts run 42334181105; none on the last step). A change made after going back
+    // steps as followed it on the way to the step shown; none on the last step). A change made after going back
     // follows the step shown: a step, checked as every step is.
     const removedSteps = before.tree.ids.filter(id => !after.tree.ids.includes(id));
     const newParents = after.tree.branch === before.tree.branch || newSteps.length === 0 ? []
@@ -1032,7 +1033,7 @@ function createWalk(page) {
     // and a sibling is reached without operating them again.
     let home = scene;
     try {
-      await untilHung(async () => {
+      await untilHung(page, async () => {
         if (!await mark(page, control.key) && !await timed('reach (inclusive)', () => reach(control, path, scene), { inclusive: true })) {
           const state = await markState(page, control.key);
           if (path.length > 0) {
@@ -1083,9 +1084,9 @@ function createWalk(page) {
         // the browser lock it to the plot: every later click goes to the
         // canvas, for a person until they press Escape. It is released as
         // they would release it. Linux Chromium grants the lock to the click;
-        // macOS headless Chromium does not, so a walk there never met it, and
-        // on Linux the next control's click waited for the button to take it
-        // (Web contracts run 42334173086, `#pointer-lock-info-btn`).
+        // macOS headless Chromium does not, so on Linux the next control's
+        // click would wait for the button to take it
+        // (`#pointer-lock-info-btn`).
         if (await page.evaluate(() => document.pointerLockElement !== null)) {
           external.push('the pointer captured');
           await page.evaluate(() => document.exitPointerLock());
@@ -1335,6 +1336,7 @@ function declarePartTest(test, part) {
       await testInfo.attach('control-walk.json', { body: JSON.stringify(report, null, 1), contentType: 'application/json' });
       PROGRESS.onProgress = null;
     }
+    if (recordsWalkWeights()) recordWalkWeight(part, walk.report);
 
     expect(walk.report.length, `the page shows controls ${where}`).toBeGreaterThan(0);
     const failed = walk.report.filter(entry => entry.outcome === 'failed');
@@ -1353,7 +1355,7 @@ function declareGraphAndVectorsTest(test) {
   test('a neighbour graph\'s and a vector field\'s controls make one undoable step each', async ({ page }, testInfo) => {
     keepPartAlive(testInfo);
     await openFixture(page);
-    await chooseFiles(page.locator('#user-data-file-input'), GRAPH_AND_VECTORS);
+    await chooseFiles(page.locator('#user-data-file-input'), GRAPH_AND_VECTORS_FILE);
     await waitForDatasetReady(page, 300);
     await waitForHistory(page);
     await waitForPageAtRest(page);
@@ -1375,18 +1377,26 @@ function declareGraphAndVectorsTest(test) {
     expect(unmet.map(setting => setting.id), 'graph and vector settings the walk never met').toEqual([]);
     const failed = walk.report.filter(entry => entry.outcome === 'failed');
     expect(failed.map(line), 'every control either changes nothing or makes one undoable step').toEqual([]);
+    if (recordsWalkWeights()) recordWalkWeight(GRAPH_AND_VECTORS, walk.report);
   });
 }
 
-/** Every test of the walk, as a function that declares it: the parts, then the graph and vectors. */
-const WALK_TESTS = [...PARTS.map(part => test => declarePartTest(test, part)), declareGraphAndVectorsTest];
+/** Declare the test `name` of the walk (`WALK_TESTS`): a part, or the graph and vectors. */
+function declareWalkTest(test, name) {
+  if (name === GRAPH_AND_VECTORS) declareGraphAndVectorsTest(test);
+  else declarePartTest(test, name);
+}
 
 /**
  * Declare the share of the walk's tests that the spec file `specUrl` holds:
- * `control-walk-<k>-of-<n>.spec.mjs` holds every n-th test from the k-th
- * (`WALK_TESTS`), so the n files hold each test exactly once and `--shard`
- * over the walk alone (`CELLUCID_CONTROL_WALK=only`, CI's `control-walk`
- * job) runs them side by side, a file a shard. The n files must all
+ * `control-walk-<k>-of-<n>.spec.mjs` holds the k-th of the n shares the
+ * walk's tests (`WALK_TESTS`) are split into by weight (`walkShares`,
+ * `control-walk-parts.mjs`: the controls each test's walk operated when last
+ * recorded; as many tests in each), so the n files hold each test exactly
+ * once, the longest tests are in different files, and `--shard` over the
+ * walk alone
+ * (`CELLUCID_CONTROL_WALK=only`, CI's `control-walk` job) runs them side by
+ * side, a file a shard. The n files must all
  * be there, and no others, or no test is declared. The walk runs on Chromium
  * only.
  *
@@ -1409,5 +1419,5 @@ export function declareWalkTests(test, specUrl) {
   // which does not depend on the engine; on Firefox and WebKit, and above all
   // macOS Firefox's slow GL, it would only add hours of CI time.
   test.skip(({ browserName }) => browserName !== 'chromium', 'The control walk runs on Chromium only');
-  WALK_TESTS.filter((_, index) => index % shares === share - 1).forEach(declareTest => declareTest(test));
+  for (const name of walkShares(WALK_TESTS, readWalkWeights(), shares)[share - 1]) declareWalkTest(test, name);
 }

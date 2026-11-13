@@ -63,6 +63,7 @@ import { readWhole, requireHeld, writeAt } from '../formats/io/sync-access.js';
 import { abortReason, cancelled, onAbort } from '../utils/abort.js';
 import { measureOf } from '../utils/machine.js';
 import { yieldToMacrotask } from '../utils/yield-macrotask.js';
+import { promiseWithResolvers } from '../utils/promise-resolvers.js';
 
 /**
  * How long one part of a background index's synchronous work runs before the
@@ -84,7 +85,7 @@ export const SEGMENT_ELEMENTS = 2 ** 27;
  * (`recordAllocationSuccess`).
  *
  * @template T
- * @param {new (length: number) => T} ArrayType
+ * @param {import('../utils/large-arrays.js').TypedArrayConstructor<T>} ArrayType
  * @param {number} length
  * @param {string} label
  * @returns {T}
@@ -768,7 +769,6 @@ class MemorySparseStructure extends SparseStructure {
       ]);
     }
     const nnz = this._nnz;
-    const nCols = this.nCols;
     const nRows = this.nRows;
     const columnStart = this._columnStart;
     const pointers = this._rowPointers;
@@ -1226,9 +1226,8 @@ function checkedPiece(kept, name, column, piece) {
 /**
  * Bytes between two pieces of a kept copy that one read still covers: a
  * read of the origin-private file system costs about a millisecond before
- * its first byte (measured: 60,000 reads of a gene's piece, a 10M-cell
- * index, 70 s in Chromium on an M1 Pro), in which a disk delivers about a
- * mebibyte. A scheduling choice, measured.
+ * its first byte, in which a disk delivers about a mebibyte (measured:
+ * 23_decisions_partial_reading.md). A scheduling choice, measured.
  */
 const KEPT_READ_GAP_BYTES = 1 << 20;
 
@@ -1267,9 +1266,8 @@ function keptReadMs(bytes) {
  *   store on disk then), the pieces asked for in one task are read
  *   together, one read per run of pieces less than `KEPT_READ_GAP_BYTES`
  *   apart: an analysis asks for its genes many at once, so it reads the
- *   copy in long sequential ranges, never a read per gene (a 10M-cell
- *   revisit's differential expression read each gene's piece on its own:
- *   71.7 s against 16.0 s from the index built in memory).
+ *   copy in long sequential ranges, never a read per gene (measured:
+ *   23_decisions_partial_reading.md).
  */
 class KeptReads {
   /**
@@ -1815,8 +1813,8 @@ function stoppedError(label) {
  *   read every slab's values beside its indices, in the same round trip, and
  *   they are kept: the first gene was priced with them (`subsample-plan.js`
  *   `firstGeneReadCost`), and each later gene would otherwise read the
- *   chunks its entries lie in, a round trip or more each (on a CELLxGENE
- *   atlas, a gene sample's third gene: 316 requests);
+ *   chunks its entries lie in, a round trip or more each (measured:
+ *   23_decisions_partial_reading.md);
  * - otherwise pass 2 reads the row pointers again, the indices unless kept,
  *   and the values unless kept, into a column store of `storeBytes`
  *   (`createColumnStoreFactory` places it: memory, disk, or nowhere).
@@ -1857,10 +1855,10 @@ export class RowMajorColumnIndex {
    * Every reader returns a promise of the values read from the store; the
    * index's own reads get `{signal}`, which aborts when the build stops (a
    * read already sent is let go; one still queued is never sent).
-   * @param {(start: number, end: number) => Promise<ArrayLike<number|bigint>>} [options.readRowPointers]
-   * @param {(start: number, end: number) => Promise<ArrayLike<number|bigint>>} [options.readIndices]
-   * @param {(start: number, end: number) => Promise<Float32Array>} [options.readValues]
-   * @param {(rowStart: number, rowEnd: number) => Promise<Float32Array>} [options.readRows] - Dense only
+   * @param {(start: number, end: number, options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<number|bigint>>} [options.readRowPointers]
+   * @param {(start: number, end: number, options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<number|bigint>>} [options.readIndices]
+   * @param {(start: number, end: number, options?: {signal?: AbortSignal|null}) => Promise<Float32Array>} [options.readValues]
+   * @param {(rowStart: number, rowEnd: number, options?: {signal?: AbortSignal|null}) => Promise<Float32Array>} [options.readRows] - Dense only
    * @param {Object} options.storeFactory - `createColumnStoreFactory`
    * @param {boolean} [options.valuesOnDemand] - Sparse only: index the structure
    *   and read each gene's values as it is asked for (a matrix read over a
@@ -1918,6 +1916,10 @@ export class RowMajorColumnIndex {
     this.nRows = options.nRows;
     this.nCols = options.nCols;
     this._label = options.label ?? 'Matrix';
+    /**
+     * What holds the built index: a store of this run, or one kept from an earlier one.
+     * @type {MemorySparseStore|MemorySparseStructure|MemoryDenseStore|DiskSparseStore|DiskDenseStore|KeptSparseStructure|KeptSparseStore|KeptDenseStore|null}
+     */
     this._store = null;
     this._requests = new Map();
     this._build = null;
@@ -2201,12 +2203,7 @@ export class RowMajorColumnIndex {
     const restartScan = this.phase === 'unindexed';
     let request = this._requests.get(column);
     if (request === undefined) {
-      let resolve;
-      let reject;
-      const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
+      const { promise, resolve, reject } = promiseWithResolvers();
       request = {
         column,
         promise,
@@ -2668,14 +2665,14 @@ export class RowMajorColumnIndex {
    * gene is waiting (its values are wanted from this slab), values are read
    * on demand (a link slower than a disk), and the slab's values whole cost
    * no more bytes than one round trip of the link moves -- the round trip
-   * they save. On a 40,000-cell file over 150 ms at 5 MB/s, a 1% subsample's
-   * first gene read pointers, indices, then values: three round trips where
-   * two do. Only a round trip at the pass's end is saved: a slab's waiting
+   * they save: a 1% subsample's first gene would read pointers, indices, then
+   * values, three round trips where two do. Only a round trip at the pass's end is saved: a slab's waiting
    * values asked for after its indices arrive while the slabs after it are
    * read, so a slab is read with its values only when the indices still to
    * read after it take less than a round trip (counted at the values' stored
-   * bytes an entry). Before, every slab was: a 40,000-cell CSR `.h5ad`'s
-   * first gene over every cell read 35.4 MB where 28.4 MB do. Values stored
+   * bytes an entry); read with every slab's values, a first gene over every
+   * cell reads more bytes than it needs (measured:
+   * 23_decisions_partial_reading.md). Values stored
    * in chunks read whole are read beside every slab when the plan buys them
    * (`sparseIndexPlan` `buysValues`): the first gene was priced with them,
    * and no later gene then reads one. @private
@@ -2935,7 +2932,7 @@ export class RowMajorColumnIndex {
 
   /** One pass over a sparse matrix: into `store` (or none), extracting requests. */
   async _sparseScan(store) {
-    const { nCols, nnz, readIndices, readValues } = this._options;
+    const { nnz, readIndices, readValues } = this._options;
     const label = this._label;
     const retained = store !== null ? this._retainedIndices : null;
     const retainedValues = store !== null ? this._retainedValues : null;

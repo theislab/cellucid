@@ -19,7 +19,7 @@
  * controls the inventory leaves to their owners (field pickers, the outlier
  * slider, the navigation mode, the representation picker, the multiview
  * layout). The selection tool and Select mode are input modes, page chrome
- * like a held Alt key, and no setting (History v2 §3.3.8).
+ * like a held Alt key, and no setting.
  *
  * Restore reads the saved record one setting at a time (`readSavedControls`,
  * `readSavedFigureExportSettings`): a value this version cannot use (a

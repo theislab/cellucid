@@ -1,10 +1,10 @@
 /**
- * The State panel's branch graph as rows (`ui/modules/state/graph-layout.js`,
- * History v2 §3.9) and the plans its confirmations are worded from
- * (`history-source.js`), on History v2 records built with the contract's own
- * constructors (`helpers/history-v2-builder.mjs`): the path shown, undone
- * steps, fork stubs (the undone tail stays visible after branching, §2.6
- * item 1), nested stubs, turns, groups, folded runs of view and layout steps
+ * The State panel's branch graph as rows (`ui/modules/state/graph-layout.js`)
+ * and the plans its confirmations are worded from (`history-source.js`), on
+ * history records built with the contract's own constructors
+ * (`helpers/history-v2-builder.mjs`): the path shown, undone
+ * steps, fork stubs (the undone tail stays visible after branching), nested
+ * stubs, turns, groups, folded runs of view and layout steps
  * (section open and close among them), the paused marker, search folding,
  * lanes, aria places, selection ranges, revealing a step, and why a revert,
  * a group or a squash is not offered.

@@ -12,10 +12,9 @@
 // failed runs and the tests that failed.
 //
 // A browser process lives as long as CI lets it (`planRepeatBatches`, the
-// bounded runner's files and tests a process): one WebKit that ran on past
-// its fortieth test stopped answering a new page's first navigation (no
-// request made in 90 s, at tests 52 to 192 of runs of 127 and 210 tests,
-// 2026-11-01), a failure no CI cell can have.
+// bounded runner's files and tests a process): a WebKit that runs on past its
+// fortieth test can stop answering a new page's first navigation, a failure
+// no CI cell can have.
 //
 // Without paths it runs the specs changed relative to `origin/main` (committed
 // and uncommitted, and untracked files) and every spec that imports a changed

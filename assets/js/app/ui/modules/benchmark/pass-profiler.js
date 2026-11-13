@@ -77,14 +77,14 @@ export const PASS_SIGNATURES = Object.freeze([
 /** Label of a program no signature matches. */
 export const OTHER_PASS = 'other';
 /** Label of `blitFramebuffer` (the MSAA resolve and any other blit). */
-export const RESOLVE_PASS = 'resolve';
+const RESOLVE_PASS = 'resolve';
 /** Label of `clear`. */
-export const CLEAR_PASS = 'clear';
+const CLEAR_PASS = 'clear';
 /** Label of work issued before the first pass boundary of a frame. */
-export const UNATTRIBUTED_PASS = 'unattributed';
+const UNATTRIBUTED_PASS = 'unattributed';
 
 /** Shadowed context methods. */
-export const PROFILED_METHOD_NAMES = Object.freeze([
+const PROFILED_METHOD_NAMES = Object.freeze([
   'useProgram',
   'blitFramebuffer',
   'clear'

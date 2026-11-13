@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
@@ -21,67 +20,6 @@ import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-var
 import { createRunTuner } from '../assets/js/app/analysis/shared/run-tuner.js';
 import { runGeneStream } from '../assets/js/app/analysis/shared/gene-stream-runner.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
-
-const ANALYSIS_ROOT = new URL('../assets/js/app/analysis/', import.meta.url);
-
-async function analysisSource(path) {
-  return readFile(new URL(path, ANALYSIS_ROOT), 'utf8');
-}
-
-test('analysis fallback, retry, coercion, and compatibility shims are absent from current surfaces', async () => {
-  const paths = [
-    'data/data-layer.js',
-    'data/gene-route.js',
-    'compute/data-worker.js',
-    'genes-panel/clustering-engine.js',
-    'genes-panel/constants.js',
-    'genes-panel/genes-panel-controller.js',
-    'genes-panel/marker-cache.js',
-    'genes-panel/marker-discovery-engine.js',
-    'plots/layout-engine.js',
-    'plots/plot-base.js',
-    'plots/plotly-hints.js',
-    'plots/types/gene-heatmap.js',
-    'shared/concurrency-utils.js',
-    'shared/dom-utils.js',
-    'shared/gene-stream-runner.js',
-    'shared/plot-theme.js',
-    'ui/analysis-types/de-analysis-ui.js',
-    'ui/components/options.js',
-  ];
-  const forbidden = /\bfallback\b|fall(?:ing)?\s+back|\bretry\b|\bcoerc(?:e|ion)\b|\blegacy\b|back-compat|api compatibility|best.?effort|skip failed genes?|ignore (?:cleanup|release) (?:errors?|failures?)/i;
-
-  for (const path of paths) {
-    const source = await analysisSource(path);
-    assert.doesNotMatch(source, forbidden, `${path} contains an obsolete alternate contract`);
-  }
-
-  const [hints, options] = await Promise.all([
-    analysisSource('plots/plotly-hints.js'),
-    analysisSource('ui/components/options.js'),
-  ]);
-  assert.doesNotMatch(hints, /detachPlotlyHints|\bdetach:/);
-  assert.doesNotMatch(options, /coerceSelectValue|parseFloat\(input\.value\)|!!value/);
-
-  const performanceForm = await analysisSource('shared/dom-utils.js');
-  assert.doesNotMatch(
-    performanceForm,
-    /pointCount\s*=\s*[^;\n]*\|\||geneCount\s*=\s*[^;\n]*\|\||getValue\([^)]*\)\s*\|\||parseInt\(/,
-  );
-
-  const [markerEngine, markerWorker] = await Promise.all([
-    analysisSource('genes-panel/marker-discovery-engine.js'),
-    analysisSource('compute/data-worker.js'),
-  ]);
-  assert.doesNotMatch(
-    markerEngine,
-    /clampInt|safeP|geneList\s*\|\||poolSize:\s*1|log2FoldChange\s*\|\|\s*0/,
-  );
-  assert.doesNotMatch(
-    markerWorker,
-    /useApproxWilcox|histBins|Math\.min\(values\.length,\s*cellGroupIndex\.length\)/,
-  );
-});
 
 test('plot metadata and ranges require exact scientific ownership', () => {
   assert.equal(

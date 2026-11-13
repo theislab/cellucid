@@ -4,7 +4,7 @@
  *
  * Handed one million raw values, Plotly's histogram `calc` assigns each one to
  * a bin and records it there — a per-value pass on the main thread that grows
- * with the page (about 0.2 s for a million cells, two seconds for ten). With
+ * with the page (measured: 37_decisions_analysis.md). With
  * explicit bins (`xbins.start` and `xbins.size`) Plotly assigns a value `v` to
  * bin `floor((v - start) / size + 1e-9)` (`Lib.findBin`); this module groups
  * the values by that same expression and hands Plotly, per occupied bin, at

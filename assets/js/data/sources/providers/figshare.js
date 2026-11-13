@@ -8,8 +8,7 @@
  *
  * `ndownloader` sits behind an AWS WAF that answers some requests with a bot
  * challenge (HTTP 202, `x-amzn-waf-action: challenge`) instead of the
- * redirect, and no other site's page can answer it. Measured on 2026-10-23:
- * Chromium's page passes and its workers do not (a worker's request carries
+ * redirect, and no other site's page can answer it. Chromium's page passes and its workers do not (a worker's request carries
  * no client hints), WebKit passes from both, headless Chromium never passes.
  * So the page asks `ndownloader` for the signed link and hands it to the
  * reader (`sources/access.js`); the reader reads S3 only, which has no such
@@ -71,7 +70,7 @@ function isFigshareHost(host) {
  * The canonical value of a Figshare reference, or null: `<item>[v<n>][/<file>]`,
  * `doi:<doi>` (resolved when opened), `private:<link>`, `file:<id>`.
  */
-export function parseFigshare(input, explicit = true) {
+function parseFigshare(input, explicit = true) {
   if (typeof input !== 'string') return null;
   const text = input.trim();
   if (explicit) {

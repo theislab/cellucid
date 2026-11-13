@@ -11,8 +11,8 @@
  *   ZIP entries) feed the decompressor in the same input slices and read the
  *   output against the size the format declares, so a bomb is stopped after
  *   a few slices: the reader cancels the stream as soon as the output passes
- *   the declared size. (Written whole, WebKit's decompressor expanded the
- *   whole bomb before the reader could stop it.)
+ *   the declared size. (Written whole, WebKit's decompressor expands the
+ *   whole bomb before the reader can stop it.)
  *
  * Both are properties of the browser's `DecompressionStream` and its
  * backpressure, so they are measured here, in each engine the application

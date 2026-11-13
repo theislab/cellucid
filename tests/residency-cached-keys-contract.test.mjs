@@ -2,8 +2,9 @@
  * The page's residency count (`state/managers/field/residency.js`) is asked
  * on every memory report — each worker report, each working-set change — so
  * its work is the views times the cached keys, never the inventories' length
- * (a 30,000-gene inventory was walked whole on every report: 0.5–1.4 s of the
- * page's main thread per markers run at 10M cells). The answer stays the full
+ * (a 30,000-gene inventory walked whole on every report would cost about a
+ * second of the page's main thread per markers run at 10M cells; measured:
+ * 27_decisions_memory_model.md). The answer stays the full
  * walk's, bit for bit, through every change that moves a field in or out of
  * use.
  */

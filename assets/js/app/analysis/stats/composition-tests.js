@@ -33,10 +33,9 @@
  * two units' sizes alone (`0.5 / (total + 0.5·K)`), so the difference is the
  * log ratio of the units' sizes — the same sign for every donor whose one
  * organ gave more cells than the other, which a paired t reads as a change
- * of a type that is not there (F109: myelocytes, cells in one donor's
- * spleen, came out adjusted p 0.03 from seven pairs). The signed-rank test
- * already drops such a pair (a zero difference); the t-tests now drop it
- * too, so the three methods test one set of pairs. Below
+ * of a type that is not there (measured: 37_decisions_analysis.md). The
+ * signed-rank test drops such a pair (a zero difference) and the t-tests drop
+ * it too, so the three methods test one set of pairs. Below
  * `MIN_PAIRS_WITH_CELLS` such pairs a type is not tested (`TOO_FEW_PAIRS`):
  * with two, a paired t has one degree of freedom and the signed-rank test
  * cannot reach p < 0.5. It stays in the CLR centre and the pseudo-proportions'
@@ -75,8 +74,8 @@ import {
 import { chiSquaredIndependence, fisherExact2x2 } from './categorical-tests.js';
 import { normalSurvival } from '../compute/math-utils.js';
 
-export const COMPOSITION_METHODS = Object.freeze(['logit', 'rank', 'clr']);
-export const COMPOSITION_CORRECTIONS = Object.freeze(['bh', 'bonferroni']);
+const COMPOSITION_METHODS = Object.freeze(['logit', 'rank', 'clr']);
+const COMPOSITION_CORRECTIONS = Object.freeze(['bh', 'bonferroni']);
 const PSEUDOCOUNT = 0.5;
 /** The test of a type with no cells in any unit: none, out of the family. */
 export const NO_CELLS = 'no cells';
@@ -302,10 +301,9 @@ export function testComposition(input) {
   for (let unit = 0; unit < unitCount; unit++) unitsPerCondition[conditionOfUnit[unit]] += 1;
 
   // Paired, the samples in both conditions: the test reads them alone, and so
-  // do the mean proportions and their ratio (live-7 L25-12: with every sample,
-  // a donor with 2 liver cells and none in the marrow turned LYVE1+
-  // macrophages' log2 ratio toward the liver while the paired test, 6 of 6
-  // donors, found more in the marrow).
+  // do the mean proportions and their ratio: with every sample, a donor with
+  // cells in one condition only would turn the ratio toward that condition
+  // against what the paired test finds (measured: 37_decisions_analysis.md).
   const pairing = paired ? compositionPairs(unitSample, conditionOfUnit) : null;
   const meanUnits = pairing === null ? null : new Uint8Array(unitCount);
   if (pairing !== null) for (const unit of [...pairing.first, ...pairing.second]) meanUnits[unit] = 1;
@@ -352,9 +350,9 @@ export function testComposition(input) {
     const { first, second } = pairing;
     // The test reads the pairs only: a type with cells only in units left
     // out (a sample in one condition) has none in any unit it tests, and its
-    // transformed proportions there would be the pairs' sizes alone (L11-7:
-    // one Langerhans cell in a spleen-only donor came out "significant",
-    // adjusted p 0.04, from seven pairs without it). It is not tested.
+    // transformed proportions there would be the pairs' sizes alone, which
+    // can come out "significant" with no cell in any pair (measured:
+    // 37_decisions_analysis.md). It is not tested.
     const inPairs = new Uint8Array(typeCount);
     for (let type = 0; type < typeCount; type++) {
       for (const unit of [...first, ...second]) {
@@ -368,7 +366,7 @@ export function testComposition(input) {
     test = method === 'rank' ? 'Wilcoxon signed-rank (paired)' : 'paired t-test';
     for (let type = 0; type < typeCount; type++) {
       if (inPairs[type] === 0) continue;
-      // Only the pairs holding its cells (F109, above).
+      // Only the pairs holding its cells (above).
       const a = [];
       const b = [];
       for (let pair = 0; pair < pairs; pair++) {

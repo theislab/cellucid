@@ -185,7 +185,7 @@ export function validateAnnDataCatalog(catalog, baseUrl, sourceType) {
     const label = `datasets[${index}]`;
     requireCatalogKeys(entry, ['id', 'path'], ['session', 'name'], label, sourceType);
     // Its name as a person reads it (the dataset's own, `uns['cellucid']['name']`): what the picker
-    // and the opening say before its file is read (round 9 close: "Opening garcia" until then).
+    // and the opening say before its file is read, so neither shows the dataset's id.
     if (Object.hasOwn(entry, 'name') && (typeof entry.name !== 'string' || entry.name.trim() === '' || entry.name !== entry.name.trim())) {
       throw invalidCatalog(`${label}.name must be the dataset's name, a trimmed nonempty text`, sourceType);
     }

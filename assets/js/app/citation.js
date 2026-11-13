@@ -4,9 +4,9 @@
  * `CITATION.cff` in this repository is the one place the citation is written
  * (between its `# BEGIN/END cellucid preferred-citation` markers). Every other
  * surface is generated from it: the README sections, the documentation's
- * "Citing Cellucid" page and the R package's citation by
- * `cellucid-private/scripts/sync_citation.py`, and the in-app Cite dialog here,
- * at runtime. This module is that script's reader and formatters in
+ * "Citing Cellucid" page and the R package's citation by the maintainers'
+ * sync script, and the in-app Cite dialog here, at runtime. This module is
+ * that script's reader and formatters in
  * JavaScript, so the dialog says exactly what the documentation says:
  * `tests/citation-contract.test.mjs` compares the two whenever the
  * documentation is checked out.
@@ -17,7 +17,7 @@
  * @module app/citation
  */
 
-export const CITATION_PATH = 'CITATION.cff';
+const CITATION_PATH = 'CITATION.cff';
 export const CITING_PAGE_URL = 'https://docs.cellucid.com/en/latest/citing.html';
 const BIBTEX_KEY = 'cellucid';
 const BEGIN_MARKER = '# BEGIN cellucid preferred-citation';

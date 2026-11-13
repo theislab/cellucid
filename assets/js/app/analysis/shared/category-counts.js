@@ -4,8 +4,9 @@
  * A categorical page's values are one category label per cell. Every
  * categorical consumer — bar, pie and heatmap plots, the summary table, the
  * chi-squared and Fisher tests, CSV export — reads how often each label occurs,
- * in first-occurrence order, and walking ten million labels through a `Map`
- * takes about 0.2 s of main-thread time each time it is done. The data layer
+ * in first-occurrence order, and walking millions of labels through a `Map`
+ * takes main-thread time each time it is done (measured:
+ * 37_decisions_analysis.md). The data layer
  * already visits every cell when it builds the values, so it counts them there
  * (by code, which costs one array increment) and adopts the counts for the
  * array it publishes; anything else is counted once and kept.

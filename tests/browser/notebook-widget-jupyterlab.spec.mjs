@@ -8,12 +8,13 @@
  * reaches the viewer.
  *
  * Needs CELLUCID_PYTHON set to an interpreter with JupyterLab, anywidget and
- * cellucid's dependencies; without it the file is skipped, as the other
- * live-server specs are. The R test also needs CELLUCID_R, an R with IRkernel
- * and cellucid-r's dependencies (and pkgload), and is skipped without it. The
- * kernels load the cellucid-python and cellucid-r checkouts beside this
- * repository (or CELLUCID_PYTHON_ROOT / CELLUCID_R_ROOT), never an installed
- * copy.
+ * cellucid's dependencies; without it the file is skipped, as the other live-
+ * server specs are, and CELLUCID_REQUIRE_VIEWERS=1 (set by the CI job that
+ * runs this spec) makes that a failure. The R test needs CELLUCID_R, an R
+ * with IRkernel and cellucid-r's dependencies (and pkgload); it is skipped
+ * without it, and under CELLUCID_REQUIRE_VIEWERS=1 that is a failure too. The kernels load the cellucid-python and cellucid-r checkouts
+ * beside this repository (or CELLUCID_PYTHON_ROOT / CELLUCID_R_ROOT), never an
+ * installed copy.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -24,9 +25,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
+import { viewerInterpreter } from './helpers/viewer-interpreters.mjs';
 
-const PYTHON = process.env.CELLUCID_PYTHON ?? null;
-const R = process.env.CELLUCID_R ?? null;
+const PYTHON = viewerInterpreter('CELLUCID_PYTHON');
+const R = viewerInterpreter('CELLUCID_R');
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PYTHON_SOURCE = path.join(
   process.env.CELLUCID_PYTHON_ROOT ?? path.resolve(here, '..', '..', '..', 'cellucid-python'),
@@ -36,7 +38,7 @@ const R_SOURCE = process.env.CELLUCID_R_ROOT ?? path.resolve(here, '..', '..', '
 
 const CELLS = 2_000;
 
-// Two clusters of cells on a 2-D UMAP, a categorical column and three genes.
+// Two clusters of cells on a 2-D UMAP, two categorical columns and three genes.
 const MAKE_DATASET = `
 import sys
 import anndata as ad, numpy as np, pandas as pd
@@ -45,7 +47,8 @@ n = ${CELLS}
 umap = np.concatenate([rng.normal(-4, 1, (n // 2, 2)), rng.normal(4, 1, (n - n // 2, 2))]).astype(np.float32)
 adata = ad.AnnData(
     X=rng.poisson(1.0, (n, 3)).astype(np.float32),
-    obs=pd.DataFrame({"cell_type": pd.Categorical(["left"] * (n // 2) + ["right"] * (n - n // 2))},
+    obs=pd.DataFrame({"cell_type": pd.Categorical(["left"] * (n // 2) + ["right"] * (n - n // 2)),
+                      "batch": pd.Categorical(["a", "b"] * (n // 2))},
                      index=[f"cell{i}" for i in range(n)]),
     var=pd.DataFrame(index=["GeneA", "GeneB", "GeneC"]),
     obsm={"X_umap": umap},
@@ -70,7 +73,7 @@ function pythonNotebook(appUrl) {
         'print("RESULT", viewer.state.ready is not None, viewer._server.is_running(), ',
         'None if selection is None else len(selection["cells"]), None if selection is None else selection["source"])',
       ]),
-      code(['viewer.color_by(field={"source": "obs", "key": "cell_type"})']),
+      code(['viewer.color_by(field={"source": "obs", "key": "batch"})']),
     ],
     metadata: { kernelspec: { name: 'python3', display_name: 'Python 3 (ipykernel)', language: 'python' } },
     nbformat: 4,
@@ -89,7 +92,7 @@ function rNotebook(appUrl) {
         'selection <- cellucid_selection(viewer)\n',
         'cat("RESULT", !is.null(viewer$ready), is.null(viewer$server), length(selection$cells), selection$source, "\\n")',
       ]),
-      code(['cellucid_color_by(viewer, field = list(source = "obs", key = "cell_type"))']),
+      code(['cellucid_color_by(viewer, field = list(source = "obs", key = "batch"))']),
     ],
     metadata: { kernelspec: { name: 'ir', display_name: 'R', language: 'R' } },
     nbformat: 4,
@@ -251,9 +254,13 @@ async function exerciseNotebook(page, url, appOrigin, label) {
   // Confirmed by its button's click; where the select bar lands in the
   // output, JupyterLab's own side panel may cover it.
   await app.locator('#lasso-confirm-btn').dispatchEvent('click');
-  const lassoLabel = app.locator('text=/Lasso \\([\\d,]+ cells?\\)/').first();
-  await expect(lassoLabel).toBeVisible();
-  const lassoed = Number((await lassoLabel.textContent()).match(/\(([\d,]+) cells?\)/)[1].replace(/,/g, ''));
+  // The saved selection is listed in the sidebar, which a widget this size opens closed.
+  if (await app.locator('#sidebar').evaluate(sidebar => sidebar.classList.contains('hidden'))) {
+    await app.locator('#sidebar-toggle').click();
+  }
+  const lassoRow = app.locator('[data-highlight-id]', { hasText: 'Lasso' }).first();
+  await expect(lassoRow).toBeVisible();
+  const lassoed = Number((await lassoRow.textContent()).match(/Lasso\s*([\d,]+)/)[1].replace(/,/g, ''));
   expect(lassoed).toBeGreaterThan(0);
 
   // The next cell reads what reached the kernel between the cells.
@@ -262,14 +269,16 @@ async function exerciseNotebook(page, url, appOrigin, label) {
   await expect(result).toContainText('RESULT');
   const report = (await result.textContent()).trim();
 
-  // A command from the kernel reaches the viewer: color by the categorical column.
+  // A command from the kernel reaches the viewer: color by the batch (the
+  // cell types color the dataset when it opens, so coloring by them changes nothing).
   await runCell(page, 2);
-  await expect(app.locator('#categorical-field option:checked')).toHaveText('cell_type');
+  await expect(app.locator('#categorical-field option:checked')).toHaveText('batch');
   // It is a step of the viewer's history, labeled with the notebook's
   // language (a Python widget's runtime is "jupyter"; its steps are Python's).
-  const hostSteps = await appFrame.evaluate(() => [...window._cellucidHistories.current().active.steps.values()]
-    .filter(step => step.by.origin === 'host').map(step => [step.type, step.by.host]));
-  expect(hostSteps).toEqual([['color.by', label.toLowerCase()]]);
+  // The step is recorded once the action settles, after the control shows the new field.
+  await expect.poll(() => appFrame.evaluate(() => [...window._cellucidHistories.current().active.steps.values()]
+    .filter(step => step.by.origin === 'host').map(step => [step.type, step.by.host])))
+    .toEqual([['color.by', label.toLowerCase()]]);
   expect(consoleErrors.filter(text => /cellucid/i.test(text))).toEqual([]);
   return { report, lassoed };
 }

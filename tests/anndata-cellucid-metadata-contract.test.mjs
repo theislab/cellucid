@@ -227,7 +227,7 @@ test('an unknown key in uns[\'cellucid\'] refuses the file when it opens', async
   assert.equal(source.datasetId, null);
 });
 
-test('descriptive text is read trimmed, an identifier still refused for a space at either end (R9U-9)', () => {
+test('descriptive text is read trimmed, an identifier still refused for a space at either end', () => {
   const read = requireCellucidFileMetadata({
     id: 'pbmc',
     name: ' PBMC 3k ',

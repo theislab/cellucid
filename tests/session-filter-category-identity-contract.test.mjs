@@ -292,7 +292,7 @@ test('a saved label a column found on load does not have is refused once it is l
   await assert.rejects(missing.filters.restore(saved.filters), /no longer has/);
 });
 
-test('hidden cells without a category are a filter of their own, and restored (K-06)', async () => {
+test('hidden cells without a category are a filter of their own, and restored', async () => {
   const saving = createHarness(['B cell', 'T cell', 'Monocyte']);
   saving.state.ensureCategoryMetadata(saving.cellType);
   saving.state.setMissingCategoryVisibility(saving.cellType, false);

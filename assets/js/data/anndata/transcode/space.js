@@ -6,22 +6,36 @@
  *
  * **Lifetime (kept across visits).** A directory is
  * `cellucid-transcoded/<key>-<random>`, `<key>` the start of the digest of
- * the source file's identity (`cacheKey`: a local file's name, size and
+ * the source file's identity (`kept-format.js` `cacheKey`: a local file's name, size and
  * modification time; a remote file's provider id and the version its host
  * reports: its ETag, its provider's revision or checksum; a link's
  * signature and token query parameters left out, so a link signed again is
  * the same file and no credential is stored). Its `manifest.json`, written
  * last, makes it complete, and names the identity's whole digest (never the
- * identity itself), the store revision (`KEPT_STORE_REVISION`), whether it is
- * kept for later visits (else the tab it belongs to), and the size of every
- * file it refers to.
+ * identity itself), the fingerprint of the code that wrote it
+ * (`codeFingerprint`, below), whether it is kept for later visits (else the
+ * tab it belongs to), and the size of every file it refers to. What a
+ * directory's files are (their names, the manifest's fields, the digests it
+ * is filed under, the tables of page checksums, a journal's records) is
+ * decided by `kept-format.js` and `kept-journal.js`; this module keeps the
+ * directories: it writes and reads them with those, under locks, within
+ * the browser's quota.
+ *
+ * **Code fingerprints.** Every manifest is stamped with the code
+ * fingerprint of its kind (`codeFingerprintOf`): a digest of the code that
+ * decides what a directory of that kind holds, written by the build into
+ * `kept-code-fingerprints.js` (`scripts/kept-code-fingerprints.mjs` names
+ * the modules of each kind and why; comments and layout do not count). A
+ * directory stamped by other code is not this code's to read: it is
+ * removed, never read, and what it held is made again on the next opening.
+ * Nothing is raised by hand: changing that code changes the fingerprint.
  *
  * - A file whose identity names a version (`persistsAcrossVisits`) is kept
  *   for later visits: opening it again, in this tab or another one, a day
  *   later, opens its directory without reading the file (`findKeptStore`),
- *   once the manifest is checked against the identity, the revision and the
- *   files it lists (any mismatch removes the directory, and the file is read
- *   again). A file known only by its size (a host that reports no
+ *   once the manifest is checked against the identity, the code fingerprint
+ *   and the files it lists (any mismatch removes the directory, and the file
+ *   is read again). A file known only by its size (a host that reports no
  *   version) is kept for the tab's life, as it may change
  *   under the same name and size, and only that tab opens it again
  *   (`THIS_TAB`).
@@ -30,8 +44,8 @@
  *   completed, until the tab closes (`holdTranscodedStore`). A held
  *   directory is never removed.
  * - A directory nobody holds is removed when it is incomplete (a closed or
- *   crashed tab's pass, a canceled one), kept for one tab only, or written
- *   by another store revision: when the app starts
+ *   crashed tab's pass, a canceled one), kept for one tab only, or stamped
+ *   by other code: when the app starts
  *   (`sweepAbandonedTranscodes`), before a new pass begins, and at once
  *   after a canceled pass (`removeTranscodedStore`, which waits for the
  *   stopped worker's lock to go).
@@ -51,7 +65,7 @@
  * - `listKeptStores` lists what is kept for later visits, an item per
  *   converted store, download and gene index, each with what its manifest's
  *   `about` says it is (the file's name and host, never a link:
- *   `keptAbout`), its size, when it was last opened and whether an open tab
+ *   `kept-format.js` `keptAbout`), its size, when it was last opened and whether an open tab
  *   uses it; `removeKeptStores` removes the items chosen, or everything, that
  *   no open tab holds (the Session panel's Stored dialog).
  *
@@ -60,8 +74,8 @@
  * its manifest is written first, and its contents are the records of its
  * `j.bin` (each appended after the bytes it names in `d.bin`, framed by its
  * length and CRC-32 with its bytes' page checksums), read as far as they are
- * whole (`parseKeptJournal`); its writer holds a writing lock, and another
- * reader reads it only once that lock is free.
+ * whole (`kept-journal.js` `parseKeptJournal`); its writer holds a writing
+ * lock, and another reader reads it only once that lock is free.
  *
  * Kept payloads arrive while the file streams, each into a file of its own
  * (`p<n>.bin`), so one that turns out not to be wanted is deleted: at once
@@ -74,18 +88,24 @@
  */
 
 import { blobReader } from '../../../formats/zarr/stores/mapped.js';
-import {
-  CHECK_PAGE_BYTES, PageChecksums, checkedRead, checksumBytes, checksumOf, checksumsFit, checksumsFromBytes, pageChecksumsOf,
-} from '../../../formats/io/page-checks.js';
+import { CHECK_PAGE_BYTES, PageChecksums, checkedRead } from '../../../formats/io/page-checks.js';
 import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
 import { createOpaqueId } from '../../../utils/opaque-id.js';
-import { sha256Hex } from '../../../utils/sha256.js';
-import { linkIdentity } from '../../sources/link-credentials.js';
 import { addressOf, fileIdentityOf, persistsAcrossVisits } from '../../sources/identity.js';
 import { ARRAY_PIECE_BYTES } from '../../../utils/large-arrays.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
 import { KeptBytesMissing, readWhole, requireHeld, writeAt, writeWhole } from '../../../formats/io/sync-access.js';
 import { createListenerSet } from '../../../utils/listener-set.js';
+import { openFileWritable } from '../../../utils/file-writable.js';
+import { KEPT_CODE_FINGERPRINTS } from './kept-code-fingerprints.js';
+import {
+  DERIVED, DOWNLOADED, JOURNAL, LAST_USED, MANIFEST,
+  checkTableFile, checkTableFrom, checkTables, directoryFor, directoryPrefix, downloadIdentity, fileFields,
+  identityDigest, keptAbout, keptManifest, namedForAddress, pageChecked,
+} from './kept-format.js';
+import {
+  absentRecord, confirmedRecord, isJournal, journalSaid, objectRecord, parseKeptJournal, rangeRecord,
+} from './kept-journal.js';
 
 export const TRANSCODED_DIRECTORY = 'cellucid-transcoded';
 
@@ -110,132 +130,25 @@ async function blobBytes(blob, start, end) {
   }
   return out;
 }
-const MANIFEST = 'manifest.json';
-const DERIVED = 'd.bin';
-/** The file whose text is when a directory was last opened (ms since the epoch). */
-const LAST_USED = 'used';
-/** The file a kept download is. */
-const DOWNLOADED = 'source';
-/** The records of a kept journal (`openKeptJournal`): where each piece of its bytes (`d.bin`) is of its file. */
-const JOURNAL = 'j.bin';
-
 /**
- * The revision of what the transcoders write. A kept store of another
- * revision is removed, never read: raise it whenever a transcoder's output
- * changes (`tests/transcode-cache-contract.test.mjs` fails until it is).
+ * The code fingerprint a manifest of its kind is stamped with and read
+ * under (`kept-code-fingerprints.js`, written by the build): a converted
+ * store's (a manifest with no `kind`), a gene index's (`column-index`), a
+ * file downloaded whole's (`download`), the downloaded parts of a file's
+ * (`parts`). A directory stamped with anything else was written by other
+ * code: it is removed, never read.
+ *
+ * @param {Object|null|undefined} manifest
+ * @returns {string}
  */
-export const KEPT_STORE_REVISION = 16;
-
-/**
- * The revision of what a gene index kept in this browser holds
- * (`../kept-column-index.js`, manifests of kind `column-index`): a kept index
- * of another revision is removed, never read. Raise it whenever the code
- * that decides what an index holds changes: the index and its kept form,
- * the matrix reads and conversions it is built from, the layouts and the
- * chunk decoders (`tests/kept-column-index-contract.test.mjs` pins the
- * digest of that code, comments aside, and fails until it is raised).
- */
-export const KEPT_INDEX_REVISION = 11;
-
-/**
- * The revision of the raw bytes of remote files kept in this browser: a
- * file downloaded whole (`kind: download`) and the downloaded parts of one
- * read in place (`kind: parts`, `formats/io/kept-parts.js`, kept as a
- * journal: `openKeptJournal`). They are the file's own bytes, so no reader,
- * converter or decoder change touches them: only a change of how they are
- * laid out and checked (the manifest, the journal's records, the page
- * checksums) does. Raise it then: the golden bytes in
- * `tests/kept-parts-contract.test.mjs` change with any such change, and a
- * release that does not change them keeps every download. 2: files named
- * by the one version rule (`writeVersion`), with their address in the
- * manifest; downloads kept at 1 (0.9.6) are removed, never read.
- */
-export const KEPT_BYTES_REVISION = 2;
-
-/** The revision a manifest of its kind is read at. */
-function revisionOf(manifest) {
-  if (manifest?.kind === 'column-index') return KEPT_INDEX_REVISION;
-  return manifest?.kind === 'download' || manifest?.kind === 'parts' ? KEPT_BYTES_REVISION : KEPT_STORE_REVISION;
+export function codeFingerprintOf(manifest) {
+  if (manifest?.kind === 'column-index') return KEPT_CODE_FINGERPRINTS.index;
+  if (manifest?.kind === 'download') return KEPT_CODE_FINGERPRINTS.download;
+  return manifest?.kind === 'parts' ? KEPT_CODE_FINGERPRINTS.parts : KEPT_CODE_FINGERPRINTS.store;
 }
 
 function lockName(directory) {
   return `${TRANSCODED_DIRECTORY}/${directory}`;
-}
-
-/** JSON of a value with every object's keys in order: one text per identity. */
-export function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value !== null && typeof value === 'object') {
-    return `{${Object.keys(value).sort().filter(key => value[key] !== undefined)
-      .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value ?? null);
-}
-
-/**
- * One field of an identity as it is filed: a link, in any of the forms an
- * identity names one (a remote file's `url`, a provider key that is a link,
- * `url:<encoded address>`), as its identity (`linkIdentity`: no credential).
- */
-function filedField(name, value) {
-  if (typeof value !== 'string') return value;
-  if (name === 'url') return linkIdentity(value);
-  if (name === 'key' && value.startsWith('url:')) {
-    let href;
-    try {
-      href = decodeURIComponent(value.slice(4));
-    } catch {
-      return value;
-    }
-    return `url:${encodeURIComponent(linkIdentity(href))}`;
-  }
-  return value;
-}
-
-/**
- * What a kept store is filed under: the source's identity, every link in it
- * without its credential parameters (a link signed again is the same file).
- */
-export function cacheKey(identity) {
-  if (identity === null || typeof identity !== 'object') return identity ?? null;
-  if (Array.isArray(identity)) return identity.map(cacheKey);
-  const out = {};
-  for (const [name, value] of Object.entries(identity)) {
-    out[name] = value !== null && typeof value === 'object' ? cacheKey(value) : filedField(name, value);
-  }
-  return out;
-}
-
-/** Hex SHA-256 of a source's cache key: the manifest names it whole, a directory by its start. */
-export async function identityDigest(identity) {
-  return sha256Hex(new TextEncoder().encode(canonicalJson(cacheKey(identity))));
-}
-
-/**
- * What every kept directory's manifest says of the file it is of, besides
- * the digest of what it is filed under (`key`): the file's digest
- * (`fileKey`: its identity, version included) and its address's
- * (`address`: `addressOf`, null for a file on this computer), so that the
- * kept copies of every kind of another version of the same file are found
- * (`forgetOtherVersions`).
- */
-async function fileFields(identity) {
-  const file = fileIdentityOf(identity);
-  const address = addressOf(file);
-  return { fileKey: await identityDigest(file), address: address === null ? null : await identityDigest(address) };
-}
-
-/** How much of an address's digest a directory name carries (`keptAtAddress`). */
-const ADDRESS_NAME_DIGITS = 12;
-
-/**
- * A directory name for a source: its digest's start, its file's address's
- * (`addressOf`; `local` for a file on this computer), then a random part.
- */
-async function directoryFor(identity) {
-  const address = addressOf(identity);
-  const at = address === null ? 'local' : (await identityDigest(address)).slice(0, ADDRESS_NAME_DIGITS);
-  return `${(await identityDigest(identity)).slice(0, 24)}-${at}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /**
@@ -256,11 +169,11 @@ export async function keptAtAddress(address, environment = globalThis) {
   try {
     const at = addressOf(address);
     if (at === null) return false;
-    const marker = `-${(await identityDigest(at)).slice(0, ADDRESS_NAME_DIGITS)}-`;
+    const digest = await identityDigest(at);
     const root = await opfsRoot(environment);
     const parent = root === null ? null : await parentDirectory(root, false);
     if (parent === null) return false;
-    for (const { name } of await directoriesOf(parent)) if (name.slice(24).startsWith(marker)) return true;
+    for (const { name } of await directoriesOf(parent)) if (namedForAddress(name, digest)) return true;
     return false;
   } catch {
     return false;
@@ -388,7 +301,11 @@ async function lastUsedOf(folder) {
   }
 }
 
-/** Write a small file whole: through a synchronous access handle (a worker), else a writable stream (a page). */
+/**
+ * Write a small file whole: through a synchronous access handle (a worker),
+ * else a writable stream (a page; `utils/file-writable.js` writes exactly
+ * the bytes given in every engine).
+ */
 async function writeSmallFile(folder, name, bytes) {
   const handle = await folder.getFileHandle(name, { create: true });
   if (typeof handle.createSyncAccessHandle === 'function') {
@@ -402,7 +319,7 @@ async function writeSmallFile(folder, name, bytes) {
     }
     return;
   }
-  const writable = await handle.createWritable();
+  const writable = await openFileWritable(handle);
   try {
     await writable.write(bytes);
     await writable.close();
@@ -413,42 +330,35 @@ async function writeSmallFile(folder, name, bytes) {
   }
 }
 
-/** The file a kept blob's page checksums are in (`formats/io/page-checks.js`). */
-const sumsFileOf = name => `${name}.sums`;
-
 /**
- * Keep the page checksums of a directory's blobs beside them, each table in
- * its own file: what the manifest records of them (`checks`), the table's
- * own CRC-32 with it.
+ * Keep the page checksums of a directory's blobs beside them
+ * (`kept-format.js` `checkTables`: each table in a file of its own): what
+ * the manifest records of them (`checks`).
  *
  * @param {FileSystemDirectoryHandle} folder
  * @param {Map<string, Uint32Array>} sums - Each blob's page checksums, by name
  */
 async function writeChecks(folder, sums) {
-  const files = {};
-  for (const [name, table] of sums) {
-    const bytes = checksumBytes(table);
-    await writeSmallFile(folder, sumsFileOf(name), bytes);
-    files[name] = checksumOf(bytes);
-  }
-  return { pageBytes: CHECK_PAGE_BYTES, files };
+  const { files, checks } = checkTables(sums);
+  for (const [name, bytes] of files) await writeSmallFile(folder, name, bytes);
+  return checks;
 }
 
 /**
  * The page checksums of one kept blob, checked against the manifest's
- * record of them; null when they are missing or do not match (damage).
+ * record of them (`kept-format.js` `checkTableFrom`); null when they are
+ * missing or do not match (damage).
  */
 async function readChecks(folder, checks, name, size) {
-  if (checks?.pageBytes !== CHECK_PAGE_BYTES || !Number.isInteger(checks.files?.[name])) return null;
+  const table = checkTableFile(checks, name);
+  if (table === null) return null;
   let bytes;
   try {
-    bytes = new Uint8Array(await (await (await folder.getFileHandle(sumsFileOf(name))).getFile()).arrayBuffer());
+    bytes = new Uint8Array(await (await (await folder.getFileHandle(table)).getFile()).arrayBuffer());
   } catch {
     return null;
   }
-  if (checksumOf(bytes) !== checks.files[name]) return null;
-  const sums = checksumsFromBytes(bytes);
-  return checksumsFit(sums, size) ? sums : null;
+  return checkTableFrom(checks, name, bytes, size);
 }
 
 /**
@@ -463,9 +373,6 @@ function checkedBlob(file, sums, label, forget) {
     read: checkedRead(reader.read, { size: reader.size, sums, label, onDamage: forget }),
   };
 }
-
-/** Whether a manifest's blobs are read through page checksums: a gene index checks each gene's piece instead. */
-const pageChecked = manifest => manifest?.kind !== 'column-index';
 
 /** What a kept directory is, in a message about it. */
 const keptLabel = manifest => (manifest?.kind === 'download' ? 'A file downloaded whole'
@@ -485,9 +392,9 @@ async function touch(folder, locks) {
   }
 }
 
-/** Whether a manifest is one this revision reads and keeps for later visits. */
+/** Whether a manifest is one this code wrote (its code fingerprint) and keeps for later visits. */
 function keptForLater(manifest) {
-  return manifest !== null && manifest.revision === revisionOf(manifest) && manifest.persist === true;
+  return manifest !== null && manifest.codeFingerprint === codeFingerprintOf(manifest) && manifest.persist === true;
 }
 
 /**
@@ -515,14 +422,14 @@ async function whileUnheld(locks, name, remove) {
  * a removal or a rewrite wait for the reads in flight, and a read for them:
  * WebKit logs a read of a file removed or rewritten after the read began as
  * a failed load ("WebKitBlobResource error 1", whatever the caller does
- * with the error). The Stored listing read directories a reader's opening
- * removed (Web contracts runs 41213981681 and 41255961977, macOS WebKit,
- * `kept-parts.spec.mjs`), and the last-used time a later visit's reader
- * writes as it opens the directory (`kept-parts.spec.mjs`, WebKit: logged
- * in one run of 120, 2026-11-06). Measured in WebKit on a file a worker
- * rewrites through a synchronous access handle while the page reads it: 5
- * of 2,645 reads refused and logged without a lock, none of 3,001 under
- * this one; Chromium and Firefox refuse none either way. Taken after the
+ * with the error). The Stored listing reads directories a reader's opening
+ * removes, and the last-used time a later visit's reader writes as it
+ * opens the directory is rewritten while the page reads it (a worker
+ * rewriting a file through a synchronous access handle while the page
+ * reads it makes WebKit refuse and log some reads without a lock, none
+ * under this one; Chromium and Firefox refuse none either way: measured,
+ * 23_decisions_partial_reading.md; the browser test is
+ * `kept-parts.spec.mjs`). Taken after the
  * directory's own lock, never before, and held only for the reads, the
  * removal or the rewrite.
  */
@@ -566,7 +473,7 @@ async function directoriesOf(parent) {
 
 /**
  * Remove every directory nobody holds that is not kept for later visits:
- * incomplete, kept for one tab, or of another revision.
+ * incomplete, kept for one tab, or stamped by other code.
  */
 async function removeAbandoned(parent, locks) {
   if (typeof locks?.request !== 'function') return;
@@ -704,38 +611,6 @@ async function isHeld(locks, name) {
 function fileOf(name, manifest) {
   if (manifest === null) return `directory:${name}`;
   return manifest.kind === 'download' || manifest.kind === 'column-index' || manifest.kind === 'parts' ? manifest.source : manifest.key;
-}
-
-/**
- * What a kept directory is, for the person who manages what is kept: the
- * file's name (a file's or a folder's, else the last part of a link's path)
- * and its host (null for a file on this computer). Never a link: a signed
- * link's query (its credentials) and its path are not kept. Recorded in the
- * manifest as `about` by whoever keeps a directory.
- *
- * @param {{name?: string|null, url?: string|null}} [source]
- * @returns {{name: string|null, host: string|null}}
- */
-export function keptAbout({ name = null, url = null } = {}) {
-  // A name that is itself a link says only what a link does.
-  const nameIsLink = typeof name === 'string' && /^[a-z][a-z0-9+.-]*:\/\//i.test(name);
-  let host = null;
-  let last = null;
-  try {
-    const parsed = new URL(url ?? (nameIsLink ? name : null));
-    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-      host = parsed.host;
-      const part = parsed.pathname.split('/').filter(Boolean).at(-1) ?? '';
-      try {
-        last = decodeURIComponent(part) || null;
-      } catch {
-        last = part || null;
-      }
-    }
-  } catch {
-    // Not a link: a file on this computer.
-  }
-  return { name: typeof name === 'string' && name !== '' && !nameIsLink ? name : last, host };
 }
 
 /** What a kept item is, by its manifest's kind. */
@@ -1138,12 +1013,13 @@ export async function removeTranscodedStore(directory, environment = globalThis)
 
 /**
  * Whether a complete directory is what its manifest says, for the source
- * whose digest is `digest`: this revision, the same digest, kept for later
- * visits or written for `tab`, every file it lists there at its size. Its
- * blob readers when it is, else null; `'other-tab'` for another tab's store.
+ * whose digest is `digest`: stamped by this code (its code fingerprint),
+ * the same digest, kept for later visits or written for `tab`, every file
+ * it lists there at its size. Its blob readers when it is, else null;
+ * `'other-tab'` for another tab's store.
  */
 async function checkedBlobs(folder, manifest, digest, tab, locks, directory) {
-  if (manifest === null || manifest.revision !== revisionOf(manifest)) return null;
+  if (manifest === null || manifest.codeFingerprint !== codeFingerprintOf(manifest)) return null;
   if (manifest.key !== digest) return null;
   if (manifest.persist !== true && manifest.tab !== tab) return 'other-tab';
   const sizes = manifest.blobs;
@@ -1203,7 +1079,7 @@ export async function findKeptStores(identity, environment = globalThis, { tab =
   const parent = await parentDirectory(root, false);
   if (parent === null) return found;
   const digest = await identityDigest(identity);
-  const prefix = `${digest.slice(0, 24)}-`;
+  const prefix = directoryPrefix(digest);
   const locks = environment.navigator?.locks;
   let candidates;
   try {
@@ -1309,9 +1185,6 @@ export async function keptWhere(identity, environment = globalThis) {
   if (parent === null || !(await writesFiles(environment, parent))) return { kept: 'memory', persistent: false };
   return { kept: 'opfs', persistent: persistsAcrossVisits(identity) };
 }
-
-/** What a kept download is filed under: apart from the store of the same file, filed under the file's own identity. */
-const downloadIdentity = identity => ({ download: identity });
 
 /**
  * Whether the complete store of a source is kept (`findKeptStore`), as a
@@ -1441,20 +1314,14 @@ export async function keepDownload(identity, pieces, { name, url = null, size = 
     const sums = pageSums.finish();
     const checks = await writeChecks(folder, new Map([[DOWNLOADED, sums]]));
     await touch(folder, locks);
-    await writeSmallFile(folder, MANIFEST, new TextEncoder().encode(JSON.stringify({
-      kind: 'download',
-      whole: true,
-      revision: KEPT_BYTES_REVISION,
-      persist: persistent,
-      ...(persistent ? {} : { tab: THIS_TAB }),
-      key: await identityDigest(filed),
-      ...await fileFields(filed),
-      source: await identityDigest(identity),
-      about: keptAbout({ name, url }),
-      createdAt: Date.now(),
+    const said = { kind: 'download', whole: true, source: await identityDigest(identity), about: keptAbout({ name, url }) };
+    await writeSmallFile(folder, MANIFEST, new TextEncoder().encode(JSON.stringify(await keptManifest(said, filed, {
+      codeFingerprint: codeFingerprintOf(said),
+      persistent,
+      tab: THIS_TAB,
       blobs: { [DOWNLOADED]: written },
       checks,
-    })));
+    }))));
     keptDownloads.set(await identityDigest(identity), directory);
     return {
       file: new File([stored], name, { lastModified: stored.lastModified }),
@@ -1509,14 +1376,15 @@ async function* summed(pieces, sums) {
 }
 
 /**
- * Write a stream of pieces to one file: a writable stream (a page) or a
- * synchronous access handle (a worker). `onWritten(bytes)` hears how much is
- * written so far.
+ * Write a stream of pieces to one file: a writable stream (a page;
+ * `utils/file-writable.js` writes exactly each piece's bytes in every
+ * engine, whatever buffer the piece is a view of) or a synchronous access
+ * handle (a worker). `onWritten(bytes)` hears how much is written so far.
  */
 async function writeStream(handle, pieces, onWritten) {
   let written = 0;
   if (typeof handle.createWritable === 'function') {
-    const writable = await handle.createWritable();
+    const writable = await openFileWritable(handle);
     try {
       for await (const piece of pieces) {
         await writable.write(piece);
@@ -1525,7 +1393,7 @@ async function writeStream(handle, pieces, onWritten) {
       }
       await writable.close();
     } catch (error) {
-      await writable.abort?.().catch(() => {});
+      await writable.abort(error).catch(() => {});
       throw error;
     }
     return written;
@@ -1583,8 +1451,8 @@ async function gatherInMemory(pieces, name) {
  * @property {(region: Region) => Promise<Uint8Array>} read - Read a region back
  * @property {(manifest: Object, used: Set<string>) => Promise<Map<string, Object>>} finish -
  *   Delete the blobs not in `used`, write the manifest last (OPFS: with the
- *   identity, the revision, whether it is kept for later visits and every
- *   blob's size), and the blob readers by name
+ *   identity's digest, the code fingerprint, whether it is kept for later
+ *   visits and every blob's size), and the blob readers by name
  * @property {() => Promise<void>} discard - Remove everything written (the
  *   reader's lock goes with the worker; a complete store stays held)
  * @property {() => void} release - Let go of the writer's lock on a complete
@@ -1824,17 +1692,13 @@ async function opfsSpace(parent, identity, environment, onDirectory, tab, upTo) 
       }
       await touch(folder, locks);
       // Last: the manifest makes the directory complete.
-      const bytes = new TextEncoder().encode(JSON.stringify({
-        ...manifest,
-        revision: revisionOf(manifest),
-        persist: space.persistent,
-        ...(space.persistent ? {} : { tab }),
-        key: await identityDigest(identity),
-        ...await fileFields(identity),
-        createdAt: Date.now(),
+      const bytes = new TextEncoder().encode(JSON.stringify(await keptManifest(manifest, identity, {
+        codeFingerprint: codeFingerprintOf(manifest),
+        persistent: space.persistent,
+        tab,
         blobs: sizes,
-        ...(checks === undefined ? {} : { checks }),
-      }));
+        checks,
+      })));
       try {
         await writeSmallFile(folder, MANIFEST, bytes);
       } catch (error) {
@@ -1865,147 +1729,12 @@ async function opfsSpace(parent, identity, environment, onDirectory, tab, upTo) 
 // Kept journals: bytes kept as they arrive (`formats/io/kept-parts.js`)
 // ---------------------------------------------------------------------------
 
-/** What a record of a kept journal is (its first byte). */
-const RECORD_RANGE = 1;
-const RECORD_OBJECT = 2;
-const RECORD_CONFIRMED = 3;
-const RECORD_ABSENT = 4;
-
-/** A record's frame: its body's length and its body's CRC-32, before the body. */
-const RECORD_FRAME_BYTES = 8;
-
 /**
  * The lock a journal's writer holds (exclusive) for as long as it writes:
  * another reader reads a journal only once it is free (its writer closed,
  * or its worker ended, which lets every lock it held go).
  */
 const writingOf = directory => `${directory}#writing`;
-
-const utf8 = new TextEncoder();
-const fromUtf8 = new TextDecoder();
-
-/** One framed record of `type`, its body written by `write(view, at)` after the type byte. */
-function framedRecord(type, bodyBytes, write) {
-  const out = allocateTypedArray(Uint8Array, RECORD_FRAME_BYTES + bodyBytes, 'A kept journal record');
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  view.setUint32(0, bodyBytes, true);
-  out[RECORD_FRAME_BYTES] = type;
-  write(view, RECORD_FRAME_BYTES + 1);
-  view.setUint32(4, checksumOf(out.subarray(RECORD_FRAME_BYTES)), true);
-  return out;
-}
-
-/**
- * The record of a piece of an object's bytes kept: the object (`''`, a
- * file), where the piece starts in it, where its bytes are in `d.bin`, how
- * many there are, and the CRC-32 of each `CHECK_PAGE_BYTES` of them (from
- * the piece's first byte), against which every read of them is checked.
- */
-function rangeRecord(key, start, offset, bytes) {
-  const name = utf8.encode(key);
-  const sums = pageChecksumsOf(bytes);
-  return framedRecord(RECORD_RANGE, 1 + 24 + 4 + name.length + 4 * sums.length, (view, at) => {
-    view.setFloat64(at, start, true);
-    view.setFloat64(at + 8, offset, true);
-    view.setFloat64(at + 16, bytes.length, true);
-    view.setUint32(at + 24, name.length, true);
-    new Uint8Array(view.buffer, view.byteOffset + at + 28, name.length).set(name);
-    for (let i = 0, to = at + 28 + name.length; i < sums.length; i++, to += 4) view.setUint32(to, sums[i], true);
-  });
-}
-
-/** The record of what an object's host said of it: its exact size (−1: not known) and validator (its ETag or date). */
-function objectRecord(key, { size = null, validator = null }) {
-  const name = utf8.encode(key);
-  const tag = utf8.encode(validator ?? '');
-  return framedRecord(RECORD_OBJECT, 1 + 4 + name.length + 8 + 1 + 4 + tag.length, (view, at) => {
-    view.setUint32(at, name.length, true);
-    new Uint8Array(view.buffer, view.byteOffset + at + 4, name.length).set(name);
-    const to = at + 4 + name.length;
-    view.setFloat64(to, Number.isSafeInteger(size) && size >= 0 ? size : -1, true);
-    view.setUint8(to + 8, validator === null ? 0 : 1);
-    view.setUint32(to + 9, tag.length, true);
-    new Uint8Array(view.buffer, view.byteOffset + to + 13, tag.length).set(tag);
-  });
-}
-
-/** The record of an object of a folder its host answered as absent (404, 410): under a content name, it stays absent. */
-function absentRecord(key) {
-  const name = utf8.encode(key);
-  return framedRecord(RECORD_ABSENT, 1 + 4 + name.length, (view, at) => {
-    view.setUint32(at, name.length, true);
-    new Uint8Array(view.buffer, view.byteOffset + at + 4, name.length).set(name);
-  });
-}
-
-/**
- * The records of a kept journal, read from its bytes in order, as far as
- * they are whole and what they say holds: reading stops at the first record
- * that is cut short (a write the browser or the machine stopped), does not
- * match its CRC-32, or names bytes `d.bin` (of `dataSize` bytes) does not
- * hold. `confirmed`: how many of the first ranges a confirmation follows
- * (`appendConfirmed`); `absent`: the objects of a folder its host answered
- * as absent (`appendAbsent`).
- *
- * @param {Uint8Array} bytes - The journal's records
- * @param {number} dataSize - The bytes of its `d.bin`
- * @returns {{ranges: Array<{key: string, start: number, offset: number, length: number, sums: Uint32Array}>,
- *   objects: Map<string, {size: number|null, validator: string|null}>, absent: Set<string>, confirmed: number}}
- */
-export function parseKeptJournal(bytes, dataSize) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const ranges = [];
-  const objects = new Map();
-  const absent = new Set();
-  let confirmed = 0;
-  let at = 0;
-  const safe = value => Number.isSafeInteger(value) && value >= 0;
-  while (at + RECORD_FRAME_BYTES < bytes.length) {
-    const bodyBytes = view.getUint32(at, true);
-    const end = at + RECORD_FRAME_BYTES + bodyBytes;
-    if (bodyBytes < 1 || end > bytes.length) break;
-    const body = bytes.subarray(at + RECORD_FRAME_BYTES, end);
-    if (checksumOf(body) !== view.getUint32(at + 4, true)) break;
-    const type = body[0];
-    const from = at + RECORD_FRAME_BYTES + 1;
-    if (type === RECORD_RANGE) {
-      if (bodyBytes < 29) break;
-      const start = view.getFloat64(from, true);
-      const offset = view.getFloat64(from + 8, true);
-      const length = view.getFloat64(from + 16, true);
-      const nameBytes = view.getUint32(from + 24, true);
-      const pages = Math.ceil(length / CHECK_PAGE_BYTES);
-      if (!safe(start) || !safe(offset) || !safe(length) || length === 0 || offset + length > dataSize ||
-          29 + nameBytes + 4 * pages !== bodyBytes) break;
-      const key = fromUtf8.decode(bytes.subarray(from + 28, from + 28 + nameBytes));
-      const sums = allocateTypedArray(Uint32Array, pages, 'A kept piece\'s page checksums');
-      for (let i = 0, to = from + 28 + nameBytes; i < pages; i++, to += 4) sums[i] = view.getUint32(to, true);
-      ranges.push({ key, start, offset, length, sums });
-    } else if (type === RECORD_OBJECT) {
-      if (bodyBytes < 18) break;
-      const nameBytes = view.getUint32(from, true);
-      if (1 + 4 + nameBytes + 13 > bodyBytes) break;
-      const key = fromUtf8.decode(bytes.subarray(from + 4, from + 4 + nameBytes));
-      const to = from + 4 + nameBytes;
-      const size = view.getFloat64(to, true);
-      const hasValidator = view.getUint8(to + 8) === 1;
-      const tagBytes = view.getUint32(to + 9, true);
-      if (1 + 4 + nameBytes + 13 + tagBytes !== bodyBytes) break;
-      objects.set(key, {
-        size: safe(size) ? size : null,
-        validator: hasValidator ? fromUtf8.decode(bytes.subarray(to + 13, to + 13 + tagBytes)) : null,
-      });
-    } else if (type === RECORD_CONFIRMED && bodyBytes === 1) {
-      confirmed = ranges.length;
-    } else if (type === RECORD_ABSENT && bodyBytes >= 5 && 5 + view.getUint32(from, true) === bodyBytes) {
-      absent.add(fromUtf8.decode(bytes.subarray(from + 4, from + 4 + view.getUint32(from, true))));
-    } else {
-      break;
-    }
-    at = end;
-  }
-  return { ranges, objects, absent, confirmed };
-}
 
 /**
  * A kept journal's records and bytes, checked against its manifest (as
@@ -2015,7 +1744,7 @@ export function parseKeptJournal(bytes, dataSize) {
  * tab's, `'writing'` while its writer writes it (its records still grow).
  */
 async function checkedJournal(folder, manifest, digest, tab, locks, name) {
-  if (manifest.revision !== revisionOf(manifest) || manifest.key !== digest) return null;
+  if (manifest.codeFingerprint !== codeFingerprintOf(manifest) || manifest.key !== digest) return null;
   if (manifest.persist !== true && manifest.tab !== tab) return 'other-tab';
   if (await isHeld(locks, writingOf(name))) return 'writing';
   let records;
@@ -2056,9 +1785,6 @@ async function journalSizes(folder, manifest) {
     return { bytes: 0, saves: 0 };
   }
 }
-
-/** Whether a manifest is a kept journal's (its contents are its records, not a list of files). */
-const isJournal = manifest => manifest?.journal === true;
 
 /** The bytes a kept directory takes: the files its manifest lists, or a journal's files. */
 async function directoryBytes(folder, manifest) {
@@ -2137,16 +1863,11 @@ export async function openKeptJournal(identity, { environment = globalThis, tab 
     records = await recordHandle.createSyncAccessHandle();
     await touch(folder, locks);
     // First: the manifest keeps the directory; what it holds is what its records say.
-    await writeSmallFile(folder, MANIFEST, utf8.encode(JSON.stringify({
-      ...manifest,
-      journal: true,
-      revision: revisionOf(manifest),
-      persist: persistent,
-      ...(persistent ? {} : { tab }),
-      key: await identityDigest(identity),
-      ...await fileFields(identity),
-      createdAt: Date.now(),
-    })));
+    await writeSmallFile(folder, MANIFEST, new TextEncoder().encode(JSON.stringify(await keptManifest(journalSaid(manifest), identity, {
+      codeFingerprint: codeFingerprintOf(manifest),
+      persistent,
+      tab,
+    }))));
   } catch {
     for (const handle of [data, records]) {
       try {
@@ -2215,7 +1936,7 @@ export async function openKeptJournal(identity, { environment = globalThis, tab 
       return offset;
     },
     appendObject: (key, info) => append(objectRecord(key, info)),
-    appendConfirmed: () => append(framedRecord(RECORD_CONFIRMED, 1, () => {})),
+    appendConfirmed: () => append(confirmedRecord()),
     appendAbsent: key => append(absentRecord(key)),
     read(offset, length) {
       return readWhole(data, allocateTypedArray(Uint8Array, length, 'Kept bytes'), offset);

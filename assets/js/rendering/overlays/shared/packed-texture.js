@@ -6,17 +6,19 @@
  * many layers as the count needs, one texel an item, written row by row
  * straight from the source array (no padded CPU copy). A shader finds item
  * `i` with `linearTexel(i, layout)`, the layout uniform set by
- * `setLinearLayoutUniform`. A single 2D texture used to cap them at
+ * `setLinearLayoutUniform`. A single 2D texture caps them at
  * `MAX_TEXTURE_SIZE^2` items: 67,108,864 cells where the engine reports 8192
- * (Firefox on macOS), so the velocity overlay refused larger datasets there;
- * a linear texture holds every item a shader index can address (2^31 - 1).
+ * (Firefox on macOS), so the velocity overlay would refuse larger datasets
+ * there; a linear texture holds every item a shader index can address
+ * (2^31 - 1).
  *
  * A texture whose storage already has the packed shape is rewritten in place:
  * rows written into storage WebGL has accepted allocate nothing, so only a lost
  * context can refuse them and no error is read back (`requireLiveContext`).
  * `getError()` is a synchronous round trip to the GPU process that waits for
- * every queued command, the previous frames' draws included: a velocity
- * overlay rebuilding the tables of seven restored views spent 112 ms there.
+ * every queued command, the previous frames' draws included: rebuilding the
+ * tables of several restored views of a velocity overlay spends over a
+ * hundred milliseconds there (measured: 28_decisions_rendering_layers.md).
  * Only a new allocation reads the error queue, once, so a refused allocation is
  * deleted instead of published: at once (`allocationCheck: 'now'`), or by the
  * caller before it publishes (`'caller'`), which lets it read once for several

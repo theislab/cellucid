@@ -360,7 +360,7 @@ export async function readCodes(codes, nCategories, key, format, nRows, options 
  * read (`resolveCategoricalColumn`, `validateCodes`, `nullableContract`),
  * which refuses a column whose parts are wrong with the same words.
  */
-export function validateColumnAxis(frame, key, format, frameLabel, expectedLength) {
+function validateColumnAxis(frame, key, format, frameLabel, expectedLength) {
   if (!frame.has(key)) throw new AnnDataFormatError(`${frameLabel} declared column '${key}' was not found`);
   const item = frame.get(key);
   const label = `${frameLabel} column '${key}'`;

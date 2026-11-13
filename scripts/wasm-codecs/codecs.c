@@ -173,7 +173,7 @@ int uncompress(Bytef *dest, uLongf *destLen, const Bytef *source, uLong sourceLe
 
 /*
  * Undo c-blosc2's delta filter over a decoded frame, in place (as
- * formats/zarr/codecs/blosc.js did): the first block is a running XOR of
+ * formats/zarr/codecs/blosc.js does): the first block is a running XOR of
  * words of the element size (8 bytes for other multiples of 8, bytes
  * otherwise), each later block is XORed with the first.
  */

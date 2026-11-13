@@ -345,8 +345,7 @@ test(
 );
 
 for (const [label, SourceClass] of [
-  ['H5AD', AnnDataFileSource],
-  ['Zarr', AnnDataFileSource],
+  ['AnnData file', AnnDataFileSource],
 ]) {
   test(
     `${label} source connectivity edges forward their cancellation signal`,

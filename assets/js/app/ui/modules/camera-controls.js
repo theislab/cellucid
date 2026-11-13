@@ -300,15 +300,15 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   // hold) nor the camera in motion when a history move or a camera action
   // ends gestures. An agent's play is its own step; a play the person
   // started, or a loop, is recorded once where it comes to rest (paused,
-  // stopped or ended). Live (L11-6): each undo or turn during a loop recorded
+  // stopped or ended). Each undo or turn during a loop would otherwise record
   // the moving camera as the person's "Moved the camera" step, and an undo
-  // then undid that step and branched the history on the next.
+  // would then undo that step and branch the history on the next.
   let cameraPathPlaying = false;
   /**
    * The meta of the camera path action running now (`camera-path.stop`, the
    * transport bar's or an agent's), or null: the camera a path comes to rest
    * under it is that actor's move, so an agent's Stop of its loop is a step of
-   * its turn (Undo turn takes it back), not the person's (L11-6).
+   * its turn (Undo turn takes it back), not the person's.
    */
   let pathActor = null;
 

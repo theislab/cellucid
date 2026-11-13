@@ -44,7 +44,7 @@ export async function waitForAvailableSlot(inFlight, maxInFlight) {
  * hands the event loop back. Below one 60 Hz frame, so input and painting keep
  * their turn while a long gene list streams.
  */
-export const MAIN_THREAD_SLICE_MS = 12;
+const MAIN_THREAD_SLICE_MS = 12;
 
 /**
  * A yield that only yields once the current slice of work has used up
@@ -63,7 +63,7 @@ export function createSlicedYield(sliceMs = MAIN_THREAD_SLICE_MS) {
     if (performance.now() - sliceStart < sliceMs) return undefined;
     // One macrotask: input, painting and queued network callbacks run first,
     // and unlike setTimeout(0) it is never clamped to 4 ms, which over a long
-    // chain of yields turned into seconds of idle time.
+    // chain of yields adds up to seconds of idle time.
     return yieldToMacrotask().then(() => {
       sliceStart = performance.now();
     });

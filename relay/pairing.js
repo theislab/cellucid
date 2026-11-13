@@ -42,8 +42,8 @@ export const TAB_LIST_WAIT_MS = 5_000;
 /**
  * How long a call or a status waits for this browser's tab to come back when
  * its last tab closed a moment ago: a reloaded page reaches the relay again
- * in 1.5–2.8 s (measured on the Pancreas sample, local relay, 2026-11-11: the
- * page dials before its dataset opens) and reports its dataset soon after,
+ * within a few seconds (the page dials before its dataset opens; measured:
+ * 34_decisions_agents.md) and reports its dataset soon after,
  * so a call that arrives during a reload runs in the reloaded tab instead of
  * being told no tab is there. A tab that closed for good is said so after
  * this wait, well within the time a client shows a call as running.

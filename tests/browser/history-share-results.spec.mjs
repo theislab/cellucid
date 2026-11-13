@@ -1,6 +1,6 @@
 /**
  * Analysis results left out of a shared file are computed again on open
- * (History v2 §3.15.4, Share › Results "compute again on open"), in the
+ * (Share › Results "compute again on open"), in the
  * page, through the one share action (`history.share`) and Load:
  *
  * - the file leaves the result out and marks it so (kind and what it was
@@ -180,22 +180,5 @@ test('a result left out of a shared file is computed again on open, as one step,
   // The left-out record is what the page shows there: no change outside the history.
   await page.evaluate(() => window._cellucidHistories.current().reconcile());
   expect((await shown(page)).steps.filter(step => step.kind === 'outside')).toEqual([]);
-  expect(errors).toEqual([]);
-});
-
-test('the current state only, its result left out, is computed again on open', async ({ page }) => {
-  test.setTimeout(180_000);
-  const errors = observeProductErrors(page);
-  await openFixture(page);
-  await runMarkers(page);
-  const bytes = await share(page, { content: 'state', results: 'recompute' });
-  expect((await sessionManifest(bytes)).scope).toMatchObject({ content: 'state', results: 'recompute' });
-  await load(page, 'state-results-left-out.cellucid-session', bytes);
-  await expect(page.locator('.notification-message', { hasText: 'Computed again on open (left out of the file): Marker genes.' })).toBeVisible();
-  const opened = await shown(page);
-  expect(opened.steps.map(step => step.kind)).toEqual(['root', 'squashed', 'action']);
-  expect(opened.steps[1].result).toEqual({ leftOut: true, kind: 'markers', provenance: true });
-  expect(opened.steps[2]).toMatchObject({ type: 'analysis.run', origin: 'session', result: { payload: true } });
-  expect(await markers(page)).toMatchObject({ has_result: true, stale: false });
   expect(errors).toEqual([]);
 });

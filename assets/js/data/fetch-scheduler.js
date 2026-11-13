@@ -44,6 +44,7 @@
 
 import { onAbort, abortReason, cancelled, requireSignalOrNull } from '../utils/abort.js';
 import { REMOTE_POLICY } from '../formats/io/byte-source.js';
+import { promiseWithResolvers } from '../utils/promise-resolvers.js';
 
 /** @typedef {'high'|'normal'|'bulk'|'low'} DownloadPriority */
 
@@ -233,12 +234,7 @@ export class FetchScheduler {
   }
 
   _create(key, priority, start) {
-    let resolve;
-    let reject;
-    const promise = new Promise((resolvePromise, rejectPromise) => {
-      resolve = resolvePromise;
-      reject = rejectPromise;
-    });
+    const { promise, resolve, reject } = promiseWithResolvers();
     // Nobody may be left to observe a cancelled shared download.
     promise.catch(() => {});
     /** @type {Download<unknown>} */

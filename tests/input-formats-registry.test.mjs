@@ -5,8 +5,9 @@
  *
  * - `tests/fixtures/input-formats.json` is its document byte for byte, and
  *   cellucid-python (`src/cellucid/input_formats.json`) and cellucid-r
- *   (`inst/input_formats.json`) keep the same bytes,
- *   pinned there by this digest, so the three name formats the same way;
+ *   (`inst/input_formats.json`) keep the same bytes (compared with this file by
+ *   `tests/shared-files-contract.test.mjs` and by each package's own tests), so
+ *   the three name formats the same way;
  * - names, folder markers and signatures decide as stated;
  * - every entry point that takes a name (served stores, catalogs, drops, the
  *   address bar, the File… picker, the info tips) follows the registry;
@@ -15,7 +16,6 @@
  *   not entry points).
  */
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
@@ -52,27 +52,13 @@ import { INFO_TIPS } from '../assets/js/app/ui/components/info-tips.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FIXTURE = path.join(ROOT, 'tests/fixtures/input-formats.json');
 
-/**
- * The digest of `input-formats.json`. cellucid-python
- * (`tests/test_input_formats.py`) and cellucid-r
- * (`tests/testthat/test-input-formats.R`) pin the same one.
- */
-const INPUT_FORMATS_SHA256 = '31a4853465dd05ec412f4645f9a9efdfb6a14393f0932b4c26883648ad01f6f9';
-
 /** A dataset's structure for its default id (`defaultDatasetIdOf`), and its pinned digits. */
 const PBMC = Object.freeze({ nObs: 2700, nVars: 3, varNames: Object.freeze(['CD3E', 'MS4A1', 'LYZ']) });
 const PBMC_STRUCTURE = '1bd42f4e';
 
-test('input-formats.json is the registry document, byte for byte, at the pinned digest', async () => {
+test('input-formats.json is the registry document, byte for byte', async () => {
   const bytes = await readFile(FIXTURE, 'utf8');
-  assert.equal(
-    bytes,
-    inputFormatsJson(),
-    'Regenerate it: node --input-type=module -e "import(\'./assets/js/data/input-formats.js\')' +
-    '.then(m => process.stdout.write(m.inputFormatsJson()))" > tests/fixtures/input-formats.json, ' +
-    'then copy it to cellucid-python and cellucid-r and update the three digests.'
-  );
-  assert.equal(createHash('sha256').update(bytes).digest('hex'), INPUT_FORMATS_SHA256);
+  assert.equal(bytes, inputFormatsJson(), 'Run node scripts/sync-shared-files.mjs (it writes the file here and its copies in cellucid-python and cellucid-r).');
 });
 
 test('every format is well formed, and each container and layout has one format read as stored', () => {
@@ -191,7 +177,7 @@ test('Cellucid\'s own files are named, are no dataset, and say what they are and
     }
   }
   assert.match(cellucidFileOfName('x.cellucid-library').said, /library file.*Session › Open data › My datasets › All… › Import…\.$/);
-  // A session file opens in the web app, its dataset with it (L25-8): no "open its dataset first".
+  // A session file opens in the web app, its dataset with it: no "open its dataset first".
   assert.match(cellucidFileOfName('x.cellucid-session').said, /session file.*drop it on the page, or choose it with State › Session › Load… › Open a session file…; its dataset opens with it\..*cellucid\.read_session\(\).*cellucid_read_session\(\)\.$/);
   assert.doesNotMatch(cellucidFileOfName('x.cellucid-session').said, /Open its dataset, then/);
   // Python and R read them from the document.
@@ -383,9 +369,8 @@ test('the retired per-format sources and schemes are gone', async () => {
 });
 
 test('the Link or server tip names every link provider the registry holds', async () => {
-  // The tip was written by hand and fell behind the registry (Figshare,
-  // Google Drive and OneDrive were missing): every provider a pasted link can
-  // reach is named, by the label the registry gives it.
+  // The tip names every provider a pasted link can reach, by the label the
+  // registry gives it (not a hand-written list that falls behind the registry).
   const { DEFAULT_PROVIDERS } = await import('../assets/js/data/sources/registry.js');
   const text = INFO_TIPS['data-address'].body
     .map(block => (typeof block === 'string' ? block : block.list.join('\n')))
@@ -419,7 +404,7 @@ test('a folder on this computer and a listing on a host tell a MatrixMarket matr
 
 test('the single files Cellucid opens are named in one sentence, the packages\' too', () => {
   // cellucid-python's openable_files_text() and cellucid-r's .openable_files_text()
-  // pin the same words: each refuses a file it does not open with them (R9Y-4).
+  // pin the same words: each refuses a file it does not open with them.
   assert.equal(
     openableNamesText({ layouts: ['file', 'zip'] }),
     'an .h5ad file, a .loom file, an .h5 file, an .h5mu file, an .rds file, an .rda/.rdata file or a .zarr.zip archive'

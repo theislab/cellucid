@@ -133,7 +133,7 @@ test('pages: made with unique names, shown, renamed, recolored, deleted; refusal
   await act('highlight.page.recolor', { page: 'Monocytes', color: '#123456' });
   assert.equal(state.getHighlightPages()[2].color, '#123456');
 
-  // Several pages in one call (L25-3): every name found first, so an unknown one deletes nothing; all of them are refused.
+  // Several pages in one call: every name found first, so an unknown one deletes nothing; all of them are refused.
   await assert.rejects(act('highlight.page.delete', { pages: ['T cells', 'B cells'] }), /There is no highlight page "B cells"/);
   assert.deepEqual(pages(state), ['Page 1', 'T cells', 'Monocytes', 'Page 4']);
   await assert.rejects(act('highlight.page.delete', { pages: ['Page 1', 'T cells', 'Monocytes', 'Page 4'] }),
@@ -227,7 +227,7 @@ test('category and range: cells of the selected view, named by field and label',
   await assert.rejects(act('highlight.range', { field: { source: 'var', key: 'NOPE' }, min: 0, max: 1 }), /"NOPE" is not a gene in this dataset\. genes\.search finds a gene by part of its name\./);
 });
 
-test('several categories in one call: a group each, one outcome, all or none (F107)', async () => {
+test('several categories in one call: a group each, one outcome, all or none', async () => {
   const { state, act, dispatched } = await scene();
   const field = { source: 'obs', key: 'cluster' };
   const outcome = await act('highlight.category', { field, categories: ['a', 'c', 'd'], page: 'Donors' });
@@ -270,7 +270,7 @@ test('several categories in one call: a group each, one outcome, all or none (F1
   await assert.rejects(act('highlight.category', { field, categories: ['a', 'a'] }), /categories must not repeat an item/);
 });
 
-test('a category is named by its label as the legend shows it: a boolean or numeric value as its text (L14-6)', async () => {
+test('a category is named by its label as the legend shows it: a boolean or numeric value as its text', async () => {
   const { upgradeParams } = await import('../assets/js/app/actions/catalog.js');
   const definition = getActionCatalog().get('highlight.category');
   // A version 1 step of the legend's button held the raw value; version 2 holds its label.

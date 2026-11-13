@@ -1,7 +1,7 @@
 /**
  * A history that could not be loaded is said in one sentence, its ids under Details.
  *
- * Live pass 3: after a reload, Continue failed as "Loading failed. Saved state:
+ * After a reload, Continue must not fail as "Loading failed. Saved state:
  * tracker 4f3c…: a group cuts the run of turn … between steps "s5" and "s6"; a
  * group holds whole runs of a turn" — the model's own check, with the tracker's
  * uuid, as the sentence. The person reads what happened and that the history
@@ -45,7 +45,7 @@ test('a damaged session file says the file is damaged; what is wrong goes under 
   assert.equal(isDamagedFile(new TypeError('This session file is damaged: forged')), false);
 });
 
-test('a session file whose framing breaks (truncated, trailing bytes, a manifest out of the format) is damaged, never raw "Invalid …" (F141)', async () => {
+test('a session file whose framing breaks (truncated, trailing bytes, a manifest out of the format) is damaged, never raw "Invalid …"', async () => {
   const written = await new Response(writeBundle({ manifest: { chunks: [{ id: 'c', storedBytes: 3 }] }, chunks: [new Uint8Array([1, 2, 3])] })).arrayBuffer();
   const bytes = new Uint8Array(written);
   const read = async blob => {

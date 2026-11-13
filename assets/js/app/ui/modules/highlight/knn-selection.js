@@ -38,7 +38,7 @@ import {
   requireSelectionStepEvent,
   requireUnifiedSelectionState,
 } from './exact-contract.js';
-import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
 import { createSelectionConfirmer } from './highlight-actions.js';
 

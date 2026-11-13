@@ -188,25 +188,6 @@ test('a coarse pointer draws controls compact and extends their hit area', () =>
   assert.ok(extend * 2 <= 6, 'two extensions fit in the stacked-control gap (--space-1-5)');
 });
 
-test('the hit extension is a pseudo-element on every leaf control', async () => {
-  const buttons = stripComments(await read('assets/css/components/_buttons.css'));
-  const controls = stripComments(await read('assets/css/components/_controls.css'));
-  for (const selector of ['.btn::after', '.icon-btn::after', '.segmented-btn::after']) {
-    assert.ok(buttons.includes(selector), `${selector} carries the extension`);
-  }
-  for (const selector of ['.checkbox-inline::after', '.switch::after']) {
-    assert.ok(controls.includes(selector), `${selector} carries the extension`);
-  }
-  assert.match(buttons, /inset:\s*calc\(-1 \* \(var\(--control-hit-extend\)/);
-  assert.match(controls, /inset:\s*calc\(-1 \* var\(--control-hit-extend\)\) 0/);
-  // A one-line field takes the extension as transparent border on touch.
-  const touchField = /@media \(pointer: coarse\) \{\s*\.obs-select:not\(textarea\) \{([^}]*)\}/.exec(controls);
-  assert.ok(touchField, 'one-line fields have a touch rule');
-  assert.match(touchField[1], /border-width:\s*var\(--control-hit-extend\) 0;/);
-  assert.match(touchField[1], /background-clip:\s*padding-box;/);
-  assert.match(touchField[1], /min-height:\s*calc\(var\(--control-target-min\) \+ 2 \* var\(--control-hit-extend\)\);/);
-});
-
 test('field text is never forced to 16px for touch screens', async () => {
   const offenders = [];
   for (const file of [

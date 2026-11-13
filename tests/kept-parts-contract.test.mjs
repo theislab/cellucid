@@ -32,6 +32,10 @@
  * - Nothing is kept of a source on this machine or a notebook kernel, nor
  *   of a served store; an opening whose version cannot be told removes
  *   nothing kept.
+ * - Code: a journal is stamped with the code fingerprint of kept parts; one
+ *   stamped by other code is removed, never read, and its bytes are
+ *   fetched and kept again (which code that is:
+ *   `tests/kept-code-fingerprints-contract.test.mjs`).
  */
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -48,12 +52,13 @@ import {
   TRANSCODED_DIRECTORY,
   keepDownload,
   openKeptJournal,
-  parseKeptJournal,
   keptAtAddress,
   listKeptStores,
   makeRoomForRetry,
   removeKeptStores,
 } from '../assets/js/data/anndata/transcode/space.js';
+import { KEPT_CODE_FINGERPRINTS } from '../assets/js/data/anndata/transcode/kept-code-fingerprints.js';
+import { parseKeptJournal } from '../assets/js/data/anndata/transcode/kept-journal.js';
 import { writeVersion } from '../assets/js/data/sources/identity.js';
 import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
 import { bytesByteSource, httpByteSource } from '../assets/js/formats/io/byte-source.js';
@@ -178,7 +183,7 @@ function directories(disk) {
 
 const partsOf = disk => directories(disk).filter(item => item.manifest?.kind === 'parts');
 
-/** The ranges a kept journal of parts holds (`space.js` `openKeptJournal`): `{key, start, length}` each. */
+/** The ranges a kept journal of parts holds (`kept-journal.js` `parseKeptJournal`): `{key, start, length}` each. */
 function journalRanges(folder) {
   const records = new Uint8Array(readFileSync(path.join(folder, 'j.bin')));
   return parseKeptJournal(records, statSync(path.join(folder, 'd.bin')).size).ranges;
@@ -613,7 +618,7 @@ test('a file whose earlier visits kept a hundred thousand ranges opens again in 
   }
   newVisit(disk);
   // Inserted one by one into one sorted array (each a shift of every range
-  // after it), this took minutes: found and ordered at once shifts next to none.
+  // after it), this would take minutes: found and ordered at once shifts next to none.
   let shifted = 0;
   const splice = Array.prototype.splice;
   // eslint-disable-next-line no-extend-native
@@ -638,49 +643,27 @@ test('a file whose earlier visits kept a hundred thousand ranges opens again in 
   await parts.close();
 });
 
-/**
- * The bytes a kept download and a file's kept parts are stored as, for
- * fixed inputs: their manifests (what changes with every write left out:
- * when, and the directory's random name) and every file they write. Any
- * change of these bytes is a change of what is kept: raise
- * `KEPT_BYTES_REVISION` (`transcode/space.js`), and pin the new revision
- * with its digest here. A release that does not change them keeps every
- * download and every part kept before it.
- */
-const KEPT_BYTES_GOLDEN = [
-  // Revision 2 (not yet released): parts kept as a journal (`space.js` `openKeptJournal`).
-  { revision: 2, digest: 'd749b997afb2fb95f759d1f338bceaf95c07a38557a4ddd84e298bf4b23d36e5' },
-];
-
-test('the kept raw bytes revision is raised whenever what they are stored as changes', async t => {
-  const { createHash } = await import('node:crypto');
-  const { KEPT_BYTES_REVISION } = await import('../assets/js/data/anndata/transcode/space.js');
+test('parts stamped by other code are removed, never read: the bytes are fetched again, kept again, and exact', async t => {
   const disk = opfsOnDisk();
   t.after(() => disk.cleanup());
-  newVisit(disk);
-  const bytes = Uint8Array.from({ length: 70_000 }, (_, i) => (i * 31 + 7) % 251);
-  const identity = { kind: 'remote', key: 'golden:file', version: 'census:golden' };
-  // A download, and the parts of a file read in place (three ranges, two of them adjacent).
-  await keepDownload(identity, (async function* pieces() { yield bytes.subarray(0, 40_000); yield bytes.subarray(40_000); })(), { name: 'golden.h5ad', url: 'https://host.test/golden.h5ad', environment: disk.environment });
-  const parts = keptPartsOf({ url: 'https://host.test/golden.h5ad', size: bytes.length, name: 'golden.h5ad', identity }, { environment: disk.environment, tab: 'tab' });
-  await parts.open();
-  parts.keep(100, bytes.subarray(100, 20_100));
-  parts.keep(20_100, bytes.subarray(20_100, 30_000));
-  parts.keep(50_000, bytes.subarray(50_000, 70_000));
-  await parts.close();
-  const hash = createHash('sha256');
-  for (const { manifest, folder } of directories(disk).sort((a, b) => (a.manifest?.kind < b.manifest?.kind ? -1 : 1))) {
-    const { createdAt: _createdAt, ...stable } = manifest;
-    hash.update(JSON.stringify(stable));
-    for (const name of readdirSync(folder).filter(entry => entry !== 'manifest.json' && entry !== 'used').sort()) {
-      hash.update(name);
-      hash.update(readFileSync(path.join(folder, name)));
-    }
-  }
-  const digest = hash.digest('hex');
-  assert.deepEqual({ revision: KEPT_BYTES_REVISION, digest }, KEPT_BYTES_GOLDEN.at(-1),
-    'What kept downloads and parts are stored as changed: raise KEPT_BYTES_REVISION in assets/js/data/anndata/transcode/space.js ' +
-    '(kept bytes of the earlier revision are then removed, not read), and add a row with the new revision and digest here.');
+  const log = host(t);
+  const version = 'census:1';
+  const first = await visit(disk, remoteFile(version));
+  const fetched = log.bytes;
+  const kept = partsOf(disk);
+  assert.ok(kept.length > 0 && kept.every(({ manifest }) => manifest.codeFingerprint === KEPT_CODE_FINGERPRINTS.parts), 'each journal is stamped with the code fingerprint of kept parts');
+  // The same journals, as other code would have left them.
+  for (const { folder, manifest } of kept) writeFileSync(path.join(folder, 'manifest.json'), JSON.stringify({ ...manifest, codeFingerprint: 'other code' }));
+  const again = await visit(disk, remoteFile(version));
+  assert.deepEqual(again, first, 'exact values');
+  assert.ok(log.bytes - fetched >= fetched, `nothing kept by other code is read: every byte is fetched again (${log.bytes - fetched} of ${fetched})`);
+  const left = partsOf(disk);
+  assert.ok(kept.every(({ name }) => !directories(disk).some(item => item.name === name)), 'the journals of other code are removed');
+  assert.ok(left.length > 0 && left.every(({ manifest }) => manifest.codeFingerprint === KEPT_CODE_FINGERPRINTS.parts), 'what was fetched is kept by this code');
+  // And serves the next visit.
+  const before = log.bytes;
+  assert.deepEqual(await visit(disk, remoteFile(version)), first);
+  assert.equal(log.bytes - before, 0, 'the next visit downloads nothing');
 });
 
 test('reading the open dataset again keeps what is shown only for the same version; a file with no version is the same bytes within its opening only', async t => {

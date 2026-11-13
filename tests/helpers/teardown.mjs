@@ -7,8 +7,8 @@
  * reader, a worker pool, a control) and registers each one's undoing as it
  * goes would put the real global back before what used the fake is torn
  * down: work still under way then reaches the real thing -- a read left
- * running fetched `data.example.org` over the real network, retrying, and
- * kept the test process from ever ending (slow-delivery run, 2026-11-01).
+ * running would fetch `data.example.org` over the real network, retrying,
+ * and keep the test process from ever ending.
  * `undoLater(t, undo)` keeps each test's undoings and runs them last
  * registered first, each awaited, as a `finally` nest would: what was made
  * with a fake is gone before the fake is.

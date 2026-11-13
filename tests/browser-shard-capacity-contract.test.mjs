@@ -19,10 +19,9 @@
  * `--shard` listings of one engine (every other shard and the last: every
  * boundary between two shards) are compared with their plans, test for
  * test, so a change of Playwright's sharding is caught: 6 processes for the
- * browser job and 4 for the walk job, which load the walk's files alone. It
- * listed each of the 21 shards in a process of its own before: 26 s on an
- * idle machine and 166 s at a load average of 42, past the suite's 120 s a
- * test, in 4 of 13 loaded runs (2026-11-01).
+ * browser job and 4 for the walk job, which load the walk's files alone. A
+ * listing of each of the 21 shards in a process of its own is too slow under
+ * load (measured: 38_decisions_testing_and_hosted_runners.md).
  */
 
 import assert from 'node:assert/strict';
@@ -143,8 +142,8 @@ async function planJob(job, compared, cacheRoot) {
 }
 
 // Playwright lists the specs ten times here, each a process of its own (four of them the walk's
-// files alone): 17 to 35 s on hosted runners, past the suite's fence for a hung test on a machine
-// at work. Nothing here waits for anything but those processes, so this fence is only for one of
+// files alone): slow on hosted runners and on a machine at work, past the suite's fence for a
+// hung test. Nothing here waits for anything but those processes, so this fence is only for one of
 // them hanging.
 test('every browser shard of the CI matrix fits its runner\'s bounded processes', { timeout: 600_000 }, async () => {
   const workflow = await readFile(new URL('../.github/workflows/test.yml', import.meta.url), 'utf8');

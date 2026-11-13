@@ -2,8 +2,9 @@
  * CSV text of per-cell analysis data, written in chunks.
  *
  * A page-data export is one row per cell: half a million cells is a 15 MB
- * text. Joining one string per row on the main thread held it for about 70 ms
- * and built the whole text twice (rows, then the join). This writer runs in an
+ * text. Joining one string per row on the main thread holds it for tens of
+ * milliseconds and builds the whole text twice (rows, then the join; measured:
+ * 37_decisions_analysis.md). This writer runs in an
  * analysis worker (compute/operation-handlers.js): rows are encoded as UTF-8 a
  * batch at a time into `Blob` parts, and the `Blob` is handed back, so the main
  * thread never sees the text.

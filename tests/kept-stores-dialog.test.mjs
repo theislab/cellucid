@@ -78,8 +78,8 @@ test('kept items are grouped by dataset: its name and host, its kinds in order, 
 });
 
 test('a saved state is a row of its dataset: its size, what it is, how many steps, when saved', () => {
-  // An autosave by its latest step, as Load… and My datasets name it (L10-10: eight read
-  // "History kept in this browser · saved today" alike).
+  // An autosave by its latest step, as Load… and My datasets name it (eight would
+  // otherwise read "History kept in this browser · saved today" alike).
   const state = { id: 'a', kind: 'autosave', name: null, lastStep: 'Colored by gene SOX9', dataset: { id: 'atlas', name: 'Lung atlas' }, steps: 3, bytes: 2048, updatedAt: NOW - 2 * 60 * 60 * 1000, openable: true };
   assert.deepEqual(describeSavedState(state, NOW), {
     name: 'Lung atlas',
@@ -145,8 +145,8 @@ test('the Stored row: the datasets kept and their bytes; with none, the hosts re
   // One line beside Manage… at the narrowest panel; the whole of it in its title.
   const said = (...args) => { const { text, title } = summarizeKeptStores(...args); return [text, title]; };
   assert.deepEqual(said(items), ['2 datasets · 540 MB kept', '2 datasets · 540 MB kept']);
-  // The other kinds are named in the title, not counted on the line (found 2026-11-10: "· 28 more"
-  // said nothing and, at 30 characters, ran under Manage…).
+  // The other kinds are named in the title, not counted on the line ("· 28 more"
+  // would say nothing and, at 30 characters, run under Manage…).
   assert.deepEqual(said(items, 3), ['2 datasets · 540 MB kept', '2 datasets · 540 MB · 3 connection speeds']);
   assert.deepEqual(said([], 1), ['1 connection speed', '1 connection speed']);
   assert.deepEqual(said(items, 1, 2), ['2 datasets · 540 MB kept', '2 datasets · 540 MB · 2 saved states · 1 connection speed']);

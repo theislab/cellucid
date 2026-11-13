@@ -42,7 +42,7 @@
  *   fetch an address its parameters name (`opensLinks`: a dataset's link)
  *   asks, by its implementation and before anything is requested, about an
  *   address the person has not seen in this tab (`ctx.confirmLink(address)`,
- *   the kind `unseen-link`, F121). Without a
+ *   the kind `unseen-link`). Without a
  *   confirmer an action with `confirm` is refused; a refusal changes
  *   nothing. Only an agent's action is asked about, and what any other
  *   origin that is not a click in the page publishes (`confirm:
@@ -80,6 +80,7 @@ import { MARKED_QUOTE, plainSentence } from './targets/names.js';
 import { isSteplessEffect } from './catalog.js';
 import { awaitWithSignal, cancel, cancelled, onAbort, throwIfAborted } from '../../utils/abort.js';
 import { createListenerSet } from '../../utils/listener-set.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 export const ACTION_ORIGINS = Object.freeze([
   'user', 'agent', 'host', 'session', 'replay', 'startup',
@@ -198,13 +199,57 @@ export function createActionDispatcher({ catalog }) {
    * applying}; `applying` once its before-values are kept and its handler runs.
    */
   const inFlight = new Set();
-  /** Every dispatch from the moment it is made until it ends, reads included: {meta, controller}; what `stop` reaches. */
+  /**
+   * Every dispatch from the moment it is made until it ends, reads included:
+   * {meta, controller, asking}; what `stop` reaches and `idle` waits
+   * for. `asking`: how many of the person's answers it waits for now (asked
+   * at its start, by its implementation, or about heavy work an internal
+   * dispatch it runs finds: `askConfirmer`).
+   */
   const running = new Set();
+  /** Wakes each `idle` waiting now: a dispatch ended, or the person was asked or answered. */
+  const idleWaiters = new Set();
+  function runningChanged() {
+    const waiters = [...idleWaiters];
+    idleWaiters.clear();
+    for (const wake of waiters) wake();
+  }
+  /**
+   * Ask the confirmer `request` on behalf of the dispatches `works`, and tell
+   * whoever waits on them when the person is asked and when they answered:
+   * each of `works` waits for the person from the moment the confirmer says
+   * it asks (its `asking()`, never for a change its settings allow at once)
+   * until the answer. Resolves the confirmer's answer.
+   */
+  async function askConfirmer(works, request) {
+    const { definition, params, meta, detail } = request;
+    let asked = false;
+    let yes = false;
+    const asking = () => {
+      if (asked) return;
+      asked = true;
+      for (const work of works) work.asking++;
+      runningChanged();
+      emit({ kind: 'asking', type: definition.type, params, meta, detail });
+    };
+    try {
+      yes = await confirmer({ ...request, asking });
+      return yes;
+    } finally {
+      if (asked) {
+        for (const work of works) work.asking--;
+        runningChanged();
+        emit({ kind: 'answered', type: definition.type, params, meta, allowed: yes === true });
+      }
+    }
+  }
+  /** Each `ctx.heavy` this dispatcher made → its asker given the dispatches that wait on it too (`heavyAskerFor`). */
+  const heavyAskers = new WeakMap();
   /**
    * Work an action started that goes on after it answers (`ctx.ongoing(stop)`:
    * a looping camera path), {meta, stop}, until the work ends or is stopped.
    * It belongs to the turn that started it: `stop` reaches it as it reaches
-   * the dispatches of that turn (R9R-8), so a film an agent set looping never
+   * the dispatches of that turn, so a film an agent set looping never
    * outlives the turn the person stopped.
    */
   const ongoingWork = new Set();
@@ -264,7 +309,7 @@ export function createActionDispatcher({ catalog }) {
    * heavy work its implementation finds later is judged against it
    * (`heavyAskerFor`).
    */
-  async function confirmIfNeeded(definition, params, meta, { signal, atHandler = false, detail = null, kind = null }) {
+  async function confirmIfNeeded(definition, params, meta, { signal, work, atHandler = false, detail = null, kind = null }) {
     if (meta.origin === 'user' || definition.effect === 'read') return null;
     const askedNow = definition.confirm !== null && (definition.confirmAt === 'handler') === atHandler;
     // `kind`: a question the implementation asks of its own (an unseen link), not the definition's `confirm`.
@@ -283,18 +328,7 @@ export function createActionDispatcher({ catalog }) {
     const estimate = atHandler ? null : await estimateOf(definition, params, signal, meta);
     // Whoever waits on the agent's call (the relay, the chat bar) hears when
     // the person is asked, and when they answered.
-    let asked = false;
-    let yes = false;
-    const asking = () => {
-      if (asked) return;
-      asked = true;
-      emit({ kind: 'asking', type: definition.type, params, meta, detail });
-    };
-    try {
-      yes = await confirmer({ definition, params, meta, signal, estimate, confirm, detail, stage: atHandler ? 'handler' : 'start', asking });
-    } finally {
-      if (asked) emit({ kind: 'answered', type: definition.type, params, meta, allowed: yes === true });
-    }
+    const yes = await askConfirmer([work], { definition, params, meta, signal, estimate, confirm, detail, stage: atHandler ? 'handler' : 'start' });
     if (yes !== true) {
       throw new ActionRefused(`The person declined, so this was not done: ${definition.title} (${definition.describe(params, null, MARKED_QUOTE)}).`, {
         code: 'declined', type: definition.type,
@@ -308,46 +342,43 @@ export function createActionDispatcher({ catalog }) {
    * once it runs (what restoring a saved state reads, the cells' totals a
    * new matrix needs): `estimate` as `provideEstimate` gives one (`{ms,
    * bytes, what}`, and `doing`: the work as a progress line says it while it
-   * runs, F167). An internal dispatch hands it to its outer action's `heavy`
+   * runs). An internal dispatch hands it to its outer action's `heavy`
    * (`meta.heavy`). An agent's action is judged as at its start, by the
    * person's heavy-work permission, unless its start already was (its own
    * estimate heavy: asked, or allowed, then); any other origin acts for the
    * person and is not asked. Rejects with the refusal when declined.
-   * `started()`: the estimate the start was asked with.
+   * `started()`: the estimate the start was asked with. `work`: its
+   * dispatch, which waits for the person while they are asked, as does
+   * each internal dispatch whose heavy work it is asked about.
    */
-  function heavyAskerFor(definition, params, meta, signal, started) {
-    return async estimate => {
+  function heavyAskerFor(definition, params, meta, signal, started, work) {
+    const ask = async (estimate, waiting) => {
       if (estimate === null || estimate === undefined) return;
       if (typeof estimate !== 'object' || typeof estimate.what !== 'string' || estimate.what.length === 0
         || (estimate.doing !== undefined && (typeof estimate.doing !== 'string' || estimate.doing.length === 0))) {
         throw new TypeError('Heavy work found by a handler is an estimate {ms, bytes, what, doing?}');
       }
-      if (meta.heavy !== null) return meta.heavy(estimate);
+      if (meta.heavy !== null) {
+        const outer = heavyAskers.get(meta.heavy);
+        return outer === undefined ? meta.heavy(estimate) : outer(estimate, waiting);
+      }
       if (meta.origin !== 'agent' || definition.effect === 'read' || confirmer === null) return;
       throwIfAborted(signal);
-      let asked = false;
-      let yes = false;
       const detail = estimate.what;
-      const asking = () => {
-        if (asked) return;
-        asked = true;
-        emit({ kind: 'asking', type: definition.type, params, meta, detail });
-      };
-      try {
-        yes = await confirmer({ definition, params, meta, signal, estimate, confirm: null, detail, stage: 'handler', started: started(), asking });
-      } finally {
-        if (asked) emit({ kind: 'answered', type: definition.type, params, meta, allowed: yes === true });
-      }
+      const yes = await askConfirmer(waiting, { definition, params, meta, signal, estimate, confirm: null, detail, stage: 'handler', started: started() });
       if (yes !== true) {
         throw new ActionRefused(`The person declined, so this was not done: ${definition.title} (${definition.describe(params, null, MARKED_QUOTE)}). ${plainSentence(detail)}.`, {
           code: 'declined', type: definition.type,
         });
       }
     };
+    const heavy = estimate => ask(estimate, [work]);
+    heavyAskers.set(heavy, (estimate, waiting) => ask(estimate, [work, ...waiting]));
+    return heavy;
   }
 
   /** The `ctx.confirm(detail)` a handler asks with (a `confirmAt: 'handler'` action); `signal`: its dispatch's. */
-  function askerFor(definition, params, meta, signal) {
+  function askerFor(definition, params, meta, signal, work) {
     return detail => {
       if (definition.confirm === null || definition.confirmAt !== 'handler') {
         return Promise.reject(new TypeError(`"${definition.type}" asks the person only as its definition says (confirm, confirmAt: 'handler')`));
@@ -355,7 +386,7 @@ export function createActionDispatcher({ catalog }) {
       if (detail !== null && (typeof detail !== 'string' || detail.length === 0)) {
         return Promise.reject(new TypeError('What a confirmation is about is one sentence, or null'));
       }
-      return confirmIfNeeded(definition, params, meta, { signal, atHandler: true, detail });
+      return confirmIfNeeded(definition, params, meta, { signal, work, atHandler: true, detail });
     };
   }
 
@@ -367,7 +398,7 @@ export function createActionDispatcher({ catalog }) {
    * shows. Only an agent is asked; any other origin is the person's own
    * choice, asked in the page. Rejects with the refusal when declined.
    */
-  function replaceAskerFor(definition, params, meta, signal) {
+  function replaceAskerFor(definition, params, meta, signal, work) {
     return detail => {
       if (definition.effect !== 'dataset') {
         return Promise.reject(new TypeError(`"${definition.type}" does not replace the dataset shown (effect 'dataset')`));
@@ -375,7 +406,7 @@ export function createActionDispatcher({ catalog }) {
       if (typeof detail !== 'string' || detail.length === 0) {
         return Promise.reject(new TypeError('What would be lost is one sentence'));
       }
-      return confirmIfNeeded(definition, params, meta, { signal, atHandler: true, detail, kind: 'replaces-unkept' });
+      return confirmIfNeeded(definition, params, meta, { signal, work, atHandler: true, detail, kind: 'replaces-unkept' });
     };
   }
 
@@ -388,7 +419,7 @@ export function createActionDispatcher({ catalog }) {
    * notebook, a session or a replay acts for the person. Rejects with the
    * refusal when declined.
    */
-  function linkAskerFor(definition, params, meta, signal) {
+  function linkAskerFor(definition, params, meta, signal, work) {
     return address => {
       if (definition.opensLinks !== true) {
         return Promise.reject(new TypeError(`"${definition.type}" fetches no address its parameters name (opensLinks)`));
@@ -397,7 +428,7 @@ export function createActionDispatcher({ catalog }) {
         return Promise.reject(new TypeError('The address asked about is its text'));
       }
       const detail = `It opens ${MARKED_QUOTE(address)}, an address not typed, pasted or opened in this tab before.`;
-      return confirmIfNeeded(definition, params, meta, { signal, atHandler: true, detail, kind: 'unseen-link' });
+      return confirmIfNeeded(definition, params, meta, { signal, work, atHandler: true, detail, kind: 'unseen-link' });
     };
   }
 
@@ -428,16 +459,16 @@ export function createActionDispatcher({ catalog }) {
     // waits at the gate, as while it runs; so does its caller's signal.
     const controller = new AbortController();
     const { signal } = controller;
-    const work = { meta: exactMeta, controller };
+    const work = { meta: exactMeta, controller, asking: 0 };
     running.add(work);
     const removeOuter = onAbort(exactMeta.signal, () => controller.abort(exactMeta.signal.reason));
-    const confirm = askerFor(definition, exactParams, exactMeta, signal);
-    const confirmLink = linkAskerFor(definition, exactParams, exactMeta, signal);
-    const confirmReplacing = replaceAskerFor(definition, exactParams, exactMeta, signal);
+    const confirm = askerFor(definition, exactParams, exactMeta, signal, work);
+    const confirmLink = linkAskerFor(definition, exactParams, exactMeta, signal, work);
+    const confirmReplacing = replaceAskerFor(definition, exactParams, exactMeta, signal, work);
     let started = null;
-    const heavy = heavyAskerFor(definition, exactParams, exactMeta, signal, () => started);
+    const heavy = heavyAskerFor(definition, exactParams, exactMeta, signal, () => started, work);
     try {
-      started = await awaitWithSignal(confirmIfNeeded(definition, exactParams, exactMeta, { signal }), signal);
+      started = await awaitWithSignal(confirmIfNeeded(definition, exactParams, exactMeta, { signal, work }), signal);
       if (isSteplessEffect(definition.effect)) {
         // A read, a move of the history (undo, redo, a jump), another
         // dataset opened or an act outside the state (a file written, a
@@ -467,6 +498,7 @@ export function createActionDispatcher({ catalog }) {
     } finally {
       removeOuter();
       running.delete(work);
+      runningChanged();
     }
   }
 
@@ -480,8 +512,8 @@ export function createActionDispatcher({ catalog }) {
     }
     const domains = new Set(definition.touches);
     const waits = overlapping(domains);
-    let settle;
-    const entry = { definition, domains, controller, applying: false, done: new Promise(resolve => { settle = resolve; }) };
+    const { promise: done, resolve: settle } = promiseWithResolvers();
+    const entry = { definition, domains, controller, applying: false, done };
     inFlight.add(entry);
     emit({ kind: 'start', type, params: exactParams, meta: exactMeta });
     try {
@@ -500,12 +532,12 @@ export function createActionDispatcher({ catalog }) {
         // handler that went on to its end: it ends as a cancellation all the
         // same and what it changed is put back, so "stopped" never leaves a
         // change or a step, whether or not its implementation watched the
-        // signal (bug hunt LB-1). One a newer choice of its type replaced and
+        // signal. One a newer choice of its type replaced and
         // that still finished keeps its step: the newer one runs right after
         // it on the same state, and putting back a domain it is about to
         // replace (the open cells: a read of the dataset) is work for nothing.
         // One that keeps what it did when stopped (`keepsWhenStopped`: a
-        // camera path stays where the film stopped, F104) answers and keeps
+        // camera path stays where the film stopped) answers and keeps
         // its step.
         if (
           controller.signal.aborted
@@ -605,8 +637,8 @@ export function createActionDispatcher({ catalog }) {
     if (recorder === null) return Promise.resolve(null);
     // A change made while an action on the same state runs (a camera the
     // cells read again put back) is that action's: its step holds it. A
-    // person's own act never is (R9W-5: a window closed while its run ran
-    // was the run's, and the stopped run's rollback opened it again): it is
+    // person's own act never is (a window closed while its run ran would
+    // be the run's, and the stopped run's rollback would open it again): it is
     // its own step, and a rollback of that action leaves what it changed.
     if (!person) {
       for (const entry of inFlight) {
@@ -705,8 +737,31 @@ export function createActionDispatcher({ catalog }) {
       // Its owners are withdrawn with the page and end their own work.
       ongoingWork.clear();
     },
-    /** Resolves once nothing is in flight (tests, a save). */
+    /**
+     * Resolves once every dispatch has ended, those made meanwhile included,
+     * but for those waiting for the person's go-ahead: from the moment it is
+     * made a dispatch is under way, so one waiting at the gate (behind a
+     * history operation, a dataset's history starting) or for its estimate
+     * is too. One waiting for the person's go-ahead (at its start, from its
+     * implementation, for heavy work a dispatch it runs finds) is not, from
+     * the moment it waits until the person answers: it waits for a person,
+     * not for work. Judged again whenever a dispatch ends or begins or stops
+     * waiting for the person. What a control's caller waits for (a test, a
+     * host); never awaited inside a dispatch, which would wait for itself
+     * (that waits for `whenApplied`).
+     */
     async idle() {
+      while ([...running].some(work => work.asking === 0)) {
+        await new Promise(resolve => idleWaiters.add(resolve));
+      }
+    },
+    /**
+     * Resolves once no change is applying: the changes past the gate, those
+     * started meanwhile included. What a history move and a saved file wait
+     * for from inside their own turn, where a change waiting at the gate
+     * waits for them.
+     */
+    async whenApplied() {
       while (inFlight.size > 0) await Promise.all([...inFlight].map(entry => entry.done));
     },
     catalog,

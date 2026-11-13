@@ -57,8 +57,8 @@ function toggleFullscreen() {
  *
  * The sidebar is shown (its step, `layout.sidebar.show`) before the panel
  * opens (its own, `layout.section.open`): opened first, the panel's opening
- * reached the history while the sidebar's action was starting and was kept
- * as a change made outside the history (R9K-2).
+ * would reach the history while the sidebar's action was starting and be kept
+ * as a change made outside the history.
  */
 function showShortcutsHelp(ownerDocument = document) {
   const section = ownerDocument.getElementById('shortcuts-section');

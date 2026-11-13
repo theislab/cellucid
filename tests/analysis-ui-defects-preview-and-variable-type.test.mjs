@@ -1,20 +1,19 @@
 /**
- * CEL-0057 and CEL-0058.
+ * Two analysis panel behaviours: the preview's Expand button and Detailed's
+ * Variable type select.
  *
- * CEL-0058 — Correlation's expanded view was a bare click listener on the
- * preview `<div>` (`tabindex="-1"`, no role, no accessible name), while DE,
- * Gene Signature and Marker Genes each hand-rolled the same `.analysis-actions`
- * row with a real `.analysis-expand-btn` after calling the shared preview
- * renderer. Correlation was the one that never added it. The affordance now
- * belongs to the preview renderer, so every mode gets exactly one real button.
+ * Expand: Correlation's expanded view is not a bare click listener on the
+ * preview `<div>` (`tabindex="-1"`, no role, no accessible name), as it would be
+ * if DE, Gene Signature and Marker Genes each hand-rolled the same
+ * `.analysis-actions` row with a real `.analysis-expand-btn` after calling the
+ * shared preview renderer. The affordance belongs to the preview renderer, so
+ * every mode gets exactly one real button.
  *
- * CEL-0057 — Detailed's Variable type select discarded the first interaction.
- * Changing the type reports `('', '')`; the panel read that as "selection
- * cleared", wiped `dataSource` and rebuilt the variable selector from the now
- * empty config, so the type the user had just chosen came back as "None".
- * Choosing the same option again worked, because by then there was no variable
- * left to clear and no rebuild happened. The selector is now built once and
- * re-attached, so the control that raises a change is never destroyed by it.
+ * Variable type: changing Detailed's type reports `('', '')`, which the panel
+ * must not read as "selection cleared" (wiping `dataSource` and rebuilding the
+ * variable selector from the now empty config, so that the type the user just
+ * chose comes back as "None"). The selector is built once and re-attached, so
+ * the control that raises a change is never destroyed by it.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -175,7 +174,7 @@ async function withFakeDOM(run) {
 }
 
 // =============================================================================
-// CEL-0058
+// Expand button
 // =============================================================================
 
 const PREVIEW_MODES = [
@@ -254,7 +253,7 @@ function previewHarness(modeCase) {
   return { ui, modalOpens: () => modalOpens };
 }
 
-test('CEL-0058: every analysis preview renders one real Expand button', async () => {
+test('every analysis preview renders one real Expand button', async () => {
   await withFakeDOM(async () => {
     const originalGet = PlotRegistry.get;
     const originalMergeOptions = PlotRegistry.mergeOptions;
@@ -301,7 +300,7 @@ test('CEL-0058: every analysis preview renders one real Expand button', async ()
   });
 });
 
-test('CEL-0058: re-rendering a preview never accumulates Expand buttons', async () => {
+test('re-rendering a preview never accumulates Expand buttons', async () => {
   await withFakeDOM(async () => {
     const originalGet = PlotRegistry.get;
     const originalMergeOptions = PlotRegistry.mergeOptions;
@@ -327,7 +326,7 @@ test('CEL-0058: re-rendering a preview never accumulates Expand buttons', async 
 });
 
 // =============================================================================
-// CEL-0057
+// Variable type select
 // =============================================================================
 
 function detailedHarness(dataSource) {
@@ -353,7 +352,7 @@ function detailedHarness(dataSource) {
   return { ui, calls };
 }
 
-test('CEL-0057: a rebuild re-attaches the live selector instead of replacing it', async () => {
+test('a rebuild re-attaches the live selector instead of replacing it', async () => {
   await withFakeDOM(() => {
     const { ui, calls } = detailedHarness({ type: '', variable: '' });
     const block = ui._variableBlock;
@@ -377,7 +376,7 @@ test('CEL-0057: a rebuild re-attaches the live selector instead of replacing it'
   });
 });
 
-test('CEL-0057: clearing a completed selection does not reseed the selector', async () => {
+test('clearing a completed selection does not reseed the selector', async () => {
   await withFakeDOM(() => {
     const { ui, calls } = detailedHarness({
       type: 'categorical_obs',
@@ -403,7 +402,7 @@ test('CEL-0057: clearing a completed selection does not reseed the selector', as
   });
 });
 
-test('CEL-0057: a config the panel owns is still pushed into the selector', async () => {
+test('a config the panel owns is still pushed into the selector', async () => {
   await withFakeDOM(() => {
     const { ui, calls } = detailedHarness({ type: '', variable: '' });
     // A restored session or a copied window sets the config directly.

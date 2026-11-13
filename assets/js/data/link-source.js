@@ -877,7 +877,7 @@ function unansweredProviderError(provider, error, shown) {
  * address is its own host), and a refusal (401, 403) of a provider whose
  * every file is public (`capabilities.public`: GEO, the CELLxGENE Census) is
  * that host refusing this network for now (`refusing`), never the link's
- * permissions: NCBI answered 403 for its files during its 2026-10-31 outage.
+ * permissions: NCBI has answered 403 for its files during an outage.
  *
  * @param {Object|null} provider
  * @param {Object} fault - `hostFaultOf`'s fields with `what`

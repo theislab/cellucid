@@ -14,7 +14,7 @@ export const SMOKE_GRID_SIZES = Object.freeze([
 
 // The two procedural noise volumes are RGBA8 with mipmaps: 18 MiB together at
 // 128³. Finer noise is not visible through a 128³ density grid at a fraction
-// of screen resolution, and at 256³ the pair cost 146 MiB of GPU memory.
+// of screen resolution, and at 256³ the pair costs 146 MiB of GPU memory.
 export const MIN_SMOKE_NOISE_RESOLUTION = 32;
 export const MAX_SMOKE_NOISE_RESOLUTION = 128;
 

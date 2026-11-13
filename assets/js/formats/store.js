@@ -190,6 +190,28 @@
  * @property {(name: string) => ({dtype: Dtype, shape: ReadonlyArray<number>}|null)} attributeType
  */
 
+/**
+ * @typedef {StoreNode & {
+ *   kind: 'group',
+ *   loaded: boolean,
+ *   load: (paths?: ReadonlyArray<string|{path: string, depth?: number}>, options?: {signal?: AbortSignal|null, activity?: Object|null}) => Promise<void>,
+ *   keys: () => string[],
+ *   get: (name: string) => any,
+ *   has: (name: string) => boolean,
+ *   zarrFormat?: number,
+ *   rowPointersPending?: () => boolean,
+ *   rowPointers?: () => any,
+ *   storedData?: () => any,
+ *   columnWindow?: {matrix: StoreGroup, start: number, count: number}
+ * }} StoreGroup
+ * A group of the store. `get` answers a child node by its kind (a group, an
+ * array or null), which only the caller's path says. The optional members
+ * are those of particular groups: `zarrFormat` of a Zarr store's root; the
+ * three pointer members of a sparse matrix read for chosen rows, whose
+ * `indptr` is made from them (`views/cell-subset.js`); `columnWindow` of a
+ * column window of a matrix (`views/view-nodes.js`).
+ */
+
 /** Element type names by kind and size in bytes. */
 const INTEGER_NAMES = Object.freeze({
   int: Object.freeze({ 1: 'int8', 2: 'int16', 4: 'int32', 8: 'int64' }),
@@ -328,7 +350,12 @@ export function compareNames(left, right) {
   return a.length - b.length;
 }
 
-/** Whether `value` is a store group. */
+/**
+ * Whether `value` is a store group.
+ *
+ * @param {any} value - Any value, read without assuming its shape
+ * @returns {value is StoreGroup}
+ */
 export function isGroup(value) {
   return value !== null && typeof value === 'object' && value.kind === 'group' &&
     typeof value.keys === 'function' && typeof value.get === 'function';

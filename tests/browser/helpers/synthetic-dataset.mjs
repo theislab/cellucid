@@ -7,9 +7,8 @@
  * first moment, before the start dataset is read, and a run clicked then
  * meets the start dataset's publication, which lays the sidebar out again
  * (the Session panel's Dataset box fills in) between the click's aim and its
- * landing. Measured on WebKit: 1 run in 24, the click landing on the
- * Synthetic data heading above the run button, the start dataset's 120 cells
- * staying.
+ * landing: the click can land on the Synthetic data heading above the run
+ * button, and the start dataset's 120 cells stay.
  */
 import { expect } from './test.mjs';
 

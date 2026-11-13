@@ -45,7 +45,7 @@ const STREAM_AHEAD = 3;
  * not after `STREAM_AHEAD` large ones; one that reads on reaches full-size
  * pieces within six requests.
  */
-export const STREAM_FIRST_PIECE_BYTES = 64 * 1024;
+const STREAM_FIRST_PIECE_BYTES = 64 * 1024;
 
 /**
  * The compression one file's first bytes name.
@@ -142,7 +142,8 @@ export async function* readInOrder(file, {
 
 /**
  * Compressed bytes from which a gzip stream is decompressed on a worker of
- * its own (a scheduling choice, measured): below it, starting the worker
+ * its own (a scheduling choice, measured: 21_decisions_decoders_and_codecs.md):
+ * below it, starting the worker
  * costs about what decompressing them in this thread does.
  */
 export const GUNZIP_WORKER_MIN_BYTES = 1 << 20;
@@ -151,8 +152,8 @@ export const GUNZIP_WORKER_MIN_BYTES = 1 << 20;
  * Decompressed messages (about a megabyte each) a gzip worker may send
  * before the first is taken, and compressed pieces (`STREAM_PIECE_BYTES`)
  * sent before one is written (scheduling choices): enough that the worker
- * keeps decompressing through some 30 ms of this thread being busy
- * elsewhere (Chromium inflates about 580 MB a second).
+ * keeps decompressing while this thread is busy elsewhere for some tens of
+ * milliseconds (measured: 21_decisions_decoders_and_codecs.md).
  */
 const GUNZIP_OUTPUT_AHEAD = 16;
 const GUNZIP_INPUT_AHEAD = 2;

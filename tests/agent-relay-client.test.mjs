@@ -267,7 +267,7 @@ test('a call runs its action as the agent and answers with the step it made', as
     result: {
       content: [{
         type: 'text',
-        // The connection's first result: the person's settings follow it (L26-9).
+        // The connection's first result: the person's settings follow it.
         text: '<cellucid-data>{"step":{"id":"s1","label":"Colored by cell_type"},"result":{"field":"cell_type"}}</cellucid-data>\n'
           + '[Cellucid: the person\'s settings for you now. Reads of this dataset are not limited (values of cells and pictures of the plot included).]',
       }],
@@ -453,7 +453,7 @@ test('approvals: a code is claimed as this browser (its cookies and tab secret);
   client.start();
   const [socket] = FakeWebSocket.made;
   // The claim is a credentialed request to the relay, never a socket message: the
-  // relay answers only the browser whose cookie the waiting page set (R9Z-1).
+  // relay answers only the browser whose cookie the waiting page set.
   const claiming = client.claim('abcd efgh', { via: 'typed' });
   assert.equal(claims.calls.length, 1);
   const [claim] = claims.calls;
@@ -511,7 +511,7 @@ test('approvals: a code is claimed as this browser (its cookies and tab secret);
   await assert.rejects(silent, { code: 'relay-unanswered' });
 });
 
-test('L26-4 / F122: an app no site vouches for acts under the name Manage… gives it; two of them are told apart', async () => {
+test('an app no site vouches for acts under the name Manage… gives it; two of them are told apart', async () => {
   const { client, seen } = setup();
   client.start();
   const [socket] = FakeWebSocket.made;
@@ -670,7 +670,7 @@ test('a call names its connection; the person asked about it is heard by the rel
   assert.equal(done[0].meta.connection.id, 'g1');
 });
 
-test('one tool list for every connection whatever its settings; each connection is told its settings after its results (L26-9)', async () => {
+test('one tool list for every connection whatever its settings; each connection is told its settings after its results', async () => {
   let writes = 'ask';
   const { client } = setup({
     permissionFor: ({ kind, connection }) => {

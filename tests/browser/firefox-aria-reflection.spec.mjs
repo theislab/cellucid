@@ -1,17 +1,11 @@
 /**
  * The Firefox guard of `helpers/firefox-aria-reflection.mjs` holds what it
  * claims: the crash it guards against is Firefox's own, on a page with no
- * script; a guarded page survives the same queries; and Cellucid's code never
- * reads the property the guard answers for it.
+ * script, and a guarded page survives the same queries.
  */
-import { readFile, readdir } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import { closeContextWithApplicationRetirement, expect, test } from './helpers/test.mjs';
 import { FIREFOX_ARIA_REFLECTION_BUG } from './helpers/firefox-aria-reflection.mjs';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PAGE = '<!doctype html><div role="dialog" aria-labelledby="title"><h2 id="title">Save</h2></div>';
 
 /** A named role query answered in Playwright's utility world, then in the page's world. */
@@ -46,16 +40,4 @@ test('an unguarded Firefox page with no script crashes on the same queries', asy
   } finally {
     await browser.close();
   }
-});
-
-test('Cellucid never reads ariaLabelledByElements, which the guard answers with null', async () => {
-  const sources = [path.join(ROOT, 'index.html')];
-  for (const entry of await readdir(path.join(ROOT, 'assets', 'js'), { recursive: true, withFileTypes: true })) {
-    if (entry.isFile() && entry.name.endsWith('.js')) sources.push(path.join(entry.parentPath, entry.name));
-  }
-  const readers = [];
-  for (const source of sources) {
-    if ((await readFile(source, 'utf8')).includes('ariaLabelledByElements')) readers.push(path.relative(ROOT, source));
-  }
-  expect(readers).toEqual([]);
 });

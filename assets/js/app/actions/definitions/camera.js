@@ -33,7 +33,7 @@ const NAVIGATION_MODE = Object.freeze({
 });
 
 /** The camera state of `rendering/camera-state-contract.js`: both poses, kept in step. */
-export const CAMERA_STATE_PARAM = Object.freeze({
+const CAMERA_STATE_PARAM = Object.freeze({
   type: 'object', additionalProperties: false, required: ['navigationMode', 'orbit', 'freefly'],
   description: 'A camera: its navigation mode, and its orbit and free-fly poses (the one the mode drives is used). Coordinates are the view\'s (the embedding scaled to about -1..1, y up); an orbit camera sits at target + radius·(sin phi·cos theta, cos phi, sin phi·sin theta) looking at target (theta the azimuth, phi from straight above, radians); a planar one at target + (0, 0, radius). Take cameras from `camera_framing` rather than composing them.',
   properties: {
@@ -312,7 +312,7 @@ export const cameraActions = Object.freeze([
     title: 'Set camera path playback',
     summary: 'Set how the camera path plays: interpolation, easing, speed of automatic transitions, loop, autoplay and captions.',
     group: PATH,
-    // Version 2 adds `captions` (F110); a version 1 step names none.
+    // Version 2 adds `captions`; a version 1 step names none.
     version: 2,
     upgrade: { 1: params => params },
     params: {
@@ -352,7 +352,7 @@ export const cameraActions = Object.freeze([
     context: ['views'],
     effect: 'view',
     // The person's Stop of the turn stops the film where it is, as a pause
-    // does, and the step keeps that camera (F104).
+    // does, and the step keeps that camera.
     keepsWhenStopped: true,
     describe: (params, outcome) => (
       outcome?.ended === 'stopped'

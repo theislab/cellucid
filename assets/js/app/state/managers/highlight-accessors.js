@@ -15,6 +15,7 @@
 
 export const highlightAccessorMethods = {
   // Get the cell index at a screen position (requires viewer support).
+  /** @this {import('../core/data-state.js').DataState} */
   getCellAtScreenPosition(x, y) {
     if (this.viewer && typeof this.viewer.pickCellAtScreen === 'function') {
       return this.viewer.pickCellAtScreen(x, y);

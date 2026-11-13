@@ -1,6 +1,5 @@
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -32,23 +31,6 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
-}
-
-async function withJsonResponse(value, callback, status = 200) {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  globalThis.fetch = async url => {
-    calls.push(String(url));
-    return new Response(JSON.stringify(value), {
-      status,
-      headers: { 'content-type': 'application/json' },
-    });
-  };
-  try {
-    return await callback(calls);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
 }
 
 async function withDirectSource({
@@ -140,11 +122,6 @@ test('no fixed working-set cap refuses a large graph: a k = 15 graph over 10M an
     };
     assert.strictEqual(validateConnectivitySummary(summary), summary);
   }
-  const source = readFileSync(
-    new URL('../assets/js/data/connectivity-summary-contract.js', import.meta.url),
-    'utf8'
-  );
-  assert.doesNotMatch(source, /MAX_CONNECTIVITY_WORKING_BYTES|working-set limit/);
 });
 
 test('direct connectivity absence is exact and method-owned', async t => {
@@ -365,10 +342,9 @@ test('edge dispatch revalidates the summary for the explicit URL protocol', asyn
   });
 });
 
-test('H5AD and Zarr summary access is metadata-only', async t => {
+test('AnnData file summary access is metadata-only', async t => {
   for (const [label, SourceClass] of [
-    ['H5AD', AnnDataFileSource],
-    ['Zarr', AnnDataFileSource],
+    ['AnnData file', AnnDataFileSource],
   ]) {
     await t.test(label, async () => {
       const source = new SourceClass();

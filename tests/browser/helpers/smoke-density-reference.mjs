@@ -260,7 +260,7 @@ function releaseResources(gl, resources) {
 }
 
 /**
- * Test-only reference that preserves the historical smoke-density algorithm:
+ * Test-only reference of the smoke-density algorithm:
  * R32F splat -> readback/max in JavaScript -> R32F normalize -> readback.
  */
 export function buildPriorSmokeDensityReference(

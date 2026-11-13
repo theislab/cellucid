@@ -584,15 +584,15 @@ export class HighlightRenderer {
       lightDir: gl.getUniformLocation(this.program, 'u_lightDir'),
       halfDir: gl.getUniformLocation(this.program, 'u_halfDir'),
     };
-    // Scratch for the per-draw products the shaders no longer form per vertex.
+    // Scratch for the per-draw products the shaders would otherwise form per vertex.
     this._shaderFrame = {
       modelView: new Float32Array(16),
       halfDir: new Float32Array(3),
       invCenterShade: 1,
     };
 
-    // Per-view GPU buffer/VAO pairs + bookkeeping (fixes multi-view races and
-    // keeps highlight attributes out of the viewer's shared default VAO).
+    // Per-view GPU buffer/VAO pairs + bookkeeping (views never share one, and
+    // highlight attributes stay out of the viewer's shared default VAO).
     // LOD membership itself is shared by the spatial generation.
     this._viewBuffers = new Map();
     this._stagingBuffer = null;
@@ -780,7 +780,7 @@ export class HighlightRenderer {
 
   /**
    * Directly set the highlighted indices cache (avoids O(n) full-array scan).
-   * Call this when you already know which indices are highlighted (e.g., from state.js groups).
+   * Call this when you already know which indices are highlighted (e.g., from the highlight groups of `app/state/domains/highlights.js`).
    *
    * Both the index list and `highlightData` are adopted by reference. That is
    * the same ownership rule the caller-owned `Uint8Array` has always followed:
@@ -1180,7 +1180,7 @@ export class HighlightRenderer {
     // `_publishEmptyViewBuffer` normally flushes after committing one view.
     // Temporarily detach all buffers first so one hostile delete cannot leave a
     // later hidden pane drawable under the superseded highlight generation.
-    for (const [viewId, viewBuffer] of pendingPublications) {
+    for (const [, viewBuffer] of pendingPublications) {
       this._commitEmptyViewBuffer(
         viewBuffer,
         null,
@@ -1295,8 +1295,8 @@ export class HighlightRenderer {
     // from the highlight and visibility bytes, and the cells not admitted
     // rejected by the vertex shader. The second is taken when it writes no
     // more bytes than the first: gathering millions of positions on the CPU
-    // is most of a highlight of every cell (10M: 72 ms, and the store is
-    // cleared by the GPU process before it is written: 54 ms more).
+    // is most of a highlight of every cell, and the store is cleared by the GPU
+    // process before it is written (measured: 28_decisions_rendering_layers.md).
     const store = this._storeDrawing
       ? this._slotStoreFor(vid, exactPositions, exactDimensionLevel, exactMembership)
       : null;
@@ -1353,8 +1353,9 @@ export class HighlightRenderer {
     const isInitialPublication = !hasBuffer;
     // `gl.getError()` is a synchronous round trip to the GPU process that
     // waits for every queued command, including the previous frame's point
-    // draws: three checks here cost 104 ms of a 199 ms highlight at
-    // 10,000,000 points. One is taken, after the store is sized, where the
+    // draws: three checks here cost over half of a highlight of every cell at
+    // 10,000,000 points (measured: 28_decisions_rendering_layers.md). One is
+    // taken, after the store is sized, where the
     // failure it detects can appear -- a first allocation, or one larger than
     // any this buffer has already been verified to hold, which is where
     // OUT_OF_MEMORY lives -- and none when the same store is re-sized at or
@@ -2057,11 +2058,7 @@ export class HighlightRenderer {
     return true;
   }
 
-  /**
-   * Draw highlight rings for the specified view's buffer.
-   * Uses per-view buffers for multi-view rendering with correct LOD sizes.
-   * @param {string} viewId - Required view ID for per-view buffer and LOD size lookup
-   */
+  /** The time a frame is drawn at, in seconds. */
   _readFrameTimeSeconds() {
     return performance.now() * 0.001;
   }
@@ -2789,6 +2786,7 @@ export class HighlightTools {
 
     this.highlightArray = null;
     // viewId -> 'none'|'continuous'|'categorical'; see setViewFieldKindSource.
+    /** @type {(viewId: string) => string} */
     this.getViewFieldKind = NO_VIEW_FIELD_KIND_SOURCE;
     this.cellSelectionEnabled = true;
     this.cellSelectionCallback = null;
@@ -2967,7 +2965,7 @@ export class HighlightTools {
    * @param {number[]|Uint32Array} [highlightedIndices] - Optional pre-computed
    *   list of highlighted cell indices. If provided, skips the expensive O(n)
    *   full-array scan. Pass this when you already know which cells are
-   *   highlighted (e.g., from state.js highlight groups).
+   *   highlighted (e.g., from the highlight groups of `app/state/domains/highlights.js`).
    * @returns {boolean} Whether the published highlight changed; an identical
    *   republication (same array, same cells, full intensity) changes nothing.
    */

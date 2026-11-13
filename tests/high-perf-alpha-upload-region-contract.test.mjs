@@ -9,9 +9,9 @@ import {
 /**
  * Alpha-texture publication cost contract.
  *
- * Hiding eight cells out of ten million uploaded the entire 10.01 MB alpha
- * texture, because the publication compared every byte but then re-sent all of
- * them. These tests pin two things at once:
+ * Hiding eight cells out of ten million must not upload the entire 10.01 MB
+ * alpha texture (as a publication does that compares every byte and then
+ * re-sends all of them). These tests pin two things at once:
  *
  *  - the resident texture image is byte-identical to what a full upload would
  *    have produced, for every filter shape; and

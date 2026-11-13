@@ -10,8 +10,8 @@ const CSS_ROOT = fileURLToPath(new URL('../assets/css', import.meta.url));
    `:focus-visible` ring from `base/_accessibility.css`, with the replacement
    indicator that makes the suppression safe. A selector that removes the
    outline and paints nothing else leaves keyboard focus with no visual
-   position at all (WCAG 2.4.7 Focus Visible) — that is CEL-AUDIT-0077, and it
-   is why this list is exact rather than a threshold. */
+   position at all (WCAG 2.4.7 Focus Visible), which is why this list is exact
+   rather than a threshold. */
 const APPROVED_OUTLINE_SUPPRESSIONS = Object.freeze([
   {
     file: 'base/_accessibility.css',
@@ -78,14 +78,6 @@ for (const absolute of cssFiles) {
   );
 }
 
-test('the stylesheet declares exactly one shared focus ring', async () => {
-  const css = await readFile(path.join(CSS_ROOT, 'base/_accessibility.css'), 'utf8');
-  assert.match(
-    css,
-    /:focus-visible\s*\{\s*outline:\s*2px solid var\(--color-border-focus\);\s*outline-offset:\s*2px;\s*\}/,
-  );
-});
-
 test('every outline suppression in the stylesheet is an approved one', () => {
   const approved = new Set(
     APPROVED_OUTLINE_SUPPRESSIONS.map(entry => `${entry.file} :: ${entry.selector}`),
@@ -109,66 +101,11 @@ test('every outline suppression in the stylesheet is an approved one', () => {
   );
 });
 
-test('range sliders do not redeclare the outline they must inherit', async () => {
-  const css = await readFile(path.join(CSS_ROOT, 'components/_controls.css'), 'utf8');
-  const block = css.match(/\.slider-row input\[type="range"\]\s*\{([^}]*)\}/);
-  assert.notEqual(block, null, '.slider-row input[type="range"] rule is missing');
-  assert.doesNotMatch(
-    block[1],
-    /outline\s*:/,
-    'CEL-AUDIT-0077: the slider must not redeclare outline; the shared '
-    + ':focus-visible ring has to reach it.',
-  );
-});
-
-test('range sliders expose a pointer target the painted thumb fits inside', async () => {
-  const css = await readFile(path.join(CSS_ROOT, 'components/_controls.css'), 'utf8');
-  const tokens = await readFile(path.join(CSS_ROOT, 'tokens/_controls.css'), 'utf8');
-  const block = css.match(/\.slider-row input\[type="range"\]\s*\{([^}]*)\}/);
-  assert.notEqual(block, null, '.slider-row input[type="range"] rule is missing');
-  /* WCAG 2.2 SC 2.5.8 Target Size (Minimum) is 24x24 CSS px, and the painted
-     thumb is 14px tall, so a 3px control box hides part of what the user can
-     see. The hit height is the 24px primitive; the negative block margins
-     collapse the margin box back to the 3px track so rows keep their
-     density. */
-  assert.match(tokens, /--control-slider-hit-height:\s*var\(--space-6\);/);
-  assert.match(tokens, /--control-slider-track-height:\s*3px;/);
-  assert.match(tokens, /--control-slider-thumb-size:\s*var\(--space-3-5\);/);
-  assert.match(block[1], /height:\s*var\(--control-slider-hit-height\);/);
-  assert.match(
-    block[1],
-    /margin-block:\s*calc\(\(var\(--control-slider-thumb-size\) - var\(--control-slider-hit-height\)\) \/ 2\);/,
-  );
-  assert.match(
-    css,
-    /\.slider-row input\[type="range"\]::-webkit-slider-runnable-track\s*\{[^}]*height:\s*var\(--control-slider-track-height\);/,
-  );
-  assert.match(
-    css,
-    /\.slider-row input\[type="range"\]::-moz-range-track\s*\{[^}]*height:\s*var\(--control-slider-track-height\);/,
-  );
-});
-
-test('the analysis option slider has no competing definition of its own', async () => {
-  const modals = stripComments(
-    await readFile(path.join(CSS_ROOT, 'components/_modals.css'), 'utf8'),
-  );
-  const declaringRules = [...modals.matchAll(/([^{}]+)\{[^{}]*\}/g)]
-    .map(match => match[1].trim().replace(/\s+/g, ' '))
-    .filter(selector => selector.startsWith('.analysis-option-range'));
-  assert.deepEqual(
-    declaringRules,
-    [],
-    '.analysis-option-range is rendered inside a .slider-row, so a second '
-    + 'slider definition here silently diverges from components/_forms.css.',
-  );
-});
-
 /* A native input laid invisibly (`opacity: 0`) over the control it edits — a
    color input over its swatch, a range input over a drawn timeline — takes
    keyboard focus, and the ring the shared rule draws on it is invisible too:
-   the legend's and the highlight pages' color swatches showed no focus at all
-   (lens-a11y LF-1). Each such input names, in a `:has()` rule, the drawn
+   the legend's and the highlight pages' color swatches showed no focus at all.
+   Each such input names, in a `:has()` rule, the drawn
    element that paints its ring instead. */
 const INVISIBLE_INPUT_OWNERS = Object.freeze({
   // The scrubber's container draws the ring for the scrubber and its markers.

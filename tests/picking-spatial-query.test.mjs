@@ -70,12 +70,12 @@ function makeSpatialIndex(positions, dimension = 3) {
 }
 
 test('the dot under the pointer wins over a nearer dot beside it', () => {
-  // The reported defect: the old ray search took the first cell within a fixed
-  // world radius of the ray, so a dot nearer the camera but beside the pointer
-  // beat the dot drawn right under it.
+  // A ray search taking the first cell within a fixed world radius of the ray
+  // would let a dot nearer the camera but beside the pointer beat the dot
+  // drawn right under it.
   const mvp = cameraMvp();
   const under = [0, 0, 0];
-  // 0.025 from the ray: inside the old 0.03 world radius, yet about 7.5 px
+  // 0.025 from the ray: inside a 0.03 world radius, yet about 7.5 px
   // from the pointer, beyond its 4 px dot plus the 3 px tolerance.
   const nearerBeside = [0.025, 0, 0.6];
   const positions = Float32Array.from([...nearerBeside, ...under]);
@@ -118,9 +118,9 @@ test('the hit area is the drawn dot plus the tolerance, and follows point size',
 });
 
 test('a cell near the camera is picked whole, in front of what lies behind it (no near fade)', () => {
-  // The camera 3 from the target. A near fade (F97, removed on the owner's
-  // decision 2026-11-11) left cells nearer than 1.5 of it unpicked; a cell is
-  // picked at its drawn size however near the camera it is.
+  // The camera 3 from the target. A near fade would leave cells nearer than
+  // 1.5 of it unpicked; a cell is picked at its drawn size however near the
+  // camera it is.
   const mvp = cameraMvp(3);
   const cursor = project(mvp, [0, 0, 0]);
   const common = { mvpMatrix: mvp, cursor, pointSize: 8, sizeAttenuation: 1 };

@@ -2,12 +2,12 @@
  * A run that leaves state in the analysis workers releases it however the
  * run ends. A UCell signature run keeps each worker's ranks of its range of
  * cells (about 18 bytes a cell per set gene: 1.8 GB at 2M cells and 50
- * genes); the context was released only by UCELL_FINISH, so a run that was
- * canceled, superseded or failed before it left that memory in every worker
- * until the next UCell run. And a context broadcast that is canceled while
- * in flight leaves the context in the workers that already took it, so its
- * clear is owed from the moment the broadcast is sent (DE, pseudobulk DE, the
- * dot plot: the broadcast sits inside the try whose finally clears it).
+ * genes); were the context released only by UCELL_FINISH, a run that was
+ * canceled, superseded or failed before it would leave that memory in every
+ * worker until the next UCell run. And a context broadcast that is canceled
+ * while in flight leaves the context in the workers that already took it, so
+ * its clear is owed from the moment the broadcast is sent (DE, pseudobulk DE,
+ * the dot plot: the broadcast sits inside the try whose finally clears it).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

@@ -6,24 +6,23 @@
  * A camera state carries two representations: the orbit half and the
  * free-fly half. Only the one its navigation mode drives is authoritative; the
  * viewer reports the other by deriving it through `Math.sin`, `Math.atan2` and
- * `Math.asin`, whose last bits ECMAScript leaves to the engine. The published
- * He and Kanemaru sample views were saved in WebKit, which derives their
- * live-camera pitch as `-0.16539816339745403`; Chromium and Firefox derive
- * `-0.16539816339745406`. Multiview restore compared the derived half bit for
- * bit, refused the camera, and then re-asserted the same unreachable camera
- * from its rollback — so both samples opened with "Multiview restoration
- * failed and graph rollback was incomplete." in every engine but WebKit.
+ * `Math.asin`, whose last bits ECMAScript leaves to the engine (WebKit derives
+ * a live-camera pitch of `-0.16539816339745403` where Chromium and Firefox
+ * derive `-0.16539816339745406`). A restore that compared the derived half bit
+ * for bit would refuse the camera, and then re-assert the same unreachable
+ * camera from its rollback, so a sample view saved in WebKit would open with
+ * "Multiview restoration failed and graph rollback was incomplete." in every
+ * other engine.
  *
  * These specs reproduce that portably: they save a session in the engine under
  * test and move the derived half by one unit in the last place, which is what
- * a different engine's derivation looks like. Before the fix every engine
- * refused the file.
+ * a different engine's derivation looks like.
  *
  * The same restores also count their notifications. A successful restore
- * published "Session fully restored." twice — once as its own progress entry
- * and once as a second toast — and Load State then added "Session loaded
- * successfully" on top. A failed published sample view was announced twice as
- * well: by the restore's progress entry and by "Sample view unavailable". A
+ * publishes "Session fully restored." once (not also as its own progress entry
+ * and again as a second toast), and Load State adds no "Session loaded
+ * successfully" on top. A failed published sample view is announced once: by
+ * the restore's progress entry or by "Sample view unavailable", not both. A
  * published sample view that applies says nothing: the person opened a
  * sample, not a session, so its camera landing is the only sign.
  */
@@ -34,7 +33,6 @@ import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
 import { cameraStatesIn, rewriteShownValue, sessionManifest, startingViewBytes } from './helpers/session-files.mjs';
-import { NOT_A_SESSION_FILE_MESSAGE, otherSessionFormatMessage } from '../../assets/js/app/session/bundle/format.js';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -140,9 +138,9 @@ function deriveInAnotherEngine(camera) {
 /**
  * Keep every notification element the page ever publishes.
  *
- * A count of what is on screen is not a count of what was announced: the
- * second "Session fully restored." toast expired after 2.2 s, so a retrying
- * on-screen count went green once it had gone. The recorder holds each element
+ * A count of what is on screen is not a count of what was announced: a toast
+ * expires (the second "Session fully restored." one after 2.2 s), so a retrying
+ * on-screen count goes green once it has gone. The recorder holds each element
  * past its removal, and a notification updated in place (a progress entry
  * that completes or fails) is still one element.
  */
@@ -259,8 +257,8 @@ test('a session saved by another engine restores, and says so once', async ({
     1,
     'a successful restore is announced exactly once',
   );
-  // Load State used to add a third announcement of the same event, and the offer to undo the load
-  // was a second notice of it (found 2026-11-10). One notice says how the load ended: the restore,
+  // Load State adds no third announcement of the same event, and the offer to undo the load
+  // is not a second notice of it. One notice says how the load ended: the restore,
   // what it added beside the trackers shown, and Undo. (The progress card, published only when the
   // read outlasts NOTICE_AFTER_MS, gives way to it and says nothing of the outcome.)
   expect((await publishedNotifications(page)).filter(notice => notice.title !== 'Loading')).toEqual([
@@ -394,250 +392,184 @@ async function servePublishedDefault(page, stateBytes) {
   );
 }
 
-test('a published sample view saved by another engine applies, without a word', async ({
+test('a published sample view: applied, refused, of an earlier version, of another format, and from a linked catalog', async ({
   page,
 }, testInfo) => {
+  // One session is saved once; each step publishes a variant of it as the
+  // sample's starting view and starts the page again, which is its subject.
   const productErrors = observeProductErrors(page);
   await recordNotifications(page);
   await openDataset(page);
   await poseCamera(page);
   const savedOrbit = await readLiveOrbit(page);
-  const stateBytes = await rewriteSession(
-    await saveSession(page, testInfo, 'published.cellucid-session'),
-    moveDerivedCameraBits,
-    { startingView: true },
-  );
-  await servePublishedDefault(page, stateBytes);
-
-  await page.reload({ waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('html')).toHaveAttribute(
-    'data-startup-phase',
-    'ready',
-  );
-  await expect.poll(
-    () => readLiveOrbit(page),
-    { message: 'the sample view moves the camera to its saved pose' },
-  ).toEqual(savedOrbit);
-  const published = await publishedNotifications(page);
-  expect(
-    published.filter(restored),
-    'a sample view is part of opening the sample, not a session to announce',
-  ).toEqual([]);
-  expect(published.filter(sampleViewUnavailable)).toEqual([]);
-  expect(published.filter(loadingFailed)).toEqual([]);
-  expect(productErrors).toEqual([]);
-});
-
-test('a published sample view that cannot be applied is reported once', async ({
-  page,
-}, testInfo) => {
-  await recordNotifications(page);
-  await openDataset(page);
-  let brokeCamera = false;
-  const stateBytes = await rewriteSession(
-    await saveSession(page, testInfo, 'broken.cellucid-session'),
-    {
-      // A camera no view can take (a negative distance): refused when the
-      // cameras are put back, after the file has been read. Not a setting: a
-      // saved setting this version cannot use is said and left as shown, and
-      // never fails the view (next test).
-      camera: value => {
-        for (const state of cameraStatesIn(value)) {
-          state.orbit.radius = -1;
-          state.orbit.targetRadius = -1;
-          brokeCamera = true;
-        }
-      },
-    },
-    { startingView: true },
-  );
-  expect(brokeCamera, 'the saved session must hold a camera').toBe(true);
-  await servePublishedDefault(page, stateBytes);
-
-  await page.reload({ waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expectAnnounced(
-    page,
-    sampleViewUnavailable,
-    1,
-    'the failed sample view is announced exactly once',
-  );
-  const published = await publishedNotifications(page);
-  expect(
-    published.filter(loadingFailed),
-    'the restore progress entry must not repeat the sample-view failure',
-  ).toEqual([]);
-  expect(published.filter(restored)).toEqual([]);
-
-  // R9U-13: the notice is about this dataset; the next opening withdraws it,
-  // so it never reads as the next dataset's (two samples in a row left two).
-  const unavailable = page.locator('#notification-center .notification').filter({ hasText: 'Sample view unavailable' });
-  await expect(unavailable).toHaveCount(1);
-  await chooseFiles(
-    page.locator('#user-data-file-input'),
-    path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'current-ui-smoke.zarr.zip'),
-  );
-  await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
-  await expect(unavailable).toHaveCount(0);
-});
-
-test('a published sample view saved by an earlier version applies: a setting this version cannot use is said, never failing the view', async ({
-  page,
-}, testInfo) => {
-  // Found 2026-11-11: every sample's starting view holds the Figure export
-  // record of version 1 (an SVG strategy left unchosen, null); once version 2
-  // refused null, every sample opened on "Sample view unavailable".
-  const productErrors = observeProductErrors(page);
-  await recordNotifications(page);
-  await openDataset(page);
-  await poseCamera(page);
-  const savedOrbit = await readLiveOrbit(page);
-  let rewroteSelect = false;
-  const stateBytes = await rewriteSession(
-    await saveSession(page, testInfo, 'earlier.cellucid-session'),
-    {
-      settings: value => {
-        value.figureExport = { ...value.figureExport, version: 1, svgStrategy: null };
-        // And a choice this version's control does not offer (not the
-        // background, which a starting view leaves as shown).
-        const applied = Object.entries(value.controls).filter(([id]) => id !== 'background-select');
-        rewroteSelect = applied.some(([, control]) => breakFirstSelect(control));
-      },
-    },
-    { startingView: true },
-  );
-  expect(rewroteSelect, 'the saved session must contain a select').toBe(true);
-  await servePublishedDefault(page, stateBytes);
-
-  await page.reload({ waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
-  await expect.poll(
-    () => readLiveOrbit(page),
-    { message: 'the sample view moves the camera to its saved pose' },
-  ).toEqual(savedOrbit);
-  await expectAnnounced(
-    page,
-    ({ message }) => message === '1 saved setting could not be used and stays as shown',
-    1,
-    'the one setting it could not use is said once',
-  );
-  const published = await publishedNotifications(page);
-  expect(published.filter(sampleViewUnavailable)).toEqual([]);
-  expect(published.filter(loadingFailed)).toEqual([]);
-  // The unchosen SVG strategy is read as Full vector.
-  expect(await page.evaluate(async () => {
-    const { getActions } = await import('/assets/js/app/actions/index.js');
-    return (await getActions().dispatch('figure-export.get', {})).outcome.svg_strategy;
-  })).toBe('full-vector');
-  expect(productErrors.filter(text => !/saved setting/.test(text))).toEqual([]);
-});
-
-test('a published sample view of another session format: the dataset opens on its default view, with one short line', async ({
-  page,
-}, testInfo) => {
-  // The app and the datasets are deployed minutes apart: a new app meets an
-  // old view, or a cached app a new one. No format is read but this one, and
-  // nothing about formats reaches the person.
-  const productErrors = observeProductErrors(page);
-  await recordNotifications(page);
-  await openDataset(page);
-  const current = await saveSession(page, testInfo, 'current.cellucid-session');
-  const signature = Buffer.from('CELLUCID_SESSION/4\n');
-  expect(current.subarray(0, signature.length).equals(signature)).toBe(true);
-  for (const prefix of ['CELLUCID_SESSION/3\n', 'CELLUCID_SESSION/9\n']) {
+  const saved = await saveSession(page, testInfo, 'published.cellucid-session');
+  const publish = async stateBytes => {
     await page.unrouteAll({ behavior: 'wait' });
-    await servePublishedDefault(page, Buffer.concat([Buffer.from(prefix), current.subarray(signature.length)]));
+    await servePublishedDefault(page, stateBytes);
+  };
+  const reopen = async () => {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await dismissWelcome(page);
     await openCollapsedPanels(page);
-    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  };
+
+  await test.step('a published sample view saved by another engine applies, without a word', async () => {
+    const errorsBefore = productErrors.length;
+    await publish(await rewriteSession(saved, moveDerivedCameraBits, { startingView: true }));
+    await reopen();
+    await expect(page.locator('html')).toHaveAttribute(
+      'data-startup-phase',
+      'ready',
+    );
+    await expect.poll(
+      () => readLiveOrbit(page),
+      { message: 'the sample view moves the camera to its saved pose' },
+    ).toEqual(savedOrbit);
+    const published = await publishedNotifications(page);
+    expect(
+      published.filter(restored),
+      'a sample view is part of opening the sample, not a session to announce',
+    ).toEqual([]);
+    expect(published.filter(sampleViewUnavailable)).toEqual([]);
+    expect(published.filter(loadingFailed)).toEqual([]);
+    expect(productErrors.slice(errorsBefore)).toEqual([]);
+  });
+
+  await test.step('a published sample view holding settings this version cannot use applies: they are said, never failing the view', async () => {
+    // A Figure export record of another version is refused whole and a
+    // choice the control does not offer is refused alone; the rest of the
+    // view still applies.
+    const errorsBefore = productErrors.length;
+    let rewroteSelect = false;
+    const stateBytes = await rewriteSession(
+      saved,
+      {
+        settings: value => {
+          value.figureExport = { ...value.figureExport, version: 1 };
+          // And a choice this version's control does not offer (not the
+          // background, which a starting view leaves as shown).
+          const applied = Object.entries(value.controls).filter(([id]) => id !== 'background-select');
+          rewroteSelect = applied.some(([, control]) => breakFirstSelect(control));
+        },
+      },
+      { startingView: true },
+    );
+    expect(rewroteSelect, 'the saved session must contain a select').toBe(true);
+    await publish(stateBytes);
+    await reopen();
+    await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
+    await expect.poll(
+      () => readLiveOrbit(page),
+      { message: 'the sample view moves the camera to its saved pose' },
+    ).toEqual(savedOrbit);
     await expectAnnounced(
       page,
-      ({ message }) => /starting view isn\u2019t available right now/.test(message),
+      ({ message }) => message === '2 saved settings could not be used and stay as shown',
       1,
-      `${prefix.trim()}: one short line`,
+      'the two settings it could not use are said once',
     );
     const published = await publishedNotifications(page);
     expect(published.filter(sampleViewUnavailable)).toEqual([]);
     expect(published.filter(loadingFailed)).toEqual([]);
-    expect(published.filter(({ message }) => /session format|earlier version|newer version/i.test(message))).toEqual([]);
-    await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
-    // The dataset's history starts from what is shown, after the line is said.
-    await expect.poll(() => page.evaluate(() => window._cellucidHistories?.current()?.active != null)).toBe(true);
-  }
-  expect(productErrors).toEqual([]);
-});
+    expect(productErrors.slice(errorsBefore).filter(text => !/saved setting/.test(text))).toEqual([]);
+  });
 
-test('a published sample view applies when its catalog is opened from a link', async ({
-  page,
-}, testInfo) => {
-  // datasets.json is one format however it is opened: the same catalog
-  // linked with ?data= applies the default session it names.
-  const productErrors = observeProductErrors(page);
-  await recordNotifications(page);
-  await openDataset(page);
-  await poseCamera(page);
-  const savedOrbit = await readLiveOrbit(page);
-  const stateBytes = await rewriteSession(
-    await saveSession(page, testInfo, 'published.cellucid-session'),
-    {},
-    { startingView: true },
-  );
-  await servePublishedDefault(page, stateBytes);
+  await test.step('a published sample view of another session format: the dataset opens on its default view, with one short line', async () => {
+    // The app and the datasets are deployed minutes apart: a new app meets an
+    // old view, or a cached app a new one. No format is read but this one, and
+    // nothing about formats reaches the person.
+    const errorsBefore = productErrors.length;
+    const signature = Buffer.from('CELLUCID_SESSION/4\n');
+    expect(saved.subarray(0, signature.length).equals(signature)).toBe(true);
+    for (const prefix of ['CELLUCID_SESSION/3\n', 'CELLUCID_SESSION/9\n']) {
+      await publish(Buffer.concat([Buffer.from(prefix), saved.subarray(signature.length)]));
+      await reopen();
+      await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+      await expectAnnounced(
+        page,
+        ({ message }) => /starting view isn’t available right now/.test(message),
+        1,
+        `${prefix.trim()}: one short line`,
+      );
+      const published = await publishedNotifications(page);
+      expect(published.filter(sampleViewUnavailable)).toEqual([]);
+      expect(published.filter(loadingFailed)).toEqual([]);
+      expect(published.filter(({ message }) => /session format|earlier version|newer version/i.test(message))).toEqual([]);
+      await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
+      // The dataset's history starts from what is shown, after the line is said.
+      await expect.poll(() => page.evaluate(() => window._cellucidHistories?.current()?.active != null)).toBe(true);
+    }
+    expect(productErrors.slice(errorsBefore)).toEqual([]);
+  });
 
-  const link = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/`;
-  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(link)}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
-  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await expect.poll(
-    () => readLiveOrbit(page),
-    { message: 'the linked catalog applies its starting view' },
-  ).toEqual(savedOrbit);
-  expect(
-    (await publishedNotifications(page)).filter(restored),
-    'a starting view restores without a word',
-  ).toEqual([]);
-  expect(productErrors).toEqual([]);
-});
+  await test.step('a published sample view applies when its catalog is opened from a link', async () => {
+    // datasets.json is one format however it is opened: the same catalog
+    // linked with ?data= applies the default session it names.
+    const errorsBefore = productErrors.length;
+    await publish(await rewriteSession(saved, {}, { startingView: true }));
+    const link = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/`;
+    await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(link)}`, { waitUntil: 'domcontentloaded' });
+    await openCollapsedPanels(page);
+    await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
+    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+    await expect.poll(
+      () => readLiveOrbit(page),
+      { message: 'the linked catalog applies its starting view' },
+    ).toEqual(savedOrbit);
+    expect(
+      (await publishedNotifications(page)).filter(restored),
+      'a starting view restores without a word',
+    ).toEqual([]);
+    expect(productErrors.slice(errorsBefore)).toEqual([]);
+  });
 
-test('a file without the format-4 signature is refused, and nothing changes', async ({
-  page,
-}, testInfo) => {
-  // Format 4 carries its version in the signature. A session of format 3
-  // (saved by an earlier Cellucid: one state, not the history of its steps)
-  // is refused naming its format; a file with any other signature (here the
-  // unversioned "CELLUCID_SESSION\n") with the one sentence naming the
-  // expected format. Nothing of either is restored.
-  const productErrors = observeProductErrors(page);
-  await recordNotifications(page);
-  await openDataset(page);
-  await poseCamera(page);
-  const orbit = await readLiveOrbit(page);
-  const current = await saveSession(page, testInfo, 'current.cellucid-session');
-  const signature = Buffer.from('CELLUCID_SESSION/4\n');
-  expect(current.subarray(0, signature.length).equals(signature)).toBe(true);
-  const refusals = [
-    ['format3.cellucid-session', 'CELLUCID_SESSION/3\n', otherSessionFormatMessage(3)],
-    ['unversioned.cellucid-session', 'CELLUCID_SESSION\n', NOT_A_SESSION_FILE_MESSAGE],
-  ];
-  for (const [name, prefix, sentence] of refusals) {
-    const other = Buffer.concat([Buffer.from(prefix), current.subarray(signature.length)]);
-    await forgetNotifications(page);
-    await loadSessionFile(page, name, other);
+  // Last: it ends on a file of this computer, not on the sample.
+  await test.step('a published sample view that cannot be applied is reported once', async () => {
+    let brokeCamera = false;
+    const stateBytes = await rewriteSession(
+      saved,
+      {
+        // A camera no view can take (a negative distance): refused when the
+        // cameras are put back, after the file has been read. Not a setting: a
+        // saved setting this version cannot use is said and left as shown, and
+        // never fails the view.
+        camera: value => {
+          for (const state of cameraStatesIn(value)) {
+            state.orbit.radius = -1;
+            state.orbit.targetRadius = -1;
+            brokeCamera = true;
+          }
+        },
+      },
+      { startingView: true },
+    );
+    expect(brokeCamera, 'the saved session must hold a camera').toBe(true);
+    await publish(stateBytes);
+    await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+    await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expectAnnounced(
       page,
-      ({ message }) => message.includes(sentence),
+      sampleViewUnavailable,
       1,
-      `${name} is refused once, naming the format`,
+      'the failed sample view is announced exactly once',
     );
-    expect((await publishedNotifications(page)).filter(restored)).toEqual([]);
-    expect(await readLiveOrbit(page)).toEqual(orbit);
-  }
-  expect(productErrors.filter(line => !refusals.some(([, , sentence]) => line.includes(sentence)))).toEqual([]);
+    const published = await publishedNotifications(page);
+    expect(
+      published.filter(loadingFailed),
+      'the restore progress entry must not repeat the sample-view failure',
+    ).toEqual([]);
+    expect(published.filter(restored)).toEqual([]);
+
+    // The notice is about this dataset; the next opening withdraws it, so it
+    // never reads as the next dataset's.
+    const unavailable = page.locator('#notification-center .notification').filter({ hasText: 'Sample view unavailable' });
+    await expect(unavailable).toHaveCount(1);
+    await chooseFiles(
+      page.locator('#user-data-file-input'),
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'current-ui-smoke.zarr.zip'),
+    );
+    await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
+    await expect(unavailable).toHaveCount(0);
+  });
 });

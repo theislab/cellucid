@@ -21,10 +21,11 @@
  *   the reads go, less its bytes' transfer at its share of the bandwidth
  *   (the requests in flight sharing it): the median of the latest
  *   requests' made on a connection already set up (a request that opened
- *   one waited for its handshakes too: an export priced from an opening's
- *   requests took the round trip under load at 883 ms, 365 ms as it ran). A host answers slower under load than idle (S3 us-west-2
- *   from Europe: 230 ms the shortest, 0.35-0.5 s a small request with 42
- *   in flight), and what a read will take is priced at this
+ *   one waited for its handshakes too, and priced from an opening's
+ *   requests it would put the round trip under load far above what it takes
+ *   as the reads run). A host answers slower under load than idle (S3's
+ *   small requests, measured: 22_decisions_link_model_and_request_planning.md),
+ *   and what a read will take is priced at this
  *   (`loadedRoundTripMs`: the gene sample, Genes read for, an export,
  *   a progressive first view); shaping (which gaps a plan fetches, how
  *   long a request is) keeps the shortest.
@@ -32,10 +33,9 @@
  *   least `backgroundConcurrency` requests in flight and requests waiting, the time between completions less their bytes'
  *   transfer, over the latest of them: what one more request really costs
  *   when a read is request-bound. A path may complete only so many small
- *   requests a second whatever the connections (CELLxGENE's S3 mirrors from
- *   Europe: 70-88 a second with 42 in flight, 14 ms a request, where a
- *   round trip over the connections said 6 ms), so plans price a request at
- *   no less (`requestCostMs`, `requestMs`): the floor of a read is the
+ *   requests a second whatever the connections (CELLxGENE's S3 mirrors,
+ *   measured: 22_decisions_link_model_and_request_planning.md), so plans
+ *   price a request at no less (`requestCostMs`, `requestMs`): the floor of a read is the
  *   longer of its requests over that rate and its bytes over the bandwidth.
  * - **Bandwidth** (`bytesPerMs`): the fastest of the latest requests'
  *   deliveries, each over one request (its bytes over its whole time, round
@@ -56,7 +56,7 @@
  * ahead, the price of a read) reads the window as it is now.
  * - **The clock's resolution** (`clockTickMs`): a request is timed by a
  *   clock that may tick in whole milliseconds (`performance.now()` in
- *   WebKit and Firefox, measured in their workers: 1 ms; Chromium 0.1 ms).
+ *   WebKit and Firefox workers: 1 ms; Chromium 0.1 ms).
  *   One request's measured time is right on average, but the shortest of
  *   many is the one the ticks cut shortest: below the true shortest by up to
  *   a tick, and 0 for a request that ended within one (a server on the same
@@ -110,7 +110,7 @@
  * answers one request per connection at a time; over HTTP/2 or HTTP/3 one
  * connection carries as many requests at once as the host's
  * `SETTINGS_MAX_CONCURRENT_STREAMS`, which RFC 9113 asks to be no smaller
- * than 100 (GitHub's is 100, measured). A web host's prior names both
+ * than 100 (GitHub's is 100). A web host's prior names both
  * (`connections`, `streams`), and reads over a link whose protocol is not
  * known yet start at the streams: on a host that multiplexes, every request
  * of a burst is on the wire at once instead of six at a time.
@@ -153,11 +153,9 @@ import { measureOf } from '../../utils/machine.js';
 
 /**
  * The rate, in stored bytes per millisecond, at which the reader builds a
- * gene index from a compressed row-major matrix: measured on an Apple M1 Pro
- * (562k cells x 8k genes, 52M entries, gzip): the column indices (80 MB
- * stored) in 1.2 s, about 67 MB/s; the indices and the values in about
- * 90 MB/s. A link delivering at least this much is not what the index waits
- * for. A scheduling choice, measured.
+ * gene index from a compressed row-major matrix. A link delivering at least
+ * this much is not what the index waits for. A scheduling choice (measured:
+ * 22_decisions_link_model_and_request_planning.md).
  */
 export const READ_AHEAD_BYTES_PER_MS = 64 * 1000;
 
@@ -209,9 +207,9 @@ export const MIN_STALL_TIMEOUT_MS = 1000;
  * How long a request may stay silent before its link has answered once: its
  * first answer waits for the connection to be made too (DNS, TCP and TLS,
  * and any redirect), which a round trip's timeout never covered: RFC 6298
- * 5.7 and RFC 1122 4.2.3.1 give connection set-up 3 s. Measured: a
- * Dropbox share link's first byte took 2.1–2.2 s, S3 us-west-2's 0.7–2.4 s,
- * EBI's over 1 s, each healthy, each aborted as stalled at 1 s before.
+ * 5.7 and RFC 1122 4.2.3.1 give connection set-up 3 s. A healthy host's
+ * first byte can take longer than one second (measured:
+ * 22_decisions_link_model_and_request_planning.md).
  */
 export const FIRST_ANSWER_TIMEOUT_MS = 3000;
 
@@ -323,8 +321,8 @@ export const RECENT_REQUESTS = 16;
  * A request whose time is at least this many round trips is bounded by the
  * link's transfer, not by its round trip: its delivery measures the link
  * (`LinkMeter._rate`). Two round trips of transfer past its own round trip,
- * so a host answering slower under load (S3: 0.35-0.5 s against 230 ms
- * idle) is not taken for a slower link. A measuring choice.
+ * so a host answering slower under load than idle (S3) is not taken for a
+ * slower link. A measuring choice.
  */
 const TRANSFER_BOUND = 3;
 
@@ -332,14 +330,13 @@ const TRANSFER_BOUND = 3;
  * One connection carries only part of the link when a transfer-bound
  * request alone on the link (nothing else in flight from its start to its
  * end) delivered less than this share of the most the link has delivered,
- * which requests together have shown (Amazon S3: 0.5 MB/s a connection, tens of
- * MB/s in all). A request's delivery while others share the link is its share
- * of a busy link, not what a connection can carry: counted as a
- * connection's, it made `requestPieceBytes` split the next plan finer, which
- * shared the link among more requests, whose deliveries were smaller again
- * (a 10M-cell export over an emulated 30 MB/s HTTP/2 link: 255 → 7,556
- * requests of 16-40 KB, +18% time, +45% CPU, the same bytes). A
- * measuring choice (the margin keeps a lone request a little below the
+ * which requests together have shown (Amazon S3 delivers a small share of the
+ * link on each connection). A request's delivery while others share the link
+ * is its share of a busy link, not what a connection can carry: counted as a
+ * connection's, it would make `requestPieceBytes` split the next plan finer,
+ * which shares the link among more requests, whose deliveries are smaller
+ * again, without end (measured: 22_decisions_link_model_and_request_planning.md).
+ * A measuring choice (the margin keeps a lone request a little below the
  * link's best for the link's).
  */
 const CONNECTION_BOUND_SHARE = 0.8;
@@ -351,9 +348,8 @@ const CONNECTION_BOUND_SHARE = 0.8;
  * a link that carries more than a connection shows it many times over; one
  * delivery timed over a stretch little longer than the clock's tick (a
  * loopback host, bytes a cache had) can be any rate, and taken alone it
- * split every later plan of the page (a 1% share's `.h5ad` export of a 10M
- * file on a local web host: 473 → 3,135 requests, 6.2 → 18.2 s, the same
- * bytes, after one such delivery). A measuring choice.
+ * split every later plan of the page (measured:
+ * 22_decisions_link_model_and_request_planning.md). A measuring choice.
  */
 const LINK_EVIDENCE = 4;
 
@@ -1100,11 +1096,10 @@ export class LinkMeter {
    * The bandwidth reads are priced at: the measured one, and for a local
    * file never less than its prior's. A local file's reads measure only a
    * lower bound of its bandwidth (`readsAhead`): reads of a few hundred
-   * bytes each (a gene's counted entries) measured a disk at 141 MB/s, so a
-   * gap of a few kilobytes looked dearer than another read, every gene was
-   * read alone, and nothing larger was read to measure it again (a
-   * subsample's every gene, 1% of 40,000 cells: 4,004 reads in 270 ms,
-   * 534 in 150 ms with its chunk files' gaps read). @private
+   * bytes each (a gene's counted entries) measure a disk far below its rate,
+   * so a gap of a few kilobytes looks dearer than another read, every gene is
+   * read alone, and nothing larger is read to measure it again (measured:
+   * 22_decisions_link_model_and_request_planning.md). @private
    */
   _pricedBytesPerMs() {
     return this._readsAheadPrior() ? Math.max(this._prior.bytesPerMs, this.bytesPerMs) : this.bytesPerMs;
@@ -1172,8 +1167,8 @@ export class LinkMeter {
    * A source whose prior is read ahead (a local file: a disk) stays read
    * ahead whatever one request measures: a small read's bytes over its time
    * (round trip and the reader thread's own delay included) is a lower
-   * bound of the bandwidth, and has put a local `.zarr.zip` at 62.7 KB/ms,
-   * under the line. A web host is read ahead once measured at or above it.
+   * bound of the bandwidth, and can put a local `.zarr.zip` under the line. A
+   * web host is read ahead once measured at or above it.
    */
   get readsAhead() {
     if (this._readsAheadPrior()) return true;
@@ -1185,9 +1180,8 @@ export class LinkMeter {
    * priced at (`_pricedBytesPerMs`), as its round trip's bytes and merge gap
    * are: a local file's never below its prior's. Reported as measured, a
    * local file's few small opening reads (a lower bound: `readsAhead`)
-   * priced its first gene past the gene time, and genes were read for a
-   * sample of a file whose every cell reads in milliseconds (in Node, a
-   * 2,000-cell share sampled at 100-200 cells).
+   * would price its first gene past the gene time, and genes would be read
+   * for a sample of a file whose every cell reads in milliseconds.
    */
   snapshot() {
     const bytesPerMs = this._pricedBytesPerMs();

@@ -70,64 +70,84 @@ function expectSameOrbit(actual, expected) {
   }
 }
 
-test('removing the focused snapshot with unlocked cameras restores the live camera', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  const { live } = await openTwoUnlockedPanes(page);
-  await moveFocusedSnapshotCamera(page);
+/** Focus the live pane and read its camera once it has stopped moving. */
+async function focusLiveAndReadCamera(page) {
+  await badge(page, 1).click();
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.getViewLayout().activeId),
+  ).toBe('live');
+  await expect.poll(() => page.evaluate(() => new Promise(resolve => {
+    const viewer = window._cellucidViewer;
+    const before = JSON.stringify(viewer.getCameraState());
+    requestAnimationFrame(() => requestAnimationFrame(
+      () => resolve(JSON.stringify(viewer.getCameraState()) === before),
+    ));
+  }))).toBe(true);
+  return page.evaluate(() => window._cellucidViewer.getCameraState());
+}
 
-  await badge(page, 2).locator('.split-badge-remove').click();
-  await expect(page.locator('.split-badge')).toHaveCount(1);
-
-  const after = await page.evaluate(() => ({
-    camera: window._cellucidViewer.getCameraState(),
-    stored: window._cellucidViewer.getViewCameraState('live'),
-  }));
-  expectSameOrbit(after.camera, live);
-  expectSameOrbit(after.stored, live);
-  expect(productErrors).toEqual([]);
-});
-
-test('clearing snapshots while one is focused restores the live camera', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  const { live } = await openTwoUnlockedPanes(page);
-  await moveFocusedSnapshotCamera(page);
-
-  await page.locator('#split-clear-btn').click();
-  await expect(page.locator('#split-view-badges-box')).toBeHidden();
-
-  const camera = await page.evaluate(() => window._cellucidViewer.getCameraState());
-  expectSameOrbit(camera, live);
-  expect(productErrors).toEqual([]);
-});
-
-test('a focus change does not carry the outgoing pane inertia into the incoming pane', async ({ page }) => {
+test('each pane owns its camera: no inertia across a focus change, and the live camera back when the focused view goes', async ({ page }) => {
   const productErrors = observeProductErrors(page);
   const { snapshotId } = await openTwoUnlockedPanes(page);
 
-  const proof = await page.evaluate(async id => {
-    const viewer = window._cellucidViewer;
-    const frames = count => new Promise(resolve => {
-      const step = remaining => {
-        if (remaining === 0) resolve();
-        else requestAnimationFrame(() => step(remaining - 1));
-      };
-      step(count);
-    });
-    const cameraOf = () => JSON.stringify(viewer.getCameraState());
-    // Navigation keys build camera velocity on the focused (live) pane.
-    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyD', key: 'd' }));
-    await frames(8);
-    window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyD', key: 'd' }));
-    const liveBefore = cameraOf();
-    await frames(1);
-    const liveStillGliding = cameraOf() !== liveBefore;
-    viewer.setViewLayout('grid', id);
-    const incoming = cameraOf();
-    await frames(10);
-    return { liveStillGliding, incoming, settled: cameraOf(), mode: viewer.getNavigationMode() };
-  }, snapshotId);
+  await test.step('a focus change does not carry the outgoing pane inertia into the incoming pane', async () => {
+    const proof = await page.evaluate(async id => {
+      const viewer = window._cellucidViewer;
+      const frames = count => new Promise(resolve => {
+        const step = remaining => {
+          if (remaining === 0) resolve();
+          else requestAnimationFrame(() => step(remaining - 1));
+        };
+        step(count);
+      });
+      const cameraOf = () => JSON.stringify(viewer.getCameraState());
+      // Navigation keys build camera velocity on the focused (live) pane.
+      window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyD', key: 'd' }));
+      await frames(8);
+      window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyD', key: 'd' }));
+      const liveBefore = cameraOf();
+      await frames(1);
+      const liveStillGliding = cameraOf() !== liveBefore;
+      viewer.setViewLayout('grid', id);
+      const incoming = cameraOf();
+      await frames(10);
+      return { liveStillGliding, incoming, settled: cameraOf(), mode: viewer.getNavigationMode() };
+    }, snapshotId);
 
-  expect(proof.liveStillGliding, JSON.stringify(proof)).toBe(true);
-  expect(JSON.parse(proof.settled)).toEqual(JSON.parse(proof.incoming));
-  expect(productErrors).toEqual([]);
+    expect(proof.liveStillGliding, JSON.stringify(proof)).toBe(true);
+    expect(JSON.parse(proof.settled)).toEqual(JSON.parse(proof.incoming));
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('removing the focused snapshot with unlocked cameras restores the live camera', async () => {
+    const live = await focusLiveAndReadCamera(page);
+    await moveFocusedSnapshotCamera(page);
+
+    await badge(page, 2).locator('.split-badge-remove').click();
+    await expect(page.locator('.split-badge')).toHaveCount(1);
+
+    const after = await page.evaluate(() => ({
+      camera: window._cellucidViewer.getCameraState(),
+      stored: window._cellucidViewer.getViewCameraState('live'),
+    }));
+    expectSameOrbit(after.camera, live);
+    expectSameOrbit(after.stored, live);
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('clearing snapshots while one is focused restores the live camera', async () => {
+    // A view is kept again; the cameras stay unlocked.
+    await page.locator('#split-keep-view-btn').click();
+    await expect(page.locator('.split-badge')).toHaveCount(2);
+    expect(await page.evaluate(() => window._cellucidViewer.getCamerasLocked())).toBe(false);
+    const live = await focusLiveAndReadCamera(page);
+    await moveFocusedSnapshotCamera(page);
+
+    await page.locator('#split-clear-btn').click();
+    await expect(page.locator('#split-view-badges-box')).toBeHidden();
+
+    const camera = await page.evaluate(() => window._cellucidViewer.getCameraState());
+    expectSameOrbit(camera, live);
+    expect(productErrors).toEqual([]);
+  });
 });

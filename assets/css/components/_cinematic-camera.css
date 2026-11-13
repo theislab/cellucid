@@ -368,7 +368,7 @@ body:has(.cinematic-transport-bar.visible) #view-title-layer {
 }
 
 
-/* Camera path captions (F110): the named keyframe's label over the plot
+/* Camera path captions: the named keyframe's label over the plot
    while the path plays, a documentary's title. Compact, centred low over the
    plot, above the chat's foot; fades in and out (`captions.js`), at once
    under reduced motion. */

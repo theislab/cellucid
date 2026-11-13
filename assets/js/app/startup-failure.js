@@ -157,7 +157,7 @@ export function describeStartupFailure(error, { webgl2Available, hasLaunchSettin
   }
   if (isContextRefusedError(error)) {
     // This browser has WebGL2 (the probe's context came), yet refused one to
-    // the viewer: its graphics process cannot make another now (R9E-6).
+    // the viewer: its graphics process cannot make another now.
     return {
       kind: 'graphics',
       title: 'The browser\u2019s graphics stopped working',

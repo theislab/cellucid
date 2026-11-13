@@ -321,8 +321,8 @@ test('theme bootstrap starts on the declared defaults over a stored value this v
 });
 
 test('theme bootstrap starts on the declared defaults where the browser keeps nothing for the site', async () => {
-  // Site data blocked: the read of a stored value throws (R9E-5). Cellucid
-  // starts all the same (it did not: "Cellucid could not start").
+  // Site data blocked: the read of a stored value throws. Cellucid starts
+  // all the same (never "Cellucid could not start").
   const failure = new Error('SecurityError: access is denied for this document');
   const result = await runBootstrap({ theme: 'dark', viewerBackground: 'black', getFailure: failure });
   assert.equal(result.failure, null);
@@ -341,9 +341,9 @@ test('HTML declares the exact theme and background defaults before bootstrap', a
 
 test('the wordmark follows the theme instead of pinning a light surface', async () => {
   // The wordmark is gray-scale ink drawn for a light surface. Its two surfaces
-  // (the sidebar card and the welcome header) used to opt into the light theme,
-  // which left a white block in the dark sidebar. Now the surfaces follow the
-  // theme and the dark theme inverts the artwork itself.
+  // (the sidebar card and the welcome header) follow the theme, not opt into
+  // the light theme, which would leave a white block in the dark sidebar; the
+  // dark theme inverts the artwork itself.
   const [html, css] = await Promise.all([
     readFile(INDEX_URL, 'utf8'),
     readFile(SIDEBAR_CSS_URL, 'utf8'),

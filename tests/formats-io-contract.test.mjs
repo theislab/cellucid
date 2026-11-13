@@ -758,8 +758,8 @@ test('a read a view waits for goes ahead of queued background work, which never 
   const source = recordingSource(pattern(1_000_000), { ...POLICY, concurrency: 3, mergeGapBytes: 0 });
   // On a clock that stands still the link is never measured: what waits is
   // shaped by the source's prior, not by how long this machine took over
-  // the reads before it (measured on the real clock, a slow runner priced
-  // the far-apart gaps as worth fetching and merged the queued reads).
+  // the reads before it (a slow machine would price the far-apart gaps as
+  // worth fetching and merge the queued reads).
   const reader = createByteReader(source, { clock: virtualTime().now });
   const index = new ReadActivity({ kind: 'index', label: 'X, indexed by gene', background: true });
   const release = source.hold();
@@ -1474,8 +1474,8 @@ test('a read through the page range cache fetches small held pieces again with t
   // around. (A link of a 1 s round trip at 1 byte/ms: the 40,000 held bytes
   // cost 40 s to fetch again, a request a sixth of a second. The page is
   // given a round trip of the link to answer, so its round trip is not
-  // what is short: a 1 ms link gave a page slower than 1 ms -- a Windows
-  // runner, 2026-11-01 -- no time, and the whole range was fetched.)
+  // what is short: a page slower than the round trip of a 1 ms link must
+  // still get time, or the whole range is fetched.)
   const dear = { measured: true, latencyMs: 1000, bytesPerMs: 1, pricingBytesPerMs: 1, concurrencies: [6], mergeGapBytes: 1, maxRequestBytes: 8 << 20 };
   await cached.read(120_000, 40_000, { link: { latencyMs: 1000 } });
   source.calls.length = 0;
@@ -1592,7 +1592,7 @@ test('a file described from an ETag-less host is refused when its first read say
   assert.ok(Number.isFinite(known.resource.answeredMs), 'the answer of an earlier request to the host is carried');
 });
 
-test('a file its server says changed on disk (409) is refused as changed, in the server\'s words (R9S-9)', async () => {
+test('a file its server says changed on disk (409) is refused as changed, in the server\'s words', async () => {
   const bytes = pattern(5000);
   const why = 'served.h5ad changed while it was read';
   const changed = fakeHost(bytes, () => new Response(why, { status: 409, headers: { 'Content-Type': 'text/plain', 'Content-Length': String(why.length) } }));
@@ -1600,10 +1600,10 @@ test('a file its server says changed on disk (409) is refused as changed, in the
   await assert.rejects(source.read(10, 20), error => error.code === BYTE_SOURCE_FAILURES.CHANGED && error.message === why);
 });
 
-test('a probe whose head stops coming says the host stalls; it is not read as a content-coded file to download whole (R9S-11)', async () => {
-  // A host that sent half a range and stopped was read as content-coding
-  // its files (the whole file's first bytes came): the opening downloaded
-  // it whole, which stalled again, and said nothing of a stall.
+test('a probe whose head stops coming says the host stalls; it is not read as a content-coded file to download whole', async () => {
+  // A host that sends half a range and stops is not read as content-coding
+  // its files (the whole file's first bytes come, so the opening would
+  // download it whole, stall again, and say nothing of a stall).
   const { ByteSourceError: Failure } = await import('../assets/js/formats/io/byte-source.js');
   let wholes = 0;
   const fetchImpl = async (url, init = {}) => {

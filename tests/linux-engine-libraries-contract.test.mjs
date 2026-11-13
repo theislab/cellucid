@@ -1,8 +1,8 @@
 /**
  * The Linux CI runner's engine libraries are fetched by
  * `scripts/install-linux-engine-libraries.mjs`, not by apt: apt cannot leave
- * a mirror connection that trickles (its timeout fires only on silence), and
- * one runner in two dozen got one. Held here: a transfer under the speed floor
+ * a mirror connection that trickles (its timeout fires only on silence).
+ * Held here: a transfer under the speed floor
  * is dropped and the package is fetched from the next mirror of the runner's
  * own mirror list, a file whose hash or size differs from the index is never
  * kept, and the apt and Playwright outputs the script reads are read right.
@@ -157,10 +157,10 @@ test('apt --print-uris and Playwright dry-run output are read as they are printe
 
 test('the Linux browser jobs install the engine libraries through the script, not through apt downloads', () => {
   const workflow = readFileSync(path.join(ROOT, '.github', 'workflows', 'test.yml'), 'utf8');
-  // The browser job anchors the step; the control-walk job repeats it by alias.
+  // The browser job anchors the step; the control-walk and viewers jobs repeat it by alias.
   const step = /- &install-linux-libraries\n\s+name: Install the Linux libraries the selected engine needs\n([\s\S]*?)\n\n/.exec(workflow)?.[1];
   assert.ok(step, 'the step exists');
-  assert.equal((workflow.match(/^\s+- \*install-linux-libraries$/gm) ?? []).length, 1, 'the control-walk job runs the same step');
+  assert.equal((workflow.match(/^\s+- \*install-linux-libraries$/gm) ?? []).length, 2, 'the control-walk and viewers jobs run the same step');
   assert.match(step, /run: node scripts\/install-linux-engine-libraries\.mjs \$\{\{ matrix\.browser \}\}/);
   assert.doesNotMatch(workflow, /playwright install-deps/);
 });

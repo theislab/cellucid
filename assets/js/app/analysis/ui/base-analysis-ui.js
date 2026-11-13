@@ -69,6 +69,7 @@ import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js'
 import { failureDetails, joinFailure, sayFailure } from '../../../utils/errors.js';
 import { noDatasetOpenTo } from '../../ui/no-dataset.js';
 import { debounce } from '../../../utils/debounce.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /**
  * A per-cell CSV file written by the analysis workers (compute/csv-export.js),
@@ -340,7 +341,7 @@ export class BaseAnalysisUI {
    */
   validateDataRequirements() {
     // Nothing to analyze: said as such, never as a missing kind of data
-    // (R9E-8: "Requires gene expression data." with no dataset open).
+    // ("Requires gene expression data." with no dataset open).
     if (!(this.dataLayer.state.pointCount > 0)) {
       return { valid: false, noDataset: true, error: noDatasetOpenTo('analyze it') };
     }
@@ -669,8 +670,8 @@ export class BaseAnalysisUI {
    * The inventory is the shared selectable domain, not this mode's own view of
    * it. `AnalysisUIManager` hands the same selection to whichever mode becomes
    * active, so a mode that answered from its page selector — or, when it owns
-   * none, from the base pages alone — refused a page the manager had already
-   * accepted.
+   * none, from the base pages alone — would refuse a page the manager had
+   * already accepted.
    *
    * @param {string[]} pageIds
    * @param {string} label
@@ -794,7 +795,7 @@ export class BaseAnalysisUI {
    * redraw, a re-cluster: `_trackInteractiveTask`), work started meanwhile
    * included. Work started in the same turn as the call is waited for too.
    *
-   * `signal`: what stops the change that waits (an action's Stop, F147).
+   * `signal`: what stops the change that waits (an action's Stop).
    * When it aborts, the work under way is stopped (`_stopInteractiveWork`:
    * its run's job canceled, an update still in its delay dropped), and once
    * that work has ended the wait throws why it stopped: the change ends
@@ -867,7 +868,7 @@ export class BaseAnalysisUI {
    * @protected
    */
   get _pendingUpdate() {
-    this._pendingUpdateDebounce ??= debounce((requestId, settle) => {
+    this._pendingUpdateDebounce ??= debounce(/** @param {number} requestId @param {() => void} settle */ (requestId, settle) => {
       if (this._settleScheduledUpdate === settle) this._settleScheduledUpdate = null;
       if (!this._isCurrentAnalysisIntent(requestId)) {
         settle();
@@ -894,8 +895,7 @@ export class BaseAnalysisUI {
     // the update once it starts: what it changes belongs to the change that
     // scheduled it. A newer schedule replaces it (one pending at a time).
     this._settleScheduledUpdate?.();
-    let settle;
-    const scheduled = new Promise(resolve => { settle = resolve; });
+    const { promise: scheduled, resolve: settle } = promiseWithResolvers();
     this._settleScheduledUpdate = settle;
     this._trackInteractiveTask(scheduled, 'Scheduled analysis update');
     this._pendingUpdate(requestId, settle, delay);
@@ -1348,8 +1348,11 @@ export class BaseAnalysisUI {
   /**
    * Run the analysis (override in subclass): `job` is the request's
    * cancellable job, whose signal its reads and tasks take.
+   *
+   * @param {number} requestId - The request's generation
+   * @param {import('../../jobs/cancellable-job.js').CancellableJob} job
    */
-  async _runAnalysis() {
+  async _runAnalysis(requestId, job) {
     throw new Error('_runAnalysis() must be implemented by subclass');
   }
 
@@ -1359,8 +1362,10 @@ export class BaseAnalysisUI {
 
   /**
    * Hide the preview area
+   *
+   * @param {number|null} [requestId] - The request that hides it, for a subclass whose hiding waits
    */
-  _hidePreview() {
+  _hidePreview(requestId) {
     if (this._previewContainer) {
       // Purge any existing plot to prevent WebGL memory leaks
       const plotEl = this._previewContainer.querySelector('.analysis-preview-plot');
@@ -1611,12 +1616,7 @@ export class BaseAnalysisUI {
       return this._baseDestroyPromise;
     }
 
-    let rejectDestroy;
-    let resolveDestroy;
-    const destroyTask = new Promise((resolve, reject) => {
-      resolveDestroy = resolve;
-      rejectDestroy = reject;
-    });
+    const { promise: destroyTask, resolve: resolveDestroy, reject: rejectDestroy } = promiseWithResolvers();
     this._baseDestroyPromise = destroyTask;
 
     const errors = [];

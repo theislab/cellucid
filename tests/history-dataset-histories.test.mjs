@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createDomainRegistry, DOMAIN_IDS } from '../assets/js/app/actions/domains.js';
 import { createHistoryStore } from '../assets/js/app/history/autosave-store.js';
 import { listSavedStates, openSavedState } from '../assets/js/app/history/autosave.js';
 import { createDatasetHistories } from '../assets/js/app/history/dataset-history.js';
@@ -75,9 +76,27 @@ test('a save needs a dataset open', async () => {
   await api.destroy();
 });
 
+test('a page left while its history starts: the start ends quietly, though the owners it reads are gone', async () => {
+  const { dispatcher } = setup();
+  const domains = createDomainRegistry();
+  const withdraw = DOMAIN_IDS.map(id => domains.provide(id, { capture: async () => null, restore: () => {} }));
+  const api = createDatasetHistories({
+    dispatcher, domains, notifications: recorder(), header: async () => HEADER,
+    loadSavedHistory: async () => {}, openSavedState: async () => ({ opened: true, problem: null, code: null }),
+    store: createHistoryStore(memoryDatabase()),
+  });
+  const history = api.open({ id: 'demo', name: 'Demo' });
+  const begun = api.begin(history);
+  // The page's teardown: the history first, then every owner (`main.js`).
+  await api.destroy();
+  for (const remove of withdraw) remove();
+  await begun;
+  assert.equal(history.active, null, 'no tracker started on the page left');
+});
+
 test('a session load under way holds the offer to continue: made once it settled, and not at all when it loaded a history', async () => {
-  // Found 2026-11-10: loading a session file of another dataset opened that dataset, which offered
-  // "Continue where you left off?" in the middle of the load; the offer went once the session landed.
+  // Loading a session file of another dataset opens that dataset, which must not offer
+  // "Continue where you left off?" in the middle of the load; the offer goes once the session lands.
   const { api, dispatcher, store } = histories();
   const first = api.open({ id: 'demo', name: 'Demo' });
   await api.begin(first);
@@ -127,7 +146,7 @@ test('a session load under way holds the offer to continue: made once it settled
   await later.destroy();
 });
 
-test('the welcome comes first: "Continue where you left off?" is offered once it is closed, never on top of it (R9U-14)', async () => {
+test('the welcome comes first: "Continue where you left off?" is offered once it is closed, never on top of it', async () => {
   const { api, dispatcher, store } = histories();
   const first = api.open({ id: 'demo', name: 'Demo' });
   await api.begin(first);
@@ -158,7 +177,7 @@ test('the welcome comes first: "Continue where you left off?" is offered once it
 });
 
 test('a saved state is listed with its latest step, which tells autosaves apart in Load…', async () => {
-  // Found 2026-11-10: Load… listed nine rows all reading "Autosave [Auto]".
+  // Load… must not list nine rows all reading "Autosave [Auto]".
   const { api, dispatcher, store } = histories();
   const history = api.open({ id: 'demo', name: 'Demo' });
   await api.begin(history);
@@ -187,9 +206,9 @@ test('a starting view puts back what its keepShown leaves, read from what is sho
   assert.equal(history.shownValue('colors').by, 'kept as shown');
 });
 
-test('Continue on a saved state kept by an earlier version restores every part it can and keeps that saved state as it was (F155)', async () => {
-  // Live pass 6: an autosave kept minutes before a rename of a domain's value (F149) failed whole on
-  // Continue, and the views and the conversation went with the one part this version could not read.
+test('Continue on a saved state kept by an earlier version restores every part it can and keeps that saved state as it was', async () => {
+  // An autosave kept before a rename of a domain's value must not fail whole on
+  // Continue, taking the views and the conversation with the one part this version cannot read.
   const { api, dispatcher, store } = histories();
   const first = api.open({ id: 'demo', name: 'Demo' });
   await api.begin(first);

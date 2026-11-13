@@ -1,13 +1,11 @@
 /**
- * A stand-in History v2 core for the State panel's specs while the real core
- * (H1) is being built: the records of `app/history/model.js` (built with
- * `history-v2-builder.mjs`), and the history actions the panel dispatches,
- * provided on a dispatcher, acting on the records only (no state domain is
- * put back: the viewer does not move). Each edit is journaled whole, so
- * Recently deleted restores it.
+ * A stand-in history core for the State panel's specs: the records of
+ * `app/history/model.js` (built with `history-v2-builder.mjs`), and the
+ * history actions the panel dispatches, provided on a dispatcher, acting on
+ * the records only (no state domain is put back: the viewer does not move).
+ * Each edit is journaled whole, so Recently deleted restores it.
  *
- * It is a test helper: the page's own history replaces it once the core
- * provides these actions. Installed in a page by `installFakeHistory`.
+ * It is a test helper, installed in a page by `installFakeHistory`.
  */
 import { trackerBuilder } from './history-v2-builder.mjs';
 import { createBy, createJournalEntry, emptyPatch, idOf, validateTracker } from '../../assets/js/app/history/model.js';
@@ -371,7 +369,7 @@ export function createFakeHistory({ dispatcher, build = () => {}, now = () => Da
     setPausedChoice(choice, { remember = false } = {}) {
       if (remember) pausedChoice.remembered = choice; else pausedChoice.next = choice;
     },
-    /** The core's dry runs (H1: `branchDeletePlan`, `deletePlan`), for the records the stand-in keeps. */
+    /** The core's dry runs (`branchDeletePlan`, `deletePlan`), for the records the stand-in keeps. */
     branchDeletePlan(ref, { withSubBranches = false } = {}) {
       const record = branch(ref);
       const steps = own(record.id);

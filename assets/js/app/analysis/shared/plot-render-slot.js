@@ -14,6 +14,7 @@
 
 import { abortReason, cancel, onAbort } from '../../../utils/abort.js';
 import { InternalError } from '../../../utils/errors.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 const ALWAYS_CURRENT = () => true;
 
@@ -281,19 +282,16 @@ export class PlotRenderSlot {
       this._settleRequest(this._pending, null);
     }
 
+    const { promise, resolve, reject } = promiseWithResolvers();
     const request = {
       generation,
       payload,
       isCurrent,
       abortController: new AbortController(),
       settled: false,
-      resolve: null,
-      reject: null
+      resolve,
+      reject
     };
-    const promise = new Promise((resolve, reject) => {
-      request.resolve = resolve;
-      request.reject = reject;
-    });
 
     this._pending = request;
     this._pump();

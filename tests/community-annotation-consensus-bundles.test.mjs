@@ -1,5 +1,5 @@
 /**
- * Consensus over bundled suggestions (audit B3 and its neighbors).
+ * Consensus over bundled suggestions.
  *
  * - Equal labels (Unicode NFC, nothing else folded) are one bundle: two
  *   people who propose "T cell" independently agree, they do not tie.
@@ -295,9 +295,9 @@ test('bundle vote info of a suggestion in no bundle is no delegated vote', () =>
   );
 });
 
-// Bug hunt R9A-2: the voting dialog listed "Alpha (immature)" (net 1, ▲1) above "Alpha cell"
-// (net 1, ▲2), and the legend named both as tied, while the consensus line named "Alpha cell"
-// the leader. One rank everywhere: net votes, then upvotes; equal on both is a tie.
+// One rank everywhere (voting dialog, legend, consensus line): net votes, then upvotes; equal
+// on both is a tie. "Alpha (immature)" (net 1, ▲1) is not listed above "Alpha cell" (net 1, ▲2),
+// and the legend does not name them tied while the consensus line names "Alpha cell" the leader.
 test('the leader is listed first and the legend names it alone: net votes, then upvotes, as the consensus ranks', async () => {
   const { computeTopConsensusSummary } = await import('../assets/js/app/ui/modules/legend/categorical-legend.js');
   const s = session();

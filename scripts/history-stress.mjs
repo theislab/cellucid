@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * The history stress suite (`tests/stress/`, `cellucid-private/plans/history-v2.md`
- * §3.15.4): builds mixed histories on a synthetic dataset and measures the
+ * The history stress suite (`tests/stress/`): builds mixed histories on a
+ * synthetic dataset and measures the
  * recording overhead, jumps, undo and redo, delete-a-step, replay, the
  * autosave, the memory accounting, `history.get`, the session file and
  * memory, at each checkpoint; and each kind of step alone (bytes per step,
@@ -28,8 +28,8 @@
  *   and `--rscript` (or `Rscript` on the path).
  *
  * Each run is one Node process with `--expose-gc` (memory is read after a
- * collection). Run it alone: on a 16 GB machine through
- * `.cellucid-maintenance/heavy.sh`, never beside another heavy job. Nothing it
+ * collection). Run it alone: on a 16 GB machine, never beside another heavy
+ * job. Nothing it
  * writes is committed; `tests/stress/RESULTS.md` records what it measured.
  */
 

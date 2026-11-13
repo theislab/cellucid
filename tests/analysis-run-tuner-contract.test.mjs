@@ -87,7 +87,7 @@ test('compute in flight is two tasks per worker, capped by half the budget', () 
   assert.equal(tunerWith({ budget: 100_000, bytes: 10_000 }).tuner.computeInFlight(), 5);
   // Never below one, however small the budget.
   assert.equal(tunerWith({ budget: 1000, bytes: 10_000 }).tuner.computeInFlight(), 1);
-  // Before a read is measured a gene costs a dense column.
+  // Before a read is observed a gene costs a dense column.
   const unmeasured = createRunTuner({ poolSize: 4, cellCount: 25_000, budgetBytes: () => 1_000_000 });
   assert.equal(unmeasured.computeInFlight(), 5);
 });

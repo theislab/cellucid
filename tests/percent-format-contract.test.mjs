@@ -1,10 +1,10 @@
 /**
  * A percent is written one way: the sign attached ("50%", never "50 %"), by
  * `formatPercent` or `formatShare` (`utils/format-units.js`, beside the count
- * nouns). Round 9 (R9U-3) found both forms side by side — "100 % cells ·
- * genes 6 %" over "Loading fields… 40%", "Hid outliers of x above 95 %" beside
- * "outlier threshold 95%" — from about thirty hand-built `${n}%` and `${n} %`
- * strings, each rounding its own way ("5.0%", "5%", "5.5%" for one share).
+ * nouns). Hand-built `${n}%` and `${n} %` strings put both forms side by side
+ * ("100 % cells · genes 6 %" over "Loading fields… 40%", "Hid outliers of x
+ * above 95 %" beside "outlier threshold 95%"), each rounding its own way
+ * ("5.0%", "5%", "5.5%" for one share); the one function rounds one way.
  * The Python and R packages write a share of the cells by the same rule
  * (`history.py`, `history.R`: the methods paragraph).
  */

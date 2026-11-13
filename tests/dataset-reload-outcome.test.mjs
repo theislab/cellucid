@@ -679,7 +679,7 @@ test('a change that may not touch the dataset never overrides a later action', a
   assert.throws(() => changes.beginIfNoActionSince(1.5), TypeError);
 });
 
-test('the startup opening is no choice of the person\'s: a connection asked for before it began still replaces it (R9V-2)', async () => {
+test('the startup opening is no choice of the person\'s: a connection asked for before it began still replaces it', async () => {
   const { createLatestDatasetReloadCoordinator } =
     await import(outcomeModuleUrl);
   const changes = createLatestDatasetReloadCoordinator(() => ({
@@ -1193,14 +1193,14 @@ test('reload owner adopts one committed identity before published-state success'
 
 test('manual session replacement is a ready state outcome without an error banner', async () => {
   const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
+    new URL('../assets/js/app/dataset/published-state.js', import.meta.url),
     'utf8'
   );
   const restoreOwnerStart = mainSource.indexOf(
     'async function restoreAdvertisedDatasetState({ requestStep, signal })'
   );
   const restoreOwnerEnd = mainSource.indexOf(
-    '// -----------------------------------------------------------------------',
+    '\n  return Object.freeze({',
     restoreOwnerStart
   );
   const restoreOwner = mainSource.slice(
@@ -1761,25 +1761,29 @@ test('position loading reads only an AnnData dataset, with exactly its own optio
 
 test('in-place reload stages one generation before reversible publication', async () => {
   const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
+    new URL('../assets/js/app/dataset/reload.js', import.meta.url),
     'utf8'
   );
   const start = mainSource.indexOf(
     'async function reloadActiveDatasetInPlace'
   );
   const end = mainSource.indexOf(
-    '// One-time helper to rebuild density',
+    '/**\n   * Start the first tracker of the dataset shown',
     start
   );
   assert.ok(start >= 0 && end > start);
   const reloadSource = mainSource.slice(start, end);
+  const publicationSource = await readFile(
+    new URL('../assets/js/app/dataset/publication.js', import.meta.url),
+    'utf8'
+  );
 
   assert.match(
-    mainSource,
+    publicationSource,
     /!baseUrl\.endsWith\('\/'\)/
   );
   assert.doesNotMatch(
-    mainSource,
+    publicationSource,
     /baseUrl\.endsWith\('\/'\)\s*\?\s*baseUrl\s*:\s*`\$\{baseUrl\}\//,
     'application staging must reject a non-directory source URL, not repair it'
   );
@@ -1926,12 +1930,28 @@ test(
       new URL('../assets/js/app/main.js', import.meta.url),
       'utf8'
     );
-    const slice = (startNeedle, endNeedle, from = 0) => {
-      const start = mainSource.indexOf(startNeedle, from);
-      const end = mainSource.indexOf(endNeedle, start);
-      assert.ok(start >= 0 && end > start);
-      return mainSource.slice(start, end);
+    const benchmarkSource = await readFile(
+      new URL('../assets/js/app/ui/modules/benchmark/benchmark-controls.js', import.meta.url),
+      'utf8'
+    );
+    const publicationSource = await readFile(
+      new URL('../assets/js/app/dataset/publication.js', import.meta.url),
+      'utf8'
+    );
+    const sliceOf = source => (startNeedle, endNeedle, from = 0) => {
+      const start = source.indexOf(startNeedle, from);
+      const end = source.indexOf(endNeedle, start);
+      assert.ok(start >= 0 && end > start, `expected ${startNeedle} before ${endNeedle}`);
+      return source.slice(start, end);
     };
+    const slice = sliceOf(mainSource);
+    const benchmarkSlice = sliceOf(benchmarkSource);
+    const publicationSlice = sliceOf(publicationSource);
+    const reloadSource = await readFile(
+      new URL('../assets/js/app/dataset/reload.js', import.meta.url),
+      'utf8'
+    );
+    const reloadSlice = sliceOf(reloadSource);
     const requireCheckAfter = (
       source,
       awaitNeedle,
@@ -1955,7 +1975,7 @@ test(
       );
     };
 
-    const emptyPublication = slice(
+    const emptyPublication = publicationSlice(
       'function publishEmptyDatasetRuntime',
       'async function stageDatasetRuntime'
     );
@@ -1969,7 +1989,7 @@ test(
       'retireDatasetInteractions();',
       'empty-runtime restoration must reject a stale publication before mutation'
     );
-    const datasetCommit = slice(
+    const datasetCommit = publicationSlice(
       'function commitDatasetRuntimeStage',
       'function commitSyntheticRuntimeStage'
     );
@@ -1979,7 +1999,7 @@ test(
       'retireDatasetInteractions({ keepHistory });',
       'dataset restoration must reject a stale publication before mutation'
     );
-    const syntheticCommit = slice(
+    const syntheticCommit = publicationSlice(
       'function commitSyntheticRuntimeStage',
       'function restorePreviousRuntime'
     );
@@ -1989,7 +2009,7 @@ test(
       'retireDatasetInteractions();',
       'synthetic restoration must reject a stale publication before mutation'
     );
-    const publicationOwner = slice(
+    const publicationOwner = publicationSlice(
       'function publishRuntimeContinuation',
       'function requireRestorablePublication'
     );
@@ -2002,7 +2022,7 @@ test(
       /datasetPublicationGeneration = publication\.generation/
     );
 
-    const uiSynchronization = slice(
+    const uiSynchronization = publicationSlice(
       'async function synchronizePublishedDatasetUi',
       '// Startup publishes the empty runtime'
     );
@@ -2010,7 +2030,7 @@ test(
     // inside the synchronous commit, before the renderer receives the new
     // points (retireDatasetInteractions); none is left for the UI settlement.
     assert.doesNotMatch(uiSynchronization, /clearSnapshotViews|retireKeptViews/);
-    const retirement = slice(
+    const retirement = publicationSlice(
       'function retireDatasetInteractions',
       'function publishEmptyDatasetRuntime'
     );
@@ -2028,17 +2048,17 @@ test(
     );
     const fieldSettlementCheck = requireCheckAfter(
       uiSynchronization,
-      'await ui?.settleFieldInteractions?.()',
+      'await getUi()?.settleFieldInteractions?.()',
       'assertCurrentDatasetPublication(publication)'
     );
     requireCheckAfter(
       uiSynchronization,
-      'await ui?.settleFieldInteractions?.()',
+      'await getUi()?.settleFieldInteractions?.()',
       'assertCurrentDatasetPublication(publication)'
     );
     requireCheckAfter(
       uiSynchronization,
-      'await window._comparisonModule.resetForDatasetReload({',
+      'await getComparisonModule().resetForDatasetReload({',
       'assertCurrentDatasetPublication(publication)',
       fieldSettlementCheck + 1
     );
@@ -2047,7 +2067,7 @@ test(
       /transaction\.(?:assertCurrent|isCurrent|signal)/
     );
 
-    const reload = slice(
+    const reload = reloadSlice(
       'async function reloadActiveDatasetInPlace',
       'async function clearActiveDatasetInPlace'
     );
@@ -2084,9 +2104,9 @@ test(
       /reloadTransaction\.(?:adoptCurrentIdentity|assertCurrent|isCurrent|signal)/
     );
 
-    const clear = slice(
+    const clear = reloadSlice(
       'async function clearActiveDatasetInPlace',
-      '// One-time helper to rebuild density'
+      '/**\n   * Start the first tracker of the dataset shown'
     );
     assert.match(
       clear,
@@ -2097,12 +2117,12 @@ test(
     );
     requireCheckAfter(
       clear,
-      'await ui?.settleFieldInteractions?.()',
+      'await getUi()?.settleFieldInteractions?.()',
       'assertCurrentDatasetPublication(emptyPublication)'
     );
     requireCheckAfter(
       clear,
-      'await window._comparisonModule.resetForDatasetReload({',
+      'await getComparisonModule().resetForDatasetReload({',
       'assertCurrentDatasetPublication(emptyPublication)'
     );
     const clearManagerFinalization = clear.indexOf(
@@ -2131,7 +2151,7 @@ test(
       /reloadTransaction\.(?:adoptCurrentIdentity|assertCurrent|isCurrent|signal)/
     );
 
-    const synthetic = slice(
+    const synthetic = benchmarkSlice(
       'async function runBenchmark',
       'async function generateSituationReport'
     );
@@ -2140,8 +2160,8 @@ test(
       'await ensureBenchmarkModule()',
       'syntheticTransaction.isCurrent()'
     );
-    // Generation is off-thread for every pattern now, so the one await that
-    // used to belong to the GLB branch alone covers all of them.
+    // Generation is off-thread for every pattern, so the one await covers
+    // all of them, not the GLB branch alone.
     syntheticSearch = requireCheckAfter(
       synthetic,
       'data = await generateSyntheticDataOffThread({',
@@ -2188,10 +2208,10 @@ test(
       /const dismissSupersededBenchmark[\s\S]*notifications\.dismiss\(benchNotifId\)/
     );
 
-    // A superseded run used to exit in silence: `return false` with the run's
-    // own notification already dismissed, so a click that landed while a
-    // dataset change was still settling was indistinguishable from a dead
-    // button. Every superseded exit now names itself to the user.
+    // A superseded run never exits in silence: `return false` with the run's
+    // own notification already dismissed would make a click that lands while
+    // a dataset change is still settling indistinguishable from a dead
+    // button. Every superseded exit names itself to the user.
     assert.doesNotMatch(
       synthetic,
       /if \(!syntheticTransaction\.isCurrent\(\)\) return false;/,
@@ -2202,13 +2222,13 @@ test(
       /const dismissSupersededBenchmark[\s\S]*?return reportSupersededBenchmark\(\)/
     );
     assert.match(
-      slice('function reportSupersededBenchmark', 'async function runBenchmark'),
+      benchmarkSlice('function reportSupersededBenchmark', 'async function runBenchmark'),
       /notifications\.warning\(/
     );
 
     // `runBenchmark` rejects on publication failure, so a control that drops
     // its promise turns that into an unhandled rejection nobody sees.
-    const controls = slice(
+    const controls = benchmarkSlice(
       '// Wire up run button',
       '// BOTTLENECK ANALYSIS (Single Button)'
     );
@@ -2223,7 +2243,7 @@ test(
       'the run button and the presets must both go through that owner'
     );
     assert.match(
-      slice('function startBenchmarkRun', '// Wire up run button'),
+      benchmarkSlice('function startBenchmarkRun', '// Wire up run button'),
       /runBenchmark\([\s\S]*?\)\.catch\(/
     );
   }
@@ -2231,7 +2251,7 @@ test(
 
 test('scientific publication excludes fallible UI and global reset work', async () => {
   const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
+    new URL('../assets/js/app/dataset/publication.js', import.meta.url),
     'utf8'
   );
   const commitStart = mainSource.indexOf(
@@ -2262,7 +2282,7 @@ test('scientific publication excludes fallible UI and global reset work', async 
     initialStart
   );
   const ownerInitialization = mainSource.indexOf(
-    'const connectivityRuntimeOwner = initializeConnectivityControls()'
+    'const connectivityRuntimeOwner = initializeConnectivityControls({'
   );
   const ownerValidation = mainSource.indexOf(
     "typeof connectivityRuntimeOwner.prepareDatasetReplacement !=="
@@ -2287,7 +2307,7 @@ test('scientific publication excludes fallible UI and global reset work', async 
   );
   assert.match(
     synchronizeSource,
-    /ui\.refreshDatasetUI\(activeMetadata\)/
+    /getUi\(\)\.refreshDatasetUI\(activeMetadata\)/
   );
   const connectivitySynchronizationStart = mainSource.indexOf(
     'function synchronizeDatasetPublication()'
@@ -2310,14 +2330,14 @@ test('scientific publication excludes fallible UI and global reset work', async 
 
 test('connectivity edge publication has one abortable generation owner', async () => {
   const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
+    new URL('../assets/js/app/ui/modules/connectivity-controls.js', import.meta.url),
     'utf8'
   );
   const connectivityStart = mainSource.indexOf(
-    'function initializeConnectivityControls()'
+    'function initializeConnectivityControls({'
   );
   const connectivityEnd = mainSource.indexOf(
-    '// PERFORMANCE BENCHMARK CONTROLS',
+    '\n}\n',
     connectivityStart
   );
   assert.ok(connectivityStart >= 0 && connectivityEnd > connectivityStart);
@@ -2338,14 +2358,14 @@ test('connectivity edge publication has one abortable generation owner', async (
     connectivitySource,
     /loadEdges\(\s*owner\.url,\s*owner\.summary,\s*\{ signal: owner\.controller\.signal, readKey \}/s
   );
-  assert.match(connectivitySource, /url: connectivityUrl/);
-  assert.match(connectivitySource, /owner\.url !== connectivityUrl/);
+  assert.match(connectivitySource, /url: getGraphUrl\(\)/);
+  assert.match(connectivitySource, /owner\.url !== getGraphUrl\(\)/);
   assert.match(
     connectivitySource,
-    /publicationGeneration: datasetPublicationGeneration/
+    /publicationGeneration: getPublicationGeneration\(\)/
   );
-  assert.match(connectivitySource, /summary: connectivitySummary/);
-  assert.match(connectivitySource, /datasetBaseUrl: DATASET_BASE_URL/);
+  assert.match(connectivitySource, /summary: getGraphSummary\(\)/);
+  assert.match(connectivitySource, /datasetBaseUrl: getDatasetBaseUrl\(\)/);
   assert.match(
     connectivitySource,
     /sourceType,\s*datasetId,\s*identityId,\s*managerBaseUrl,/s

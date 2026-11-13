@@ -3,7 +3,7 @@
  * reads of the history shown, and the one way it acts on it.
  *
  * **Reads.** The tracker in use (`history.active`) holds the records of
- * `app/history/model.js` (History v2 §3.2): its steps, branches, groups and
+ * `app/history/model.js`: its steps, branches, groups and
  * turns by id, its notes and journal, the step shown (`headId`), the active
  * and main branches and the recording switch. {@link trackerView} wraps it in
  * the accessors the panel draws from (`step(id)`, `branch(id)`, …) and in the
@@ -15,7 +15,7 @@
  * The history's runtime state that is not a record is read through the
  * history object, each by one name (as the core, H1, provides them):
  * `pending()` ("Branch here" waiting for the next change, `{name, from}`),
- * `stale()` (the results stale at the step shown, §3.4: `[{step, cause,
+ * `stale()` (the results stale at the step shown: `[{step, cause,
  * inputs}]`), `pausedChanges()` (while paused, what a move would ask about:
  * `{domains, remembered}`, or null) and `setPausedChoice(choice, {remember})`
  * (the Keep / Discard card's answer for the next move). A core that does not
@@ -24,23 +24,23 @@
  * **Acts.** Every operation the panel offers is a catalog action
  * (`app/actions/definitions/history.js`), dispatched as the person's
  * (origin `user`) through the page's dispatcher, the same path an agent, a
- * notebook and a replay take (History v2 §6 test 3). The panel never calls a
+ * notebook and a replay take. The panel never calls a
  * history mutator.
  *
  * **Plans.** What a destructive operation would do is stated before it is
  * done, by the core's own dry runs, read from the history object:
- * `branchDeletePlan(branch, {withSubBranches})` (§3.3.3: `{branches, steps,
+ * `branchDeletePlan(branch, {withSubBranches})` (`{branches, steps,
  * first, last, results, kept_views, replays, absorbed_by, head}`),
- * `deletePlan(step)` (§3.3.4: `{reapply, ms}`) and `turnUndoPlan(turn)`
- * (§3.3.10: `{first, own, since, contiguous, otherBranches}`). Why a menu item
+ * `deletePlan(step)` (`{reapply, ms}`) and `turnUndoPlan(turn)`
+ * (`{first, own, since, contiguous, otherBranches}`). Why a menu item
  * is not offered is pure, from the records and the history's own sentences:
- * {@link revertProblem} (§3.3.4), {@link squashProblem} and
- * {@link groupRange} (§3.15.2).
+ * {@link revertProblem}, {@link squashProblem} and
+ * {@link groupRange}.
  *
  * @module ui/modules/state/history-source
  */
 
-import { HISTORY_SENTENCES, idNumber } from '../../../history/model.js';
+import { HISTORY_SENTENCES } from '../../../history/model.js';
 import { plainSentence } from '../../../actions/targets/names.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 
@@ -158,10 +158,10 @@ export function createTrackerView(tracker, history = null) {
     /** How many steps branch `branchId` has, the opening not counted (as everywhere in the panel). */
     branchStepCount: branchId => view.ownSteps(branchId).filter(step => step.parent !== null).length,
     /**
-     * The results stale at the step shown (§3.4): step id → `{cause, inputs,
+     * The results stale at the step shown: step id → `{cause, inputs,
      * causes}` (`cause`: the first step after it that changed an input, or
      * null; `inputs`: the domains, or `history`, that differ; `causes`: each
-     * input's own cause, F156).
+     * input's own cause).
      */
     stale: () => once('stale', () => {
       const read = typeof history?.stale === 'function' && view.tracker === history.active ? history.stale() : [];
@@ -228,7 +228,7 @@ export function createHistoryActions(dispatch) {
 // Plans: what an operation would do, in words, before it is done.
 
 /**
- * Why a step cannot be reverted as a new step (§3.3.4), or null: a later
+ * Why a step cannot be reverted as a new step, or null: a later
  * step on the path to the step shown changed one of its parts too.
  *
  * @param {TrackerView} view
@@ -277,7 +277,7 @@ export function stepRun(view, from, to) {
 }
 
 /**
- * The steps a group of `from`..`to` takes (§3.15.2): widened to whole turns,
+ * The steps a group of `from`..`to` takes: widened to whole turns,
  * with the sentence that says so, or the reason it cannot be made.
  *
  * @param {TrackerView} view
@@ -319,7 +319,7 @@ export function groupRange(view, from, to) {
 }
 
 /**
- * Why `from`..`to` cannot be squashed into one step (§3.15.2), or null: a
+ * Why `from`..`to` cannot be squashed into one step, or null: a
  * branch starts inside the run (anywhere but its last step).
  *
  * @param {TrackerView} view

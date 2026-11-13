@@ -1,6 +1,5 @@
 /**
- * @fileoverview One concept, one implementation (round 9, lane
- * one-implementation). Each rule names a concept, the module that owns it,
+ * @fileoverview One concept, one implementation. Each rule names a concept, the module that owns it,
  * and the hand-written forms a copy takes; a new copy anywhere in
  * `assets/js` fails here with the owner to use instead. Sibling sweeps:
  * `byte-text-contract` (bytes as text, SHA-256), `hex-color-contract`
@@ -109,8 +108,8 @@ const RULES = [
     owner: 'utils/yield-macrotask.js',
     pattern: /new Promise\(\s*(\w+)\s*=>\s*setTimeout\(\1,\s*0\)\s*\)|setImmediate\(|\.onmessage = \(\) => \{?\s*\w+\.port1\.close\(\)/,
     except: {
-      // Waits for a Web Lock this tab let go to be released by the browser (a timer's task, measured
-      // in practice), before asking whether anyone else holds it: not a yield.
+      // Waits for a Web Lock this tab let go to be released by the browser (a timer's task),
+      // before asking whether anyone else holds it: not a yield.
       'data/anndata/transcode/space.js': 'waits for a released lock',
     },
   },
@@ -144,7 +143,7 @@ const RULES = [
     owner: 'utils/format-units.js',
     // Seconds written by hand from milliseconds: "took ${(ms / 1000).toFixed(1)} s", "about ${Math.round(ms / 1000)} s",
     // "in ${Math.max(1, Math.ceil(delayMs / 1000))} s", "~${Math.round((end - now) / 1000)}s"; minutes or hours
-    // ("~${Math.round(ms / 60_000)} min", RCD-5: a second "time left" formatter beside `formatRemaining`).
+    // ("~${Math.round(ms / 60_000)} min", a second "time left" formatter beside `formatRemaining`).
     pattern: /\$\{[^`}]*?\/\s*1000\s*\)(?:\.toFixed\([^)]*\))?\)?\s*\}\s*s\b|\$\{[^`}]*?\/\s*(?:60_?000|3_?600_?000)\s*\)[^`}]*\}\s*(?:min|h)\b/,
   },
   {
@@ -183,8 +182,8 @@ const RULES = [
     pattern: /toISOString\(\)\.replace\(|padStart\(2, '0'\)[^\n]*getHours|getFullYear\(\)\)?[^\n]*padStart/,
   },
   {
-    // 44 sets in 31 modules had five policies for a listener that throws (the rest not told, told
-    // and the error swallowed, logged, collected and thrown back at the notifier, rethrown later).
+    // Policies for a listener that throws are one: every listener is told, a throw is reported (hand-written
+    // sets chose among: the rest not told, told and the error swallowed, logged, collected and thrown back at the notifier, rethrown later).
     concept: 'a set of listeners told of a change (`createListenerSet`: every one told, a throw reported)',
     owner: 'utils/listener-set.js',
     // A loop calling each of a set named …listeners/callbacks/watchers/subscribers/observers/
@@ -202,9 +201,9 @@ const RULES = [
     },
   },
   {
-    // Round 9: 20 hand-written debounces in 16 modules (search, preview, wheel rest, hints, idle
-    // workers, journals). The split forms (the clear in a cancel function, the set elsewhere) were
-    // migrated with them; this finds the form a copy is written in.
+    // A debounce: run once calls stop coming for a while. The split forms (the clear in a
+    // cancel function, the set elsewhere) are found with it; this finds the form a copy is
+    // written in.
     concept: 'a debounce: run once calls stop coming for a while (`debounce`, with cancel/flush/pending)',
     owner: 'utils/debounce.js',
     pattern: /clearTimeout\(\s*([\w.$]+)\s*\);?[^\n]*\n(?:[^\n]*\n){0,3}?[^\n]*?\b\1\s*=\s*(?:globalThis\.|window\.|self\.)?setTimeout\(/,
@@ -215,9 +214,9 @@ const RULES = [
     },
   },
   {
-    // Round 9: eleven validators of a signal (five `assertAbortSignalOrNull`, `requireAbortSignal`,
-    // `assertSignal`, `isAbortSignal`, figure export's brand check, …) and 25 inline checks; the
-    // duck-typed ones took any object with an `aborted` boolean (gzip, cell sets, bundles) for one.
+    // Validators of a signal (`assertAbortSignalOrNull`, `requireAbortSignal`,
+    // `assertSignal`, `isAbortSignal`, figure export's brand check, …) and inline checks; a
+    // duck-typed one takes any object with an `aborted` boolean (gzip, cell sets, bundles) for one.
     concept: 'whether a value is an AbortSignal (`isAbortSignal`, `requireSignal`, `requireSignalOrNull`)',
     owner: 'utils/abort.js',
     pattern: /instanceof AbortSignal|\.aborted\s*[!=]==\s*['"]boolean['"]|function\s+(?:assert|require|validate|is)\w*Signal(?:OrNull)?\s*\(|getOwnPropertyDescriptor\(\s*\w*AbortSignal\w*\.prototype/,
@@ -225,6 +224,11 @@ const RULES = [
       // The Cloudflare Worker asks whether its runtime gives requests a signal (`enable_request_signal`).
       'app/community-annotations/_worker-code.js': 'the Worker runtime\'s request signal',
     },
+  },
+  {
+    concept: 'a method group mixed onto a class (its members defined on the prototype by their descriptors)',
+    owner: 'utils/apply-mixin.js',
+    pattern: /Object\.defineProperties\(\s*\w+\.prototype\s*,\s*(?:Object\.getOwnPropertyDescriptors\(|descriptors\b)|delete\s+descriptors\.constructor\b/,
   },
 ];
 
@@ -251,7 +255,7 @@ test('every download is named safely, at the one exit, with one time stamp', () 
   // The AnnData copy's names: one rule for the one it makes and the one it is given.
   assert.equal(copyFileName('a/b'), 'a_b with this state.zarr.zip');
   assert.equal(copyFileNamed('x:y.zarr.zip'), 'x_y.zarr.zip');
-  // A figure keeps a dataset's name in every script (it used to drop every letter outside ASCII).
+  // A figure keeps a dataset's name in every script (every letter outside ASCII stays).
   assert.equal(
     buildExportFilename({ datasetName: 'Lunge Übersicht 肺', fieldKey: 'cell_type', viewLabel: null, variant: null, ext: 'png', timestamp: '20261104_090307' }),
     'Lunge_Übersicht_肺_cell_type_20261104_090307.png',
@@ -296,13 +300,13 @@ test('the backoff doubles per attempt up to its ceiling, in the upper half of ea
 });
 
 test('one compact count: "4M", "2.5M", "1M" for 999,960, and no second formatter', () => {
-  // Two formatters wrote "4.0M" and "4M" for one count (round 9, one-implementation lane).
+  // Two formatters wrote "4.0M" and "4M" for one count.
   assert.deepEqual([950, 999.6, 1_500, 15_000, 250_000, 999_960, 2_500_000, 4_000_000, 1.2e9, -1_500].map(formatCompactCount),
     ['950', '1K', '1.5K', '15K', '250K', '1M', '2.5M', '4M', '1.2B', '-1.5K']);
   assert.equal(displayFormat.formatCompactCount, undefined, 'the display module keeps no copy');
 });
 
-test('one time left: `formatRemaining`, in its largest unit where room is short, and no second formatter (RCD-5)', () => {
+test('one time left: `formatRemaining`, in its largest unit where room is short, and no second formatter', () => {
   assert.deepEqual([400, 40_000, 690_000, 4_680_000, 43_200_000].map(ms => formatRemaining(ms, { compact: true })),
     ['<1 s', '~40 s', '~12 min', '~1.3 h', '~12 h']);
   assert.deepEqual([400, 40_000, 690_000].map(ms => formatRemaining(ms)), ['<1 s', '~40 s', '~11 min 30 s']);
@@ -388,8 +392,7 @@ test('one listener set: every listener is told, a throw is reported once, a noti
  * host's request budget and Retry-After, a stall ends a request, offline and a host refusing said by
  * who is at fault, the retry line), with why: each file's raw calls to the global `fetch`, counted. A
  * raw `fetch` that fails rejects with a bare `TypeError`, which reads as a problem inside Cellucid
- * (`utils/errors.js` `isInternalFailure`). Round 9 (RCD-2) moved a catalog's "Try again", a Cellucid
- * server's requests and GEO's README probe onto the transport.
+ * (`utils/errors.js` `isInternalFailure`).
  */
 const RAW_FETCH = {
   // The transport's own.
@@ -418,7 +421,7 @@ const RAW_FETCH = {
   'dev/benchmark.js': [1, 'a developer benchmark\'s own file'],
 };
 
-test('every request goes through the one transport, except where a raw fetch says why (RCD-2)', () => {
+test('every request goes through the one transport, except where a raw fetch says why', () => {
   const counts = new Map();
   for (const source of sources()) {
     const hits = matchesOf(source, /(?<![\w$.])fetch\(|\b(?:globalThis|window|self)\.fetch\(/);

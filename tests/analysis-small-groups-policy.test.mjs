@@ -170,9 +170,8 @@ test('a run without two columns or without a group to test is refused with its r
   assert.deepEqual(tested(pooledPair), ['T', 'Other small groups (2)']);
 });
 
-// Genes read for a sample of the open cells (the walk of 2026-10-31: "15
-// skipped" of 50 cell types on a CELLxGENE atlas, with no reason given):
-// a group is counted among the sample, and a result says each group's cells
+// Genes read for a sample of the open cells ("15 skipped" of 50 cell types
+// with no reason given is not a result): a group is counted among the sample, and a result says each group's cells
 // among it of its cells in every open cell, and that a group is skipped for
 // too few sampled cells.
 globalThis.HTMLElement ??= class HTMLElement {};

@@ -62,7 +62,7 @@ test('codes decide: Worker versions, layout, contract, unreachable, cut answers'
 });
 
 test('a programming TypeError is the code\'s own failure, never an unreachable Worker asked again', async () => {
-  // Round 9: any TypeError read as "GitHub unreachable", so a broken contract was retried and said as GitHub's.
+  // A TypeError is not "GitHub unreachable": a broken contract is not retried and not said as GitHub's.
   const programming = new TypeError("Cannot read properties of undefined (reading 'login')");
   assert.equal(isWorkerUnreachable(programming), false);
   assert.equal(isTransientRoleResolutionFailure(programming), false);

@@ -70,7 +70,7 @@ class ProbeUI extends FormBasedAnalysisUI {
 
 test('a display option changed mid-run is applied when the run publishes, and the run completes', async () => {
   const ui = new ProbeUI();
-  const run = ui._runAnalysis();
+  const run = ui._runForm();
   await Promise.resolve();
   // The user changes a display option while the run computes.
   ui._options = { ...ui._requireOptions(), scale: 3 };
@@ -89,7 +89,7 @@ test('a display option changed mid-run is applied when the run publishes, and th
 test('a display redraw after a run starts no analysis request', async () => {
   const ui = new ProbeUI();
   ui.gate.resolve();
-  await ui._runAnalysis();
+  await ui._runForm();
   const intent = ui._activeAnalysisRequestId;
   ui._options = { ...ui._options, scale: 5 };
   ui._handleOptionsChanged('scale');

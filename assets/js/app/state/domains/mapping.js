@@ -39,6 +39,10 @@ export function createMappingDomain({ state, refreshUi }) {
     // the ones its matrix is shown in at once: a matrix is never summed for
     // values the restore does not end on. `heavy`: the running action's
     // `ctx.heavy`, asked before a matrix's cells' totals are summed.
+    /**
+     * @param {*} value
+     * @param {{heavy?: *, target?: (domain: string) => *, signal?: AbortSignal|null}} [options]
+     */
     async restore(value, { heavy = null, target = () => undefined, signal = null } = {}) {
       const current = state.getDataMapping();
       if (JSON.stringify(current) === JSON.stringify(value)) return;
@@ -51,7 +55,7 @@ export function createMappingDomain({ state, refreshUi }) {
       await state.applyDataMapping(value, {
         origin: 'session',
         heavy,
-        // The move's Stop (F147): the restore ends with it.
+        // The move's Stop: the restore ends with it.
         signal,
         ...(expression === undefined ? {} : { expression: requireExpressionTransform(expression, 'The expression values to restore') }),
       });

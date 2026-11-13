@@ -1,7 +1,7 @@
 /**
- * R9V-8 (bug hunt round 9): a vector field whose row held an infinity said
- * "(NaN in the file)". A row is left out when any value of it is NaN or
- * infinite (`data/embedding-payload.js`), for positions and vectors alike.
+ * A row is left out when any value of it is NaN or infinite
+ * (`data/embedding-payload.js`), for positions and vectors alike: a vector
+ * field whose row holds an infinity must not say "(NaN in the file)".
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

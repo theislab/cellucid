@@ -111,8 +111,8 @@ a control sits), never a second look for a control.
 
 ### Rules
 
-- **Nested actions are quiet.** Controls get quieter the deeper they sit
-  (owner, 2026-11-11). A panel's, a dialog's or a floating card's own actions
+- **Nested actions are quiet.** Controls get quieter the deeper they sit.
+  A panel's, a dialog's or a floating card's own actions
   are `.btn` (`.btn-primary` for the one that commits); an action inside
   something smaller — a list item's row or details (history steps, saved
   states, My datasets, Stored data, Recently deleted, deleted fields,
@@ -126,7 +126,7 @@ a control sits), never a second look for a control.
   and B, Score as signature, Reset to defaults, All / None / Invert, a gene
   set's Clear / Add set / Import / Export) and Community annotation's
   comment Edit / Delete, View merged, View full evidence and View all
-  comments are `.btn-quiet` too (F102). An underline marks only a link
+  comments are `.btn-quiet` too. An underline marks only a link
   (`a`) or a link inside a sentence (History settings… in the History tip,
   the gene sample line); the list is held by
   `tests/nested-actions-quiet-contract.test.mjs`.
@@ -268,13 +268,9 @@ pointer size:
   their full stop; a status word followed by a sentence takes it after the
   sentence only.
 - **US spelling** ("color", "neighbor", "gray", "normalize", "center",
-  "catalog", "labeled"): one British word list, `tests/fixtures/spelling.json`
-  (shared byte for byte with cellucid-python and cellucid-r at one pinned
-  digest), is refused by `tests/failure-wording-contract.test.mjs` in the
-  page's prose, the scripts' strings and templates, the relay, the action
-  catalog, every README and guide, and every text a test expects, and by the
-  packages' suites in their messages, help and the documentation. Keys,
-  identifiers and file names keep the spelling they were stored with.
+  "catalog", "labeled") in every word a person or an agent reads, in the
+  packages and the documentation too. Keys, identifiers and file names keep
+  the spelling they were stored with.
 - Data units are **cells**, not points; "point" is reserved for the rendered
   mark ("Point size").
 - Numbers go through `assets/js/app/ui/components/display-format.js` and

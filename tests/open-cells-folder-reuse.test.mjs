@@ -12,10 +12,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 // The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
 // The link too: the host below is a function in this process, so what its
-// requests measure is how busy this machine is, never a link. Measured, a
-// loaded runner's 900-cell opening took over no index of the 300 cells open
-// before it (`undefined !== 300`, Web contracts run 42180511574, Windows).
-// With every interval timed 40 times longer it does so on every run: the
+// requests measure is how busy this machine is, never a link. On a loaded
+// runner a 900-cell opening takes over no index of the 300 cells open
+// before it (`undefined !== 300`): with every interval timed 40 times longer
+// it does so on every run: the
 // first gene of its 900 cells is priced at 14.7 s, genes are read for 8 of
 // them, and the share opens in the file's cell order, of which the cells
 // open before are no prefix.
@@ -173,9 +173,9 @@ for (const [label, validatorOf] of [
   });
 }
 
-test('a growth step reads beside the folder\'s version check, not after it; read from a folder found changed, it is opened anew (F170)', async t => {
-  // Each step of a progressive opening waited one round trip for a HEAD of
-  // `.zmetadata` before its first read, in series (R9P-1: about 4% of a 3G
+test('a growth step reads beside the folder\'s version check, not after it; read from a folder found changed, it is opened anew', async t => {
+  // A step of a progressive opening must not wait one round trip for a HEAD of
+  // `.zmetadata` before its first read, in series (about 4% of a 3G
   // opening). The HEAD answers slowly here: the step's reads go out first.
   const files = storeFiles({ priority: true });
   let version = 1;
@@ -227,8 +227,8 @@ test('a folder whose host names no version is opened anew on Apply', async t => 
 test('a progressive opening is planned only where it can grow in place: a folder whose host names no version opens every cell at once', () => {
   // Each step of a growth reads the same bytes again; a folder no later
   // reading can tell to be the same is read anew, other cells than those
-  // shown, and its growth stopped at the first view (the Garcia sample on
-  // a host naming no validator: 48,860 of 219,731 cells, "A progressive
+  // shown, and its growth stops at the first view (the Garcia sample on
+  // a host naming no validator: "A progressive
   // opening step read other cells than the ones shown and more").
   const asked = { mode: 'all', progressive: { targetMs: 1000, msPerCell: 0.02 } };
   assert.deepEqual(cellsToOpen(asked, { key: null, folder: { version: null } }), { mode: 'all' }, 'every cell at once');
@@ -242,8 +242,8 @@ test('a folder read at a version naming its content is taken over on every readi
   // GitHub's raw host sends an ETag but exposes no header to a page (no
   // Access-Control-Expose-Headers): read at a commit, the folder is the same
   // bytes for the same address and commit. Opened anew, every step of a
-  // progressive opening read other cells than those shown and the page
-  // stopped growing at its first view (Suo: 32,768 of 561,947 cells).
+  // progressive opening would read other cells than those shown and the page
+  // would stop growing at its first view.
   const files = storeFiles();
   const requests = serveStore(t, files, () => null);
   const call = handler();

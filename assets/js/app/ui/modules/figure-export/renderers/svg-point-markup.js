@@ -2,7 +2,8 @@
  * @fileoverview The point markup of a Full Vector or Optimized Vector SVG.
  *
  * One `<circle>` per drawn point (and a dot and a ring per highlighted point) is the
- * bulk of a vector figure: 562k cells write about 65 MB. It is written in the
+ * bulk of a vector figure, so the markup of a large dataset is tens of
+ * megabytes (measured: 36_decisions_figure_export.md). It is written in the
  * figure-export worker (`figure-export-worker.js`) and leaves as one Blob, so
  * the page's main thread never projects, shades or formats a point, and never
  * holds the markup as a string.
@@ -44,7 +45,7 @@ import { fogOpacityAt } from '../../../../../rendering/shaders/fog-shaders.js';
  * A highlighted point is drawn as the screen's flat highlight draws it: a dot
  * of the highlight's color out to the ring's inner edge, inside a ring of the
  * ring's color (`highlightRingColorFor`: black around the light dot, so it
- * reads against any coloring, F162), at the radii of the shader's flat circle
+ * reads against any coloring), at the radii of the shader's flat circle
  * style (`highlightRingRadii`).
  */
 const HIGHLIGHT_RING_RADII = highlightRingRadii(HIGHLIGHT_STYLES_BY_QUALITY.light);

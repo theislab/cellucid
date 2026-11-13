@@ -73,7 +73,6 @@ test('no code turns a dimension back into "the" embedding of that dimension', ()
     'assets/js/data/data-mapping-candidates.js',
     'assets/js/data/base-anndata-adapter.js',
     'assets/js/data/dimension-manager.js',
-    'assets/js/data/dataset-identity.js',
     'assets/js/app/state/managers/mapping-manager.js',
     'assets/js/app/ui/modules/data-mapping-controls.js',
     'assets/js/analytics/schema.js',
@@ -90,11 +89,6 @@ test('no code turns a dimension back into "the" embedding of that dimension', ()
 
 test('the renderer shares geometry by representation, never by dimension alone', () => {
   const renderer = CODE.get('assets/js/rendering/high-perf-renderer.js');
-  // Snapshot geometry is looked up by its positions array (one per
-  // representation), so two views of two embeddings of one dimension never
-  // share a buffer or a tree, and two views of one embedding always do.
-  assert.match(renderer, /_findPooledGeometry\(positions, dimension\)/);
-  assert.match(renderer, /geometry\.positions === positions && geometry\.dimension === dimension/);
   // The per-dimension maps belong to the one live publication (one geometry)
   // and are replaced with it; nothing else keys a cache by dimension.
   // (The registry's defaults are keyed by dimension by definition.)

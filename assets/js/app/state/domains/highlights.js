@@ -61,9 +61,6 @@ export function canonicalHighlights(value) {
   };
 }
 
-/** The group types that name a field, and so carry a field binding. */
-export const FIELD_BOUND_HIGHLIGHT_TYPES = new Set(['category', 'range']);
-
 /**
  * Bind field-owned highlight groups to the field and category they name.
  *
@@ -161,7 +158,7 @@ export function createHighlightFieldBinder(state, { allowDeleted = false } = {})
  * @param {Iterable<{type: string, fieldSource: string, fieldKey: string}>} groups
  * @returns {number[]} Their positions
  */
-export function fieldsToLoadForHighlightBinding(state, groups) {
+function fieldsToLoadForHighlightBinding(state, groups) {
   const fields = Array.isArray(state.obsData?.fields) ? state.obsData.fields : [];
   const indexByKey = new Map(fields.map((field, index) => [field?.key, index]));
   const pending = new Set();

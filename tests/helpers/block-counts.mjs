@@ -3,9 +3,9 @@
  *
  * A contract about cost ("no pass over a million categories", "not a scan per
  * character") cannot be a threshold on a clock: a shared runner stalls for
- * longer than any budget short enough to mean something (CI run 42129386525: a
- * 1 MB publish measured 11.71 ms of CPU against a floor of 0.96 ms on one job
- * and half that on the next). V8 counts every block of JavaScript it runs
+ * longer than any budget short enough to mean something (the same work
+ * measures many times longer on one job than on the next; measured:
+ * 38_decisions_testing_and_hosted_runners.md). V8 counts every block of JavaScript it runs
  * (precise block coverage), and that count is the same on every machine and
  * every run: a loop over each character adds a count per character whatever
  * the machine's speed. The contract then says how the count grows with the

@@ -18,7 +18,7 @@
  * Each run's rows are appended to `--out` as `scale-app.mjs` writes them
  * (one per step), so a run cut short keeps what it measured. `--pause`
  * seconds between runs keeps a public host's traffic paced. Run it alone
- * (`heavy.sh`, a `big`/`atlas` label: 10M stores and atlases run alone).
+ * (a `big`/`atlas` label: 10M stores and atlases run alone).
  */
 
 import { spawn } from 'node:child_process';

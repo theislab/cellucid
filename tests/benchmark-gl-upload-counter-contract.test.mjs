@@ -163,8 +163,8 @@ test('the wrapped call reaches the original with its exact arity', () => {
 });
 
 test('element-buffer reallocation is counted apart from vertex traffic', () => {
-  // The suspected defect is a full element-buffer store reallocation on every
-  // frame of camera motion. Separating the element target from the vertex one
+  // A full element-buffer store reallocation on every frame of camera motion
+  // is the cost to price. Separating the element target from the vertex one
   // is what makes that claim checkable instead of arguable.
   const gl = new FakeWebGL2Context();
   const handle = instrumentGlUploads(gl);

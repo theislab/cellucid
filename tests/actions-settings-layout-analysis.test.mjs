@@ -42,12 +42,12 @@ const B3_TYPES = {
   'layout.section.open': ['layout'],
   'layout.sidebar.show': ['layout'],
   'layout.sidebar.width': ['layout'],
-  'layout.theme.set': ['layout', 'settings'], // an unchosen background follows the theme (F46, F66)
+  'layout.theme.set': ['layout', 'settings'], // an unchosen background follows the theme
   'analysis.open': ['analysis', 'layout'],
   'analysis.close': ['analysis'],
   'analysis.pages.set': ['analysis'],
   'analysis.run': ['analysis'],
-  // A window's place, size and fold are layout (History v2 §3.15.5); opening,
+  // A window's place, size and fold are layout; opening,
   // copying or closing one changes both what is analyzed and the layout.
   'analysis.window.copy': ['analysis', 'layout'],
   'analysis.window.close': ['analysis', 'layout'],
@@ -152,7 +152,7 @@ test('how an analysis is shown is one action: each analysis\'s view keys, named 
   assert.match(schemaProblem(view.params, { analysis: 'composition', view: { plot: [] } }), /at least 1/);
   assert.equal(view.describe({ analysis: 'markers', view: { plot: [{ option: 'showValues', value: true }] } }, null),
     'Set showValues to true in the plot of Marker genes');
-  // Made, it is named as the options column labels it (found 2026-11-10: option keys on the step).
+  // Made, it is named as the options column labels it, not by option keys.
   assert.equal(view.describe({ analysis: 'markers', view: { plot: [{ option: 'transform', value: 'zscore' }] } }, { changed: 'plot', plot: ['Transform set to z-score'] }),
     'Marker genes: Transform set to z-score');
   assert.notEqual(view.coalesce({ analysis: 'composition', in: 'panel', view: { plot: [{ option: 'view', value: 'bar' }] } }),
@@ -167,7 +167,7 @@ test('how an analysis is shown is one action: each analysis\'s view keys, named 
   // An analysis sent another's genes opens with them in one step.
   const set = catalog.get('analysis.signature.set');
   assert.equal(set.describe({ options: { geneSets: [] }, show: true }, null), 'Opened Gene signature: Gene sets set to none');
-  // A step names an option as its form does, with its value (found 2026-11-10: "Set geneSets of Dot plot").
+  // A step names an option as its form does, with its value (not "Set geneSets of Dot plot").
   const dotplot = catalog.get('analysis.dotplot.set');
   assert.equal(dotplot.describe({ options: { scale: 'var' } }, null), 'Dot plot: Color set to Mean, scaled 0–1 per gene');
   assert.equal(dotplot.describe({ options: { geneSets: [{ name: 'Set 1', genes: ['KLRD1', 'PRF1'] }] } }, null),
@@ -176,7 +176,7 @@ test('how an analysis is shown is one action: each analysis\'s view keys, named 
   assert.equal(dotplot.describe({ options: { cells: 'visible' } }, null), 'Dot plot: Cells set to Visible cells');
   assert.equal(dotplot.describe({ options: { cells: 'page:Early EP' } }, null), 'Dot plot: Cells set to page Early EP');
   assert.equal(dotplot.describe({ options: { swapAxes: true } }, null), 'Dot plot: Genes down, groups across set to On');
-  // Several options: each by what was chosen (found 2026-11-11, L3-11: "Marker genes: Group by, Compare against, … set").
+  // Several options: each by what was chosen (not "Marker genes: Group by, Compare against, … set").
   assert.equal(dotplot.describe({ in: 2, options: { scale: 'var', plot: 'matrix' } }, null), 'Dot plot: Color Mean, scaled 0–1 per gene; plot Matrix plot in window 2');
   const markers = catalog.get('analysis.markers.set');
   assert.equal(markers.describe({ options: { groupBy: 'cell_type', compareAgainst: 'rest', testGroups: { mode: 'subset', ids: ['Alpha', 'Beta'] }, direction: 'up', topN: 5 } }, null),

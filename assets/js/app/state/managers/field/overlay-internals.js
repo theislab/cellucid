@@ -195,6 +195,7 @@ function findFieldByOriginalKey(fields, source, originalKey) {
 }
 
 export class FieldOverlayInternalMethods {
+  /** @this {import('../../core/data-state.js').DataState} */
   _ensureActiveSelectionNotDeleted() {
     const source = this.activeFieldSource;
     if (source === null) {
@@ -240,6 +241,7 @@ export class FieldOverlayInternalMethods {
    * since, so a view switch or a kept view costs the edits, not one pass over
    * every gene. An inventory not seen before, or one older than a whole
    * registry replacement (a dataset or a session restore), is read in full.
+   * @this {import('../../core/data-state.js').DataState}
    */
   _applyOverlaysToFields(fields, source) {
     requireSource(source);
@@ -309,7 +311,7 @@ export class FieldOverlayInternalMethods {
     overlayRevisions.set(fields, revisions);
   }
 
-  /** Show one field under the rename and delete registries. */
+  /** Show one field under the rename and delete registries. @this {import('../../core/data-state.js').DataState} */
   _applyOverlayToField(field, source, fieldIndex) {
     if (field._isUserDefined === true) {
       requireIdentifier(
@@ -365,6 +367,7 @@ export class FieldOverlayInternalMethods {
    * Show one categorical field's categories under their display names (the
    * rename registry), keeping the original names beside them.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {Object} field
    * @param {string} source
    * @param {string} originalKey
@@ -417,6 +420,7 @@ export class FieldOverlayInternalMethods {
     this._syncCentroidCategoryLabels(field, previousCategories);
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   _injectUserDefinedFields() {
     this._injectUserDefinedFieldsForSource(FieldSource.OBS);
     this._injectUserDefinedFieldsForSource(FieldSource.VAR);
@@ -427,6 +431,7 @@ export class FieldOverlayInternalMethods {
    * (first), then the field object of each view's inventory that names it
    * (the focused view's is the state's, every other view's is its context's).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} fieldId
    * @param {'obs'|'var'} source
    * @returns {object[]}
@@ -467,8 +472,8 @@ export class FieldOverlayInternalMethods {
    * Its categories, codes and centroid tables are the field's, not a view's:
    * the registry holds one definition, a session saves it, and every view's
    * copy holds the same arrays and tables. A copy left holding the previous
-   * ones went on drawing them, computed a new layout's centroids into a table
-   * it no longer shared, or met the new categories under colors indexed for
+   * ones would go on drawing them, compute a new layout's centroids into a table
+   * it no longer shares, or meet the new categories under colors indexed for
    * the old ones. What belongs to a view, its colors and hidden categories,
    * is carried into the new categories by `carryCategoryState`, from that
    * copy's own; what the previous definition derived (counts, outlier
@@ -477,6 +482,7 @@ export class FieldOverlayInternalMethods {
    * The caller draws the views that use the field again
    * (`_redrawViewsUsingUserDefinedField`).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} fieldId
    * @param {{
    *   categories: Array<string|number|boolean>,
@@ -561,6 +567,7 @@ export class FieldOverlayInternalMethods {
    * is drawn as the focused view, which then gets the focus back, as a new
    * latent space recolors the views (`_recolorCategoricalViews`).
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {string} fieldId
    * @param {{includeFocused: boolean}} options - Whether the focused view is
    *   drawn here too, or by the caller.
@@ -606,6 +613,7 @@ export class FieldOverlayInternalMethods {
     }
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   _injectUserDefinedFieldsForSource(source) {
     requireSource(source);
     const fields = requireInventory(this, source, { nullable: true });
@@ -707,12 +715,13 @@ export class FieldOverlayInternalMethods {
    *
    * A field's centroid tables, like its category list, are never written in
    * place: a kept view's field is a shallow copy (`_cloneFieldState`) that
-   * shares them, and a relabel written into the shared records changed the
+   * shares them, and a relabel written into the shared records would change the
    * other view's centroids under its unchanged categories (an undo past
-   * `view.keep` after a category rename then found labels it did not hold).
+   * `view.keep` after a category rename would find labels it did not hold).
    * A relabel makes a new table of new records; positions stay shared with
    * the field's `_normalizedLayouts`, which records their normalization.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {object} field - A categorical field whose `categories` changed
    * @param {Array<string|number|boolean>} previousCategories
    */
@@ -796,6 +805,7 @@ export class FieldOverlayInternalMethods {
     if (changed) field.centroidsByLayout = relabelled;
   }
 
+  /** @this {import('../../core/data-state.js').DataState} */
   _refreshHighlightGroupsForField(source, fieldIndex) {
     requireSource(source);
     const index = requireIndex(fieldIndex, 'Highlight field index');
@@ -903,6 +913,7 @@ export class FieldOverlayInternalMethods {
    * centroids are computed from exactly that geometry and are normalized from
    * birth. Any other field is left alone.
    *
+   * @this {import('../../core/data-state.js').DataState}
    * @param {object} field
    * @param {string} layoutKey
    * @param {Float32Array} positions - normalized positions, stride = dimension

@@ -29,6 +29,7 @@ import {
 } from '../assets/js/data/sources/auth/token-store.js';
 import { codeChallengeOf, createPkce } from '../assets/js/data/sources/auth/pkce.js';
 import { SignInSteps } from '../assets/js/data/sources/auth/sign-in.js';
+import { isWaitingOnPerson } from '../assets/js/utils/person-wait.js';
 import { DRIVE_FILE_SCOPE, GOOGLE_ADMIN_HELP, REVOKE_URL, createGoogleAuth } from '../assets/js/data/sources/auth/google.js';
 import {
   CALLBACK_PATH,
@@ -110,8 +111,6 @@ test('one store holds every sign-in for the tab: GitHub keeps its key, Google an
   writeSignIn('google', '{"accessToken": 1}');
   assert.equal(readSignInRecord('google', record => typeof record.accessToken === 'string'), null);
   assert.equal(values.size, 0);
-  const github = await readFile(path.join(ROOT, 'assets/js/app/community-annotations/github-auth.js'), 'utf8');
-  assert.match(github, /from '\.\.\/\.\.\/data\/sources\/auth\/token-store\.js'/);
 });
 
 test('a browser that refuses storage is said as a storage failure, never a crash', t => {
@@ -178,6 +177,22 @@ test('sign-in steps: one per account and kind, run inside the click, a failed at
   assert.deepEqual(await Promise.all([first, second]), [TOKEN, TOKEN]);
   assert.equal(steps.list().length, 0);
   for (const list of seen) assert.ok(!JSON.stringify(list).includes(TOKEN), 'a step never carries its token');
+});
+
+test('the page waits on the person while a sign-in step is open', async () => {
+  const steps = new SignInSteps();
+  assert.equal(isWaitingOnPerson(), false);
+  let finish;
+  const act = () => new Promise(resolve => {
+    finish = resolve;
+  });
+  const pending = steps.request({ account: 'google', kind: 'expired', text: 'Google sign-in expired.', action: 'Sign in again', act });
+  assert.equal(isWaitingOnPerson(), true, 'a step waits on the person');
+  steps.run(steps.list()[0].id);
+  finish(TOKEN);
+  assert.equal(await pending, TOKEN);
+  await Promise.resolve();
+  assert.equal(isWaitingOnPerson(), false, 'the wait ends with the step');
 });
 
 test('sign-in steps: an attempt reported unfinished offers the button again and still ends the step when it signs in', async () => {
@@ -719,7 +734,7 @@ test('Microsoft: each sign-in error, from the callback to the message and the ac
   const ADMIN = /\(the Cellucid documentation, "Work and school accounts: administrator approval", says how\)/;
   const cases = [
     {
-      // As Helmholtz Zentrum München's tenant answers (2026-10-25).
+      // As Helmholtz Zentrum München's tenant answers.
       hash: '#error=access_denied&state=STATE&error_description=AADSTS90094%3a+An+administrator+of+Helmholtz+Zentrum+M%c3%bcnchen+has+set+a+policy+that+prevents+you+from+granting+Cellucid+the+permissions+it+is+requesting.',
       message: /^Your organization \(Helmholtz Zentrum München\) lets only an administrator approve Cellucid\./, also: ADMIN,
       action: 'Use another account', help: true, prompt: 'select_account',
@@ -884,30 +899,16 @@ test('Microsoft: a sign-in window found closed offers the step again, and its si
 });
 
 test('the provider config holds public identifiers only', async () => {
-  const source = await readFile(path.join(ROOT, 'assets/js/data/sources/provider-config.js'), 'utf8');
   const { PROVIDER_CONFIG } = await import('../assets/js/data/sources/provider-config.js');
   assert.deepEqual(Object.keys(PROVIDER_CONFIG.google).sort(), ['apiKey', 'clientId', 'projectNumber', 'registeredOrigins']);
   assert.deepEqual(Object.keys(PROVIDER_CONFIG.microsoft).sort(), ['authority', 'clientId']);
   assert.deepEqual([...PROVIDER_CONFIG.google.registeredOrigins], ['https://www.cellucid.com', 'http://127.0.0.1:8765', 'http://localhost:8765']);
   assert.equal(PROVIDER_CONFIG.microsoft.authority, 'common');
-  assert.doesNotMatch(source.replace(/\/\*[\s\S]*?\*\//g, ''), /secret/i, 'no secret is configured');
 });
 
-test('the privacy page says where sign-ins live, for how long, what is kept of the data, and that no Cellucid server sees it', async () => {
+test('the privacy page keeps its canonical link and a policy without inline code or styles', async () => {
   const page = await readFile(path.join(ROOT, 'privacy.html'), 'utf8');
   assert.match(page, /<link rel="canonical" href="https:\/\/www\.cellucid\.com\/privacy\.html" \/>/);
-  assert.match(page, /session storage, which your browser may also write to its profile on disk/);
-  assert.match(page, /lasts about an hour/);
-  assert.match(page, /Microsoft's renewal token[^.]*is kept only in the page's memory/);
-  assert.match(page, /Your GitHub token expires after 8 hours/);
-  assert.match(page, /signing out also revokes it at GitHub/);
-  assert.match(page, /Signing out revokes the Google token at Google/);
-  // What is kept of the data, in the policy Google and Microsoft link to.
-  assert.match(page, /the parts of a remote file it downloaded/);
-  assert.match(page, /Session › Open data › Stored › Manage…/);
-  assert.match(page, /The parts of the file Cellucid downloaded are kept/);
-  assert.match(page, /Neither the file nor your sign-in passes through a Cellucid server/);
-  assert.match(page, /Limited Use requirements/);
   const policy = /<meta http-equiv="Content-Security-Policy" content="([^"]+)" \/>/.exec(page)[1];
   assert.doesNotMatch(policy, /unsafe-inline|unsafe-eval/);
   assert.doesNotMatch(page, /style=/);

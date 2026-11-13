@@ -66,8 +66,8 @@
  * - **Its pace** (`pace`, `seedPace`, `watchPace`): a host that blocks a
  *   network for sending too many requests (a host that answered and then
  *   sends nothing a page may read to two rounds in a row: Zenodo's
- *   and Google's "unusual traffic" pages, which Zenodo sent this machine
- *   after about 550 range reads in a few minutes, within the 133 a minute
+ *   and Google's "unusual traffic" pages, which Zenodo sends a network that
+ *   read a few hundred ranges in a few minutes, within the 133 a minute
  *   its headers state) is a host whose real limit is lower than anything it
  *   says. When it answered most of the requests sent in the minute before
  *   the block (`PACE_WINDOW_MS`), those requests are what it refused, however
@@ -267,6 +267,12 @@ export function budgetOf(headers, epochNow = Date.now()) {
   if (limit === null && remaining === null && resetInMs === null) return null;
   return { limit, remaining, resetInMs };
 }
+
+/**
+ * What `admit` hands a request that may be sent: called with its response.
+ *
+ * @typedef {(response: Response|null, options?: {limiting?: boolean, waitMs?: number|null}) => void} Answered
+ */
 
 /**
  * The hosts this realm reads: a book of what it knows of each (the module
@@ -483,9 +489,7 @@ export function createHostBook({
     // the requests were lost on this side (this computer offline, its link
     // down for a moment): no pace mends that, and a pace learned from it
     // would slow every read of the host for the rest of the visit and, kept,
-    // the next day's (round 9, R9P-5: a flapping link read Suo at 70 KB/s
-    // over a fast one, "theislab.github.io limits how many requests it
-    // answers").
+    // the next day's.
     if (loss.streak === 2 && host.deliveries > 0 && !loss.thisSide) learnPace(host);
     const refused = host.queue.filter(waiter => waiter.address === address);
     host.queue = host.queue.filter(waiter => waiter.address !== address);
@@ -702,8 +706,7 @@ export function createHostBook({
      * @param {string} url
      * @param {{signal?: AbortSignal|null, onWait?: ((info: {host: string, untilMs: number|null, limit: number|null}|null) => void)|null,
      *   waits?: boolean, burst?: boolean|string}} [options]
-     * @returns {Answered|Promise<Answered>|null} `Answered`: `(response: Response|null,
-     *   options?: {limiting?: boolean, waitMs?: number|null}) => void`
+     * @returns {Answered|Promise<Answered>|null}
      */
     admit(url, { signal = null, onWait = null, waits = true, burst = false } = {}) {
       const origin = originOf(url);

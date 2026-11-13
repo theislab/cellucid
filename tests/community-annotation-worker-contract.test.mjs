@@ -1264,8 +1264,8 @@ test('worker projects installation repositories to the browser contract', async 
 });
 
 // Cloudflare Free allows 50 subrequests per request: a collection is one
-// GitHub page per Worker request, however large it is (repro r05: 10,000
-// installations were 100 subrequests in one request).
+// GitHub page per Worker request, however large it is (10,000
+// installations would be 100 subrequests in one request).
 test('a collection is one GitHub page per Worker request, paged by GitHub\'s Link header', async () => {
   const previousFetch = globalThis.fetch;
   const githubRequests = [];

@@ -112,7 +112,7 @@ export function cameraStatesIn(value) {
  * The same session file as a newer Cellucid would write it with a part of
  * the state this version does not have (`domain`): stamped `version`, the
  * shown tracker's last step also changing that part (to a value the file
- * holds already). What the app reads part by part (F164).
+ * holds already). What the app reads part by part.
  *
  * @param {Uint8Array|Buffer} bytes
  * @param {{domain?: string, version?: string}} [options]

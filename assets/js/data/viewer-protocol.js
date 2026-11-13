@@ -48,7 +48,7 @@
  * A binary frame, either way, is a little-endian uint32 header length, that
  * many bytes of UTF-8 JSON header, then the body (`encodeViewerBinaryFrame`).
  * A body of cells is little-endian uint32 cell indices: a million cells are
- * 4 MB read in place, where the same cells as JSON text were 7 MB to build
+ * 4 MB read in place, where the same cells as JSON text are 7 MB to build
  * and parse. A binary `action`'s header lists each typed array of its
  * parameters (`arrays`: where it goes in `params`, its type and length) and
  * its body holds them in that order (`encodeViewerAction`).

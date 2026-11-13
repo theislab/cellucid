@@ -1,9 +1,8 @@
 /**
- * L24-15 (live pass 6, 2026-11-11): a newcomer asked where the germ cells
- * are; the agent highlighted them, then colored by NANOS3 and, reading its
- * screen picture, said "the bright cyan patches are the cells with high
- * NANOS3". The cyan was the highlight drawn over the gene's viridis. A
- * screen picture now says what it draws over the coloring.
+ * A screen picture says what it draws over the coloring: an agent that
+ * highlighted cells, then colored by NANOS3 and read its screen picture, must
+ * not take the highlight's cyan, drawn over the gene's viridis, for "the
+ * bright cyan patches are the cells with high NANOS3".
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

@@ -1,9 +1,9 @@
 /**
  * Who a key press belongs to (`utils/key-ownership.js`): one rule for every
- * page-wide key listener. Round 9, R9K-1: six listeners each kept their own
- * "is the person typing?" test and five treated every `<input>` as a text
- * field, so after a slider or a checkbox was used W A S D, H, R, O… did
- * nothing until the plot was clicked.
+ * page-wide key listener. Not six listeners each keeping their own
+ * "is the person typing?" test, five of which treat every `<input>` as a text
+ * field, so that after a slider or a checkbox was used W A S D, H, R, O… do
+ * nothing until the plot is clicked.
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -61,7 +61,7 @@ test('a key the focused control already took is not the page\'s', () => {
 });
 
 test('no module keeps its own "is the person typing?" rule', async () => {
-  // The shapes the six copies had: a tag list, a closest() over fields, a
+  // The shapes a copy takes: a tag list, a closest() over fields, a
   // named predicate.
   const copies = [
     /\[\s*'INPUT',\s*'TEXTAREA'/,

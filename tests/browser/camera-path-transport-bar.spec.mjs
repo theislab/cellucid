@@ -54,66 +54,236 @@ async function openCameraPathWithTwoKeyframes(page) {
   await whenActionsShown(page);
 }
 
-test('the transport bar occupies a bounded strip and leaves the rest of the viewport clickable', async ({
-  page
-}) => {
+// One opening. The first step saves one keyframe, the second adds the one that makes a path;
+// the kept view of the last step comes after everything that reads a single view.
+test('navigation and Camera Path: the Navigation panel and Go to, the transport bar as a bounded strip, keyframes edited by keyboard, and the bar clear of the view title chips', async ({ page }) => {
   const productErrors = observeProductErrors(page);
-  await openCameraPathWithTwoKeyframes(page);
-  await expect(page.locator('.cinematic-transport-bar')).toHaveClass(/visible/);
-  // Ready and stopped, it says the path's length (found 2026-11-10: "0:00 / 0:00" until played).
-  await expect(page.locator('.cinematic-time-readout')).toHaveText(/^0:00 \/ (?!0:00$)\d+:\d\d$/);
+  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI fixture'
+  );
 
-  const layout = await page.evaluate(() => {
-    const bar = document.querySelector('.cinematic-transport-bar');
-    const inner = document.querySelector('.cinematic-transport-inner');
-    const barBox = bar.getBoundingClientRect();
-    const innerBox = inner.getBoundingClientRect();
-    const sidebar = document.getElementById('sidebar').getBoundingClientRect();
-    return {
-      trackWidth: barBox.width,
-      barWidth: innerBox.width,
-      barLeft: innerBox.left,
-      barRight: innerBox.right,
-      barTop: innerBox.top,
-      barHeight: innerBox.height,
-      sidebarRight: sidebar.right,
-      viewportWidth: window.innerWidth
+  await test.step('navigation lives in its own panel, and Camera Path follows it', async () => {
+    // One mode select, in the Navigation panel; Camera Path carries no copy.
+    await expect(page.locator('#navigation-section #navigation-mode')).toHaveCount(1);
+    await expect(page.locator('#cinematic-camera-section select#cinematic-nav-mode')).toHaveCount(0);
+
+    // Each mode reveals exactly its own settings box.
+    const panels = {
+      orbit: '#orbit-controls',
+      planar: '#planar-controls',
+      free: '#freefly-controls'
     };
+    for (const mode of Object.keys(panels)) {
+      await page.locator('#navigation-mode').selectOption(mode);
+      for (const [other, selector] of Object.entries(panels)) {
+        await expect(page.locator(selector)).toBeVisible({ visible: other === mode });
+      }
+    }
+
+    // A keyframe saved in one mode brings the panel back to that mode on Go to.
+    // The mode chosen is a step: its History row moves the Camera Path below it
+    // (under a software rasterizer it is drawn after the action is done).
+    await page.locator('#navigation-mode').selectOption('free');
+    await whenActionsShown(page);
+    await page.locator('#cinematic-camera-section > summary').click();
+    await whenActionsShown(page);
+    await page.locator('#cinematic-save-btn').click();
+    await page.locator('#navigation-mode').selectOption('planar');
+    await whenActionsShown(page);
+    await page.locator('#cinematic-keyframe-list [data-action="goto"]').first().click();
+    await expect(page.locator('#navigation-mode')).toHaveValue('free');
+    await expect(page.locator('#freefly-controls')).toBeVisible();
+    // Go to set the mode, a step: shown before the next click below the History.
+    await whenActionsShown(page);
+
+    // The camera-path tip explains keyframes and points at the docs.
+    await page.locator('#camera-path-info-btn').click();
+    const tip = page.locator('#camera-path-info-tooltip');
+    await expect(tip).toContainText('With two or more, a playback bar appears');
+    await expect(tip.locator('a.info-tip-link')).toHaveAttribute(
+      'href',
+      /^https:\/\/docs\.cellucid\.com\/en\/latest\/user_guide\/web_app\/c_core_interactions\/08_camera_path\.html#the-keyframes-list$/
+    );
+
+    expect(productErrors).toEqual([]);
   });
 
-  // The visible bar is a bounded strip, not the full viewport width.
-  expect(layout.barWidth).toBeLessThanOrEqual(620);
-  expect(layout.barWidth).toBeLessThan(layout.trackWidth);
-  expect(layout.barWidth).toBeLessThan(layout.viewportWidth * 0.6);
-  // It never overlaps the sidebar.
-  expect(layout.barLeft).toBeGreaterThan(layout.sidebarRight);
+  await test.step('the transport bar occupies a bounded strip and leaves the rest of the viewport clickable', async () => {
+    // The tip of the step above is closed and the mode put back to Orbit; a
+    // second keyframe makes the path, and with it the bar.
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#camera-path-info-tooltip')).toBeHidden();
+    await page.locator('#navigation-mode').selectOption('orbit');
+    await whenActionsShown(page);
+    await page.locator('#cinematic-save-btn').click();
+    await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
+    await expect(page.locator('.cinematic-transport-bar')).toHaveCount(1);
+    await whenActionsShown(page);
+    await expect(page.locator('.cinematic-transport-bar')).toHaveClass(/visible/);
+    // Ready and stopped, it says the path's length (never "0:00 / 0:00" before it is played).
+    await expect(page.locator('.cinematic-time-readout')).toHaveText(/^0:00 \/ (?!0:00$)\d+:\d\d$/);
 
-  // The positioning track spans the viewport so the bar can center inside it.
-  // It must stay transparent to the pointer, or it swallows canvas clicks.
-  const hitTests = await page.evaluate((box) => {
-    const y = Math.round(box.barTop + box.barHeight / 2);
-    const at = (x) => {
-      const element = document.elementFromPoint(Math.round(x), y);
-      return element === null
-        ? null
-        : {
-          id: element.id,
-          classes: element.getAttribute('class'),
-          insideBar: element.closest('.cinematic-transport-bar') !== null
-        };
-    };
-    return {
-      rightOfBar: at(box.barRight + 30),
-      leftOfBar: at(box.barLeft - 30),
-      onBar: at(box.barLeft + 15)
-    };
-  }, layout);
+    const layout = await page.evaluate(() => {
+      const bar = document.querySelector('.cinematic-transport-bar');
+      const inner = document.querySelector('.cinematic-transport-inner');
+      const barBox = bar.getBoundingClientRect();
+      const innerBox = inner.getBoundingClientRect();
+      const sidebar = document.getElementById('sidebar').getBoundingClientRect();
+      return {
+        trackWidth: barBox.width,
+        barWidth: innerBox.width,
+        barLeft: innerBox.left,
+        barRight: innerBox.right,
+        barTop: innerBox.top,
+        barHeight: innerBox.height,
+        sidebarRight: sidebar.right,
+        viewportWidth: window.innerWidth
+      };
+    });
 
-  expect(hitTests.rightOfBar.insideBar).toBe(false);
-  expect(hitTests.leftOfBar.insideBar).toBe(false);
-  expect(hitTests.onBar.insideBar).toBe(true);
+    // The visible bar is a bounded strip, not the full viewport width.
+    expect(layout.barWidth).toBeLessThanOrEqual(620);
+    expect(layout.barWidth).toBeLessThan(layout.trackWidth);
+    expect(layout.barWidth).toBeLessThan(layout.viewportWidth * 0.6);
+    // It never overlaps the sidebar.
+    expect(layout.barLeft).toBeGreaterThan(layout.sidebarRight);
 
-  expect(productErrors).toEqual([]);
+    // The positioning track spans the viewport so the bar can center inside it.
+    // It must stay transparent to the pointer, or it swallows canvas clicks.
+    const hitTests = await page.evaluate((box) => {
+      const y = Math.round(box.barTop + box.barHeight / 2);
+      const at = (x) => {
+        const element = document.elementFromPoint(Math.round(x), y);
+        return element === null
+          ? null
+          : {
+            id: element.id,
+            classes: element.getAttribute('class'),
+            insideBar: element.closest('.cinematic-transport-bar') !== null
+          };
+      };
+      return {
+        rightOfBar: at(box.barRight + 30),
+        leftOfBar: at(box.barLeft - 30),
+        onBar: at(box.barLeft + 15)
+      };
+    }, layout);
+
+    expect(hitTests.rightOfBar.insideBar).toBe(false);
+    expect(hitTests.leftOfBar.insideBar).toBe(false);
+    expect(hitTests.onBar.insideBar).toBe(true);
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('keyframe list editing is keyboard operable, rejects bad durations, and keeps focus', async () => {
+    const items = page.locator('.cinematic-keyframe-item');
+
+    // A duration below 0.1 s is reported on the field and nothing is stored;
+    // there is no longest duration.
+    const duration = page.locator('.cinematic-duration-input[data-pair-index="0"]');
+    await duration.fill('0.05');
+    await duration.press('Tab');
+    await expect(duration).toHaveValue('');
+    expect(await duration.evaluate(input => input.validationMessage))
+      .toMatch(/at least 0\.1 seconds/);
+    await duration.fill('500');
+    await duration.press('Tab');
+    await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
+      .toHaveValue('500');
+    await duration.fill('2.5');
+    await duration.press('Tab');
+    await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
+      .toHaveValue('2.5');
+    // A decimal comma reads as a point in every engine and locale; the box
+    // shows it back with a point.
+    await page.locator('.cinematic-duration-input[data-pair-index="0"]').fill('1,5');
+    await page.locator('.cinematic-duration-input[data-pair-index="0"]').press('Tab');
+    await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
+      .toHaveValue('1.5');
+
+    const setAll = page.locator('#cinematic-set-all-duration');
+    await setAll.fill('0');
+    // Each duration stored above is a step: its History row is drawn first.
+    await whenActionsShown(page);
+    await page.locator('#cinematic-set-all-btn').click();
+    await expect(setAll).toHaveValue('');
+    expect(await setAll.evaluate(input => input.validationMessage))
+      .toMatch(/at least 0\.1 seconds/);
+    await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
+      .toHaveValue('1.5');
+
+    // Rename is a real button: Enter starts editing, Enter commits, and focus
+    // returns to the renamed keyframe's label after the list rebuilds.
+    const firstLabel = items.first().locator('.cinematic-keyframe-label');
+    await expect(firstLabel).toHaveRole('button');
+    await firstLabel.focus();
+    await page.keyboard.press('Enter');
+    const rename = items.first().locator('.cinematic-keyframe-rename');
+    await expect(rename).toBeFocused();
+    await rename.fill('Opening shot');
+    await rename.press('Enter');
+    await expect(items.first().locator('.cinematic-keyframe-label'))
+      .toHaveText('Opening shot');
+    await expect(items.first().locator('.cinematic-keyframe-label'))
+      .toBeFocused();
+
+    // Escape abandons the edit and keeps focus on the label.
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Escape');
+    await expect(items.first().locator('.cinematic-keyframe-rename')).toHaveCount(0);
+    await expect(items.first().locator('.cinematic-keyframe-label')).toBeFocused();
+
+    // Reordering rebuilds the list; focus follows the moved keyframe's control.
+    await items.first().locator('[data-action="down"]').focus();
+    await page.keyboard.press('Enter');
+    await expect(items.nth(1).locator('.cinematic-keyframe-label'))
+      .toHaveText('Opening shot');
+    await expect(items.nth(1).locator('[data-action="up"]')).toBeFocused();
+
+    expect(productErrors).toEqual([]);
+  });
+
+  await test.step('the shown transport bar never covers a multiview title chip', async () => {
+    // Each multiview cell centers its title chip 20px below the top of the plot,
+    // which is exactly the strip the transport bar occupies. With a camera path
+    // and two views the bar would sit on the second view's chip, hiding its
+    // name and taking the click that focuses that view.
+    await page.locator('#split-keep-view-btn').click();
+    const chips = page.locator('.view-title-chip');
+    await expect(chips).toHaveCount(2);
+
+    const bar = page.locator('.cinematic-transport-bar');
+    await page.mouse.move(900, 500);
+    await expect(bar).toHaveClass(/visible/);
+
+    const overlaps = async () => page.evaluate(() => {
+      const inner = document.querySelector('.cinematic-transport-inner')
+        .getBoundingClientRect();
+      return [...document.querySelectorAll('.view-title-chip')].map(chip => {
+        const box = chip.getBoundingClientRect();
+        return box.left < inner.right && box.right > inner.left &&
+          box.top < inner.bottom && box.bottom > inner.top;
+      });
+    });
+    await expect.poll(overlaps).toEqual([false, false]);
+
+    // Every chip stays the topmost element at its own center, so it is clickable.
+    const topmost = await page.evaluate(() =>
+      [...document.querySelectorAll('.view-title-chip')].map(chip => {
+        const box = chip.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          box.left + box.width / 2,
+          box.top + box.height / 2,
+        );
+        return hit === chip;
+      }));
+    expect(topmost).toEqual([true, true]);
+    expect(productErrors).toEqual([]);
+  });
 });
 
 test('sidebar work keeps the transport bar alive, and idle time still retires it', async ({
@@ -179,175 +349,5 @@ test('sidebar work keeps the transport bar alive, and idle time still retires it
     TRANSPORT_BAR_HIDE_DELAY_MS - TIMER_ROUNDING_TOLERANCE_MS
   );
 
-  expect(productErrors).toEqual([]);
-});
-
-test('navigation lives in its own panel, and Camera Path follows it', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture'
-  );
-
-  // One mode select, in the Navigation panel; Camera Path carries no copy.
-  await expect(page.locator('#navigation-section #navigation-mode')).toHaveCount(1);
-  await expect(page.locator('#cinematic-camera-section select#cinematic-nav-mode')).toHaveCount(0);
-
-  // Each mode reveals exactly its own settings box.
-  const panels = {
-    orbit: '#orbit-controls',
-    planar: '#planar-controls',
-    free: '#freefly-controls'
-  };
-  for (const mode of Object.keys(panels)) {
-    await page.locator('#navigation-mode').selectOption(mode);
-    for (const [other, selector] of Object.entries(panels)) {
-      await expect(page.locator(selector)).toBeVisible({ visible: other === mode });
-    }
-  }
-
-  // A keyframe saved in one mode brings the panel back to that mode on Go to.
-  // The mode chosen is a step: its History row moves the Camera Path below it
-  // (measured under SwiftShader: drawn after the action was done).
-  await page.locator('#navigation-mode').selectOption('free');
-  await whenActionsShown(page);
-  await page.locator('#cinematic-camera-section > summary').click();
-  await whenActionsShown(page);
-  await page.locator('#cinematic-save-btn').click();
-  await page.locator('#navigation-mode').selectOption('planar');
-  await whenActionsShown(page);
-  await page.locator('#cinematic-keyframe-list [data-action="goto"]').first().click();
-  await expect(page.locator('#navigation-mode')).toHaveValue('free');
-  await expect(page.locator('#freefly-controls')).toBeVisible();
-  // Go to set the mode, a step: shown before the next click below the History.
-  await whenActionsShown(page);
-
-  // The camera-path tip explains keyframes and points at the docs.
-  await page.locator('#camera-path-info-btn').click();
-  const tip = page.locator('#camera-path-info-tooltip');
-  await expect(tip).toContainText('With two or more, a playback bar appears');
-  await expect(tip.locator('a.info-tip-link')).toHaveAttribute(
-    'href',
-    /^https:\/\/docs\.cellucid\.com\/en\/latest\/user_guide\/web_app\/c_core_interactions\/08_camera_path\.html#the-keyframes-list$/
-  );
-
-  expect(productErrors).toEqual([]);
-});
-
-test('keyframe list editing is keyboard operable, rejects bad durations, and keeps focus', async ({
-  page
-}) => {
-  const productErrors = observeProductErrors(page);
-  await openCameraPathWithTwoKeyframes(page);
-  const items = page.locator('.cinematic-keyframe-item');
-
-  // A duration below 0.1 s is reported on the field and nothing is stored;
-  // there is no longest duration.
-  const duration = page.locator('.cinematic-duration-input[data-pair-index="0"]');
-  await duration.fill('0.05');
-  await duration.press('Tab');
-  await expect(duration).toHaveValue('');
-  expect(await duration.evaluate(input => input.validationMessage))
-    .toMatch(/at least 0\.1 seconds/);
-  await duration.fill('500');
-  await duration.press('Tab');
-  await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
-    .toHaveValue('500');
-  await duration.fill('2.5');
-  await duration.press('Tab');
-  await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
-    .toHaveValue('2.5');
-  // A decimal comma reads as a point in every engine and locale; the box
-  // shows it back with a point.
-  await page.locator('.cinematic-duration-input[data-pair-index="0"]').fill('1,5');
-  await page.locator('.cinematic-duration-input[data-pair-index="0"]').press('Tab');
-  await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
-    .toHaveValue('1.5');
-
-  const setAll = page.locator('#cinematic-set-all-duration');
-  await setAll.fill('0');
-  // Each duration stored above is a step: its History row is drawn first.
-  await whenActionsShown(page);
-  await page.locator('#cinematic-set-all-btn').click();
-  await expect(setAll).toHaveValue('');
-  expect(await setAll.evaluate(input => input.validationMessage))
-    .toMatch(/at least 0\.1 seconds/);
-  await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
-    .toHaveValue('1.5');
-
-  // Rename is a real button: Enter starts editing, Enter commits, and focus
-  // returns to the renamed keyframe's label after the list rebuilds.
-  const firstLabel = items.first().locator('.cinematic-keyframe-label');
-  await expect(firstLabel).toHaveRole('button');
-  await firstLabel.focus();
-  await page.keyboard.press('Enter');
-  const rename = items.first().locator('.cinematic-keyframe-rename');
-  await expect(rename).toBeFocused();
-  await rename.fill('Opening shot');
-  await rename.press('Enter');
-  await expect(items.first().locator('.cinematic-keyframe-label'))
-    .toHaveText('Opening shot');
-  await expect(items.first().locator('.cinematic-keyframe-label'))
-    .toBeFocused();
-
-  // Escape abandons the edit and keeps focus on the label.
-  await page.keyboard.press('Enter');
-  await page.keyboard.press('Escape');
-  await expect(items.first().locator('.cinematic-keyframe-rename')).toHaveCount(0);
-  await expect(items.first().locator('.cinematic-keyframe-label')).toBeFocused();
-
-  // Reordering rebuilds the list; focus follows the moved keyframe's control.
-  await items.first().locator('[data-action="down"]').focus();
-  await page.keyboard.press('Enter');
-  await expect(items.nth(1).locator('.cinematic-keyframe-label'))
-    .toHaveText('Opening shot');
-  await expect(items.nth(1).locator('[data-action="up"]')).toBeFocused();
-
-  expect(productErrors).toEqual([]);
-});
-
-test('the shown transport bar never covers a multiview title chip', async ({
-  page
-}) => {
-  // Each multiview cell centers its title chip 20px below the top of the plot,
-  // which is exactly the strip the transport bar occupies. With a camera path
-  // and two views the bar used to sit on the second view's chip, hiding its
-  // name and taking the click that focuses that view.
-  const productErrors = observeProductErrors(page);
-  await openCameraPathWithTwoKeyframes(page);
-  await page.locator('#split-keep-view-btn').click();
-  const chips = page.locator('.view-title-chip');
-  await expect(chips).toHaveCount(2);
-
-  const bar = page.locator('.cinematic-transport-bar');
-  await page.mouse.move(900, 500);
-  await expect(bar).toHaveClass(/visible/);
-
-  const overlaps = async () => page.evaluate(() => {
-    const inner = document.querySelector('.cinematic-transport-inner')
-      .getBoundingClientRect();
-    return [...document.querySelectorAll('.view-title-chip')].map(chip => {
-      const box = chip.getBoundingClientRect();
-      return box.left < inner.right && box.right > inner.left &&
-        box.top < inner.bottom && box.bottom > inner.top;
-    });
-  });
-  await expect.poll(overlaps).toEqual([false, false]);
-
-  // Every chip stays the topmost element at its own center, so it is clickable.
-  const topmost = await page.evaluate(() =>
-    [...document.querySelectorAll('.view-title-chip')].map(chip => {
-      const box = chip.getBoundingClientRect();
-      const hit = document.elementFromPoint(
-        box.left + box.width / 2,
-        box.top + box.height / 2,
-      );
-      return hit === chip;
-    }));
-  expect(topmost).toEqual([true, true]);
   expect(productErrors).toEqual([]);
 });

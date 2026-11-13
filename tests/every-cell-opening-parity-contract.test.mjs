@@ -1,7 +1,6 @@
 /**
- * Every cell opens as fast as it did before gene samples and cell orders
- * (lead 2026-10-30, "every-cell opening parity"): what an opening of every
- * cell does that it did not before is counted here.
+ * Every cell opens as fast as it does without gene samples and cell orders:
+ * what an opening of every cell does beyond that is counted here.
  *
  * - Every cell in a `blocks` order finds its runs a block at a time
  *   (`subsample-plan.js` `blockOrderRuns`), and the open cells' rows take
@@ -207,7 +206,7 @@ test('a share\'s estimated chunk share at opening: a few looks a chunk, the walk
   const { proxy, reads } = counted(rows);
   estimatedChunkShare(proxy, nRows, nRows * 20, 1_000_000);
   // One pass to check they ascend (two reads a row), then about log2(rows)
-  // a chunk; the walk read every row once more on top.
+  // a chunk; no walk over every row once more on top.
   assert.ok(reads.count < 2 * rows.length + 8 * 40, `${reads.count} reads of ${rows.length} rows in 8 chunks`);
 });
 

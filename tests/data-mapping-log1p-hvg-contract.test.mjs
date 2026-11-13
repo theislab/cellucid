@@ -351,7 +351,7 @@ test('moving to another modality takes its log1p as an opening with it would, it
   const slots = { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': null };
   const candidates = assembleAnnDataCandidates(describeAnnDataProbes(probes), { slots, guessed: [] });
   const state = Object.assign(Object.create(DataStateMappingGroupMethods.prototype), { getMappingCandidates: () => candidates });
-  // Before, this read `X` and the layers' dtypes from arguments it was never given, and threw.
+  // A call without arguments still finds `X` and the layers' dtypes: it must not throw.
   assert.deepEqual(state.defaultModalityGroups('rna').log1p, { X: { base: null }, 'layer:norm': { base: null } });
   assert.deepEqual(state.defaultModalityGroups('atac').log1p, { 'layer:norm': { base: null } });
 });

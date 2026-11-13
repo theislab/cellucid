@@ -1,26 +1,26 @@
 /**
- * Visual-consistency defects found by screenshotting every panel at desktop,
- * tablet, phone and phone-landscape sizes in both themes. Each test pins the
- * geometry or color that was wrong, never a pixel snapshot.
+ * Visual consistency of every panel at desktop, tablet, phone and
+ * phone-landscape sizes in both themes. Each test pins a geometry or color,
+ * never a pixel snapshot:
  *
- * - Touch layouts drew controls for a cursor: 24-29px text buttons and
- *   fields, 13px checkboxes behind 19px labels, and 11px field text that makes
- *   iOS Safari zoom the page on focus.
- * - On a touch tablet the 260px sidebar squeezed the field select beside its
- *   four action buttons down to a few letters.
- * - Native checkboxes kept the browser's blue in some panels and the theme's
- *   ink in others.
- * - An analysis row that followed the page selector touched it.
- * - A selected "Rest of" page chip turned white-on-pale-blue under the
- *   pointer, and the chip cut every page name at 110px.
- * - The Marker Genes method select had no visible label.
- * - In-panel disclosures drew a ▲/▼ text glyph; a nested chevron inherited
- *   its parent item's open state.
- * - Keyboard shortcut descriptions started wherever each key combination
- *   happened to end.
- * - The community-annotation wizard's step text scrolled through a strip
- *   under its sticky Back/Next bar on a short screen.
- * - The multiview layout select had no accessible name.
+ * - Touch layouts draw controls for a finger: no 24-29px text buttons and
+ *   fields, 13px checkboxes behind 19px labels, or 11px field text (which makes
+ *   iOS Safari zoom the page on focus).
+ * - On a touch tablet the 260px sidebar does not squeeze the field select
+ *   beside its four action buttons down to a few letters.
+ * - Native checkboxes take the theme's ink in every panel, not the browser's
+ *   blue in some.
+ * - An analysis row that follows the page selector does not touch it.
+ * - A selected "Rest of" page chip does not turn white-on-pale-blue under the
+ *   pointer, and the chip does not cut every page name at 110px.
+ * - The Marker Genes method select has a visible label.
+ * - In-panel disclosures draw a chevron, not a ▲/▼ text glyph; a nested
+ *   chevron does not inherit its parent item's open state.
+ * - Keyboard shortcut descriptions start at one left edge, not wherever each
+ *   key combination happens to end.
+ * - The community-annotation wizard's step text does not scroll through a
+ *   strip under its sticky Back/Next bar on a short screen.
+ * - The multiview layout select has an accessible name.
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -172,162 +172,154 @@ test.describe('touch tablet', () => {
   });
 });
 
-test('every native checkbox takes the theme ink in light and dark', async ({
+test('desktop panels keep their geometry and their ink', async ({
   page,
 }) => {
   await openDataset(page);
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('.legend-item')).toHaveCount(3);
-  for (const theme of ['light', 'dark']) {
-    await page.locator('#theme-select').selectOption(theme);
-    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
-    const readAccents = () => page.evaluate(() => {
+
+  await test.step('analysis rows keep one rhythm and the page chips stay legible', async () => {
+    const panel = await openAnalysisMode(page, 'correlation');
+
+    // The row after the page selector's Deselect All stands clear of it, the
+    // same distance any two rows are apart.
+    const gaps = await panel.evaluate(element => {
+      const actions = element.querySelector('.analysis-page-actions');
+      // The options follow the page selector: their first row, then the next.
+      const rows = [...element.querySelectorAll('.analysis-options-essentials > .control-block')];
+      const next = rows[0];
+      return {
+        afterSelector: next.getBoundingClientRect().top
+          - actions.getBoundingClientRect().bottom,
+        betweenRows: rows[1].getBoundingClientRect().top
+          - rows[0].getBoundingClientRect().bottom,
+      };
+    });
+    expect(gaps.afterSelector).toBeGreaterThanOrEqual(4);
+    expect(Math.abs(gaps.afterSelector - gaps.betweenRows)).toBeLessThanOrEqual(1);
+
+    // A selected derived chip keeps its selected colors under the pointer and
+    // shows its whole name.
+    const chip = panel.locator('.chip.chip-derived[aria-pressed="true"]').first();
+    await expect(chip).toBeVisible();
+    await chip.hover();
+    const chipState = await chip.evaluate(element => {
+      const name = element.querySelector('.chip-name');
       const probe = document.createElement('span');
       probe.style.color = 'var(--color-interactive-primary)';
       document.body.appendChild(probe);
       const ink = getComputedStyle(probe).color;
       probe.remove();
-      // A checkbox the user can see. Linux WebKit does not restyle elements
-      // inside hidden subtrees (closed sections and menus) when the theme's
-      // custom properties change; it restyles them when they are shown, so
-      // only rendered boxes are what a user can see in the wrong ink.
-      const boxes = [...document.querySelectorAll('input[type="checkbox"]')]
-        .filter(box => box.getClientRects().length > 0);
       return {
+        background: getComputedStyle(element).backgroundColor,
         ink,
-        count: boxes.length,
-        other: boxes
-          .filter(box => getComputedStyle(box).accentColor !== ink)
-          .map(box => `${box.id || box.name || 'unnamed'}=${getComputedStyle(box).accentColor}`),
+        nameFits: name.scrollWidth <= name.clientWidth + 1,
       };
     });
-    // Restyling can also land a moment after the switch, so the boxes are
-    // sampled until they settle rather than once.
-    let accents = await readAccents();
-    await expect.poll(async () => {
-      accents = await readAccents();
-      return accents.other;
-    }, { message: `${theme}: checkboxes not in the theme ink` }).toEqual([]);
-    expect(accents.count).toBeGreaterThan(5);
-  }
-});
-
-test('analysis rows keep one rhythm and the page chips stay legible', async ({
-  page,
-}) => {
-  await openDataset(page);
-  const panel = await openAnalysisMode(page, 'correlation');
-
-  // The row after the page selector's Deselect All stands clear of it, the
-  // same distance any two rows are apart.
-  const gaps = await panel.evaluate(element => {
-    const actions = element.querySelector('.analysis-page-actions');
-    // The options follow the page selector: their first row, then the next.
-    const rows = [...element.querySelectorAll('.analysis-options-essentials > .control-block')];
-    const next = rows[0];
-    return {
-      afterSelector: next.getBoundingClientRect().top
-        - actions.getBoundingClientRect().bottom,
-      betweenRows: rows[1].getBoundingClientRect().top
-        - rows[0].getBoundingClientRect().bottom,
-    };
+    expect(chipState.background).toBe(chipState.ink);
+    expect(chipState.nameFits).toBe(true);
   });
-  expect(gaps.afterSelector).toBeGreaterThanOrEqual(4);
-  expect(Math.abs(gaps.afterSelector - gaps.betweenRows)).toBeLessThanOrEqual(1);
 
-  // A selected derived chip keeps its selected colors under the pointer and
-  // shows its whole name.
-  const chip = panel.locator('.chip.chip-derived[aria-pressed="true"]').first();
-  await expect(chip).toBeVisible();
-  await chip.hover();
-  const chipState = await chip.evaluate(element => {
-    const name = element.querySelector('.chip-name');
-    const probe = document.createElement('span');
-    probe.style.color = 'var(--color-interactive-primary)';
-    document.body.appendChild(probe);
-    const ink = getComputedStyle(probe).color;
-    probe.remove();
-    return {
-      background: getComputedStyle(element).backgroundColor,
-      ink,
-      nameFits: name.scrollWidth <= name.clientWidth + 1,
-    };
+  await test.step('marker genes names its method and its disclosures draw one chevron', async () => {
+    const panel = await openAnalysisMode(page, 'genesPanel');
+    // "More options", then the groups inside it: each draws one chevron and,
+    // closed inside an open item, does not inherit the item's turn.
+    const more = panel.locator('.analysis-more-options > .disclosure-header');
+    await expect(more.locator('> .disclosure-chevron')).toHaveText('');
+    await expect(more).toHaveAttribute('aria-expanded', 'false');
+    await expect(more.locator('> .disclosure-chevron')).toHaveCSS('transform', 'none');
+    await more.click();
+    await expect(more.locator('> .disclosure-chevron')).not.toHaveCSS('transform', 'none');
+    const headers = panel.locator('.analysis-options-group .disclosure-header');
+    await expect(headers).toHaveCount(4);
+    for (const header of await headers.all()) {
+      const chevron = header.locator('> .disclosure-chevron');
+      await expect(chevron).toHaveCount(1);
+      await expect(chevron).toHaveText('');
+      await expect(header).toHaveAttribute('aria-expanded', 'false');
+      await expect(chevron).toHaveCSS('transform', 'none');
+    }
+
+    // The test is named where it is chosen.
+    await panel.getByRole('button', { name: 'Test', exact: true }).click();
+    await expect(panel.getByLabel('Method', { exact: true })).toBeVisible();
+    await expect(panel.getByLabel('Method', { exact: true })).toHaveValue('wilcox');
   });
-  expect(chipState.background).toBe(chipState.ink);
-  expect(chipState.nameFits).toBe(true);
-});
 
-test('marker genes names its method and its disclosures draw one chevron', async ({
-  page,
-}) => {
-  await openDataset(page);
-  const panel = await openAnalysisMode(page, 'genesPanel');
-  // "More options", then the groups inside it: each draws one chevron and,
-  // closed inside an open item, does not inherit the item's turn.
-  const more = panel.locator('.analysis-more-options > .disclosure-header');
-  await expect(more.locator('> .disclosure-chevron')).toHaveText('');
-  await expect(more).toHaveAttribute('aria-expanded', 'false');
-  await expect(more.locator('> .disclosure-chevron')).toHaveCSS('transform', 'none');
-  await more.click();
-  await expect(more.locator('> .disclosure-chevron')).not.toHaveCSS('transform', 'none');
-  const headers = panel.locator('.analysis-options-group .disclosure-header');
-  await expect(headers).toHaveCount(4);
-  for (const header of await headers.all()) {
-    const chevron = header.locator('> .disclosure-chevron');
-    await expect(chevron).toHaveCount(1);
-    await expect(chevron).toHaveText('');
-    await expect(header).toHaveAttribute('aria-expanded', 'false');
-    await expect(chevron).toHaveCSS('transform', 'none');
-  }
+  await test.step('shortcut descriptions share one left edge and keys sit flush right', async () => {
+    await openSection(page, 'shortcuts-section');
+    const edges = await page.locator('#shortcuts-section').evaluate(section => {
+      const items = [...section.querySelectorAll('.shortcut-item')];
+      return items.map(item => ({
+        descLeft: item.querySelector('.shortcut-desc').getBoundingClientRect().left,
+        keysRight: item.querySelector('.shortcut-keys').getBoundingClientRect().right,
+      }));
+    });
+    expect(edges.length).toBeGreaterThan(15);
+    const lefts = new Set(edges.map(edge => Math.round(edge.descLeft)));
+    const rights = new Set(edges.map(edge => Math.round(edge.keysRight)));
+    expect([...lefts]).toHaveLength(1);
+    expect([...rights]).toHaveLength(1);
+    // Every group stands the same distance from the one above it.
+    const groupGaps = await page.locator('#shortcuts-section').evaluate(section => {
+      const lists = [...section.querySelectorAll('.shortcuts-list')];
+      return lists.slice(1).map((list, index) =>
+        Math.round(list.getBoundingClientRect().top
+          - lists[index].getBoundingClientRect().bottom));
+    });
+    expect(new Set(groupGaps).size).toBe(1);
+  });
 
-  // The test is named where it is chosen.
-  await panel.getByRole('button', { name: 'Test', exact: true }).click();
-  await expect(panel.getByLabel('Method', { exact: true })).toBeVisible();
-  await expect(panel.getByLabel('Method', { exact: true })).toHaveValue('wilcox');
-});
-
-test('shortcut descriptions share one left edge and keys sit flush right', async ({
-  page,
-}) => {
-  await openDataset(page);
-  await openSection(page, 'shortcuts-section');
-  const edges = await page.locator('#shortcuts-section').evaluate(section => {
-    const items = [...section.querySelectorAll('.shortcut-item')];
-    return items.map(item => ({
-      descLeft: item.querySelector('.shortcut-desc').getBoundingClientRect().left,
-      keysRight: item.querySelector('.shortcut-keys').getBoundingClientRect().right,
+  await test.step('the multiview layout select is named and takes the free width', async () => {
+    await openSection(page, 'compare-views-section');
+    // The layout row belongs to the kept-view list, shown once a view is kept.
+    await page.locator('#split-keep-view-btn').click();
+    const select = page.getByLabel('Layout', { exact: true });
+    await expect(select).toBeVisible();
+    await expect(select).toHaveAttribute('id', 'view-layout-mode');
+    const widths = await select.evaluate(element => ({
+      select: element.getBoundingClientRect().width,
+      row: element.closest('.split-view-actions').getBoundingClientRect().width,
     }));
+    expect(widths.select).toBeGreaterThan(widths.row * 0.4);
   });
-  expect(edges.length).toBeGreaterThan(15);
-  const lefts = new Set(edges.map(edge => Math.round(edge.descLeft)));
-  const rights = new Set(edges.map(edge => Math.round(edge.keysRight)));
-  expect([...lefts]).toHaveLength(1);
-  expect([...rights]).toHaveLength(1);
-  // Every group stands the same distance from the one above it.
-  const groupGaps = await page.locator('#shortcuts-section').evaluate(section => {
-    const lists = [...section.querySelectorAll('.shortcuts-list')];
-    return lists.slice(1).map((list, index) =>
-      Math.round(list.getBoundingClientRect().top
-        - lists[index].getBoundingClientRect().bottom));
-  });
-  expect(new Set(groupGaps).size).toBe(1);
-});
 
-test('the multiview layout select is named and takes the free width', async ({
-  page,
-}) => {
-  await openDataset(page);
-  await openSection(page, 'compare-views-section');
-  // The layout row belongs to the kept-view list, shown once a view is kept.
-  await page.locator('#split-keep-view-btn').click();
-  const select = page.getByLabel('Layout', { exact: true });
-  await expect(select).toBeVisible();
-  await expect(select).toHaveAttribute('id', 'view-layout-mode');
-  const widths = await select.evaluate(element => ({
-    select: element.getBoundingClientRect().width,
-    row: element.closest('.split-view-actions').getBoundingClientRect().width,
-  }));
-  expect(widths.select).toBeGreaterThan(widths.row * 0.4);
+  await test.step('every native checkbox takes the theme ink in light and dark', async () => {
+    // Last: it switches the theme.
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await expect(page.locator('.legend-item')).toHaveCount(3);
+    for (const theme of ['light', 'dark']) {
+      await page.locator('#theme-select').selectOption(theme);
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      const readAccents = () => page.evaluate(() => {
+        const probe = document.createElement('span');
+        probe.style.color = 'var(--color-interactive-primary)';
+        document.body.appendChild(probe);
+        const ink = getComputedStyle(probe).color;
+        probe.remove();
+        // A checkbox the user can see. Linux WebKit does not restyle elements
+        // inside hidden subtrees (closed sections and menus) when the theme's
+        // custom properties change; it restyles them when they are shown, so
+        // only rendered boxes are what a user can see in the wrong ink.
+        const boxes = [...document.querySelectorAll('input[type="checkbox"]')]
+          .filter(box => box.getClientRects().length > 0);
+        return {
+          ink,
+          count: boxes.length,
+          other: boxes
+            .filter(box => getComputedStyle(box).accentColor !== ink)
+            .map(box => `${box.id || box.name || 'unnamed'}=${getComputedStyle(box).accentColor}`),
+        };
+      });
+      // Restyling can also land a moment after the switch, so the boxes are
+      // sampled until they settle rather than once.
+      let accents = await readAccents();
+      await expect.poll(async () => {
+        accents = await readAccents();
+        return accents.other;
+      }, { message: `${theme}: checkboxes not in the theme ink` }).toEqual([]);
+      expect(accents.count).toBeGreaterThan(5);
+    }
+  });
 });
 
 test.describe('short screen', () => {

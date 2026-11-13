@@ -90,10 +90,10 @@ const GROUP = 'History';
 
 /**
  * The steps one page of `history.get` holds when the caller names no
- * `limit`: a step is about 340 characters there (the stress suite measured
- * 293 before `kind`, `v`, `group` and `squash`), so 200 steps are about
+ * `limit`: a step is about 340 characters there, so 200 steps are about
  * 68,000 characters, well under what a connector's tool result carries
- * (`RESULT_TEXT_CHARS`). Not a cap: any `limit` is answered.
+ * (`RESULT_TEXT_CHARS`; measured: 33_decisions_actions_domains_and_history.md).
+ * Not a cap: any `limit` is answered.
  */
 export const HISTORY_PAGE_STEPS = 200;
 if (HISTORY_PAGE_STEPS * 340 > RESULT_TEXT_CHARS / 2) throw new Error('A page of history_get must stay well under a tool result');

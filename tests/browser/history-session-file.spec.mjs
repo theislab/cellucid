@@ -101,7 +101,7 @@ test('a saved history loads in another page at its active step, with every step 
   await loadSession(page, 'history.cellucid-session', bytes);
   await expect.poll(() => messages(page), { timeout: 60_000 }).toContain(RESTORED);
   expect(await activeField(page)).toBe('score');
-  // Its trackers are added beside the page's own (named apart), the file's active one shown (History v2 Q2).
+  // Its trackers are added beside the page's own (named apart), the file's active one shown.
   expect(await shownSteps(page)).toEqual({ labels: first.labels, trackers: [...first.trackers, ...first.trackers.map(name => `${name} (shared)`), 'Second look'] });
   // Its steps undo as they did where it was saved.
   await page.evaluate(() => window._cellucidHistories.current().undo());
@@ -111,7 +111,7 @@ test('a saved history loads in another page at its active step, with every step 
   expect(errors).toEqual([]);
 });
 
-test('a session file dropped on the page loads as Load… does: its dataset opens with it, its history beside (L25-8)', async ({ page }, testInfo) => {
+test('a session file dropped on the page loads as Load… does: its dataset opens with it, its history beside', async ({ page }, testInfo) => {
   const errors = productErrors(page);
   const sample = id => `/?sampleCatalog=${encodeURIComponent(SAMPLE_CATALOG)}&dataset=${id}&acceptance=history-session-file-ci`;
   const pages = () => page.evaluate(() => window._cellucidState.getHighlightPages().map(each => each.name));
@@ -153,7 +153,7 @@ test('a format-3 session file is refused naming its version, and nothing changes
   expect(errors.filter(line => !line.includes('session format 3'))).toEqual([]);
 });
 
-test('a file from a newer Cellucid with a part of the state this version lacks is restored but for that part, named (F164)', async ({ page }, testInfo) => {
+test('a file from a newer Cellucid with a part of the state this version lacks is restored but for that part, named', async ({ page }, testInfo) => {
   const errors = productErrors(page);
   await openDataset(page);
   await page.locator('#continuous-field').selectOption({ label: 'score' });

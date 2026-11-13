@@ -4,13 +4,12 @@
  *
  * A cancellation is an `AbortError` with a kind (user, superseded, closed,
  * released, page-left), made by `cancelled()`/`cancel()` and told apart by
- * `isCancellation()`/`cancellationKind()` alone. Before this module, about 45
- * private copies of `throwIfAborted`/`abortError`/`isAbort` disagreed on what
- * they threw, 13 subsystem codes each had a predicate that checked only its
- * own, and aborts with a plain `Error` or with no reason at all were shown as
- * failures by whichever check they passed through (audit 2026-10-28,
- * CE-03/CE-08, O-06). The guard forbids each of those forms outside the one
- * module, so a new one cannot come back.
+ * `isCancellation()`/`cancellationKind()` alone. Private copies of
+ * `throwIfAborted`/`abortError`/`isAbort` would disagree on what they throw,
+ * a subsystem predicate that checks only its own code misses the others, and
+ * an abort with a plain `Error` or with no reason at all is shown as a
+ * failure by whichever check it passes through. The guard forbids each of
+ * those forms outside the one module, so a new one cannot come back.
  */
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -123,7 +122,7 @@ test('in the layers that stop work, every abort says its kind', () => {
 test('every platform feature that sets the browser floor is checked before startup', () => {
   // `AbortSignal.any` is the newest feature the app calls (Chrome 116,
   // Firefox 124, Safari 17.4): startup refuses an older browser up front
-  // instead of failing in the middle of an opening (CE-06).
+  // instead of failing in the middle of an opening.
   const uses = files.filter(file => /AbortSignal\.any\(/.test(file.text));
   assert.ok(uses.length > 0, 'the floor feature is still used (else drop it from BROWSER_FEATURES)');
   assert.ok(BROWSER_FEATURES.some(feature => feature.name === 'AbortSignal.any'));

@@ -9,8 +9,9 @@
  * `values[k]` (strictly increasing, all below `readRows`), every other cell
  * below `readRows` 0, and every cell from `readRows` on NaN (not read). At
  * 10M cells, coloring a gene and measuring its range from the form is a
- * word fill and its few entries (~4 ms); from the column it is two passes
- * over every cell on the main thread (~50 ms; `continuous-colors.js`).
+ * word fill and its few entries; from the column it is two passes
+ * over every cell on the main thread (`continuous-colors.js`; measured:
+ * 23_decisions_partial_reading.md).
  *
  * The reader worker makes the form where the column is made, in one pass off
  * the main thread (`sparseFormOf`), and only when it is smaller than the

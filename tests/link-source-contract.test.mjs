@@ -238,7 +238,7 @@ test('one linked file is its dataset, under the id it states', async t => {
   source.disconnect();
 });
 
-test('a network failure is what the transport labeled one, never a message that names "fetch" or "network" (RCD-1)', async t => {
+test('a network failure is what the transport labeled one, never a message that names "fetch" or "network"', async t => {
   silenceNotifications(t);
   serveFixtureHost(t, { prefix: WEB, root: FIXTURES });
   const codeOf = async thrown => {

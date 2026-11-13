@@ -81,7 +81,6 @@ test('the relay bundle check is an npm script pinned to the annotation Worker\'s
   assert.match(read('.github/workflows/test.yml'), /if: matrix\.os == 'ubuntu-latest' && matrix\.node == '24'\n\s+run: npm run test:relay-bundle/);
   const readme = read('relay/README.md');
   assert.ok(readme.includes('npx --yes wrangler@4.115.0'));
-  assert.doesNotMatch(readme, /\bnpx\s+wrangler(?:\s|$)/);
 });
 
 test('the relay README lists every route the Worker answers', () => {

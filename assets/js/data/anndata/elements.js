@@ -67,8 +67,8 @@ export const ZARR_FORMAT = Object.freeze({ storage: 'Zarr', file: 'AnnData Zarr'
  * finds it loaded, whatever step of the opening or which reading names it.
  * What waits is what lies inside an element: a categorical's codes and
  * categories, a nullable column's values and mask, a graph's arrays, a
- * nested `uns` entry's children (about half of a CELLxGENE file's objects:
- * HLCA's 259); the reading that reads an element loads it first
+ * nested `uns` entry's children (about half of a CELLxGENE file's
+ * objects); the reading that reads an element loads it first
  * (`AnnDataReader._ready`).
  */
 export const ANNDATA_OPENING_PATHS = Object.freeze([

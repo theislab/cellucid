@@ -347,10 +347,9 @@ export function initDatasetCard({
    * of 22 MB read in 8 requests" wraps to two lines where its plain total
    * takes one, and drops "Reading…" 1.5 s after the last bytes), and the
    * whole box while the dataset is read again (Apply in Cells to open): its
-   * facts give way to "Reading … again…" and come back. Each change moved
-   * every control below it, under a pointer aimed at one (macOS WebKit, Web
-   * contracts run 41255961977: the second Apply of a share round trip landed
-   * 15 px below the button, which had moved up, and did nothing). So the
+   * facts give way to "Reading … again…" and come back. Each change would move
+   * every control below it, under a pointer aimed at one: a click would land
+   * below a button that had moved up, and do nothing. So the
    * read line keeps the most room it took for the dataset shown, and the box
    * keeps its room while that dataset is read again; a newly shown dataset
    * starts afresh.

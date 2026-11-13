@@ -269,7 +269,7 @@ export const STILL_FLOW_STEPS = 48;
 export const STILL_FLOW_STEP_SECONDS = 1 / 60;
 
 /**
- * The still picture of the flow drawn under reduced motion (F103): the
+ * The still picture of the flow drawn under reduced motion: the
  * particles respawn from fixed seeds and advance `STILL_FLOW_STEPS` fixed
  * steps at fixed times, all in one frame, each step drawn into a cleared
  * trail with the fade the later steps would have applied in the moving flow
@@ -852,6 +852,7 @@ export class VelocityOverlay extends OverlayBase {
     // ago uploads nothing; published positions are never written, so the
     // texture of an array stays its exact snapshot.
     this._positionTexturePool = new Map();
+    /** @type {(positions: Float32Array) => boolean} */
     this._positionRetained = () => false;
     this._positionsRefByView = new Map();
     this._pendingDerivedTextureDeletes = new Map();
@@ -1686,9 +1687,9 @@ export class VelocityOverlay extends OverlayBase {
       if (lod >= 0) {
         // Coarseness is measured from full detail, not from zero. LOD level 0 is
         // the *coarsest* level and the last level is full detail, so comparing
-        // the raw level against ascending thresholds reads the ladder backwards:
-        // it awarded the full particle count to the coarsest level and disposed
-        // the overlay at full detail, which is the exact inverse of the
+        // the raw level against ascending thresholds would read the ladder
+        // backwards: the full particle count would go to the coarsest level
+        // and the overlay would be disposed at full detail, the inverse of the
         // documented behavior ("the flow vanishes with the camera zoomed out").
         if (typeof ctx.getLodLevelCount !== 'function') {
           throw new TypeError(
@@ -5153,8 +5154,8 @@ export class VelocityOverlay extends OverlayBase {
           // capacity, so a refill with fewer visible cells keeps it too. New
           // storage is allocated in one slice and its error queue read once,
           // for both textures, in the next: by then the GPU process has taken
-          // the uploads, so the read does not wait on them (two reads in the
-          // allocating slice cost up to 90 ms a view on Suo).
+          // the uploads, so the read does not wait on them (measured:
+          // 28_decisions_rendering_layers.md).
           const previousTextureInfo = state.textureInfo;
           const previousVisibilityTextureInfo =
             state.visibilityTextureInfo;
@@ -5310,7 +5311,8 @@ export class VelocityOverlay extends OverlayBase {
 
   /**
    * A view's spawn table at once (`_createSpawnTableBuild` run to its end):
-   * the cells a build from `start` takes.
+   * the cells a build from `start` takes. The tests compare a build made in
+   * slices with it.
    *
    * @param {Uint8Array} transparency
    * @param {number} cellCount
@@ -5318,7 +5320,6 @@ export class VelocityOverlay extends OverlayBase {
    * @param {{positions: Float32Array, dimension: number}|null} [placement]
    * @param {number} [start]
    * @returns {Uint32Array}
-   * @private
    */
   _buildSpawnTable(transparency, cellCount, lodMembership, placement = null, start = 0) {
     const build = this._createSpawnTableBuild(transparency, cellCount, lodMembership, placement, start);

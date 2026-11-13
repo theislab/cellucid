@@ -109,7 +109,7 @@ python scripts/generate-browser-catalog-fixtures.py
   16-bit copy of a code names another category; five gamma cells are missing.
 - `integer-identifiers.h5ad` ("Integer identifiers") is the current-ui cells
   with `donor_id`, unsigned 64-bit integers four of whose five values are past
-  2^53 (read as their exact text, F116), and `n_counts`, 64-bit integers within
+  2^53 (read as their exact text), and `n_counts`, 64-bit integers within
   2^53 (numbers), and `tissue` with an empty and a blank category (shown
   `(empty)` and `(blank)`); `integer-identifiers.spec.mjs` opens it.
 - `replay-other.h5ad` ("Replay fixture") is the current-ui cells as another
@@ -137,3 +137,8 @@ Datasets whose shape a spec chooses at run time -- a cell count, a category
 inventory, a damaged entry -- are built in memory by
 `tests/browser/helpers/anndata-zarr-zip.mjs` and served by request
 interception, not kept on disk.
+
+Three small pages here are harnesses, not data: `webgl-harness.html` (an empty page the WebGL
+specs draw on), `analysis-plot-harness.html` (the analysis plots' layout, opened through
+`tests/browser/helpers/plot-harness.mjs`) and `community-annotation-harness.html` (the page
+`tests/browser/community-annotation-startup-lifecycle.spec.mjs` starts the module in).

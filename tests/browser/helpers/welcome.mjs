@@ -31,8 +31,7 @@ export function continueOffer(page) {
 
 /**
  * Continue the history this browser kept (the offer's Continue, never Start
- * fresh: a blanket "dismiss what is in the way" that clicked Start fresh
- * dropped the very history a reload test meant to continue).
+ * fresh, which drops the very history a reload test means to continue).
  */
 export async function continueWhereLeftOff(page, { timeout = 60_000 } = {}) {
   const offer = continueOffer(page);

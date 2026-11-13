@@ -13,8 +13,9 @@ import { OperationType } from '../../compute/operations.js';
 /**
  * Finite values from which a page's box statistics are computed by an
  * analysis worker. They need every value in ascending order — a linear-time
- * sort, still 30 ms of main-thread work for a million values and ten times
- * that for ten million; below this the hand-off costs more than it saves.
+ * sort, still main-thread work that grows with the page (measured:
+ * 37_decisions_analysis.md); below this the hand-off costs more than it
+ * saves.
  */
 const WORKER_MIN_VALUES = 100_000;
 

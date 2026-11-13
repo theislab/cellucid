@@ -110,7 +110,7 @@ test('opening a dataset is stepless, asks only once its cost is known, and is a 
   assert.deepEqual(tool.annotations, {
     title: 'Open a dataset', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
   });
-  // Whether the download is asked is the person's setting, told apart (L26-9).
+  // Whether the download is asked is the person's setting, told apart.
   assert.match(tool.description, /Replaces the open dataset, whose history stays kept in this browser \(Undo does not bring it back\); records no step\.$/);
   const list = mcpToolOf(document.actions.find(action => action.type === 'datasets.list'));
   assert.equal(list.annotations.readOnlyHint, true);
@@ -299,7 +299,7 @@ test('a dataset of My datasets opens as its menu opens it; a file only where the
 test('a link opens as the address bar opens it; its failure is the opening\'s own sentence', async t => {
   const p = page();
   t.after(p.remove);
-  // The person allows the links the agent names (asked: they were not seen in this tab, F121).
+  // The person allows the links the agent names (asked: they were not seen in this tab).
   p.dispatcher.setConfirmer(() => true);
   const { outcome } = await p.dispatcher.dispatch('dataset.open', { name: 'GSE123456' }, { origin: 'agent', agent: 'Claude' });
   assert.deepEqual(p.calls, [['address', 'GSE123456']]);
@@ -378,7 +378,7 @@ test('a whole-file download of the agent\'s own opening is asked about with its 
   let yes = true;
   // Asked about the download by the opening itself (the start's question is the person's permissions).
   p.dispatcher.setConfirmer(({ detail, stage, confirm }) => {
-    // The start's question is the person's permissions; the link, not seen in this tab, is allowed (F121).
+    // The start's question is the person's permissions; the link, not seen in this tab, is allowed.
     if (stage === 'start' || confirm === 'unseen-link') return true;
     asked.push(detail);
     return yes;
@@ -447,7 +447,7 @@ test('an agent\'s action names its connection; the person being asked is heard b
   await assert.rejects(dispatcher.dispatch('thing.open', {}, { origin: 'agent', agent: 'Claude', connection: { id: 'g', kind: 'email' } }), /names its id and kind/);
 });
 
-// --- history.saved.open (F114): Load…'s Open as an action ---------------------
+// --- history.saved.open: Load…'s Open as an action ---------------------
 
 const STATES = Object.freeze([
   { id: 'state-he', kind: 'autosave', name: null, lastStep: 'Colored by gene SFTPC', dataset: { id: 'he', name: 'Developing human lung (He)' }, steps: 12, openable: true },
@@ -504,7 +504,7 @@ test('a saved state of another dataset opens its dataset first, then its history
   });
 });
 
-test('a saved state opened but for a part tells the agent which part, in the words the person was told (F155)', async t => {
+test('a saved state opened but for a part tells the agent which part, in the words the person was told', async t => {
   const said = 'Session restored but for 1 part. Expression values could not be restored: it was saved by an earlier version of Cellucid (0.9.7), and this version cannot read this part. It is left as it was shown.';
   const p = page({ current: PANCREAS_SHOWN, saved: savedStates({ opened: true, problem: null, code: null, notRestored: said }) });
   t.after(p.remove);
@@ -577,9 +577,9 @@ test('a whole-file download of a saved state\'s dataset is asked about as the ag
   assert.match(asked[0], /^It downloads the whole file he\.h5ad \(2\.3 GB\) into this browser: /);
 });
 
-// ---- F121: a link the person has not seen in this tab is asked about first ----------------
+// ---- a link the person has not seen in this tab is asked about first ----------------
 
-test('F121: an agent\'s link the person has not seen in this tab is asked about before anything is requested; declined, nothing is fetched', async t => {
+test('an agent\'s link the person has not seen in this tab is asked about before anything is requested; declined, nothing is fetched', async t => {
   forgetSeenAddresses();
   t.after(forgetSeenAddresses);
   const p = page();
@@ -612,7 +612,7 @@ test('F121: an agent\'s link the person has not seen in this tab is asked about 
   assert.deepEqual(p.calls, [['address', exfiltrating]]);
 });
 
-test('F121: a link the person typed or pasted, one open now and one of My datasets open without asking; samples and their datasets are never asked', async t => {
+test('a link the person typed or pasted, one open now and one of My datasets open without asking; samples and their datasets are never asked', async t => {
   forgetSeenAddresses();
   t.after(forgetSeenAddresses);
   const p = page({ current: { sourceType: 'link', id: 'url:open', name: 'Open now', identity: 'id-open', cells: 50 } });
@@ -640,7 +640,7 @@ test('F121: a link the person typed or pasted, one open now and one of My datase
   assert.deepEqual(questions, []);
 });
 
-test('F121: the open dataset\'s own link is seen; spellings of one address are one', () => {
+test('the open dataset\'s own link is seen; spellings of one address are one', () => {
   forgetSeenAddresses();
   noteSeenAddress('  https://EXAMPLE.org:443/a.h5ad  ');
   assert.equal(isSeenAddress('https://example.org/a.h5ad'), true);
@@ -654,7 +654,7 @@ test('F121: the open dataset\'s own link is seen; spellings of one address are o
   assert.equal(isSeenAddress('https://example.org/a.h5ad'), false);
 });
 
-test('F121: the permission kind is asked in every preset that runs anything, refused read-only; the tool says the rule, the agent is told the setting', () => {
+test('the permission kind is asked in every preset that runs anything, refused read-only; the tool says the rule, the agent is told the setting', () => {
   const question = { meta: { origin: 'agent', agent: 'Claude' }, confirm: 'unseen-link', stage: 'handler' };
   assert.equal(decide(question, DEFAULT_PERMISSIONS).decision, 'ask');
   assert.equal(decide(question, { kinds: PERMISSION_MODES['allow-undoable'].kinds }).decision, 'ask');
@@ -664,7 +664,7 @@ test('F121: the permission kind is asked in every preset that runs anything, ref
   const opener = document.actions.find(action => action.type === 'dataset.open');
   assert.equal(opener.opensLinks, true);
   assert.deepEqual(document.actions.filter(action => action.opensLinks).map(action => action.type), ['dataset.open']);
-  // The tool list never changes with the settings (L26-9): its description says the rule, the agent is told the setting apart.
+  // The tool list never changes with the settings: its description says the rule, the agent is told the setting apart.
   const tool = mcpToolsOf(document).find(each => each.name === 'dataset_open');
   assert.match(tool.description, /A link, accession or server the person has not typed, pasted or opened in this tab is asked of them first/);
   assert.equal(tool.annotations.openWorldHint, true);
@@ -673,7 +673,7 @@ test('F121: the permission kind is asked in every preset that runs anything, ref
   assert.throws(() => defineAction({ ...getActionCatalog().get('datasets.list'), confirmAt: undefined, opensLinks: true }), /is a read, which fetches nothing an agent names/);
 });
 
-test('F121: only an opensLinks action may ask about a link, and only an agent\'s is asked', async () => {
+test('only an opensLinks action may ask about a link, and only an agent\'s is asked', async () => {
   const catalog = createActionCatalog([
     defineAction({
       type: 'thing.fetch', title: 'Fetch a thing', summary: 'Fetches a thing.', group: 'Things',

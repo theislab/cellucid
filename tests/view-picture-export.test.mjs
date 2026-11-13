@@ -1,13 +1,11 @@
 /**
- * L24-1 (live pass 6, 2026-11-11): an agent preparing Figure 2 could not see
- * the figure it was about to export. `view.picture` drew one view with plain
- * settings (the screen's background and grid, no title, 12 px text, no
- * frame); after setting a white background, no grid, a frame and 24 px text
- * it told the person three times "my previews don't show the export
- * settings, please check the file", and never saw a panel title cut off.
- * `view.picture` now takes `source: 'export'`: the figure exactly as Export
- * would download it (the Figure export panel's settings, every view while
- * Export all views is on), scaled down into the box asked for.
+ * An agent preparing a figure sees the figure it is about to export:
+ * `view.picture` takes `source: 'export'`, the figure exactly as Export would
+ * download it (the Figure export panel's settings, every view while Export
+ * all views is on), scaled down into the box asked for. A picture of one view
+ * with plain settings (the screen's background and grid, no title, 12 px
+ * text, no frame) cannot show a white background, no grid, a frame and 24 px
+ * text, or a panel title cut off.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -84,7 +82,7 @@ test('source "export" is the figure Export would write, scaled down into the box
   assert.equal(out.width, 800);
   assert.equal(out.height, 610);
   assert.equal(drawn.length, 1);
-  // Its printed size first (F271): millimetres, and a PNG download's pixels at its DPI.
+  // Its printed size first: millimetres, and a PNG download's pixels at its DPI.
   assert.equal(out.notes[0], 'The figure is 416 × 317 mm as printed (its text at its point sizes); a PNG at 300 dpi is 4913 × 3747 px, an SVG the same size in millimetres.');
   assert.match(out.notes[1], /^Its height follows from its plots' shapes/);
   assert.equal(out.notes[2], 'The picture is the figure at 96 dpi (1572 × 1199 px), shown at 51% (800 × 610).');
@@ -127,7 +125,7 @@ test('the figure\'s own refusals and notes reach the agent', async () => {
   assert.deepEqual(out.notes.slice(3), ['Velocity overlay not exported: …']);
 });
 
-test('the figure says its printed size, and when it is wider than the width asked, why (L25-10, F271)', async () => {
+test('the figure says its printed size, and when it is wider than the width asked, why', async () => {
   const signal = new AbortController().signal;
   const picture = async (figure, askedWidth) => (await setUp({
     renderExportPicture: async () => ({ blob: new Blob([pngBytes(figure.width, figure.height)]), notes: [], plot: null, asked: { width: askedWidth }, dpi: 300 }),
@@ -148,7 +146,7 @@ test('the figure says its printed size, and when it is wider than the width aske
   assert.equal(filled.some(note => /legend stands below/.test(note)), false);
 });
 
-test('with the preview\'s color-vision simulation on, the export picture is drawn as that reader sees it (L25-11)', async () => {
+test('with the preview\'s color-vision simulation on, the export picture is drawn as that reader sees it', async () => {
   const signal = new AbortController().signal;
   const { reads, drawn } = setUp({ renderExportPicture: async () => ({ blob: new Blob([pngBytes(400, 300)]), notes: [], plot: null, asked: { width: 400 }, dpi: 300, colorblindMode: 'deuteranopia' }) });
   const out = await reads.picture({ source: 'export', width: 800, height: 800, legend: true }, { signal });

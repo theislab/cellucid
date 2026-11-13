@@ -17,7 +17,7 @@
  *   its connection (its permissions, the dataset's data switch, what the
  *   History settings leave out: `../settings-told.js`) after the first
  *   result of the connection and after any result once they changed.
- * - **tells the agent what the person did since its last call** (F270, as
+ * - **tells the agent what the person did since its last call** (as
  *   the chat bar tells its model with the person's next message): the
  *   history each connection saw as its last call ended (`historySeen`) is
  *   kept for the tab (`sessionStorage`, so a reload keeps it), and the next
@@ -258,7 +258,7 @@ export function createAgentCalls({
     const controller = new AbortController();
     calls.set(id, controller);
     const turn = turnFor(connection.id);
-    // What the person did since this connection's last call, said with this call's result (F270);
+    // What the person did since this connection's last call, said with this call's result;
     // where the tracker stands as the call begins (a step someone else takes meanwhile is told next time).
     const sinceTold = historyToTell(connection.id);
     const startTree = shownTree();

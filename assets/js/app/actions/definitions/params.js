@@ -58,7 +58,7 @@ export const CATEGORY_FIELD = Object.freeze({
   ...FIELD,
   description: 'A categorical column of the cells by name (source "obs").',
   properties: {
-    // The const says it; a description here repeated the field's own in every tool (~230 tokens a call).
+    // The const says it; a description here would repeat the field's own in every tool.
     source: { type: 'string', const: 'obs' },
     key: { type: 'string', minLength: 1, description: 'The column name as the app shows it.' },
   },
@@ -197,7 +197,7 @@ export function fieldArgument(field) {
 export function categoriesWords(labels, quote = PLAIN_QUOTE, noun = ['category', 'categories']) {
   if (labels.length === 1) return quote.bare(labels[0]);
   if (labels.length <= 3) return `${labels.slice(0, -1).map(quote.bare).join(', ')} and ${quote.bare(labels.at(-1))}`;
-  return formatCountOf(labels.length, ...noun);
+  return formatCountOf(labels.length, noun[0], noun[1]);
 }
 
 /** A coalescing key for steps on one field (a slider drag on its range). */

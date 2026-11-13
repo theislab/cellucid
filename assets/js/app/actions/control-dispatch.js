@@ -19,6 +19,7 @@ import { getNotificationCenter } from '../notification-center.js';
 import { getOpeningProgress } from '../../data/opening-progress.js';
 import { isCancellation } from '../../utils/abort.js';
 import { failureDetails, failureSentence, isReported, sayFailure } from '../../utils/errors.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 /**
  * A failure nobody needs to hear of (again): superseded by a newer choice,
@@ -42,8 +43,8 @@ function sayDispatchFailure(error, failure = null) {
  * Say a dispatch's failure (`failure`: what was being done, said before
  * anything but a refusal); nothing for a quiet one. It is about what was
  * open when the control was used, so the next opening withdraws it
- * (`untilNextOpening`; R9U-13: a field's failure stayed through three
- * datasets opened after it).
+ * (`untilNextOpening`): a field's failure would otherwise stay through the
+ * datasets opened after it.
  */
 export function reportActionFailure(error, { failure = null, category = 'filter' } = {}) {
   if (isQuietFailure(error)) return;
@@ -117,7 +118,9 @@ export function createLatestDispatch(type, { failure = null, category = 'filter'
         next = JSON.stringify(params) === runningKey ? null : params;
         return;
       }
-      idle = new Promise(resolve => { resolveIdle = resolve; });
+      const gate = promiseWithResolvers();
+      idle = gate.promise;
+      resolveIdle = gate.resolve;
       run(params);
     },
     /** Drop the value waiting to be dispatched (the person stopped the work). */

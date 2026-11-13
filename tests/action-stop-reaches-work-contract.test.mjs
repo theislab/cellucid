@@ -1,10 +1,9 @@
 /**
- * An action's Stop reaches the work its implementation waits for (bug hunt
- * F147). The dispatcher waits for a stopped action to end before it puts
- * back what the action changed (LB-1: never a half-made change), so a wait
- * not tied to the action's signal holds every later history move and every
- * action on its domains until that work ends. Each shared wait below now
- * takes the signal:
+ * An action's Stop reaches the work its implementation waits for. The
+ * dispatcher waits for a stopped action to end before it puts back what the
+ * action changed (never a half-made change), so a wait not tied to the
+ * action's signal holds every later history move and every action on its
+ * domains until that work ends. Each shared wait below takes the signal:
  *
  * - a view's embedding (`setViewRepresentation`, under `view.embedding.*`
  *   and the `views` domain's restore): stopped while it waits for its turn

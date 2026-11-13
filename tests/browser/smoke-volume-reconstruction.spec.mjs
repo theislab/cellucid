@@ -339,22 +339,27 @@ test('empty-space skipping through the occupancy volume loses no smoke', async (
       densityMultiplier: 1,
       stepMultiplier: 1.5,
     };
-    const full = marchVolume(gl, options);
-    const skipped = marchVolume(gl, { ...options, occupancyTexture: derived.occupancyTexture });
+    // With and without the per-pixel jitter of each ray's first sample.
     let paintedFull = 0;
-    let lost = 0;
-    let gained = 0;
+    let differing = 0;
     let maxDifference = 0;
-    let sumDifference = 0;
-    for (let y = 0; y < full.size; y++) {
-      for (let x = 0; x < full.size; x++) {
-        const a = full.alphaAt(x, y);
-        const b = skipped.alphaAt(x, y);
-        if (a > 0) paintedFull++;
-        if (a > 2 && b === 0) lost++;
-        if (b > 2 && a === 0) gained++;
-        maxDifference = Math.max(maxDifference, Math.abs(a - b));
-        sumDifference += Math.abs(a - b);
+    const first = [];
+    for (const jitter of [false, true]) {
+      const full = marchVolume(gl, { ...options, jitter });
+      const skipped = marchVolume(gl, { ...options, jitter, occupancyTexture: derived.occupancyTexture });
+      for (let y = 0; y < full.size; y++) {
+        for (let x = 0; x < full.size; x++) {
+          if (!jitter && full.alphaAt(x, y) > 0) paintedFull++;
+          const at = ((y * full.size) + x) * 4;
+          let delta = 0;
+          for (let channel = 0; channel < 4; channel++) {
+            delta = Math.max(delta, Math.abs(full.pixels[at + channel] - skipped.pixels[at + channel]));
+          }
+          if (delta === 0) continue;
+          differing++;
+          maxDifference = Math.max(maxDifference, delta);
+          if (first.length < 8) first.push([jitter, x, y, Array.from(full.pixels.subarray(at, at + 4)), Array.from(skipped.pixels.subarray(at, at + 4))]);
+        }
       }
     }
     gl.deleteTexture(built.texture);
@@ -363,10 +368,9 @@ test('empty-space skipping through the occupancy volume loses no smoke', async (
     disposeDensityPipelineResources(gl);
     return {
       paintedFull,
-      lost,
-      gained,
+      differing,
       maxDifference,
-      meanDifference: sumDifference / (full.size * full.size),
+      first,
       occupancyGridSize: derived.occupancyGridSize,
       lightGridSize: derived.lightGridSize,
       error: gl.getError(),
@@ -377,10 +381,10 @@ test('empty-space skipping through the occupancy volume loses no smoke', async (
   expect(comparison.occupancyGridSize).toBe(16);
   expect(comparison.lightGridSize).toBe(32);
   expect(comparison.paintedFull).toBeGreaterThan(2000);
-  // No pixel the full march paints is dropped by the skip, none is invented,
-  // and the rest differ only by the sample phase a leap re-aligns.
-  expect(comparison.lost).toBe(0);
-  expect(comparison.gained).toBe(0);
-  expect(comparison.meanDifference).toBeLessThan(0.5);
-  expect(comparison.maxDifference).toBeLessThanOrEqual(24);
+  // A leap lands on a sample the full march takes, and every sample it skips
+  // reads zero: the skipped march draws the full march's pixels, byte for byte.
+  expect(
+    comparison.differing,
+    `pixels that differ (max delta ${comparison.maxDifference}, first ${JSON.stringify(comparison.first)})`,
+  ).toBe(0);
 });

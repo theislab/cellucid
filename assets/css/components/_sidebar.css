@@ -394,7 +394,7 @@
    page's ×, `_filters.css`), named "Remove View 2" — no bordered pill, no fill.
    Quiet by the secondary text color (a quiet button's), never by opacity:
    faded to 50% it read at 3.22:1, and the tertiary token at 3.90:1 on the
-   view row (lens-a11y LF-10); on the selected row it takes the row's inverse
+   view row; on the selected row it takes the row's inverse
    color. */
 .split-badge-remove {
   background: none;

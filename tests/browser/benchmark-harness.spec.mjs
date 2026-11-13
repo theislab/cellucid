@@ -4,7 +4,7 @@
  * This spec proves the harness works. It is deliberately not a baseline: the
  * point counts are small, the windows are short, and no result it prints may
  * be recorded as a performance number. What it must establish is that the
- * harness can observe the things the previous harness structurally could not:
+ * harness can observe what a measurement needs:
  *
  * - the scripted camera actually crosses LOD levels and moves geometry out of
  *   the frustum, rather than being assumed to;
@@ -26,8 +26,8 @@ import { adaptiveMinimumLevel } from '../../assets/js/rendering/high-perf/lod-le
 const SMOKE_POINT_COUNT = 120_000;
 /** The renderer's level-of-detail ladder for the smoke dataset, coarse to fine. */
 const SMOKE_LADDER = lodLadder(SMOKE_POINT_COUNT);
-// Two different numbers for two different things, and conflating them is what
-// this spec got wrong. `FULL_DETAIL_LADDER_INDEX` is the rung you force to ask
+// Two different numbers for two different things.
+// `FULL_DETAIL_LADDER_INDEX` is the rung you force to ask
 // for the whole cloud. `FULL_DETAIL_REPORTED_LEVEL` is what the renderer
 // publishes once it draws it: full detail is not a reduced level, so it draws
 // from the full buffer and reports -1, exactly as the LOD membership contract
@@ -50,7 +50,7 @@ const PROCESS_INTENSIVE = Object.freeze({
 });
 
 // The measured window's length, passed into the page and asserted against on the
-// way out. A literal on each side is how `samples` came to expect 180 frames
+// way out. A literal on each side would let `samples` expect 180 frames
 // from a window configured for 60.
 const SMOKE_WARMUP_FRAMES = 10;
 const SMOKE_MEASURE_FRAMES = 60;
@@ -197,7 +197,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   // Adaptive selection follows the camera at every dataset size. Its floor is
   // the smaller of an absolute point budget and a fixed reduction cap, so a
   // 120,000-point cloud — far inside the budget, where an absolute-budget-only
-  // floor pinned every distance to full detail and made `Auto` inert — still
+  // floor would pin every distance to full detail and make `Auto` inert — still
   // has levels between full detail and its floor for the scripted path to cross.
   const reportedLodLevels = outcome.probe.distinctLodLevels;
   expect(reportedLodLevels.length).toBeGreaterThan(1);
@@ -249,7 +249,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   );
   expect(outcome.probe.minVisiblePoints).toBeLessThan(SMOKE_POINT_COUNT);
 
-  // The upload counters must work without any renderer change. Culling now
+  // The upload counters must work without any renderer change. Culling
   // draws node ranges out of the stored draw order, so neither a moving nor a
   // still camera publishes an element buffer or uploads anything at all, and
   // nothing in the frame waits on a synchronous GL query.
@@ -348,171 +348,165 @@ test('the view-count axis publishes real views, any number of them', PROCESS_INT
   expect(browserErrors).toEqual([]);
 });
 
-test('synthetic generation runs off the main thread', PROCESS_INTENSIVE, async ({ page }) => {
+// One opening: nothing here loads what it generates, so the steps share the page.
+test('synthetic generation: off the main thread, the same bytes as the main thread builds, and an aborted one ends', PROCESS_INTENSIVE, async ({ page }) => {
   test.setTimeout(600_000);
   const browserErrors = [];
   page.on('pageerror', error => {
     browserErrors.push(`page: ${error.stack || error.message}`);
   });
 
-  // The audit below records every worker the page constructs while it is
-  // installed, so it starts once the start dataset is open: its reader
-  // workers are the opening's, not the generation's. The welcome dialog shows
-  // before that, and on a loaded machine the opening's workers otherwise
-  // land inside the audit.
+  // The first step records every worker the page constructs while its audit
+  // is installed, so the start dataset is open before it: its reader workers
+  // are the opening's, not the generation's.
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', { timeout: 120_000 });
 
-  const result = await page.evaluate(
-    async ({ moduleUrl, count }) => {
-      const harnessModule = await import(moduleUrl);
-      // Audit the runtime boundary itself. Frame delivery is allowed to be
-      // throttled independently from worker scheduling, especially in a
-      // headless background tab, so RAF counts cannot prove thread ownership.
-      const NativeWorker = window.Worker;
-      const workers = [];
-      window.Worker = new Proxy(NativeWorker, {
-        construct(target, args) {
-          workers.push({
-            url: String(args[0]),
-            type: args[1]?.type ?? null,
+  await test.step('synthetic generation runs off the main thread', async () => {
+    const result = await page.evaluate(
+      async ({ moduleUrl, count }) => {
+        const harnessModule = await import(moduleUrl);
+        // Audit the runtime boundary itself. Frame delivery is allowed to be
+        // throttled independently from worker scheduling, especially in a
+        // headless background tab, so RAF counts cannot prove thread ownership.
+        const NativeWorker = window.Worker;
+        const workers = [];
+        window.Worker = new Proxy(NativeWorker, {
+          construct(target, args) {
+            workers.push({
+              url: String(args[0]),
+              type: args[1]?.type ?? null,
+            });
+            return Reflect.construct(target, args);
+          },
+        });
+
+        const startedAt = performance.now();
+        let data;
+        try {
+          data = await harnessModule.generateSyntheticDataOffThread({
+            pattern: 'atlas',
+            count
           });
-          return Reflect.construct(target, args);
-        },
+        } finally {
+          window.Worker = NativeWorker;
+        }
+        return {
+          wallMs: performance.now() - startedAt,
+          workerMs: data.elapsedMs,
+          workers,
+          positions: data.positions.length,
+          colors: data.colors.length,
+          dimensionLevel: data.dimensionLevel,
+          positionsAreFloat32: data.positions instanceof Float32Array,
+          colorsAreUint8: data.colors instanceof Uint8Array
+        };
+      },
+      { moduleUrl: HARNESS_MODULE, count: 1_000_000 }
+    );
+
+    expect(result.positions).toBe(3_000_000);
+    expect(result.colors).toBe(4_000_000);
+    expect(result.dimensionLevel).toBe(3);
+    expect(result.positionsAreFloat32).toBe(true);
+    expect(result.colorsAreUint8).toBe(true);
+    expect(result.workerMs).toBeGreaterThan(0);
+    expect(result.workers).toEqual([{
+      url: expect.stringMatching(workerScriptPattern('benchmarkGenerationWorker')),
+      type: 'module',
+    }]);
+    expect(browserErrors).toEqual([]);
+  });
+
+  await test.step('the worker builds exactly what the main thread would have built', async () => {
+    // The Run button generates off-thread, so the worker evaluates its own copy
+    // of the generator module. Nothing may make the two copies disagree — a
+    // generator that reached for main-thread-only state, or a seed that did not
+    // survive the boundary, would silently produce a different dataset in the
+    // application than in every node test that calls the class directly.
+
+    const compared = await page.evaluate(
+      async ({ moduleUrl, count }) => {
+        const generatorModule = await import('/assets/js/dev/benchmark.js');
+        const harnessModule = await import(moduleUrl);
+        const digest = async view => {
+          const hash = await crypto.subtle.digest(
+            'SHA-256',
+            new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+          );
+          return [...new Uint8Array(hash)]
+            .map(byte => byte.toString(16).padStart(2, '0'))
+            .join('');
+        };
+        const entryPoints = {
+          atlas: 'atlasLike',
+          batches: 'batchEffects',
+          clusters: 'gaussianClusters',
+          flatumap: 'flatUMAP',
+          octopus: 'octopus',
+          spirals: 'spirals',
+          uniform: 'uniformRandom'
+        };
+        const rows = [];
+        for (const [pattern, entryPoint] of Object.entries(entryPoints)) {
+          const onThread =
+            generatorModule.SyntheticDataGenerator[entryPoint](count);
+          const offThread = await harnessModule.generateSyntheticDataOffThread({
+            pattern,
+            count
+          });
+          rows.push({
+            pattern,
+            positionsMatch:
+              (await digest(onThread.positions)) ===
+              (await digest(offThread.positions)),
+            colorsMatch:
+              (await digest(onThread.colors)) === (await digest(offThread.colors)),
+            dimensionMatch:
+              onThread.dimensionLevel === offThread.dimensionLevel
+          });
+        }
+        return {
+          seed: generatorModule.SyntheticDataGenerator.seed,
+          defaultSeed: generatorModule.DEFAULT_SYNTHETIC_SEED,
+          rows
+        };
+      },
+      { moduleUrl: HARNESS_MODULE, count: 5_000 }
+    );
+
+    expect(compared.seed).toBe(compared.defaultSeed);
+    expect(compared.rows.length).toBe(7);
+    for (const row of compared.rows) {
+      expect(row, `pattern ${row.pattern}`).toEqual({
+        pattern: row.pattern,
+        positionsMatch: true,
+        colorsMatch: true,
+        dimensionMatch: true
       });
-
-      const startedAt = performance.now();
-      let data;
-      try {
-        data = await harnessModule.generateSyntheticDataOffThread({
-          pattern: 'atlas',
-          count
-        });
-      } finally {
-        window.Worker = NativeWorker;
-      }
-      return {
-        wallMs: performance.now() - startedAt,
-        workerMs: data.elapsedMs,
-        workers,
-        positions: data.positions.length,
-        colors: data.colors.length,
-        dimensionLevel: data.dimensionLevel,
-        positionsAreFloat32: data.positions instanceof Float32Array,
-        colorsAreUint8: data.colors instanceof Uint8Array
-      };
-    },
-    { moduleUrl: HARNESS_MODULE, count: 1_000_000 }
-  );
-
-  expect(result.positions).toBe(3_000_000);
-  expect(result.colors).toBe(4_000_000);
-  expect(result.dimensionLevel).toBe(3);
-  expect(result.positionsAreFloat32).toBe(true);
-  expect(result.colorsAreUint8).toBe(true);
-  expect(result.workerMs).toBeGreaterThan(0);
-  expect(result.workers).toEqual([{
-    url: expect.stringMatching(workerScriptPattern('benchmarkGenerationWorker')),
-    type: 'module',
-  }]);
-  expect(browserErrors).toEqual([]);
-});
-
-test('the worker builds exactly what the main thread would have built', PROCESS_INTENSIVE, async ({
-  page
-}) => {
-  // The Run button generates off-thread, so the worker evaluates its own copy
-  // of the generator module. Nothing may make the two copies disagree — a
-  // generator that reached for main-thread-only state, or a seed that did not
-  // survive the boundary, would silently produce a different dataset in the
-  // application than in every node test that calls the class directly.
-  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-
-  const compared = await page.evaluate(
-    async ({ moduleUrl, count }) => {
-      const generatorModule = await import('/assets/js/dev/benchmark.js');
-      const harnessModule = await import(moduleUrl);
-      const digest = async view => {
-        const hash = await crypto.subtle.digest(
-          'SHA-256',
-          new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
-        );
-        return [...new Uint8Array(hash)]
-          .map(byte => byte.toString(16).padStart(2, '0'))
-          .join('');
-      };
-      const entryPoints = {
-        atlas: 'atlasLike',
-        batches: 'batchEffects',
-        clusters: 'gaussianClusters',
-        flatumap: 'flatUMAP',
-        octopus: 'octopus',
-        spirals: 'spirals',
-        uniform: 'uniformRandom'
-      };
-      const rows = [];
-      for (const [pattern, entryPoint] of Object.entries(entryPoints)) {
-        const onThread =
-          generatorModule.SyntheticDataGenerator[entryPoint](count);
-        const offThread = await harnessModule.generateSyntheticDataOffThread({
-          pattern,
-          count
-        });
-        rows.push({
-          pattern,
-          positionsMatch:
-            (await digest(onThread.positions)) ===
-            (await digest(offThread.positions)),
-          colorsMatch:
-            (await digest(onThread.colors)) === (await digest(offThread.colors)),
-          dimensionMatch:
-            onThread.dimensionLevel === offThread.dimensionLevel
-        });
-      }
-      return {
-        seed: generatorModule.SyntheticDataGenerator.seed,
-        defaultSeed: generatorModule.DEFAULT_SYNTHETIC_SEED,
-        rows
-      };
-    },
-    { moduleUrl: HARNESS_MODULE, count: 5_000 }
-  );
-
-  expect(compared.seed).toBe(compared.defaultSeed);
-  expect(compared.rows.length).toBe(7);
-  for (const row of compared.rows) {
-    expect(row, `pattern ${row.pattern}`).toEqual({
-      pattern: row.pattern,
-      positionsMatch: true,
-      colorsMatch: true,
-      dimensionMatch: true
-    });
-  }
-});
-
-test('an aborted generation terminates its worker', PROCESS_INTENSIVE, async ({ page }) => {
-  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-
-  const aborted = await page.evaluate(async ({ moduleUrl }) => {
-    const harnessModule = await import(moduleUrl);
-    const controller = new AbortController();
-    const pending = harnessModule.generateSyntheticDataOffThread({
-      pattern: 'atlas',
-      count: 5_000_000,
-      signal: controller.signal
-    });
-    controller.abort();
-    try {
-      await pending;
-      return { rejected: false, name: null };
-    } catch (error) {
-      return { rejected: true, name: error.name };
     }
-  }, { moduleUrl: HARNESS_MODULE });
+  });
 
-  expect(aborted.rejected).toBe(true);
-  expect(aborted.name).toBe('AbortError');
+  await test.step('an aborted generation terminates its worker', async () => {
+    const aborted = await page.evaluate(async ({ moduleUrl }) => {
+      const harnessModule = await import(moduleUrl);
+      const controller = new AbortController();
+      const pending = harnessModule.generateSyntheticDataOffThread({
+        pattern: 'atlas',
+        count: 5_000_000,
+        signal: controller.signal
+      });
+      controller.abort();
+      try {
+        await pending;
+        return { rejected: false, name: null };
+      } catch (error) {
+        return { rejected: true, name: error.name };
+      }
+    }, { moduleUrl: HARNESS_MODULE });
+
+    expect(aborted.rejected).toBe(true);
+    expect(aborted.name).toBe('AbortError');
+  });
 });

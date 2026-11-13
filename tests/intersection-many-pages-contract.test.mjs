@@ -1,7 +1,7 @@
 /**
  * A field made from highlight pages with one category per intersection
- * combines any number of pages (bug hunt F269 / L25-4: a 32-bit mask per cell
- * refused a 33rd page, and the session keyed each intersection's label by
+ * combines any number of pages (not a 32-bit mask per cell, which refuses a
+ * 33rd page, and keys each intersection's label in the session by
  * that mask). The action, the registry, the validator and the session's
  * reader key a combination by its pages' positions (`intersectionKey`); no
  * other key is read (one reader, no second path for an older shape).
@@ -171,7 +171,7 @@ test('a session value keys intersections by their pages; restore reads those key
   }
 });
 
-test('with rest (L25-3), the cells on no page of a 41-page intersection field keep their category of another field', () => {
+test('with rest, the cells on no page of a 41-page intersection field keep their category of another field', () => {
   // Two more cells, on no page: 43 is Stromal in the kept field, 44 is "P3" there (a page's label: that page's category).
   const pages = { ...pagesState(), pointCount: 45 };
   const restCodes = new Uint8Array(45).fill(255);

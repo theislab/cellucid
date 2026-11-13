@@ -14,9 +14,9 @@
  * Space choose, Escape closes and returns to where the menu opened, Tab
  * closes it and moves on from there. An open menu is shown above the page
  * (moved to the end of the body, or of the open dialog holding its button),
- * so a Tab the browser took from an item went past the last element of the
- * document and landed on its first stop, the plot (found 2026-11-11,
- * lens-a11y LF-5): the menu now hands focus back to its opener first, and
+ * so a Tab the browser took from an item would go past the last element of the
+ * document and land on its first stop, the plot: the menu hands focus back to
+ * its opener first, and
  * the browser's Tab moves on from there, to the control after the opener
  * (Shift+Tab, the one before it).
  *

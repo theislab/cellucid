@@ -1,6 +1,6 @@
 /**
  * One lifetime rule for the app's worker pools (`workers/idle-retirement.js`)
- * and the analysis pool's memory (round-2 audit MB-5):
+ * and the analysis pool's memory:
  *
  * - workers with nothing to do for `WORKER_IDLE_MS` end, and start again for
  *   the next task, with the same count; a pool keeping state for a run

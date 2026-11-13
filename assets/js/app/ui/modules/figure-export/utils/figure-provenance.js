@@ -9,10 +9,9 @@
  * panel's field and filters to all of them — a false statement in a published
  * figure.
  *
- * SVG (RDF/Dublin Core) and PNG (iTXt) previously built that text twice, which
- * is how the two could drift. One builder now serves both, so the description
- * a reader finds in an SVG is byte-identical to the one in the PNG of the same
- * export.
+ * SVG (RDF/Dublin Core) and PNG (iTXt) are served by one builder, so the
+ * description a reader finds in an SVG is byte-identical to the one in the
+ * PNG of the same export.
  *
  * @module ui/modules/figure-export/utils/figure-provenance
  */

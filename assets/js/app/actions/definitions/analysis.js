@@ -367,7 +367,7 @@ const NAMED_OPTIONS = 5;
  * compare against Rest; top genes per group 5"); null for none. The one naming of an analysis's option steps (set, and
  * opened with options).
  */
-export function optionsWords(schema, options, quote = PLAIN_QUOTE) {
+function optionsWords(schema, options, quote = PLAIN_QUOTE) {
   const keys = Object.keys(options);
   if (keys.length === 0) return null;
   if (keys.length === 1) {
@@ -388,7 +388,7 @@ export function optionsWords(schema, options, quote = PLAIN_QUOTE) {
  * and its upgraders: options are given partially, so a step of an earlier
  * version holds options the later one still has, and goes up unchanged.
  *
- * - 2 (2026-11-11): Pair samples across groups (differential) and
+ * - 2: Pair samples across groups (differential) and
  *   conditions (composition); Group by, Groups to score and Cells
  *   (signature).
  */

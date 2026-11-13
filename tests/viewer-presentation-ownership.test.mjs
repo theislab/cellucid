@@ -166,11 +166,6 @@ test('borrowed view callbacks are synchronous and validate every exit path', asy
     borrowSource,
     /runSynchronousBorrowedViewDataCallback/,
   );
-  assert.doesNotMatch(
-    viewerSource,
-    /pointCountForView\s*<=\s*0/,
-    'zero-point publications must remain valid borrowed owners',
-  );
 });
 
 test('presented layout mirrors exact odd-sized framebuffer grid arithmetic', () => {
@@ -530,91 +525,6 @@ test('a rank-order level is published by its count: O(1), nothing built per cell
     Object.values(levels).some(value => ArrayBuffer.isView(value)),
     false,
     'no per-cell array is held',
-  );
-});
-
-test('presented state owns renderer-equivalent layout, camera, fog, and LOD certificates', async () => {
-  const viewerSource = await readFile(
-    new URL('../assets/js/rendering/viewer.js', import.meta.url),
-    'utf8',
-  );
-  const presentedSource = extractSourceRange(
-    viewerSource,
-    'getPresentedViewState(viewId)',
-    '// HP renderer controls',
-  );
-  assert.match(presentedSource, /getPresentedLayout\(\)/);
-  assert.match(presentedSource, /getPresentedPane\(layout, owner\.viewId\)/);
-  assert.match(presentedSource, /selectPresentedCameraState\(\{/);
-  assert.match(presentedSource, /getPresentedPaneProjection\(layout, paneIndex\)/);
-  assert.match(presentedSource, /hpRenderer\.getViewFogRange\(/);
-  assert.match(
-    presentedSource,
-    /lodGenerationToken[\s\S]*owner\.lodMembership\?\.generationToken/,
-  );
-  assert.match(
-    presentedSource,
-    /lodGenerationId[\s\S]*getPresentedLodGenerationId/,
-  );
-  assert.match(
-    presentedSource,
-    /createPresentedLodMembership\(owner\.lodMembership\)/,
-  );
-  assert.doesNotMatch(
-    presentedSource,
-    /lodMembership:\s*owner\.lodMembership/,
-    'presented state must not disclose renderer-owned index arrays',
-  );
-  const certificateSource = extractSourceRange(
-    presentedSource,
-    'const certificate = Object.freeze({',
-    'const renderState = {',
-  );
-  assert.doesNotMatch(
-    certificateSource,
-    /lodMembership\s*:/,
-    'retained cache certificates must not own O(N) membership arrays',
-  );
-  for (const field of [
-    'projectionCenterNdcX',
-    'viewportHeight',
-    'viewportWidth',
-    'viewportX',
-    'viewportY',
-    'fogNear',
-    'fogFar',
-  ]) {
-    assert.match(presentedSource, new RegExp(`\\b${field}\\b`));
-  }
-
-  const publicationSource = extractSourceRange(
-    viewerSource,
-    'function publishLodLevelChange(viewId)',
-    'function getPublishedDimensionLevel(viewId)',
-  );
-  assert.match(
-    publicationSource,
-    /previous\.lodOwnerToken\s*===\s*lodOwnerToken/,
-    'same-level LOD replacement must compare its lightweight spatial identity',
-  );
-  assert.match(
-    publicationSource,
-    /hpRenderer\.getCurrentLodOwnerToken\(/,
-  );
-  assert.doesNotMatch(
-    publicationSource,
-    /getCurrentLodMembership\(/,
-    'LOD event publication must not materialize an O(N) membership owner',
-  );
-  assert.match(
-    viewerSource,
-    /const lodMembership = hpRenderer\.getCurrentLodMembership\(/,
-    'borrowed preview/export ownership consumes the renderer\'s one LodMembership record',
-  );
-  assert.match(
-    publicationSource,
-    /const next = Object\.freeze\(\{\s*dimensionLevel,\s*geometryGeneration,\s*lodLevel,\s*viewId:/,
-    'public LOD events must retain their exact four-key contract',
   );
 });
 

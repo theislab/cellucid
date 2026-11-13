@@ -76,7 +76,7 @@ test('correlation distance treats a constant row as uncorrelated, never NaN', ()
   }
 });
 
-test('Spearman ranks values wider than float32 exactly whether or not a pair is missing (NS-9)', async () => {
+test('Spearman ranks values wider than float32 exactly whether or not a pair is missing', async () => {
   const { computeCorrelation: correlate } = await import('../assets/js/app/analysis/compute/operation-handlers.js');
   // Integers past 2^24 (a float64 count field) and a scrambled second field.
   const n = 2000;

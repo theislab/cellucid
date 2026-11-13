@@ -55,7 +55,7 @@ import { onNextMacrotask } from '../../utils/yield-macrotask.js';
  */
 
 /** Chunks per dimension for `dims` (a dimension of unlimited maximum has none: null). */
-export function chunkGrid(dims, chunkDims) {
+function chunkGrid(dims, chunkDims) {
   return dims.map((extent, d) => (extent === null ? null : Math.ceil(extent / chunkDims[d])));
 }
 
@@ -213,10 +213,9 @@ export async function loadChunkTable(file, { dims, maxDims, layout, filtered, ch
  * a read first needs chunks below it (`cover`), the nodes of all the reads of
  * one task together, a level a round trip. Making the table costs one node
  * whatever the dataset's chunk count, and a read pays only the nodes on its
- * paths: the parents of the leaves of an 11.4M-cell atlas's `X/indices`
- * (2.26M chunks) are 552 nodes, 13.5 s of requests over S3 before its first
- * view when they were read with the table; a gene sample's 170 blocks need
- * about 170 of them. Every key of a node holds the stored size of the first
+ * paths (the parents of an atlas's leaves, read with the table, would delay
+ * its first view by seconds of requests: measured:
+ * 23_decisions_partial_reading.md). Every key of a node holds the stored size of the first
  * chunk below it, so what the dataset stores is estimated from the nodes read
  * so far (`storedSizeOf`: the chunks of one dataset compress alike), from the
  * root alone at first. A tree whose keys cannot be placed on the grid, or
@@ -318,7 +317,7 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
   // The levels below the root are read now while a level is one wave: a
   // small tree is then known down to its leaves (its later reads wait for a
   // leaf alone), a large one stops at the first level that is not (the
-  // 552 parents of 35,000 leaves).
+  // parents of tens of thousands of leaves).
   for (let internal = frontier; internal.length > 0 && internal.every(entry => entry.level > 0) && oneWave(internal.length);) {
     const nodes = await readBtreeV1Nodes(file, internal.map(entry => ({ address: entry.address, level: entry.level })), 1, { rank, signal });
     const next = [];
@@ -540,8 +539,8 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
       // needed leaves land in, with the chunks of the reads that waited for
       // those leaves alone: the byte reader plans every read of a task
       // together and starts the ones a view waits for first, the same on
-      // every engine and machine (a timer let them go before those chunks or
-      // after them, as its delay and the machine's speed fell).
+      // every engine and machine (a timer would let them go before those
+      // chunks or after them, as its delay and the machine's speed fell).
       const needed = Promise.all(wanted.map(entry => entry.loading.promise));
       needed.then(() => {
         if (frontier.some(entry => entry.level > 0)) return;
@@ -562,8 +561,8 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
     // Every read asked for in this task waits for the leaves of all of them
     // (`indexBurst`): their chunks then go out together, as one plan the
     // byte reader merges, not wave by wave as each read's own leaves land
-    // (a burst of 100 Loom genes: 44 leaf requests, then each read's few
-    // chunks alone, ~36 requests in seven turns).
+    // (otherwise a burst of Loom genes requests its leaves, then each read's
+    // few chunks alone, in many requests over several turns).
     const covered = pending.size === 0 ? Promise.resolve() : indexBurst(file, reader.background === true, pending);
     // A read that goes on where the last one ended (rows in file order: a
     // matrix read slab by slab, the kept rows of a subsample wave by wave)
@@ -572,10 +571,9 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
     // waits one round trip for its chunks, not two. They are asked for now,
     // with this read's own leaves and as its own (not as background work):
     // background requests wait while any other request waits, so leaves
-    // asked for behind this read's chunks came only once those chunks had
-    // arrived, and every slab of a scan waited a round trip more for its
-    // index (a CSR matrix's first gene over 150 ms at 5 MB/s: a 10 MB scan
-    // took 3.1 s, its floor 2.2 s). A leaf is a few kilobytes: going out
+    // asked for behind this read's chunks would come only once those chunks
+    // had arrived, and every slab of a scan would wait a round trip more for
+    // its index (measured: 23_decisions_partial_reading.md). A leaf is a few kilobytes: going out
     // first, it holds a connection one round trip. A read elsewhere (a gene
     // of a gene-major matrix) reads nothing ahead. Leaves under an internal
     // node not read yet are not read ahead (the node is a round trip first).
@@ -652,7 +650,7 @@ function unravel(index, grid, out) {
 }
 
 /** Call `visit(linear, coords)` for every chunk of `grid`, row-major. */
-export function forEachChunk(grid, visit) {
+function forEachChunk(grid, visit) {
   const rank = grid.length;
   const count = grid.reduce((a, b) => a * b, 1);
   const coords = new Array(rank).fill(0);

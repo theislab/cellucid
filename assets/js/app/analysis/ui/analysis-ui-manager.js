@@ -34,14 +34,10 @@
  */
 
 import { selectablePageIdSet } from '../shared/page-derivation-utils.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 function createOwnedOperation(assign, operation) {
-  let rejectOperation;
-  let resolveOperation;
-  const task = new Promise((resolve, reject) => {
-    resolveOperation = resolve;
-    rejectOperation = reject;
-  });
+  const { promise: task, resolve: resolveOperation, reject: rejectOperation } = promiseWithResolvers();
   assign(task);
   void Promise.resolve()
     .then(operation)
@@ -252,8 +248,8 @@ export class AnalysisUIManager {
         }
         // The host markup owns the container id when it has one, because that
         // id is the target of the accordion header's `aria-controls`.
-        // Overwriting it left every header pointing at a element that does not
-        // exist.
+        // Overwriting it would leave every header pointing at an element that
+        // does not exist.
         if (typeof container.id !== 'string' || container.id.length === 0) {
           container.id = `${id}-analysis-container`;
         }
@@ -421,8 +417,9 @@ export class AnalysisUIManager {
     }
     // Every analysis page selector offers the derived "Rest of X" pages
     // alongside the base pages, so selecting one has to be a valid selection
-    // here too. Validating against the base pages alone made choosing "Rest of
-    // Page 1" in Detailed analysis throw `page "restof__page_1" was not found`.
+    // here too. Validating against the base pages alone would make choosing
+    // "Rest of Page 1" in Detailed analysis throw `page "restof__page_1" was
+    // not found`.
     // This selection is then handed to whichever mode becomes active, so the
     // per-UI validators resolve the same domain from the same function.
     const availablePageIds = selectablePageIdSet(pages);

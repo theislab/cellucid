@@ -22,9 +22,9 @@ import { pointScaleFor, pointSpriteSize } from './point-sprite.js';
  * are not read) and, when the renderer drew them at every level of detail,
  * whatever the level.
  *
- * This replaced a ray search with a fixed world-space radius, which ignored
- * drawn size and preferred the cell nearest the camera: zoomed in it picked a
- * neighbor of the dot under the pointer, zoomed out it missed dots entirely.
+ * A ray search with a fixed world-space radius is not used: it ignores drawn
+ * size and prefers the cell nearest the camera, so zoomed in it would pick a
+ * neighbor of the dot under the pointer and zoomed out miss dots entirely.
  */
 
 /** How far outside a dot's drawn edge a click still selects it, in CSS px. */

@@ -12,7 +12,7 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 
-export const SMOKE_UNAVAILABLE_TITLE = 'Volumetric smoke unavailable';
+const SMOKE_UNAVAILABLE_TITLE = 'Volumetric smoke unavailable';
 
 /**
  * @param {{supported: false, message: string, detail: string}} support

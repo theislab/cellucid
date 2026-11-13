@@ -9,8 +9,7 @@
  * the events.
  */
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -47,22 +46,9 @@ import { getActionCatalog } from '../assets/js/app/actions/index.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FIXTURE = path.join(ROOT, 'tests/fixtures/viewer-protocol.json');
 
-/**
- * The digest of `viewer-protocol.json`. cellucid-python
- * (`tests/test_viewer_channel_contract.py`) and cellucid-r pin the same one.
- */
-const VIEWER_PROTOCOL_SHA256 = 'c117822a5d87df03439fdbed9af460617764b59d9e560ba7c0e519ec5f708dae';
-
-test('viewer-protocol.json is the protocol module\'s document, byte for byte, at the pinned digest', () => {
+test('viewer-protocol.json is the protocol module\'s document, byte for byte', () => {
   const bytes = readFileSync(FIXTURE, 'utf8');
-  assert.equal(
-    bytes,
-    viewerProtocolJson(),
-    'Regenerate it: node --input-type=module -e "import(\'./assets/js/data/viewer-protocol.js\')' +
-    '.then(m => process.stdout.write(m.viewerProtocolJson()))" > tests/fixtures/viewer-protocol.json, ' +
-    'then copy it to cellucid-python and cellucid-r and update the three digests.'
-  );
-  assert.equal(createHash('sha256').update(bytes).digest('hex'), VIEWER_PROTOCOL_SHA256);
+  assert.equal(bytes, viewerProtocolJson(), 'Run node scripts/sync-shared-files.mjs (it writes the file here and its copies in cellucid-python and cellucid-r).');
 });
 
 test('the published protocol document is what the viewer requires of a host', () => {
@@ -297,7 +283,11 @@ test('a result the protocol cannot carry is refused before it is sent', () => {
 });
 
 test('the channel and the viewer never carry the retired notebook transport', () => {
-  for (const file of ['data/viewer-host-source.js', 'data/viewer-channel.js', 'data/remote-source.js', 'app/main.js']) {
+  // The viewer's side of the channel: the start-up and every module of `app/viewer-host/`.
+  const viewerHost = readdirSync(path.join(ROOT, 'assets/js/app/viewer-host'))
+    .filter(name => name.endsWith('.js'))
+    .map(name => `app/viewer-host/${name}`);
+  for (const file of ['data/viewer-host-source.js', 'data/viewer-channel.js', 'data/remote-source.js', 'app/main.js', ...viewerHost]) {
     const source = readFileSync(path.join(ROOT, 'assets/js', file), 'utf8');
     assert.doesNotMatch(source, /postMessage|ws_port|_cellucid\/(?:events|selection|session_bundle)\b/, file);
   }

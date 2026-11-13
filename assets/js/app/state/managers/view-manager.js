@@ -17,6 +17,9 @@ import { stillFieldText, unplacedCellsText } from '../../unplaced-cells-notice.j
 import { representationOptionText } from '../../../data/representation-names.js';
 import { VELOCITY_STILL_SPEED } from '../../../rendering/overlays/velocity/velocity-shaders.js';
 import { awaitWithSignal, cancelled, throwIfAborted } from '../../../utils/abort.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
+
+/** @typedef {import('../../../data/dimension-manager.js').DimensionManager} DimensionManager */
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 function requireDimensionLevel(level, label = 'Dimension') {
@@ -164,6 +167,7 @@ export class DataStateViewMethods {
   /**
    * Enter batch mode to suppress expensive recomputations during bulk filter changes.
    * Call endBatch() when done to apply all changes in a single recompute.
+   * @this {import('../core/data-state.js').DataState}
    */
   beginBatch() {
     this._batchDepth++;
@@ -176,6 +180,7 @@ export class DataStateViewMethods {
   /**
    * Exit batch mode and perform a single consolidated recomputation.
    * Reapplies colors for affected fields and recomputes global visibility once.
+   * @this {import('../core/data-state.js').DataState}
    */
   endBatch() {
     if (this._batchDepth <= 0) return;
@@ -202,6 +207,7 @@ export class DataStateViewMethods {
 
   /**
    * Set the dimension manager instance
+   * @this {import('../core/data-state.js').DataState}
    * @param {DimensionManager} manager - The dimension manager
    */
   setDimensionManager(manager) {
@@ -245,6 +251,7 @@ export class DataStateViewMethods {
    *
    * The manager is optional: most datasets do not provide vector fields.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {import('../../../data/vector-field-manager.js').VectorFieldManager | null} manager
    */
   setVectorFieldManager(manager) {
@@ -277,10 +284,12 @@ export class DataStateViewMethods {
     );
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getVectorFieldManager() {
     return this.vectorFieldManager;
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   hasAnyVectorFields() {
     return this.vectorFieldManager === null
       ? false
@@ -288,6 +297,7 @@ export class DataStateViewMethods {
   }
 
   /**
+   * @this {import('../core/data-state.js').DataState}
    * @returns {{ id: string, label: string, layoutKeys: string[] }[]}
    */
   getAvailableVectorFields() {
@@ -297,6 +307,7 @@ export class DataStateViewMethods {
   }
 
   /**
+   * @this {import('../core/data-state.js').DataState}
    * @returns {string|null}
    */
   getDefaultVectorFieldId() {
@@ -305,6 +316,7 @@ export class DataStateViewMethods {
       : this.vectorFieldManager.getDefaultFieldId();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   hasVectorField(fieldId) {
     if (typeof fieldId !== 'string' || fieldId.length === 0) {
       throw new TypeError('Vector field id must be a non-empty string.');
@@ -319,6 +331,7 @@ export class DataStateViewMethods {
    * representation (a layout some view shows). Each layout's data is loaded
    * once and drawn by every view that shows that layout.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} fieldId
    * @param {string} layoutKey
    * @param {{ silent: boolean }} options
@@ -415,7 +428,7 @@ export class DataStateViewMethods {
             kind: 'vectors', label: descriptor.label, count: fieldData.unplacedCount, names: fieldData.unplacedNames,
           }), { category: 'data' });
         }
-        // A field too short everywhere to draw shows nothing: say why (R9V-6).
+        // A field too short everywhere to draw shows nothing: say why.
         if (fieldData.maxMagnitude < VELOCITY_STILL_SPEED) {
           notifications.info(stillFieldText({
             label: descriptor.label,
@@ -439,7 +452,7 @@ export class DataStateViewMethods {
       }
       // The loading notice goes; the caller says the failure once, with its
       // details ("The vector field could not be shown: …"). Failing the notice
-      // here as well said the same failure twice (R9V-7).
+      // here as well would say the same failure twice.
       if (notifications !== null && !readReported) notifications.dismiss(notifId);
       throw terminalError;
     }
@@ -447,6 +460,7 @@ export class DataStateViewMethods {
 
   /**
    * Get dimension manager
+   * @this {import('../core/data-state.js').DataState}
    * @returns {DimensionManager|null}
    */
   getDimensionManager() {
@@ -455,6 +469,7 @@ export class DataStateViewMethods {
 
   /**
    * The dimension of the representation the active view shows.
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number} Dimension level (1, 2, or 3)
    */
   getDimensionLevel() {
@@ -464,6 +479,7 @@ export class DataStateViewMethods {
   /**
    * The dimension of the representation one view shows: always the
    * dimension of its layout, never a separately stored value.
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId - View identifier
    * @returns {number} Dimension level (1, 2, or 3)
    */
@@ -481,6 +497,7 @@ export class DataStateViewMethods {
   /**
    * The layout key of the representation a view shows, as the dimension
    * manager published it.
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId - View identifier
    * @returns {string}
    */
@@ -498,6 +515,7 @@ export class DataStateViewMethods {
    * Whether a view shows its dimension's default because nothing else was
    * chosen for it (it follows the default when the mapping changes it), as
    * opposed to a representation the user picked.
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @returns {boolean}
    */
@@ -506,6 +524,7 @@ export class DataStateViewMethods {
     return this.viewContexts.get(targetViewId).followsDefault === true;
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   _requireKnownView(viewId) {
     const targetViewId = requireViewId(viewId);
     if (!(this.viewContexts instanceof Map)) {
@@ -528,6 +547,7 @@ export class DataStateViewMethods {
    * enabled representation when the mapping names no default for it). The
    * view then follows that dimension's default.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @param {number} level
    * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
@@ -552,6 +572,7 @@ export class DataStateViewMethods {
    * switches to this dimension's default; a view already showing this
    * dimension moves to its next enabled representation, wrapping around.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @param {number} level
    * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
@@ -592,6 +613,7 @@ export class DataStateViewMethods {
    * explicit choice, which the view keeps when the mapping's defaults
    * change. The reference must name an enabled representation.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @param {{key: string, columns: number[]|null}} ref
    * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
@@ -621,6 +643,7 @@ export class DataStateViewMethods {
    * and keeps it for the next asker); once the coordinates are in, the
    * publication is synchronous and is never cut in half.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId - Exact target view
    * @param {string} layoutKey - An enabled layout
    * @param {{followsDefault: boolean, signal?: AbortSignal|null}} options
@@ -637,10 +660,8 @@ export class DataStateViewMethods {
     }
     throwIfAborted(signal);
 
-    let unlockDimensionChange = null;
-    this._dimensionChangeLock = new Promise((resolve) => {
-      unlockDimensionChange = resolve;
-    });
+    const { promise: dimensionChangeLock, resolve: unlockDimensionChange } = promiseWithResolvers();
+    this._dimensionChangeLock = dimensionChangeLock;
     let releaseLayoutPin = null;
 
     try {
@@ -942,9 +963,7 @@ export class DataStateViewMethods {
       if (typeof releaseLayoutPin === 'function') {
         releaseLayoutPin();
       }
-      if (typeof unlockDimensionChange === 'function') {
-        unlockDimensionChange();
-      }
+      unlockDimensionChange();
       this._dimensionChangeLock = null;
     }
   }
@@ -955,9 +974,9 @@ export class DataStateViewMethods {
    * another representation (`previousLayoutKey` is then the representation
    * the previously active view showed).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {string} viewId
    * @param {string|null} previousLayoutKey
-   * @private
    */
   _notifyRepresentationChange(viewId, previousLayoutKey) {
     const layoutKey = this.dimensionManager.getViewLayout(viewId);
@@ -971,6 +990,7 @@ export class DataStateViewMethods {
 
   /**
    * Get available dimensions from dimension manager
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number[]} Array of available dimension levels
    */
   getAvailableDimensions() {
@@ -1000,6 +1020,7 @@ export class DataStateViewMethods {
 
   /**
    * Check if a specific dimension is available
+   * @this {import('../core/data-state.js').DataState}
    * @param {number} dim - Dimension level
    * @returns {boolean}
    */

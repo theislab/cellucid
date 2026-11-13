@@ -1,5 +1,5 @@
 /**
- * `mapping.set` stopped (F147, the switching lane's audit): the person's or
+ * `mapping.set` stopped: the person's or
  * an agent's Stop ends the change at once, whatever it is waiting on (an
  * embedding's coordinates read for a view to move to, a group's data
  * staged), publishes nothing, releases the mapping's lock, and leaves the

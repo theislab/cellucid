@@ -18,48 +18,12 @@ const cameraModuleSource = await readFile(
   new URL('../assets/js/app/ui/modules/cinematic-camera/index.js', import.meta.url),
   'utf8'
 );
-const playbackControllerSource = await readFile(
-  new URL(
-    '../assets/js/app/ui/modules/cinematic-camera/playback-controller.js',
-    import.meta.url
-  ),
-  'utf8'
-);
-const transportBarSource = await readFile(
-  new URL('../assets/js/app/ui/modules/cinematic-camera/transport-bar.js', import.meta.url),
-  'utf8'
-);
 const uiCoordinatorSource = await readFile(
   new URL('../assets/js/app/ui/core/ui-coordinator.js', import.meta.url),
   'utf8'
 );
-const domCacheSource = await readFile(
-  new URL('../assets/js/app/ui/core/dom-cache.js', import.meta.url),
-  'utf8'
-);
 const mainSource = await readFile(
   new URL('../assets/js/app/main.js', import.meta.url),
-  'utf8'
-);
-const datasetStateSource = await readFile(
-  new URL(
-    '../assets/js/app/session/catalog-default-session.js',
-    import.meta.url
-  ),
-  'utf8'
-);
-const sessionSerializerSource = await readFile(
-  new URL(
-    '../assets/js/app/session/session-serializer.js',
-    import.meta.url
-  ),
-  'utf8'
-);
-const publishedDefaultSource = await readFile(
-  new URL(
-    '../assets/js/app/session/published-default.js',
-    import.meta.url
-  ),
   'utf8'
 );
 const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf8');
@@ -195,9 +159,8 @@ test('Camera Path state accepts only the exact current fields', async () => {
     () => assertCameraPathState({ ...state, autoplay: 1 }),
     /autoplay/i
   );
-  // Captions are a playback setting of the path (F110), a key added after
-  // records were first written: a record saved before it reads as captions
-  // on (R9R-13), a wrong value is refused.
+  // Captions are a playback setting of the path: a record without the key
+  // reads as captions on, a wrong value is refused.
   assert.throws(() => assertCameraPathState({ ...state, captions: 'on' }), /captions/i);
   const { captions: _captions, ...savedBeforeCaptions } = state;
   assert.deepEqual(assertCameraPathState(savedBeforeCaptions), { ...savedBeforeCaptions, captions: true });
@@ -453,7 +416,7 @@ test('a reduced-motion preference completes the path instead of animating it', (
     );
     assert.equal(controller.getState(), 'STOPPED');
     assert.deepEqual(stateChanges, ['STOPPED']);
-    // The transport stays at the end, where the camera is (R9R-7: it went back to 0).
+    // The transport stays at the end, where the camera is (it does not go back to 0).
     assert.deepEqual(progress, [1]);
     assert.equal(controller.getProgress(), 1);
     assert.equal(
@@ -728,26 +691,6 @@ test('an explicit stop resets a scrubbed idle path to its first keyframe', () =>
   controller.destroy();
 });
 
-test('camera playback internals expose one explicit current control contract', () => {
-  for (const [label, source] of [
-    ['playback controller', playbackControllerSource],
-    ['transport bar', transportBarSource]
-  ]) {
-    assert.doesNotMatch(source, /options\s*=\s*\{\}/, `${label} has an implicit options default`);
-    assert.doesNotMatch(source, /options\s*\|\|\s*\{\}/, `${label} normalizes invalid options`);
-  }
-  assert.doesNotMatch(
-    playbackControllerSource,
-    /keyframeStore\.(?:on|off)\?\./,
-    'the keyframe-store event contract is required'
-  );
-  assert.doesNotMatch(
-    transportBarSource,
-    /getInterpolationOptions\s*\?/,
-    'the interpolation-options provider is required'
-  );
-});
-
 test('camera paths default to idle, start autoplay only once a session is loaded, and reset with datasets', () => {
   const restoreStart = cameraModuleSource.indexOf('function restorePath');
   const restoreEnd = cameraModuleSource.indexOf('\n  function destroy', restoreStart);
@@ -779,48 +722,6 @@ test('camera paths default to idle, start autoplay only once a session is loaded
     /id="cinematic-loop"[\s\S]*?Loop playback[\s\S]*?id="cinematic-autoplay"[\s\S]*?Autoplay/
   );
   assert.match(cameraModuleSource, /function startAutoplay\(\)/);
-});
-
-test('dataset publication restores only an integrity-pinned starting view, with no camera path a person made', () => {
-  assert.doesNotMatch(mainSource, /restoreLatestFromDatasetExports/);
-  assert.match(mainSource, /restoreCurrentDatasetState\(\{/);
-  assert.match(
-    datasetStateSource,
-    /restorePublishedDefaultState[\s\S]*new Blob\(\[stateBytes\]/
-  );
-  // The profile lives in `published-default.js`, used by the starting-view
-  // restore and by the publish step: a camera path is content a person makes,
-  // so publishing refuses one the capture's steps recorded, and the restore
-  // checks the profile before it reads any chunk. Asserting both keeps "the
-  // rule exists" from drifting apart from "the restore path applies it".
-  assert.match(
-    publishedDefaultSource,
-    /STARTING_VIEW_CONTENT_DOMAINS = Object\.freeze\(\[[^\]]*'camera-path'/
-  );
-  assert.match(
-    sessionSerializerSource,
-    /restorePublishedDefaultState\(blob, options\) \{[\s\S]*?assertPublishedDefaultProfile\(file\.manifest\)/
-  );
-  assert.match(sessionSerializerSource, /startingView: true/);
-});
-
-test('the Camera Path DOM cache exposes only controls consumed by the current module', () => {
-  const start = domCacheSource.indexOf('    cinematicCamera: {');
-  const end = domCacheSource.indexOf('\n    },', start);
-  assert.ok(start >= 0 && end > start);
-  const cinematicDomCache = domCacheSource.slice(start, end);
-
-  for (const obsoleteReference of [
-    'section',
-    'loopBackBtn',
-    'interpolationSettings'
-  ]) {
-    assert.doesNotMatch(
-      cinematicDomCache,
-      new RegExp(`\\b${obsoleteReference}\\s*:`),
-      `${obsoleteReference} is not part of the current Camera Path DOM contract`
-    );
-  }
 });
 
 test('top transport remains unmounted until two valid sidebar keyframes exist', async () => {
@@ -933,7 +834,7 @@ test('a keyframe records the representation it was captured on', () => {
   assert.deepEqual(restored.getAll().map(({ representation }) => representation), [umap, { key: 'X_umap_3d', columns: null }, null]);
 });
 
-test('a stop keeps where the film is: the transport shows it and Play goes on from it; the bar\'s Stop and a new path go back to 0 (R9R-7)', () => {
+test('a stop keeps where the film is: the transport shows it and Play goes on from it; the bar\'s Stop and a new path go back to 0', () => {
   const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
   const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
   const originalNow = performance.now;

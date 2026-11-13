@@ -214,8 +214,8 @@ test('the control keeps the open subsample\'s exact count until the share is edi
 
 test('the control is the person\'s again once the new cells are open, while what was shown comes back on them', async () => {
   // A view colored by a gene reads that gene again for the new cells (on a
-  // 2.3M-cell atlas, tens of seconds: the Apply button stayed disabled with
-  // "All 2,282,447 cells" chosen until it was in). The cells being open,
+  // 2.3M-cell atlas, tens of seconds: the Apply button must not stay disabled
+  // with "All 2,282,447 cells" chosen until it is in). The cells being open,
   // another share can be applied at once; the earlier restoring then says
   // nothing.
   const browser = installBrowser('https://www.cellucid.com/');
@@ -447,7 +447,7 @@ test('a share is read as typed in any locale: a decimal point or comma, never a 
   }
 });
 
-test('a subsample a few cells short of every cell is never "All", and Apply opens exactly it (NS-6)', async () => {
+test('a subsample a few cells short of every cell is never "All", and Apply opens exactly it', async () => {
   const browser = installBrowser('https://www.cellucid.com/');
   const previousOption = globalThis.Option;
   globalThis.Option = class { constructor(text, value) { this.text = text; this.value = value; } };

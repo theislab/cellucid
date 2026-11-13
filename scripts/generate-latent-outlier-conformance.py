@@ -6,8 +6,9 @@ and the outlier quantiles of each cell as little-endian float32 bytes. The
 quantiles are computed here with numpy, independently of the browser's
 ``assets/js/data/latent-outliers.js``, which
 ``tests/outlier-quantile-exact-contract.test.mjs`` checks against them bit for
-bit (under the fixture's SHA-256 pin). The writers that store quantiles are
-checked against byte-identical copies under the same pin: cellucid-python's
+bit. The writers that store quantiles are checked against byte-identical
+copies (compared with this file by ``tests/shared-files-contract.test.mjs``
+and each package's own tests): cellucid-python's
 ``tests/fixtures/latent_outlier_conformance.json`` (``prepare()``) and
 cellucid-r's ``tests/testthat/fixtures/latent_outlier_conformance.json``
 (``cellucid_prepare()``).

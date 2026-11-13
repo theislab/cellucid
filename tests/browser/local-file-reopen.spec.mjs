@@ -1,6 +1,6 @@
 /**
- * A file or folder opened from this computer reopens with one click (audit
- * ST-19), where the browser hands the page a handle of it (Chromium): after
+ * A file or folder opened from this computer reopens with one click, where the
+ * browser hands the page a handle of it (Chromium): after
  * a reload of the tab that showed it, and when a session saved on it is
  * loaded. The click on **Reopen <name>** is what lets the browser ask for
  * leave to read it again; a session whose file the browser already lets be
@@ -9,8 +9,7 @@
  *
  * File… is answered with a file of the origin-private file system holding
  * the fixture (`helpers/local-file-pickers.mjs`). Leave to read it is the
- * browser's to give. Chromium keeps it across a reload of the tab (measured:
- * a real dropped folder's handle is `granted` after a reload); here it is
+ * browser's to give. Chromium keeps it across a reload of the tab (a real dropped folder's handle is `granted` after a reload); here it is
  * withheld after the reload, as in a new browser session, so it is asked for
  * in the click, granted, and recorded with whether the page had the click's
  * user activation then. A dropped folder is a real directory drop

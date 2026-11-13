@@ -34,7 +34,7 @@ const SLOT_REF = Object.freeze({ ...EMBEDDING_REF, type: ['object', 'null'] });
 const NULLABLE_KEY = Object.freeze({ type: ['string', 'null'], minLength: 1 });
 
 /** Each mapping group as a parameter (snake case) and as the mapping's key. */
-export const MAPPING_GROUP_PARAMS = Object.freeze([
+const MAPPING_GROUP_PARAMS = Object.freeze([
   ['embeddings', 'embeddings'],
   ['knn', 'knn'],
   ['modality', 'modality'],
@@ -164,7 +164,7 @@ export const mappingActions = Object.freeze([
     summary: `Show and analyze the genes normalized to 10,000 counts per cell and/or log1p (${EXPRESSION_PLACE}; scanpy normalize_total(target_sum=1e4) then log1p). One setting for coloring, legends, filters, the cell card, reads and every analysis (pseudobulk differential expression always sums raw counts). The person's setting: an agent changes it only when the person asks. Offered when the mapped matrix holds counts; normalizing reads each cell's total from an obs column, else sums every gene once (heavy on a large matrix: asked first).`,
     group: 'Data',
     // Version 2 spells the switch `normalize` (US, as every name of the
-    // catalog: F149); a version 1 step named it `normalise`.
+    // catalog); a version 1 step named it `normalise`.
     version: 2,
     upgrade: {
       1: ({ normalise, ...params }) => (normalise === undefined ? params : { normalize: normalise, ...params }),

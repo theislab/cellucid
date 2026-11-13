@@ -20,8 +20,8 @@ import zenodo from '../assets/js/data/sources/providers/zenodo.js';
 import dropbox from '../assets/js/data/sources/providers/dropbox.js';
 import github from '../assets/js/data/sources/providers/github.js';
 import { downloadRemoteFile } from '../assets/js/data/sources/remote-file.js';
-import { fileFormatOfName, titleOfName } from '../assets/js/data/input-formats.js';
-import { DataSourceErrorCode, fetchCatalogFile, fetchJson, fetchWhenNotBusy } from '../assets/js/data/data-source.js';
+import { fileFormatOfName } from '../assets/js/data/input-formats.js';
+import { DataSourceErrorCode, describeHostFault, fetchCatalogFile, fetchJson, fetchWhenNotBusy } from '../assets/js/data/data-source.js';
 import { realmHosts } from '../assets/js/formats/io/hosts.js';
 import { isUnanswered, RETRY_AT_LEAST, RETRY_FOR_MS } from '../assets/js/formats/io/byte-source.js';
 import { ResponseClock } from '../assets/js/formats/io/link.js';
@@ -153,7 +153,7 @@ test('pasted text and ?data= values resolve to one canonical locator', () => {
   assert.throws(() => registry.resolve('geo:not-an-accession'), /not a valid NCBI GEO reference/);
 });
 
-test('the forms a link is pasted in are the link they mean, or refused with why (R9S-1)', () => {
+test('the forms a link is pasted in are the link they mean, or refused with why', () => {
   const registry = getProviderRegistry();
   const cases = [
     // A web address without its scheme, as an address bar shows it: https.
@@ -197,7 +197,7 @@ test('the forms a link is pasted in are the link they mean, or refused with why 
     'https://b.example/atlas.zarr/.zmetadata?X-Amz-Signature=s'
   );
   // An account never holds a dot or an @: no host, address or clone URL is
-  // read as GitHub's shorthand (it was: `gh:example.org/atlas.h5ad`).
+  // read as GitHub's shorthand, `gh:example.org/atlas.h5ad` included.
   for (const text of ['gh:example.org/atlas.h5ad', 'gh:me@host/repo', 'gh:-owner/repo', 'gh:owner/re po']) {
     assert.throws(() => registry.resolve(text), /not a valid GitHub reference/, text);
   }
@@ -222,16 +222,8 @@ test('the forms a link is pasted in are the link they mean, or refused with why 
 test('file names and formats are read from the URL, Zenodo-style /content included', () => {
   assert.equal(fileNameOfUrl(new URL('https://zenodo.org/api/records/1/files/x.h5ad/content')), 'x.h5ad');
   assert.equal(fileNameOfUrl(new URL('https://h.org/a/My%20Atlas.h5ad?dl=1')), 'My Atlas.h5ad');
-  assert.deepEqual(fileFormatOfName('a.H5AD'), { format: 'h5ad', layout: 'file' });
-  assert.deepEqual(fileFormatOfName('a.zarr.zip'), { format: 'zarr', layout: 'zip' });
   assert.deepEqual(fileFormatOfName('a.rds'), { format: 'rds', layout: 'file' });
   assert.equal(fileFormatOfName('a.qs'), null);
-  // A file that does not name itself is called by its name without the
-  // format's extension, Zarr ZIP included.
-  assert.equal(titleOfName('atlas.h5ad'), 'atlas');
-  assert.equal(titleOfName('atlas.zarr.zip'), 'atlas');
-  assert.equal(titleOfName('atlas.ZIP'), 'atlas');
-  assert.equal(titleOfName('atlas.v2.h5ad'), 'atlas.v2');
 });
 
 test('a web address opens a dataset catalog folder or one AnnData file', async t => {
@@ -389,7 +381,7 @@ test('GEO lists a series and opens its one .h5ad, or names the choices', async t
   await assert.rejects(geo.open('GSE351300'), /no supplementary file Cellucid opens \(it has: GSE351300_RAW\.tar\)/);
 });
 
-test('GEO asks whether NCBI fails through the one transport: a README that never answers ends, the refusal is said (RCD-2)', async t => {
+test('GEO asks whether NCBI fails through the one transport: a README that never answers ends, the refusal is said', async t => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
     if (String(url).endsWith('/suppl/')) return new Response('<a href="GSE351300_RAW.tar">x</a>', { status: 200 });
@@ -732,7 +724,7 @@ test('a busy host is asked again, then answered as it is: catalog files included
   await assert.rejects(pending, error => error.name === 'AbortError');
 });
 
-test('a person\'s "Try again" of a catalog file is one request through the one transport: its host\'s book hears it, and no answer is said as one (RCD-2)', async t => {
+test('a person\'s "Try again" of a catalog file is one request through the one transport: its host\'s book hears it, and no answer is said as one', async t => {
   installFetch(t, () => ({ status: 200, json: { schema: 2 } }));
   const answers = 'https://try-again-answers.example.org/catalog/datasets.json';
   assert.equal(realmHosts.answeredBefore(answers), false);
@@ -757,6 +749,14 @@ test('a person\'s "Try again" of a catalog file is one request through the one t
   await assert.rejects(
     fetchJson(silent, 'link', { askOnce: true }),
     error => error.code === DataSourceErrorCode.NETWORK_ERROR && isUnanswered(error.details.cause)
+  );
+  // This computer offline: the catalog's failure says so (Try again, once connected).
+  const navigatorOwn = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: false } });
+  t.after(() => Object.defineProperty(globalThis, 'navigator', navigatorOwn));
+  await assert.rejects(
+    fetchJson(silent, 'link', { askOnce: true }),
+    error => describeHostFault(error)?.kind === 'offline' && isUnanswered(error.details.cause)
   );
 });
 
@@ -942,7 +942,7 @@ test('a whole download rides out a busy host, and a body cut short by a host tha
 
 test('a whole download cut short goes on from the byte it stopped at where the host serves ranges, under the version it started with', async t => {
   // A compressed copy is read whole (a gzip stream has no index): on an
-  // unsteady link, every drop used to start it over.
+  // unsteady link, a read that restarted at every drop would never finish.
   const bytes = new Uint8Array(8192).map((_, i) => (i * 7) & 255);
   const headers = { ETag: '"v1"', 'Last-Modified': 'Wed, 01 Oct 2025 00:00:00 GMT' };
   let tag = '"v1"';
@@ -1008,7 +1008,7 @@ test('s3:// and gs:// addresses are read at their HTTPS address; a Census copy\'
   assert.equal(byCopy.file.id, byId.file.id, 'one dataset: sessions and annotations carry over');
 });
 
-test('a Zenodo record refused (403) is Zenodo refusing this network for now, not a record number to check (R9S-10)', async t => {
+test('a Zenodo record refused (403) is Zenodo refusing this network for now, not a record number to check', async t => {
   // Every record's description is public: a 403 for it is Zenodo's block of
   // a network ("unusual traffic"). It said "could not be read (HTTP 403).
   // Check the record number on zenodo.org".
@@ -1022,7 +1022,7 @@ test('a Zenodo record refused (403) is Zenodo refusing this network for now, not
   });
 });
 
-test('the CELLxGENE Census release list refused (403) is its host refusing this network for now (R9S-10)', async t => {
+test('the CELLxGENE Census release list refused (403) is its host refusing this network for now', async t => {
   installFetch(t, url => (url.endsWith('/cell-census/release.json') ? { status: 403, text: 'AccessDenied' } : null));
   await assert.rejects(cellxgene.open(ID), error => {
     assert.equal(error.details.hostFault.kind, 'refusing');

@@ -3,9 +3,9 @@
  *
  * The base layer of a pane, kept while only the highlight pulse moves.
  *
- * In Full quality the highlights pulse: every frame of the pulse used to draw
- * the whole pane again, every point of the dataset included, to change only
- * the rings around the highlighted cells. A pane's frame is two layers in a
+ * In Full quality the highlights pulse. Drawing the whole pane again for
+ * every frame of the pulse, every point of the dataset included, would change
+ * only the rings around the highlighted cells. A pane's frame is two layers in a
  * fixed order: the **base** (backdrop, grid, every point, the vector-field
  * overlay) and what is drawn over it (highlights, neighbor edges, centroids,
  * projectiles, the orbit anchor). The pulse changes only the second.

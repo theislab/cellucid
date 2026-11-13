@@ -23,7 +23,7 @@ import { bytesByteSource } from '../assets/js/formats/io/byte-source.js';
 import { openZipArchive } from '../assets/js/formats/zip/index.js';
 import { MEMORY_MAX_BYTES, allocateLargeArray, isMemoryBacked } from '../assets/js/utils/large-arrays.js';
 
-/** Chromium's one-ArrayBuffer cap (measured 2026-10-28; `utils/large-arrays.js`). */
+/** Chromium's one-ArrayBuffer cap (`utils/large-arrays.js`). */
 const CHROMIUM_ARRAY_BUFFER_BYTES = 2_145_386_496;
 const CACHE_BYTES = 64 * 1024 * 1024;
 

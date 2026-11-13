@@ -13,8 +13,8 @@
  * in `notes`, the warnings a download would ask the person about. A picture
  * with `source: 'screen'` is the view's pane as the screen shows it (the
  * vector field's flow and the connectivity edges included), so an agent
- * tuning an overlay sees what the person sees (L18-1). A camera path's
- * caption on screen while the path plays (F110) is drawn on the screen's
+ * tuning an overlay sees what the person sees. A camera path's
+ * caption on screen while the path plays is drawn on the screen's
  * picture as the person sees it, and named in every picture's notes.
  *
  * @module app/reads/views
@@ -133,9 +133,8 @@ export function createViewReads({ state, viewer, documentRef, getFigureExport })
   /**
    * What the screen and a figure draw over the coloring: the cells of the
    * highlight page shown, in the highlight's color. A picture says so, so a color
-   * there is not read as the coloring's (L24-15: a newcomer was told "the
-   * bright cyan patches are the cells with high NANOS3", the germ cells'
-   * highlight over a gene's viridis).
+   * there is not read as the coloring's (a highlight's bright patches over a
+   * gene's color scale would be taken for high expression).
    */
   function highlightNotes() {
     const page = state.getActivePage?.() ?? null;
@@ -203,16 +202,14 @@ export function createViewReads({ state, viewer, documentRef, getFigureExport })
    * every view as lettered panels while Export all views is on — drawn by the
    * renderer of a download at 96 dpi, scaled down (never up) into
    * width × height. What an agent preparing a figure checks before the
-   * person downloads it (L24-1: three "my previews don't show the export
-   * settings, please check the file" in one figure session).
+   * person downloads it.
    */
   /**
    * The figure's printed size, and when it is wider than the width the
    * settings ask for, why. The settings give the figure's width in
    * millimetres and the figure fills it at its own height (each plot keeps
-   * its view's shape, or its frame's): an agent once told the person "the
-   * canvas is 1800 × 800" for a 954 × 841 figure (live-7 L25-10), and did
-   * pixel-to-point arithmetic wrong twice; the note says millimetres.
+   * its view's shape, or its frame's): the note says millimetres, so an agent
+   * never turns the figure's pixels into printed size itself.
    */
   function sizeNotes(figure, asked, dpi, legendMovedBelow = false) {
     const notes = [`The figure is ${figureSizeText(figure)} as printed (its text at its point sizes); a PNG at ${dpi} dpi is ${devicePxOf(figure.width, dpi)} × ${devicePxOf(figure.height, dpi)} px, an SVG the same size in millimetres.`];
@@ -227,7 +224,7 @@ export function createViewReads({ state, viewer, documentRef, getFigureExport })
     return notes;
   }
 
-  /** A camera path's caption on screen now, which a figure leaves out (F110). */
+  /** A camera path's caption on screen now, which a figure leaves out. */
   function captionNotes() {
     const caption = readShownCaption(documentRef);
     return caption === null ? [] : [`The camera path is playing with the caption "${caption}" on screen; a figure leaves captions out (source "screen" shows it).`];
@@ -254,7 +251,7 @@ export function createViewReads({ state, viewer, documentRef, getFigureExport })
     out.width = Math.max(1, Math.round(figure.width * fit));
     out.height = Math.max(1, Math.round(figure.height * fit));
     // The preview's color-vision simulation, as the panel's preview draws it: an agent asked to check a
-    // figure for color-blind readers could not see it (live-7 L25-11). Export itself writes the true colors.
+    // figure for color-blind readers could not otherwise see it. Export itself writes the true colors.
     const simulated = colorblindMode !== 'none';
     // Its pixels are read back once: said to the canvas, so it keeps them where they can be read.
     const context = out.getContext('2d', simulated ? { willReadFrequently: true } : undefined);
@@ -309,14 +306,14 @@ export function createViewReads({ state, viewer, documentRef, getFigureExport })
     if (overlays.some(warning => warning.fix !== undefined)) {
       notes.push('To see it as drawn, take the picture with source "screen" (the view on screen now, overlays included).');
     }
-    // The vector field is drawn as a still picture of its flow (R9V-10).
+    // The vector field is drawn as a still picture of its flow.
     const shownField = readShownVectorFieldId(documentRef);
     if (shownField !== null) {
       notes.push(`The vector field ${shownField} is drawn as arrows on a grid (the mean of nearby cells' vectors, a still picture of the flow); source "screen" shows its moving particles.`);
     }
     // The figure draws the highlight as the screen does.
     notes.push(...highlightNotes());
-    // A camera path's caption is on the screen, not in a figure (F110).
+    // A camera path's caption is on the screen, not in a figure.
     notes.push(...captionNotes());
     const { blob, plot } = await figureExport.renderFigure({
       axisLabelFontSizePx: 12,

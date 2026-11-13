@@ -144,7 +144,7 @@ export async function vectorSlice(node, start, count, { readRegion }) {
 }
 
 /** The Zarr dtype of a kept region's elements (R writes big-endian). */
-export function regionDtype(node) {
+function regionDtype(node) {
   if (node.kind === 'double') return '>f8';
   if (node.kind === 'integer' || node.kind === 'logical') return '>i4';
   if (node.kind === 'raw') return '|u1';
@@ -175,7 +175,7 @@ export function writable(node) {
  * @param {Object} frame
  * @returns {Promise<string[]|null>}
  */
-export async function rowNamesOf(frame, context) {
+async function rowNamesOf(frame, context) {
   const value = attribute(frame, 'row.names');
   if (value === null) return null;
   if (value.kind === 'string') return value.values;

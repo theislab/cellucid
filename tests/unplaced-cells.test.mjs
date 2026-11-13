@@ -1,5 +1,5 @@
 /**
- * Cells an embedding does not place (K-03): NaN positions in every axis are
+ * Cells an embedding does not place: NaN positions in every axis are
  * the one mark (rendering/unplaced-positions.js). They are in no tree, in
  * no bound, never on the GPU as NaN, and every vertex shader that reads a
  * cell's position rejects their stand-in.

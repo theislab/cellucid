@@ -441,7 +441,7 @@ async function runLinkIn(context, port, { id, share, data }, { listSent = false 
       }, null, { timeout: timeoutMs, polling: 250 });
     }, steps);
     if (!opened) return result;
-    // A progressive opening (`app/open-cells-resize.js`) showed a first view
+    // A progressive opening (`app/open-cells-resize.js`) shows a first view
     // of fewer cells: the time until every cell asked for is open, read as
     // it grows in place.
     result.firstViewCells = await page.evaluate(() => window._cellucidState?.pointCount ?? null);

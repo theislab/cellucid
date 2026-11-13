@@ -39,13 +39,13 @@ import { requestOfOpenCells, requireCellSubsetRequest, takeCellSubsetRequest } f
 import { THIS_TAB, holdTranscodedStore, letGoTranscodedStore, removeTranscodedStore } from './anndata/transcode/space.js';
 import { getOpeningProgress } from './opening-progress.js';
 import { wholeReadNote } from './whole-read-notice.js';
-import { DataSourceError, DataSourceErrorCode } from './data-source.js';
+import { DataSourceError, DataSourceErrorCode, hostFaultFailure } from './data-source.js';
 import { EmbeddingLoadError, MappingLoadError } from './data-mapping-candidates.js';
 import { DataMappingError } from './data-mapping.js';
 import { confirmSourceUnreadable, confirmSourceVersion, onSourceAccessRevoked, resolveSourceAccess } from './sources/access.js';
 import { annDataReaderWorkerScript } from '../../workers/scripts.js';
 import { startWorker } from '../workers/worker-script.js';
-import { explainWorkerFailure, noteWorkerScript } from '../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript, workerFailureReason } from '../workers/worker-failure.js';
 import { hostRequesterPort } from '../formats/io/host-fetch.js';
 import { byteRangeCachePort } from './byte-range-cache.js';
 import { connectMemoryWorker } from './memory-budget.js';
@@ -363,16 +363,23 @@ export class AnnDataReaderClient {
       event?.preventDefault?.();
       if (this._worker !== worker) return;
       if (!heard) {
-        // Its script failed to load (a page that outlived its deploy, a
-        // module this browser cannot run): nothing posted to it will be
-        // answered. It is retired now, every call waiting on it fails
-        // saying why once that is found (`explainWorkerFailure`: the
-        // browser itself says nothing), and the next call starts a new
-        // worker.
-        this._retireWorker(explainWorkerFailure(worker, event).then(reason => new Error(
-          `The AnnData reader could not start (${reason}). ` +
-          'Reload the page; if Cellucid was just updated, the reload loads the new version.'
-        )));
+        // Its script failed to load (this browser offline, a page that
+        // outlived its deploy, a module this browser cannot run): nothing
+        // posted to it will be answered. It is retired now, every call
+        // waiting on it fails saying why once that is found
+        // (`explainWorkerFailure`: the browser itself says nothing), and the
+        // next call starts a new worker. Offline, the connection is the
+        // cause, said as every read says it (a host fault: Try again, once
+        // connected); a reload would not load the page either.
+        this._retireWorker(!realmHosts.online()
+          ? Promise.resolve(hostFaultFailure(
+            { kind: 'offline', host: globalThis.location?.host ?? 'this site', what: 'the code of Cellucid\'s file reader' },
+            { cause: new Error(`The AnnData reader could not start (${workerFailureReason(event)}).`) }
+          ))
+          : explainWorkerFailure(worker, event).then(reason => new Error(
+            `The AnnData reader could not start (${reason}). ` +
+            'Reload the page; if Cellucid was just updated, the reload loads the new version.'
+          )));
         return;
       }
       // A stray error in a live worker (a timer, a port's handler): it goes
@@ -1764,7 +1771,7 @@ export class AnnDataReaderClient {
   getConnectivityEdges(key, { signal = null, readKey = null } = {}) {
     this._requireOpen();
     // The read is told under `readKey` (`read-activity-log.js` `adopt`): the
-    // notice of whoever waits for the graph shows it, once (R9F-9).
+    // notice of whoever waits for the graph shows it, once.
     return this._callWith({ signal }, 'getConnectivityEdges', key, readKey === null ? null : [readKey]);
   }
 

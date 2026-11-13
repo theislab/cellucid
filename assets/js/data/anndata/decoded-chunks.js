@@ -6,8 +6,7 @@
  * A subsample's cells lie across the whole file (uniform, blocks), so every
  * step of a progressive opening's growth (`progressive-open.js`) reads, for
  * its added cells, rows of nearly every chunk an earlier step already
- * decoded: HLCA's 1% blocks share decoded the 182 chunks of `X_umap` again
- * at its last step (7.8 MB, mostly page-cache hits, 575 ms). Here each chunk
+ * decoded (measured: 23_decisions_partial_reading.md). Here each chunk
  * a read decodes is kept, so a later step, or a column read again, copies
  * its rows out of it instead of decoding it again.
  *
@@ -16,8 +15,9 @@
  * of decoded chunks (`formats/io/decoded-budget.js`): together they hold no
  * more than it, and give memory back when the memory model trims them (the
  * allowance or the working set changed, the page is hidden). A chunk
- * evicted is decoded again when asked for, nothing else changes. The chunks are a store's, keyed by array path, column range
- * and chunk, so they serve every opening of that store
+ * evicted is decoded again when asked for, nothing else changes. The
+ * chunks are a store's, keyed by array path, column range and chunk, so
+ * they serve every opening of that store
  * (`AnnDataReader.open`, `carry`).
  *
  * Every opening reading through them holds them (`retain`, `release`): two

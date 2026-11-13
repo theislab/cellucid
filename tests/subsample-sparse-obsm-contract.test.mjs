@@ -1,12 +1,12 @@
 /**
- * A share of a file whose `obsm` holds a sparse array (R9M-8): describing the
- * data mapping loads `obsm` deep enough to list each entry, and the share's
- * CSR view of a sparse array made its `indptr`, `indices` and `data` on that
- * load, before its kept rows' pointers were read -- every subsample of such a
- * file failed ("could not be read again with these cells"). The view now
- * loads the stored matrix and makes its children only when they are read;
- * the array is described (a sparse array cannot be drawn) without a pointer
- * read, and its kept rows read exactly once their pointers are.
+ * A share of a file whose `obsm` holds a sparse array: describing the data
+ * mapping loads `obsm` deep enough to list each entry, and the share's CSR
+ * view of a sparse array must not make its `indptr`, `indices` and `data` on
+ * that load, before its kept rows' pointers are read -- every subsample of
+ * such a file would fail ("could not be read again with these cells"). The
+ * view loads the stored matrix and makes its children only when they are
+ * read; the array is described (a sparse array cannot be drawn) without a
+ * pointer read, and its kept rows are read exactly once their pointers are.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

@@ -2,8 +2,7 @@
  * @fileoverview Where the cells of each category are heading along a vector
  * field (`vector-field.summary`, `app/actions/definitions/reads.js`): what an
  * agent needs to say where RNA velocity points from the data, not from a
- * picture of moving particles or from the textbook (bug hunt live pass 5,
- * L18-1: "the tools don't give me the velocity numbers").
+ * picture of moving particles or from the textbook.
  *
  * Read in the embedding a view shows, from the vectors as the overlay draws
  * them (`data/vector-field-manager.js`: scaled into the embedding's render

@@ -3,18 +3,18 @@
  * format 4 starting views: one tracker of one root, `published-default.js`)
  * record the *complete* settings control inventory in their root's `settings`
  * value (`app/state/domains/settings.js`), so adding one identified input to
- * the sidebar invalidates every preset that was saved before it existed
- * (CEL-0224). The settings domain refuses the value with `Session UI state is
+ * the sidebar invalidates every preset that was saved before it existed. The
+ * settings domain refuses the value with `Session UI state is
  * missing current control "<id>"`, the starting view fails as a whole, and the
  * visible result is that the advertised camera never applies and no field is
  * colored. Removing a control is equally fatal in the other direction: the
  * preset then carries a key the interface no longer has, and the domain
  * refuses with `... does not exist in the current interface`.
  *
- * Nothing guarded this. The advertised-default browser spec builds its session
- * bundle at runtime from the page it just loaded, so its bundle and its markup
- * can never disagree — it cannot see a stale *checked-in* file. The failure
- * only surfaced when someone opened a sample.
+ * The advertised-default browser spec builds its session bundle at runtime
+ * from the page it just loaded, so its bundle and its markup can never
+ * disagree — it cannot see a stale *checked-in* file. The failure would only
+ * surface when someone opened a sample; this file is the guard.
  *
  * ## What this file compares
  *
@@ -41,7 +41,7 @@
  *
  * The comparison is the **inventory**: the set of keys and the control type
  * each key declares. Both are decided by the markup alone, and both are what
- * CEL-0224 broke.
+ * a stale preset breaks.
  *
  * The inventory is read out of `index.html`, which is where every serialized
  * control lives today: the modules that build panels bind to markup that is
@@ -92,6 +92,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
+import { absentSibling } from '../scripts/shared-files.mjs';
 import { openHistoryFile } from '../assets/js/app/session/history-file.js';
 import {
   assertPublishedDefaultProfile,
@@ -520,15 +521,16 @@ async function readPublishedPresets() {
   } catch {
     repositoryRoot = null;
   }
-  if (repositoryRoot === null || !repositoryRoot.isDirectory()) {
-    // A repository named on purpose that is not there is a mistake, not a skip.
+  const present = repositoryRoot?.isDirectory() === true;
+  // A repository named on purpose that is not there is a mistake, not a skip.
+  if (!present) {
     assert.equal(
       NAMED_PRESET_REPOSITORY,
       null,
       `CELLUCID_DATASETS_ROOT names ${NAMED_PRESET_REPOSITORY}, which is not a cellucid-datasets checkout`,
     );
-    return null;
   }
+  if (absentSibling(present, 'the cellucid-datasets repository is not checked out beside this one')) return null;
 
   const catalog = JSON.parse(await readFile(PRESET_CATALOG_URL, 'utf8'));
   assert.equal(catalog.schema, 2, 'the sample catalog must be schema 2');
@@ -667,8 +669,8 @@ test('the parsed markup accounts for every control element in the file', () => {
 
 test('a group of pressed buttons is never a control: the selection tool is an input mode, not state', () => {
   // A toolbelt (one pressed button of several) decides what the next gesture
-  // does, as a held key does: page chrome, no setting and no step (History
-  // v2 §3.3.8). The real one, and one added beside it, stay out.
+  // does, as a held key does: page chrome, no setting and no step. The real
+  // one, and one added beside it, stay out.
   const probeGroupId = `${PROBE_ID}-group`;
   assert.equal(Object.hasOwn(currentInventory, 'highlight-mode'), false);
   const added = deriveInventory(insertAfterTagOf(
@@ -825,8 +827,7 @@ test('a control added to the markup fails the guard and is named', () => {
   assert.equal(
     loaderRefusalFor(added, stalePreset),
     `Session UI state is missing current control "${PROBE_ID}".`,
-    'the loader must name the control the stale preset lacks, and this is the '
-      + 'message CEL-0224 showed the user',
+    'the loader must name the control the stale preset lacks',
   );
 });
 

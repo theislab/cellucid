@@ -4,8 +4,8 @@
  *
  * The sidebar data-source controls are static markup, but the listeners that
  * act on them are attached by `initUI()`, which runs only once startup has read
- * its dataset catalog. They used to paint enabled and typeable for that whole
- * window, and a click there produced no request, no notification and no record
+ * its dataset catalog. Painted enabled and typeable for that whole window,
+ * they would take a click and produce no request, no notification and no record
  * of any kind. Once they open, the startup dataset has not started loading
  * yet, and a choice made while it loads replaces it
  * (`dataset-load-supersede.spec.mjs`).
@@ -88,7 +88,7 @@ async function readControlStates(page) {
 }
 
 test(
-  'no data-source control is offered while its listener is unattached',
+  'no data-source control is offered while its listener is unattached, and each works once they open',
   async ({ page, browserName }, testInfo) => {
     await withHeldCatalog(page, async releaseCatalog => {
       await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
@@ -150,6 +150,32 @@ test(
     );
     await expect(page.locator(STATUS)).toHaveClass('sr-only');
 
+    await test.step('a keyboard user can reach and use the controls once they open', async () => {
+      await expect(page.locator('#welcome-modal')).toBeHidden();
+      const input = page.locator('#data-address');
+      await input.focus();
+      await expect(input).toBeFocused();
+      await page.keyboard.type(`${SAMPLE_ORIGIN}/`);
+      await expect(input).toHaveValue(`${SAMPLE_ORIGIN}/`);
+
+      // Tab order is engine policy — WebKit does not put buttons in it unless full
+      // keyboard access is on — so operability is what is asserted: the admitted
+      // button takes focus and acts on a key press.
+      const connect = page.locator('#data-address-open-btn');
+      await connect.focus();
+      await expect(connect).toBeFocused();
+      await page.keyboard.press('Enter');
+      // A bare address of this computer is a server's; the sample host there
+      // answers, but not as a Cellucid server, and the notification says so.
+      await expect(
+        page.locator('#notification-center .notification').filter({
+          hasText: `${SAMPLE_ORIGIN} answers, but it is not a Cellucid server`,
+        }),
+      ).toHaveCount(1);
+      // The refused address has settled: the dataset startup opened is still shown.
+      await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
+    });
+
     // And they really work, rather than merely looking enabled: a Zarr
     // folder holding a different dataset replaces what startup put on screen.
     await openZarrFolder(page, browserName, LOCAL_DATASET.path);
@@ -162,38 +188,6 @@ test(
       .toBe(LOCAL_DATASET.cells);
   },
 );
-
-test('a keyboard user can reach and use the controls once they open', async ({
-  page,
-}) => {
-  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
-    waitUntil: 'domcontentloaded',
-  });
-  await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
-  await page.keyboard.press('Escape');
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-
-  const input = page.locator('#data-address');
-  await input.focus();
-  await expect(input).toBeFocused();
-  await page.keyboard.type(`${SAMPLE_ORIGIN}/`);
-  await expect(input).toHaveValue(`${SAMPLE_ORIGIN}/`);
-
-  // Tab order is engine policy — WebKit does not put buttons in it unless full
-  // keyboard access is on — so operability is what is asserted: the admitted
-  // button takes focus and acts on a key press.
-  const connect = page.locator('#data-address-open-btn');
-  await connect.focus();
-  await expect(connect).toBeFocused();
-  await page.keyboard.press('Enter');
-  // A bare address of this computer is a server's; the sample host there
-  // answers, but not as a Cellucid server, and the notification says so.
-  await expect(
-    page.locator('#notification-center .notification').filter({
-      hasText: `${SAMPLE_ORIGIN} answers, but it is not a Cellucid server`,
-    }),
-  ).toHaveCount(1);
-});
 
 test('a terminal startup failure leaves exactly one dialog on screen', async ({
   page,

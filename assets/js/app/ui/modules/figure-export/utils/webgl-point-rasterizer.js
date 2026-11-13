@@ -28,8 +28,8 @@
  * The viewer draws antialiased or not according to a live setting that also
  * follows the dataset's cell count. The export requests whatever is in force at
  * the moment of the export rather than a fixed `true` or a value read once at
- * startup; the viewer's own control measures the difference at 18% of pixels at
- * point size 0.75 and 32% with ultra-light square points.
+ * startup: the difference between the two is a sizeable share of an image's
+ * pixels (measured: 36_decisions_figure_export.md).
  *
  * WHERE IT RUNS:
  * In the figure-export worker's handler (`figure-export-worker.js`), on
@@ -97,6 +97,8 @@ import {
 import { allocateLargeArray } from '../../../../../utils/large-arrays.js';
 import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, requireColorAlphaMeaning } from '../../../../../rendering/alpha-visibility.js';
 import { isUnplacedCell, positionsForGpu } from '../../../../../rendering/unplaced-positions.js';
+
+/** @typedef {import('./lod-membership.js').FigurePointLayers} FigurePointLayers */
 const DEFAULT_ALPHA_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
 
 
@@ -330,10 +332,9 @@ function getWebgl2Context(canvas, antialias) {
     gl = canvas.getContext('webgl2', {
       alpha: true,
       // Multisampling is a property of the drawing buffer the user is looking
-      // at, not an export preference. The viewer's antialiasing control
-      // measures the difference at 18% of pixels at point size 0.75 and
-      // 32% with ultra-light square points, so requesting a fixed `true` here
-      // would publish a smoother cloud than the screen ever drew.
+      // at, not an export preference. Requesting a fixed `true` here would
+      // publish a smoother cloud than the screen ever drew (the difference is
+      // a sizeable share of the pixels; measured: 36_decisions_figure_export.md).
       antialias,
       // Source-over blending stores premultiplied RGB in transparent pixels.
       // Publish that exact ownership to canvas compositing and PNG encoding;

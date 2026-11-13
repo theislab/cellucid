@@ -21,6 +21,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { absentSibling, pythonDocsRoot, skipAbsentSibling } from '../scripts/shared-files.mjs';
 import {
   DOCS_BASE_URL,
   INFO_TIPS,
@@ -287,7 +288,7 @@ const PINNED_LINKS = [
   'g_agents/03_permissions_and_what_agents_see#permissions',
   'g_agents/03_permissions_and_what_agents_see#what-agents-are-sent',
   'd_fields_coloring_legends/02_field_selector_ux#group-categories-into-a-new-field',
-  // The keyboard shortcuts page, generated from the shortcut table (R9K-4).
+  // The keyboard shortcuts page, generated from the shortcut table.
   'o_accessibility_privacy_security/03_keyboard_shortcuts#moving-by-keys',
 ];
 
@@ -301,8 +302,7 @@ test('the docs links are the pinned, reviewed set', () => {
 // Resolution against the documentation source, when it is checked out.
 // ---------------------------------------------------------------------------
 
-const DOCS_ROOT = process.env.CELLUCID_PYTHON_DOCS
-  ?? path.resolve(ROOT, '..', 'cellucid-python', 'docs');
+const DOCS_ROOT = pythonDocsRoot();
 const WEB_APP_DOCS = path.join(DOCS_ROOT, 'user_guide', 'web_app');
 
 /** The text a Markdown heading renders to: markup removed, link text kept. */
@@ -345,10 +345,7 @@ async function headingIds(page) {
 }
 
 test('every docs link resolves to a page and heading in the documentation', async t => {
-  if (!existsSync(WEB_APP_DOCS)) {
-    t.skip(`documentation tree not present at ${DOCS_ROOT}`);
-    return;
-  }
+  if (skipAbsentSibling(t, existsSync(WEB_APP_DOCS), `documentation tree not present at ${DOCS_ROOT}`)) return;
   const missing = [];
   for (const link of usedLinks) {
     const [page, anchor] = link.split('#');
@@ -425,10 +422,8 @@ test('the cell-info tip and page state the spatial-index threshold the viewer us
   const threshold = Number(match[1].replaceAll('_', '')).toLocaleString('en-US');
   const tip = INFO_TIPS['cell-info'].body.filter(block => typeof block === 'string').join('\n');
   assert.match(tip, new RegExp(`view of ${threshold} cells or more`));
-  assert.doesNotMatch(tip, /million cells the first hover/);
-  const page = await readFile(
-    path.join(ROOT, '../cellucid-python/docs/user_guide/web_app/d_fields_coloring_legends/08_cell_info.md'),
-    'utf8'
-  ).catch(() => null);
-  if (page !== null) assert.match(page, new RegExp(`view of ${threshold} cells`));
+  const pagePath = path.join(WEB_APP_DOCS, 'd_fields_coloring_legends/08_cell_info.md');
+  if (!absentSibling(existsSync(pagePath), `${pagePath} is not there`)) {
+    assert.match(await readFile(pagePath, 'utf8'), new RegExp(`view of ${threshold} cells`));
+  }
 });

@@ -1,23 +1,23 @@
 /**
- * A share's opening never does more work than every cell's (the owner's
- * share rule), counted, never timed:
+ * A share's opening never does more work than every cell's (the share
+ * rule), counted, never timed:
  *
  * - **A share's whole column is read row by row in its rows' file order**
  *   (`cell-subset.js` `rowWaves`): the chunks its rows lie in, each once,
  *   in waves of a slab, each row one copy to its place, and no pass over
  *   pieces (its runs never ordered by source row, listed or walked through
- *   a permutation). A 50% uniform share of a 10M-cell `.h5ad` took
- *   4.7-7.0 s for its first view against every cell's 0.9 s, the same
- *   bytes: the pass placed 5M single-row pieces of each column through
- *   three permuted arrays a row.
+ *   a permutation), which for a 50% uniform share of a 10M-cell `.h5ad`
+ *   would take several times every cell's time for the same bytes, placing
+ *   5M single-row pieces of each column through three permuted arrays a row
+ *   (measured: 23_decisions_partial_reading.md).
  * - **A share that leaves a chunk unread reads only the chunks its rows lie
  *   in**, and a part of the view keeps the pass over pieces.
  * - **Runs are ordered by source row in linear time** (`rankedOrder`, a
  *   radix order of their 32-bit words), rows past 2^32 included.
  * - **Pricing a share's first gene passes over rows in chunks already
  *   counted** (`subsample-plan.js` `rowChunks`): the gene sample's fit
- *   priced 5M single-row spans at each of its steps (2 s of a 50% share's
- *   opening over a 20 ms link); the price is unchanged.
+ *   must not price 5M single-row spans at each of its steps (seconds of a
+ *   50% share's opening over a 20 ms link); the price is unchanged.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

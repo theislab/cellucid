@@ -1,7 +1,6 @@
 /**
  * @fileoverview Where agent conversations and the history meet: the one
- * place that knows both, so either can change (the history is being
- * redesigned) by changing this module.
+ * place that knows both, so either can change by changing this module.
  *
  * - **A turn's steps** (`turnSteps`, `stepsOfTurn`): read from the history's
  *   turn records (`app/history/turns.js` `turnFacts`): how many steps each
@@ -12,14 +11,14 @@
  *   `registerStepRevealer`).
  * - **From a step to its message** (`revealTurn`): the history's turn
  *   record keeps the turn's model, conversation and message (the dispatch's
- *   meta, History v2 §3.12); the chat bar registers how its message is shown
+ *   meta); the chat bar registers how its message is shown
  *   (`registerTurnLink`). A turn of an agent outside the chat bar (the
  *   connector) has no message here.
  * - **A turn's summary note** (`noteTurn`): the chat's one-line account of a
  *   turn (`chat/export.js` `turnNoteOf`) kept as the turn's note through
  *   `history.note.add` (`from_reply`), when the agent wrote none.
  * - **Undo an agent's turn** (`undoAgentTurn`: the one Undo turn of the
- *   chat, the activity line and the State panel, History v2 §3.3.10), through
+ *   chat, the activity line and the State panel), through
  *   the history's own undo of a turn (`history.undoTurn`, what
  *   `history.turn.undo` runs). The turn alone at the end of the branch shown:
  *   back to the step before it, kept for redo. Someone else acted after it
@@ -34,11 +33,11 @@
  *   person's next message tells the model, in one sentence, which of them are
  *   no longer in effect (its own turn undone, a step removed) and which steps
  *   came in (the person's, another agent's, a notebook's), by their labels,
- *   so it never reports as standing what the person took back (bug hunt
- *   L3-15: after Undo turn the model said "the Ductal cells are still
- *   hidden"); another history shown (a session file loaded beside, a saved
- *   state, another dataset) is said as which one, where from, and its latest
- *   steps (F270). What an agent saw is kept with its conversation (chat) or
+ *   so it never reports as standing what the person took back (after Undo
+ *   turn, a model not told says "the Ductal cells are still hidden");
+ *   another history shown (a session file loaded beside, a saved state,
+ *   another dataset) is said as which one, where from, and its latest
+ *   steps. What an agent saw is kept with its conversation (chat) or
  *   for its connection (`bridge/agent-calls.js`). Steps only, never data.
  *
  * @module app/agent/history-link
@@ -107,8 +106,8 @@ export function revealStep(stepId) {
 }
 
 /**
- * How a chat shows its turns' messages and names their models. Returns the unregister.
- * @param {{reveal: (turn: string) => boolean, modelLabel?: (model: string) => string}} link
+ * How a chat shows its turns' messages. Returns the unregister.
+ * @param {{reveal: (turn: string) => boolean}} link
  */
 export function registerTurnLink(link) {
   turnLink = link;
@@ -126,9 +125,8 @@ export function subscribeTurns(listener) {
 }
 
 /**
- * Keep a chat's account of a turn as the turn's summary note (History v2
- * §3.3.10), when the turn made steps and has no note yet: the agent wrote
- * none. Resolves whether a note was added.
+ * Keep a chat's account of a turn as the turn's summary note, when the turn
+ * made steps and has no note yet: the agent wrote none. Resolves whether a note was added.
  *
  * @param {object|null} history - the current history
  * @param {{turn: string, agent: string, text: string|null}} facts
@@ -138,12 +136,6 @@ export async function noteTurn(history, { turn, agent, text }) {
   if (record === null || record.notes.length > 0 || typeof text !== 'string' || text.length === 0) return false;
   await getActions().dispatch('history.note.add', { target: { turn }, text, from_reply: true }, { origin: 'agent', agent, turn });
   return true;
-}
-
-/** A turn's model as a person reads it (the chat's name for it), or the id the turn recorded. */
-export function modelLabelOf(model) {
-  if (typeof model !== 'string' || model.length === 0) return null;
-  return turnLink?.modelLabel?.(model) ?? model;
 }
 
 /** Show the message of `turn` in its chat; false when no chat here holds it. */
@@ -186,8 +178,8 @@ export function turnUndoPlan(tree, turn) {
 /**
  * Whose the steps after the turn began are, in a few words ("2 of yours,
  * 9 from 3 later turns of this chat, 1 of ChatGPT's"): the same agent's later
- * turns of the same conversation are counted as such (L12-1: they read
- * "9 from another Claude turn"), its turns elsewhere (another chat, a
+ * turns of the same conversation are counted as such (never as "another
+ * Claude turn"), its turns elsewhere (another chat, a
  * connector) as other turns.
  */
 function othersPhrase(tree, turn, agent, others) {
@@ -214,9 +206,8 @@ function othersPhrase(tree, turn, agent, others) {
 }
 
 /**
- * Ask the person how to undo a turn others acted after (history-v2
- * §3.3.10): `'own'` (only the turn's steps), `'since'` (everything since
- * it began) or null (neither).
+ * Ask the person how to undo a turn others acted after: `'own'` (only the
+ * turn's steps), `'since'` (everything since it began) or null (neither).
  * @param {{agent: string, own: object[], others: object[], elsewhere: number, othersWho: string}} plan
  * @returns {Promise<'own'|'since'|null>}
  */
@@ -359,13 +350,13 @@ export async function undoAgentTurn(history, turn, { ask = askHowToUndoTurn, run
  * mid-turn: numbered from `from`, the tracker's next step number as the
  * turn began, and not of `ownTurns`) is not something the agent saw: it is
  * left out of the steps seen and listed in `during`, so the next message
- * tells it (bug hunt L18-4: it was in the snapshot, so never "new").
+ * tells it (in the snapshot it would never be "new").
  * The record is plain data, kept with the conversation (`chat/conversation.js`
  * `transcriptOf`: a reload, a saved state or a shared session keeps what its
  * agent last saw) and by an outside agent's connection (`bridge/agent-calls.js`);
  * `isHistorySeen` checks one read back. It names the tracker (id, name) and its
  * dataset, so the next message can say the history shown is another one
- * (a session loaded beside, another dataset opened: F270).
+ * (a session loaded beside, another dataset opened).
  * @param {object|null} tree - the tracker shown
  * @param {{from?: number|null, ownTurns?: Set<string>, conversation?: string|null}} [turn] - `from`: the
  *   tracker's next step number as the turn began (null: none known, every
@@ -486,8 +477,8 @@ function startWords(tree) {
  * file loaded beside, a saved state opened, another dataset or tracker
  * shown): which one, where it came from, and its steps in effect, compactly
  * (a count by author, the latest labels), so the model never takes the
- * history before for this one (F270, bug hunt L25-8's colleague: "same
- * questions please" read as a first look).
+ * history before for this one (a "same questions please" would read as a
+ * first look).
  */
 function switchSentence(tree, seen, ownTurns, { conversation = null } = {}) {
   const now = historySeen(tree);

@@ -122,8 +122,8 @@ const BLOCK_CHUNKS = 4;
  * link is measured (`REMOTE_POLICY.mergeGapBytes`). A constant, never the
  * link as measured: a file's default sample is a property of the file, the
  * same cells whenever, wherever and however it is opened (a merge gap
- * measured from one read's timing gave the same `.h5ad` blocks of 28 to 66
- * cells from one opening to the next), and a larger share of the same
+ * measured from one read's timing would give the same file other blocks
+ * from one opening to the next), and a larger share of the same
  * request keeps every cell of a smaller one.
  */
 const BYTE_READ_BLOCK_BYTES = REMOTE_POLICY.mergeGapBytes;
@@ -152,8 +152,8 @@ export function storeCellCount(root) {
  * when it holds more genes than `X` or `X` is scaled). What a gene costs,
  * and so how many cells an opening fits and how its blocks align, is the
  * cost of this matrix: pricing `X` while genes are read from `raw.X`
- * opened every cell of a file whose first gene then read the whole of
- * `raw.X` (an anndata 0.6 file on Dropbox: 122 MB for one gene).
+ * would open every cell of a file whose first gene then reads the whole of
+ * `raw.X`.
  *
  * @param {Object} root - The stored root (never a subsample's view)
  * @param {{launch?: unknown, read?: (region: [[number, number], [number, number]]) => Promise<ArrayLike<number>>}} [options] -
@@ -346,8 +346,7 @@ export function cellShareReadShare(layout, fraction, method) {
  * about 20 s. A response-time target for an explicit request whose progress
  * is shown, not a platform limit: people keep their attention on a task for
  * about 10 s without feedback (Nielsen 1993; Miller 1968) and wait about
- * twice that with a progress line; past it the read looks endless (a 20%
- * share of a 2.3M-cell CSR file on a 1.2 MB/s link took 20-25 minutes). The
+ * twice that with a progress line; past it the read looks endless. The
  * share is the person's to raise (the subsample control, Open all cells);
  * genes then take longer, as the notice says.
  */
@@ -360,8 +359,7 @@ export const GENE_READ_TARGET_MS = 20_000;
  * reads genes for more cells, sized by what the first gene took
  * (`DataState.topUpGeneSample`), not by a price made before the link was
  * measured: on a first visit to a host the price rests on its early, small
- * reads, which measure a fraction of its rate (CELLxGENE atlases over S3:
- * priced 20 s, read in 6-15 s).
+ * reads, which measure a fraction of its rate (measured: 23_decisions_partial_reading.md).
  */
 export const FIRST_GENE_SHARE = 1 / 2;
 
@@ -370,7 +368,7 @@ export const FIRST_GENE_SHARE = 1 / 2;
  * their runs, `[starts[r], ends[r])` ascending and apart -- a `blocks` order
  * is priced a block at a time, never a row (`subsampleBlockRuns`).
  *
- * @typedef {Uint32Array|{count: number, starts: ArrayLike<number>, ends: ArrayLike<number>}} PricedRows
+ * @typedef {Uint32Array|Float64Array|{count: number, starts: ArrayLike<number>, ends: ArrayLike<number>}} PricedRows
  */
 
 /**
@@ -380,9 +378,9 @@ export const FIRST_GENE_SHARE = 1 / 2;
  * true again for later rows until a visit (it holds for a prefix of the
  * rows after each visit's last), and rows it rules out are passed over in
  * one binary search, not visited: `rowChunks` passes over the rows whose
- * elements lie in chunks already counted (a 50% uniform share's first
- * gene priced at each step of the gene sample's fit visited 5M single-row
- * spans a step: 2 s of an opening over a 20 ms link).
+ * elements lie in chunks already counted (visiting every single-row span of
+ * a large uniform share at each step of the gene sample's fit takes
+ * seconds of an opening: measured, 23_decisions_partial_reading.md).
  */
 function forEachRowSpan(rows, visit, adds = null) {
   if (ArrayBuffer.isView(rows)) {
@@ -467,9 +465,9 @@ function runsWithout(outer, inner) {
  * ones the byte reader fetches with them rather than making another request
  * (the link's merge gap, `link.js` `mergeGapBytes`, in units): they cost
  * their bytes (counted in `chunks`, and in `gaps`: fetched, never decoded)
- * and no run, as a read of scattered rows fetches them (a 1%
- * uniform share of a 10M-cell `.h5ad` over a 20 ms link: 1,365 rows priced
- * at 81 MB without them, read at 142 MB).
+ * and no run, as a read of scattered rows fetches them (a scattered share
+ * priced without them is priced far below what is read: measured,
+ * 23_decisions_partial_reading.md).
  */
 export function rowChunks(rows, elementOf, chunkElements, extra = 0, held = null, unitsPerBand = 1, touched = null, gapUnits = 0) {
   let chunks = 0;
@@ -483,8 +481,8 @@ export function rowChunks(rows, elementOf, chunkElements, extra = 0, held = null
   // rows r..s hold [elementOf(r), elementOf(s + 1)), and the chunks it
   // touches are exactly those of its rows. Two calls a run of rows, not two
   // a row: the gene sample's fit prices up to every row of the file about
-  // log2(n) times (50M rows: 11 s of an opening); given as runs, not even a
-  // step a row (every cell of 10M in blocks order: 0.5 s of an opening).
+  // log2(n) times (measured: 23_decisions_partial_reading.md); given as runs,
+  // not even a step a row.
   forEachRowSpan(rows, (firstRow, lastRow) => {
     const start = elementOf(firstRow);
     const end = elementOf(lastRow + 1) + extra;
@@ -595,8 +593,9 @@ async function storedBytesPerElement(array, readOptions) {
  * level-1 nodes and leaves, a sharded Zarr array's shard indexes) are
  * requests of their own, each counted once, and their levels dependent
  * round trips (`steps`), as is a CSR matrix's pointer read before its
- * entries (measured on an 11.4M-cell CELLxGENE atlas: 311 of the first
- * gene's 539 requests were chunk B-tree nodes, five dependent steps).
+ * entries (on a large CELLxGENE atlas most of the first gene's requests
+ * are chunk B-tree nodes in five dependent steps: measured,
+ * 23_decisions_partial_reading.md).
  *
  * @returns {Promise<(((rows: PricedRows) => {bytes: number, requests: number, keptBytes: number, decodedBytes: number, steps: number[]}) & {values: (rows: PricedRows) => Object})|null>}
  */
@@ -620,8 +619,8 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
     // Values read per gene (`valuesOnDemand`) are read by range only from a
     // data array stored raw (`partialChunks`); a compressed one is read in
     // whole chunks, and a gene's entries lie in nearly every chunk of the
-    // rows read, so the first gene reads them all (measured on a 200,000-cell
-    // gzip CSR file at 4 MB/s: 146 MB, twice the indices alone).
+    // rows read, so the first gene reads them all (twice the indices alone:
+    // measured, 23_decisions_partial_reading.md).
     const data = child(matrix.node, 'data');
     const valuesByRange = valuesOnDemand && isArrayNode(data) && data.partialChunks === true;
     const arrays = [child(matrix.node, 'indices'), ...(valuesByRange ? [] : [data])];
@@ -781,10 +780,10 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
  * **A revisit keeps its rung.** A gene index kept in this browser under a
  * rung's order (`keptIndexRows`) chooses that rung, whatever the link
  * measures now: its cells cost the first gene nothing, and another rung
- * would open other cells and read them again (a CELLxGENE atlas reopened
- * in blocks of 80 after a first visit in blocks of 20 read its first gene
- * again: 15 MB, 311 requests; HLCA 76 → 19 read 9.5 MB, 512 requests, more
- * than the first visit). Of several kept, the one holding the most cells.
+ * would open other cells and read them again (an atlas reopened in other
+ * blocks than its first visit's reads its first gene again, more than the
+ * first visit did: measured, 23_decisions_partial_reading.md). Of several
+ * kept, the one holding the most cells.
  *
  * **A first visit chooses by request economics.** A block too small to
  * fill its round trip makes the sample request-bound: a block of `b` cells
@@ -798,24 +797,21 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
  * What the opening measured of the rate is a lower bound: its structure
  * reads are a few requests on connections just made, each delivering at
  * what TCP slow start lets one connection carry, while a gene read keeps
- * dozens of connections busy (an 11.4M-cell CELLxGENE atlas measured
- * 0.8-1 MB/s at its first resolve, its delivery taken for a full link, and
- * 11.5 MB/s on its first gene). So the rate is the higher of it and the
+ * dozens of connections busy (a large CELLxGENE atlas measures a small
+ * fraction of its rate at its first resolve, its delivery taken for a full
+ * link: measured, 23_decisions_partial_reading.md). So the rate is the higher of it and the
  * seed (`seedBytesPerMs`): the rate the host sustained on earlier visits
  * (`host-link-memory.js`) or this browser's own downlink measured on the
  * page's assets (`pageDownlinkBytesPerMs`). An overestimate costs
  * no time (a larger block reads each cell's bytes once, fewer round trips),
- * only coarseness; an underestimate halves the cells per halving (embryo
- * in blocks of 20: 5,232 cells in the 20 s gene time; of 80: 11,543).
- * Measured (CELLxGENE, category shares of the sample against the whole,
- * total variation distance): on files whose rows are mixed (the HLCA core
- * and full) the block size changes nothing at a given count of cells, so
- * more cells is pure gain; on a file sorted by donor (an 11.4M-cell mouse
- * embryo atlas) larger blocks at the same count are coarser (donor 0.163
- * at 20-cell blocks, 0.402 at 160, for 2,000 cells), but at the same count
- * of blocks -- the same round trips -- they are as good or better (2,000
- * cells in blocks of 20: cell type 0.070, donor 0.163; 20,000 in blocks of
- * 160: 0.050, 0.134). Without a measured link, the storage's block.
+ * only coarseness; an underestimate halves the cells per halving. The
+ * category shares of the sample against the whole (total variation
+ * distance) show that on files whose rows are mixed the block size changes
+ * nothing at a given count of cells, so more cells is pure gain; on a file
+ * sorted by donor larger blocks at the same count are coarser, but at the
+ * same count of blocks -- the same round trips -- they are as good or
+ * better (measured: 23_decisions_partial_reading.md). Without a measured
+ * link, the storage's block.
  *
  * The rung a share's spread cells open in (`geneSampleOf`, `cellOrder`) is
  * chosen alike; the gene index it looks for is the one kept under the
@@ -883,8 +879,8 @@ export function blockSizeLadder(root, nObs, expression = 'X') {
  * every request without them) -- or a round trip a step and the bytes at
  * the measured rate (bytes flow while other requests wait for their first).
  * A round trip is the link's under load (`loadedRoundTripMs`), not its
- * shortest: an `.h5ad` export of 21,285 HLCA cells over S3 was priced at
- * 198 s by the shortest (230 ms) and took 271-386 s (0.36-0.5 s a request).
+ * shortest: priced at the shortest, a read of many requests at once comes
+ * out far below its time (measured: 23_decisions_partial_reading.md).
  */
 export function linkReadMs({ bytes, requests, steps = null }, link) {
   const running = Math.max(1, link.shapingConcurrency ?? link.concurrency ?? 1);
@@ -958,19 +954,18 @@ export function linkPriced(link) {
  * at least `FEWEST_OPEN_CELLS`, and `neededMs` and `sampleMs` are null (not
  * known). The first gene then measures the link, and the page's top-up
  * reads genes for more cells within the gene time
- * (`DataState.topUpGeneSample`). Priced as free, the HLCA core's
- * 585,000-cell revisit (Census S3, kept index of 1,518 cells, nothing
- * measured) took the gene index's memory fit, 102,271 cells, and its first
- * gene read 575 MB in 14,680 requests over 148 s, where the first visit's
- * read 9.4 MB in 3.7 s.
+ * (`DataState.topUpGeneSample`). Priced as free, a revisit with nothing
+ * measured would take the gene index's memory fit, and its first gene would
+ * read far more than the first visit's (measured:
+ * 23_decisions_partial_reading.md).
  *
  * **A later visit answers from what it kept.** When the cells whose gene
  * index is kept here lead the open order (`breaks`: the kept runs' ends
  * from the first open cell), the first gene is read for them alone, the
  * kept runs ending within the count the target prices: no new cell, so
- * coming back is never slower than the first visit (Chromium, HLCA core:
- * a revisit priced at the remembered rate read 5,400 new cells with its
- * first gene, 6.6 s and 26.3 MB, where the first visit's took 2.9 s). The
+ * coming back is never slower than the first visit (a revisit priced at
+ * the remembered rate would read thousands of new cells with its first
+ * gene: measured, 23_decisions_partial_reading.md). The
  * count priced is returned as `growTo` (null over a link with no price):
  * the page's top-up reads genes for those cells first, in the background,
  * then grows on by what its reads take (`DataState.topUpGeneSample`).
@@ -1085,7 +1080,7 @@ function indexBytesOf(matrix, nCells, nObs, { valuesOnDemand, decodedChunkBytes,
 /**
  * The root expression matrix (`expression`) when its genes are read for a
  * gene sample: indexed in segments over the open rows, so a gene is read for
- * the first open cells only (`reader.js`, `_indexedInSegments`): a matrix
+ * the first open cells only (`reader/gene-segments.js`, `_indexedInSegments`): a matrix
  * read through a row index (`readsThroughRowIndex`: CSR, dense in row
  * chunks or in strips indexed whole) that is the dataset's own, not a
  * modality's presented at the root. Null for any other.
@@ -1324,7 +1319,7 @@ function specOf(request, root, nObs, expression = 'X') {
  * @param {Readonly<import('../subsample.js').SubsampleSpec>} spec
  * @param {Object} readOptions
  * @param {(() => Promise<Uint32Array>)|null} [fileOrder] - A priority-ordered file's row order
- * @param {import('../subsample.js').SubsampleCache} [cache]
+ * @param {ReturnType<typeof import('../subsample.js').createSubsampleCache>} [cache]
  * @returns {Promise<Uint32Array|null>}
  */
 export async function keptCellsOf(root, spec, readOptions = {}, fileOrder = null, cache = createSubsampleCache()) {
@@ -1470,10 +1465,9 @@ export async function resolveCellSubset(root, request, context) {
  * bytes and time stay within every cell's (its requests may still number
  * more where its cells reach past every cell's blocks; the sample is held
  * to the whole by the `wholeSampleCost` ceiling). In its
- * own priority order each of its first cells lay in a chunk of its own: a
- * 1% uniform share of a 10M-cell CSR `.h5ad` over an emulated S3 link
- * fitted 71 cells in 10.7 s where every cell's sample read 1,572,326 in
- * 5.5 s. Its cells are exactly as asked (sessions, links and Python's and
+ * own priority order each of its first cells lies in a chunk of its own: a
+ * uniform share's sample is a tiny fraction of every cell's in the same
+ * time (measured: 23_decisions_partial_reading.md). Its cells are exactly as asked (sessions, links and Python's and
  * R's `subsample_cells` give the same set); only their order differs, and
  * the order's rung is recorded beside them (`cellOrder`; a request reading
  * them again names it: `order`). A `blocks` share keeps its own order (its
@@ -1513,10 +1507,11 @@ async function geneSampleOf(root, nObs, placed, request, priority, { valuesOnDem
   // every cell read as they were. A sample the gene time sized is fitted
   // again over the link as measured now, but never to fewer cells than were
   // read (`seenFitted`, below), nor to every cell when the gene time read
-  // fewer: fitted afresh alone, a 50M-cell store's 4.49M became every cell,
-  // and reused alone, E-ANND-5's opening sample of 68 cells (sized on the
-  // link's first small reads, its top-up cut short by the share change)
-  // came back as 68 where the measured link reads 13,290.
+  // fewer: fitted afresh alone, a large store's sample of millions of cells
+  // could become every cell, and reused alone, an opening's sample of a few
+  // dozen cells (sized on the link's first small reads, its top-up cut short
+  // by the share change) would come back as a few dozen where the measured
+  // link reads thousands.
   const seen = request?.genes == null && request?.order === undefined && request?.mode !== 'prefix'
     ? seenGeneSampleOf(geneSamplesSeen, placed)
     : null;
@@ -1656,12 +1651,12 @@ async function geneSampleOf(root, nObs, placed, request, priority, { valuesOnDem
   const ordered = { ...opening, ...wholeInOrder(cellOrder, nObs, subsampleCache) };
   // The machine's `orderMadeMs` (`utils/machine.js`): timed, it follows how
   // busy the machine is (a pass of a few thousand cells stalled for tens of
-  // milliseconds outweighs a sample's priced saving of a tenth of a second).
+  // milliseconds can outweigh a sample's priced saving of a tenth of a second).
   const orderMs = orderOpeningMs(measureOf('orderMadeMs', () => performance.now() - started));
   // A sample fitted to the first gene's time pays for the order only when
   // it brings that gene sooner than every cell's by more than the order
-  // costs (`orderPays`); else every cell opens in file order, as it always
-  // did, and its genes are read for every cell (a sample in file order
+  // costs (`orderPays`); else every cell opens in file order, and its
+  // genes are read for every cell (a sample in file order
   // would be its first rows, not a sample of it). The order stays when it
   // was asked for, kept genes are filed under it, or the sample bounds
   // memory (`geneIndexFit`), not time.
@@ -1678,9 +1673,7 @@ async function geneSampleOf(root, nObs, placed, request, priority, { valuesOnDem
  * two arrays, its embedding and its field's codes, each gathered into the
  * view and scattered to its rows (`cell-subset.js` `readInSourceOrder`,
  * `values.js` `scatterRows`) where file order reads them in place). Counted
- * from the opening's path; checked on a browser trace of every cell of a
- * 10M-cell Zarr v3 store opened in the order (Chromium, local web host,
- * 2026-10-30): the order made in 11 ms, those passes 60-70 ms more.
+ * from the opening's path (measured: 23_decisions_partial_reading.md).
  */
 export const ORDER_OPENING_PASSES = 7;
 
@@ -1706,8 +1699,8 @@ export function orderOpeningMs(orderMadeMs) {
  * every cell's first gene `neededMs`, the sample's `sampleMs`, as priced)
  * saves more than opening every cell in its order costs (`orderMs`,
  * `orderOpeningMs`: the opening end to end, not only the order made): a
- * sample of 9.84M of 10M cells over a local web host saved tens of
- * milliseconds and the order cost the opening hundreds. Over a link with
+ * sample of nearly every cell of a large file over a local web host saves
+ * tens of milliseconds where the order costs the opening hundreds. Over a link with
  * no price (`neededMs` null: nothing measured nor remembered) every cell's
  * first gene could take any time: the order pays, its sample being what
  * holds that read to what costs nothing.
@@ -1728,12 +1721,9 @@ export function orderPays({ neededMs, sampleMs }, orderMs) {
  * priority-ordered file's first rows), or Infinity for both when every
  * cell's first gene fits that time (a share's rows are among every cell's:
  * it reads no more). What a share's gene sample may make at most
- * (`geneSampleOf`): a share never costs more than the whole. Measured: a
- * 1% uniform share of a 10M-cell CSR `.h5ad` fitted to the same time read
- * 165-172 MB for its first gene, every cell's sample 150 MB; in the file's
- * cell order a 1% share of Tabula Sapiens (CELLxGENE, S3) read 3.4 MB in
- * 434 requests for 83 cells where every cell's sample made 351 (its cells
- * reach past every cell's blocks while its bytes are fewer). The page's
+ * (`geneSampleOf`): a share never costs more than the whole (a share's
+ * cells reach past every cell's blocks while its bytes are fewer, so its
+ * requests can number more: measured, 23_decisions_partial_reading.md). The page's
  * top-up holds a share's sample to it too, at the whole gene time over the
  * link measured after the first gene (`AnnDataReader.geneSampleCost`
  * `geneTime`). `priority`: the file's priority layout (only whether there
@@ -1875,7 +1865,7 @@ export function requireCellOrder(order) {
  * @param {Uint32Array|null} fileRows
  * @param {number} nFile - Rows of the file
  * @param {Readonly<CellOrder>|null} [cellOrder]
- * @param {import('../subsample.js').SubsampleCache} [cache]
+ * @param {ReturnType<typeof import('../subsample.js').createSubsampleCache>} [cache]
  * @returns {(k: number, from?: number) => PricedRows}
  */
 export function prefixRowsOf(fileRows, nFile, cellOrder = null, cache = createSubsampleCache()) {
@@ -1888,9 +1878,9 @@ export function prefixRowsOf(fileRows, nFile, cellOrder = null, cache = createSu
   // Each count asked reads only its own cells' rows, in sequence, and puts
   // them in row order: as a bit each in a table of the file's rows read
   // back word by word (a word holds 32 rows), or, for cells fewer than
-  // those words, by sorting them. The fit's two dozen counts each passed
-  // over every open cell in row order before, reading their rows out of
-  // sequence (a 50% uniform share of 10M cells: 0.47 s of its opening).
+  // those words, by sorting them. A pass over every open cell in row order
+  // for each of the fit's two dozen counts reads rows out of sequence
+  // (measured: 23_decisions_partial_reading.md).
   let words = null;
   return (k, from = 0) => {
     const count = Math.max(0, k - from);
@@ -2166,7 +2156,7 @@ async function resolveInOriginalSpace(root, request, nObs, priority, fileOrder, 
     if (memory === null) return all;
     // Whole blocks aligned to the storage: the cells left out are never
     // read. A uniform subsample's cells lie in most chunks of a row-chunked
-    // array (HLCA, 5 cells a chunk: 10% of the cells touch 45% of X's
+    // array (a few cells a chunk: a 10% share touches nearly half of X's
     // chunks), so its genes would read most of the matrix.
     // A priority-ordered file: uniform under its seed, a prefix of every array.
     const spec = requireSubsampleSpec(priority !== null

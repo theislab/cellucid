@@ -8,7 +8,7 @@
  * panel and the agents' reads all hold these records, and Python and R build
  * their reading model from the same description (`historyModelDocument`,
  * written as `history_model.schema.json` by
- * `scripts/generate-history-model.mjs` and pinned by digest in the three
+ * `scripts/generate-history-model.mjs`, the same bytes in the three
  * repositories). A field is added here first, or nowhere.
  *
  * **The records** (every key always present; `null` where a field does not
@@ -20,8 +20,8 @@
  *   is `s0`), branches `b<n>`, groups `g<n>`, notes `n<n>`, journal entries
  *   `j<n>`, each numbered by the tracker's own counter (`nextStep`, …); a
  *   tracker is `t-<uuid>`. `start` says what it started from; `removed` is
- *   set while it sits in Recently deleted. `paused` is its recording switch
- *   (History v2 §3.15.1): null while it records; while paused, changes still
+ *   set while it sits in Recently deleted. `paused` is its recording switch:
+ *   null while it records; while paused, changes still
  *   apply but make no step, and `paused` says since when, who acted, and
  *   (in this browser's autosave) the draft of what differs from the head,
  *   kept as values; resuming adds one squashed step for what differs.
@@ -30,20 +30,20 @@
  *   color slot (`lane`), and the flags `locked` and `archived`. Which branch
  *   is main is the tracker's `mainBranch`.
  * - `Group`: a named folder over consecutive steps of one branch, metadata
- *   only (§3.15.2). Each step names its group (`Step.group`); the group holds
+ *   only. Each step names its group (`Step.group`); the group holds
  *   no list of its steps, so it costs the same whatever it spans, and
  *   deleting steps shrinks it. One level: a group holds no group; it holds
  *   whole turns, never part of one.
  * - `Step`: of a `kind`. An `action` (type and parameters, by name, at the
  *   parameters' version `v`), a change made `outside` an action, the `root`,
- *   or a `squashed` step (§3.15.1-3): the net change of steps merged into
+ *   or a `squashed` step: the net change of steps merged into
  *   one, or of what changed while recording was paused, with no action of
  *   its own (`squashed` says why and from what). Each records the branch it
  *   was made on, who took it (`by`), when (`at`, `until`, `merged`), how
  *   long (`ms`), the hash of each touched domain's value before and after,
  *   the hash of each input it read (`reads`), its status and the system's
  *   reason, notes, a bookmark and its group. No picture of a step is ever
- *   stored (§3.15.7): a picture is drawn from the live view when asked for.
+ *   stored: a picture is drawn from the live view when asked for.
  * - `By`: who acted (`origin`), the agent and model, the notebook host, the
  *   person's name when they chose to record it, and the turn.
  * - `Turn`: one agent or notebook turn: its label, where it started, its
@@ -127,7 +127,7 @@ export const STEP_KINDS = Object.freeze(['root', 'action', 'outside', 'squashed'
  */
 export const SQUASH_CAUSES = Object.freeze(['paused', 'steps', 'clear', 'share']);
 
-/** The branch "Clear history, keep the state" makes (§3.15.2). */
+/** The branch "Clear history, keep the state" makes. */
 export const FRESH_START_BRANCH_NAME = 'Fresh start';
 
 /**
@@ -187,7 +187,7 @@ export const TRACKER_PATCH_FIELDS = Object.freeze(['name', 'headId', 'activeBran
 export const HISTORY_LANE_COUNT = 8;
 
 /**
- * What a Share or a Save chose (`Scope`). `content` (§3.15.3): the
+ * What a Share or a Save chose (`Scope`). `content`: the
  * `history` (the trackers and branches chosen, with every value), the
  * current `state` only (one tracker: the root and one squashed step), or the
  * `steps` only (a replay plan: no values, no cells). `results`: analysis
@@ -339,12 +339,6 @@ function quotedList(items) {
   const quoted = items.map(quoteName);
   return quoted.length <= 1 ? quoted.join('') : `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]}`;
 }
-
-/** `ActionRefused` codes of the history's actions (beyond the dispatcher's own). */
-export const HISTORY_REFUSAL_CODES = Object.freeze([
-  'no-target', 'name-taken', 'name-invalid', 'main-branch', 'locked', 'moved', 'not-author', 'not-revertible',
-  'restore-conflict', 'not-consecutive', 'splits-turn', 'forks-inside', 'in-group', 'cuts-group',
-]);
 
 /** Every sentence the history says when it refuses or tells, built from its facts. */
 export const HISTORY_SENTENCES = Object.freeze({
@@ -1239,7 +1233,7 @@ function checkUniqueNames(items, kind, label, nameOf, path) {
 
 /**
  * A tracker record as this version holds it, and the state domains it held
- * that this version does not have (F164): a history written by another
+ * that this version does not have: a history written by another
  * version of Cellucid (a domain since added, renamed or removed). Each
  * step's `touches`, `before`, `after` and `reads` (every journal entry's
  * steps too) and a paused draft keep this version's domains only; a step
@@ -1520,7 +1514,7 @@ export function validateHistory(history) {
  * Check a session file as read: its header records and every tracker, and
  * that its scope names exactly the trackers it holds.
  *
- * `unreadable` (a reader's list, F164): given, a tracker whose own records
+ * `unreadable` (a reader's list): given, a tracker whose own records
  * or rules this version refuses (`validateTracker`: one another version of
  * the model wrote) is listed `{id, name, error}` (its id and name as read,
  * null when not text) and left out of the checks that span trackers, which

@@ -36,7 +36,7 @@ function requireById(ownerDocument, id) {
  * @param {Document} ownerDocument
  * @param {ReturnType<typeof parsePreferredCitation>} citation
  */
-export function renderCitation(ownerDocument, citation) {
+function renderCitation(ownerDocument, citation) {
   const placeholder = requireById(ownerDocument, 'cite-placeholder');
   const reference = requireById(ownerDocument, 'cite-reference');
   const bib = requireById(ownerDocument, 'cite-bibtex');

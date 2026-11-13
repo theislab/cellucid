@@ -23,7 +23,7 @@
 
 
 /** Element id of the control that owns the velocity overlay. */
-export const VELOCITY_OVERLAY_CONTROL_ID = 'velocity-overlay-enabled';
+const VELOCITY_OVERLAY_CONTROL_ID = 'velocity-overlay-enabled';
 /** Element id of the control that shows the connectivity edges. */
 const CONNECTIVITY_CONTROL_ID = 'toggle-connectivity';
 

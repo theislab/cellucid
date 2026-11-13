@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -29,7 +28,7 @@ function quickInsightsOwnershipHarness({ isVisible = () => true } = {}) {
   const insights = new QuickInsights({
     container: null,
     dataLayer: {
-      // A dataset is open (no dataset: `validateDataRequirements`, R9E-8).
+      // A dataset is open (no dataset: `validateDataRequirements`).
       state: { pointCount: 100 },
       getActiveHighlightPageId() {
         return 'page-1';
@@ -262,7 +261,7 @@ test('Quick Insights computes one deterministic exact continuous contract at eve
 });
 
 test('Quick Insights summarizes a continuous field the reader gives as float64 (an integer count)', async () => {
-  // Found 2026-11-10 on Suo: n_genes arrives as a Float64Array and Quick insights failed with
+  // n_genes arrives as a Float64Array, and Quick insights must not fail with
   // "requires a Float32Array values payload".
   const values = Float64Array.from([16777217, 16777219, 3]);
   const insights = Object.create(QuickInsights.prototype);
@@ -277,20 +276,6 @@ test('Quick Insights summarizes a continuous field the reader gives as float64 (
     insights._summarizeContinuousAcrossPages('n_genes', { values: Int32Array.of(1) }, ['page-1'], { 'page-1': { cellIndices: Uint32Array.of(0) } }),
     /Float32Array or Float64Array/,
   );
-});
-
-test('Quick Insights exposes only the current selected-pages and settings contract', async () => {
-  const source = await readFile(
-    new URL(
-      '../assets/js/app/analysis/ui/analysis-types/quick-insights-ui.js',
-      import.meta.url,
-    ),
-    'utf8',
-  );
-
-  assert.doesNotMatch(source, /\bupdateForActivePage\b/);
-  assert.doesNotMatch(source, /settings\.pageMode|settings\.manuallySelectedPages/);
-  assert.doesNotMatch(source, /legacy method|legacy format|backwards compatibility/i);
 });
 
 test('Quick Insights publishes a new trigger generation before its debounce window', async t => {

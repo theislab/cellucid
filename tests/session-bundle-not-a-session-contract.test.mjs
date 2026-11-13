@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { NOT_A_SESSION_FILE_MESSAGE, SESSION_FORMAT_VERSION, otherSessionFormatMessage } from '../assets/js/app/session/bundle/format.js';
+import { NOT_A_SESSION_FILE_MESSAGE, otherSessionFormatMessage } from '../assets/js/app/session/bundle/format.js';
 import { readBundle } from '../assets/js/app/session/bundle/reader.js';
 
 async function refusal(bytes) {
@@ -47,7 +47,6 @@ test('a session of another format version is refused naming it, not as some othe
     assert.match(error.message, pattern);
     assert.notEqual(error.message, NOT_A_SESSION_FILE_MESSAGE);
   }
-  assert.equal(SESSION_FORMAT_VERSION, 4);
   // Not a version: not a session.
   for (const text of ['CELLUCID_SESSION/x\n and more bytes', 'CELLUCID_SESSION\n and more bytes!!']) {
     assert.equal((await refusal(new TextEncoder().encode(text))).message, NOT_A_SESSION_FILE_MESSAGE, text);

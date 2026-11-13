@@ -26,7 +26,7 @@ import {
   validateEvent,
   validateUserProperties,
 } from './schema.js';
-import { DATA_CONFIG } from '../data/data-source.js';
+import { DATA_CONFIG } from '../data/sample-catalog-config.js';
 import {
   SOFTWARE_RASTERIZER_MARKERS,
 } from '../app/ui/modules/benchmark/renderer-identity.js';

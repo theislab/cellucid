@@ -87,6 +87,13 @@ async function openMarkers(page) {
 }
 
 /** Set options as the form does (the record merged, then validated). */
+/** Puts back every option the panel opened with (kept on the page by the test). */
+function resetOptions(page) {
+  return page.evaluate(() => {
+    window._comparisonModule.getUI('genesPanel')._setOptions(structuredClone(window.__openedWith));
+  });
+}
+
 function setOptions(page, patch) {
   return page.evaluate(next => {
     const ui = window._comparisonModule.getUI('genesPanel');
@@ -120,111 +127,115 @@ async function run(panel) {
   await expect(panel.locator('.analysis-result-header')).toBeVisible();
 }
 
-test('small groups: skipped and listed by default, pooled, or tested and flagged', async ({ page }) => {
+// One opening, the runs in turn. A step starts from the options the panel opened with.
+test('marker gene options: small groups, a subset against a reference with display filters, the all-genes CSV and a cached run', async ({ page }) => {
   const errors = observeProductErrors(page);
   const panel = await openMarkers(page);
-  await setOptions(page, { groupBy: 'cluster' });
-  await run(panel);
+  await page.evaluate(() => { window.__openedWith = structuredClone(window._comparisonModule.getUI('genesPanel')._options); });
 
-  let result = await shown(page);
-  expect(result.tested).toEqual(['A', 'B', 'C', 'D']);
-  expect(result.skipped.sort()).toEqual(['small', 'tiny']);
-  await expect(panel.locator('.analysis-chip', { hasText: '2 skipped' })).toBeVisible();
-  // Each tested group's markers are its own two genes, best first.
-  expect(result.markers.A.slice(0, 2).sort()).toEqual(['G0', 'G1']);
-  expect(result.markers.D.slice(0, 2).sort()).toEqual(['G6', 'G7']);
+  await test.step('small groups: skipped and listed by default, pooled, or tested and flagged', async () => {
+    await setOptions(page, { groupBy: 'cluster' });
+    await run(panel);
 
-  // A test option leaves the result stale until Run.
-  await setOptions(page, { smallGroups: 'pool' });
-  await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
-  await run(panel);
-  await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
-  result = await shown(page);
-  expect(result.pooled.sort()).toEqual(['small', 'tiny']);
-  expect(result.tested).toHaveLength(5);
-  await expect(panel.locator('.analysis-chip', { hasText: '2 pooled' })).toBeVisible();
+    let result = await shown(page);
+    expect(result.tested).toEqual(['A', 'B', 'C', 'D']);
+    expect(result.skipped.sort()).toEqual(['small', 'tiny']);
+    await expect(panel.locator('.analysis-chip', { hasText: '2 skipped' })).toBeVisible();
+    // Each tested group's markers are its own two genes, best first.
+    expect(result.markers.A.slice(0, 2).sort()).toEqual(['G0', 'G1']);
+    expect(result.markers.D.slice(0, 2).sort()).toEqual(['G6', 'G7']);
 
-  await setOptions(page, { smallGroups: 'test' });
-  await run(panel);
-  result = await shown(page);
-  // Groups are listed largest first.
-  expect(result.tested).toEqual(['A', 'B', 'C', 'D', 'small', 'tiny']);
-  expect(result.lowN.sort()).toEqual(['small', 'tiny']);
-  await expect(panel.locator('.analysis-chip', { hasText: '2 low n' })).toBeVisible();
-  expect(errors).toEqual([]);
-});
+    // A test option leaves the result stale until Run.
+    await setOptions(page, { smallGroups: 'pool' });
+    await expect(panel.locator('.analysis-stale-chip')).toBeVisible();
+    await run(panel);
+    await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
+    result = await shown(page);
+    expect(result.pooled.sort()).toEqual(['small', 'tiny']);
+    expect(result.tested).toHaveLength(5);
+    await expect(panel.locator('.analysis-chip', { hasText: '2 pooled' })).toBeVisible();
 
-test('a subset against one reference group, then filters re-applied without testing again', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openMarkers(page);
-  await setOptions(page, {
-    groupBy: 'cluster',
-    compareAgainst: 'group',
-    referenceGroup: 'B',
-    testGroups: { mode: 'subset', ids: ['A', 'C'] },
+    await setOptions(page, { smallGroups: 'test' });
+    await run(panel);
+    result = await shown(page);
+    // Groups are listed largest first.
+    expect(result.tested).toEqual(['A', 'B', 'C', 'D', 'small', 'tiny']);
+    expect(result.lowN.sort()).toEqual(['small', 'tiny']);
+    await expect(panel.locator('.analysis-chip', { hasText: '2 low n' })).toBeVisible();
+    expect(errors).toEqual([]);
   });
-  await run(panel);
-  let result = await shown(page);
-  expect(result.tested).toEqual(['A', 'C']);
-  expect(result.reference).toEqual(['B']);
-  await expect(panel.locator('.analysis-result-line')).toContainText('2 groups vs B');
 
-  // Display options: the same statistics object, no stale chip, new markers.
-  await page.evaluate(() => { window.__markerStats = window._comparisonModule.getUI('genesPanel')._lastResult.stats; });
-  await setOptions(page, { direction: 'down', topN: 3 });
-  await expect.poll(async () => (await shown(page)).markers.A.length).toBeLessThanOrEqual(3);
-  result = await shown(page);
-  expect(result.markers.A).not.toContain('G0');
-  expect(await page.evaluate(() => window._comparisonModule.getUI('genesPanel')._lastResult.stats === window.__markerStats)).toBe(true);
-  await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
+  await test.step('a subset against one reference group, then filters re-applied without testing again', async () => {
+    // Every option back to what the panel opened with: the step sets its own in full.
+    await resetOptions(page);
+    await setOptions(page, {
+      groupBy: 'cluster',
+      compareAgainst: 'group',
+      referenceGroup: 'B',
+      testGroups: { mode: 'subset', ids: ['A', 'C'] },
+    });
+    await run(panel);
+    let result = await shown(page);
+    expect(result.tested).toEqual(['A', 'C']);
+    expect(result.reference).toEqual(['B']);
+    await expect(panel.locator('.analysis-result-line')).toContainText('2 groups vs B');
 
-  // The strictest filters leave nothing: the empty state offers to relax them.
-  await panel.locator('.analysis-result-controls').getByRole('button', { name: 'List', exact: true }).click();
-  await setOptions(page, { direction: 'up', minLog2FC: 100 });
-  await expect(panel.locator('.marker-ranked-preview .empty-state')).toContainText('No genes pass the filters');
-  // The expanded view says it the same way, with the same way on (R9E-11:
-  // it said only "No genes pass the filters.").
-  await panel.getByRole('button', { name: /Expand/ }).click();
-  const modal = page.locator('.analysis-modal.open');
-  await expect(modal.locator('.empty-state')).toContainText(/^No genes pass the filters \(\d+ genes? tested in 2 groups\)\./);
-  await modal.getByRole('button', { name: 'Relax filters' }).click();
-  await expect.poll(async () => (await shown(page)).markers.A.length).toBeGreaterThan(0);
-  await page.keyboard.press('Escape');
-  await expect(modal).toHaveCount(0);
-  await setOptions(page, { direction: 'up', minLog2FC: 100 });
-  await expect(panel.locator('.marker-ranked-preview .empty-state')).toContainText('No genes pass the filters');
-  await panel.getByRole('button', { name: 'Relax filters' }).click();
-  await expect.poll(async () => (await shown(page)).markers.A.length).toBeGreaterThan(0);
-  expect(errors).toEqual([]);
-});
+    // Display options: the same statistics object, no stale chip, new markers.
+    await page.evaluate(() => { window.__markerStats = window._comparisonModule.getUI('genesPanel')._lastResult.stats; });
+    await setOptions(page, { direction: 'down', topN: 3 });
+    await expect.poll(async () => (await shown(page)).markers.A.length).toBeLessThanOrEqual(3);
+    result = await shown(page);
+    expect(result.markers.A).not.toContain('G0');
+    expect(await page.evaluate(() => window._comparisonModule.getUI('genesPanel')._lastResult.stats === window.__markerStats)).toBe(true);
+    await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
 
-test('the all-genes CSV uses scanpy names; a cached run offers Recompute', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  const panel = await openMarkers(page);
-  await setOptions(page, { groupBy: 'cluster' });
-  await run(panel);
+    // The strictest filters leave nothing: the empty state offers to relax them.
+    await panel.locator('.analysis-result-controls').getByRole('button', { name: 'List', exact: true }).click();
+    await setOptions(page, { direction: 'up', minLog2FC: 100 });
+    await expect(panel.locator('.marker-ranked-preview .empty-state')).toContainText('No genes pass the filters');
+    // The expanded view says it the same way, with the count of genes tested.
+    await panel.getByRole('button', { name: /Expand/ }).click();
+    const modal = page.locator('.analysis-modal.open');
+    await expect(modal.locator('.empty-state')).toContainText(/^No genes pass the filters \(\d+ genes? tested in 2 groups\)\./);
+    await modal.getByRole('button', { name: 'Relax filters' }).click();
+    await expect.poll(async () => (await shown(page)).markers.A.length).toBeGreaterThan(0);
+    await page.keyboard.press('Escape');
+    await expect(modal).toHaveCount(0);
+    await setOptions(page, { direction: 'up', minLog2FC: 100 });
+    await expect(panel.locator('.marker-ranked-preview .empty-state')).toContainText('No genes pass the filters');
+    await panel.getByRole('button', { name: 'Relax filters' }).click();
+    await expect.poll(async () => (await shown(page)).markers.A.length).toBeGreaterThan(0);
+    expect(errors).toEqual([]);
+  });
 
-  await panel.getByRole('button', { name: /Expand/ }).click();
-  const modal = page.locator('.analysis-modal.open');
-  await expect(modal).toBeVisible();
-  const download = page.waitForEvent('download');
-  await modal.getByRole('button', { name: 'All genes CSV' }).click();
-  const file = await download;
-  await expectDownloadNamed(file, /^marker_genes_all.*\.csv$/);
-  const text = await (await file.createReadStream()).toArray().then(chunks => Buffer.concat(chunks).toString('utf8'));
-  const lines = text.trim().split('\n');
-  expect(lines[0]).toBe('group,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested');
-  // Every gene of every group, tested or skipped.
-  expect(lines).toHaveLength(1 + GROUPS.length * GENES.length);
-  await page.keyboard.press('Escape');
-  await expect(modal).toHaveCount(0);
+  await test.step('the all-genes CSV uses scanpy names; a cached run offers Recompute', async () => {
+    // Every option back to what the panel opened with: the step sets its own in full.
+    await resetOptions(page);
+    await setOptions(page, { groupBy: 'cluster' });
+    await run(panel);
 
-  // The same run again is answered from memory, and Recompute tests again.
-  await run(panel);
-  expect((await shown(page)).cached).toBe(true);
-  await panel.getByRole('button', { name: 'Recompute' }).click();
-  await expect.poll(async () => (await shown(page)).cached).toBe(false);
-  expect(errors).toEqual([]);
+    await panel.getByRole('button', { name: /Expand/ }).click();
+    const modal = page.locator('.analysis-modal.open');
+    await expect(modal).toBeVisible();
+    const download = page.waitForEvent('download');
+    await modal.getByRole('button', { name: 'All genes CSV' }).click();
+    const file = await download;
+    await expectDownloadNamed(file, /^marker_genes_all.*\.csv$/);
+    const text = await (await file.createReadStream()).toArray().then(chunks => Buffer.concat(chunks).toString('utf8'));
+    const lines = text.trim().split('\n');
+    expect(lines[0]).toBe('group,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested');
+    // Every gene of every group, tested or skipped.
+    expect(lines).toHaveLength(1 + GROUPS.length * GENES.length);
+    await page.keyboard.press('Escape');
+    await expect(modal).toHaveCount(0);
+
+    // The same run again is answered from memory, and Recompute tests again.
+    await run(panel);
+    expect((await shown(page)).cached).toBe(true);
+    await panel.getByRole('button', { name: 'Recompute' }).click();
+    await expect.poll(async () => (await shown(page)).cached).toBe(false);
+    expect(errors).toEqual([]);
+  });
 });
 
 test.describe('on a phone', () => {

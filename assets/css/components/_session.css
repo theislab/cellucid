@@ -319,7 +319,7 @@
   flex: 1;
   min-width: 0;
   white-space: nowrap;
-  /* Short by construction; never under Manage…, whatever the counts (found 2026-11-10). */
+  /* Short by construction; never under Manage…, whatever the counts. */
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: var(--type-hint);
@@ -377,7 +377,7 @@
 
 /* A status said beside its button ("Private file on Google Drive. [Sign in
    to Google] (i)"): squeezed beside the button it wrapped into a narrow
-   column of three or four lines (F73), and a long reason with a help link
+   column of three or four lines, and a long reason with a help link
    into one letter a line. The words keep their one line when they fit beside
    the button; when they do not, they take the row whole and the link, the
    button and the (i) follow on the next. */

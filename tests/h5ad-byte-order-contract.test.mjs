@@ -415,7 +415,7 @@ test(
   async () => {
     const files = [
       '../assets/js/data/anndata-file-source.js',
-      ...(await readdir(fileURLToPath(new URL('../assets/js/data/anndata/', import.meta.url))))
+      ...(await readdir(fileURLToPath(new URL('../assets/js/data/anndata/', import.meta.url)), { recursive: true }))
         .filter(name => name.endsWith('.js'))
         .map(name => `../assets/js/data/anndata/${name}`),
     ];

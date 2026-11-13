@@ -7,11 +7,11 @@
  *
  *   node scripts/efficiency-floor/scale-browser.mjs STORE [--cells 10%,100%] [--out results.jsonl]
  *
- * The app is served by `serve-browser-tests.mjs` on this lane's ports
+ * The app is served by `serve-browser-tests.mjs` on the browser tests' ports
  * (`CELLUCID_BROWSER_TEST_PORT`, default 4573); the store from its folder
  * on the next port, over loopback (a fast network: the axes measured here are
- * time, memory and GPU, the bytes are the Node runs'). Run it alone
- * (`heavy.sh`): it starts a browser on the machine's GPU (`lib/browser-launch.mjs`; each
+ * time, memory and GPU, the bytes are the Node runs'). Run it alone:
+ * it starts a browser on the machine's GPU (`lib/browser-launch.mjs`; each
  * result names the renderer, and a software one refuses the run).
  */
 

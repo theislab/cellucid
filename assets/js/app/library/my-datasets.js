@@ -22,7 +22,7 @@
  *   when the same dataset is read on other cells (Cells to open, a
  *   progressive opening's growth), which only updates a dataset already
  *   listed. The startup's default sample is not an opening the person
- *   chose and is not recorded (`app/main.js`). A notebook's dataset
+ *   chose and is not recorded (`app/dataset/reload.js`). A notebook's dataset
  *   (a viewer host) is not listed: it is served to that notebook's viewer
  *   only and cannot be opened again from here (`captureDatasetSourceRecord`
  *   names no source for it).

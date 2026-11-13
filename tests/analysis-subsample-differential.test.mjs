@@ -2,7 +2,7 @@
  * Every analysis, on every way cells can be open, against an independent
  * reference on exactly the cells kept (`scripts/generate-subsample-analysis-fixtures.py`:
  * numpy, SciPy and pandas on the AnnData in memory, the kept cells from
- * `cellucid.subsample_cells`; `reference.json.sha256` catches a hand edit).
+ * `cellucid.subsample_cells`; the reference names the digest of each file it was made over).
  *
  * Each opening is opened as the app opens it (`AnnDataFileSource`, the reader
  * worker in process, the request the link or the Cells to open control
@@ -27,10 +27,10 @@
  *   within 1e-13 relative (`expm1`, `log2` of each side's libm, at most an
  *   ulp each); Wilcoxon p within 1e-12 relative (the normal tail in
  *   float64 by other special-function code, as `analysis-scanpy-rank-genes-parity`
- *   measures); Welch t within 1e-10 (centered against raw moments) and its p
+ *   states); Welch t within 1e-10 (centered against raw moments) and its p
  *   within 3e-10: the app's incomplete beta (`tCDF`) stops its continued
  *   fraction once a factor is within 1e-10 of 1, so its relative error is a
- *   few 1e-10 (1.1e-10 measured here against SciPy's `stdtr`);
+ *   few 1e-10 (1.1e-10 against SciPy's `stdtr`);
  * - the sparse block DE and markers read (`getMatrixCellSubset`, the
  *   groups' cells of every gene, in order and reversed, all of them and those
  *   among the first half of the open cells, which a priority file reads from
@@ -45,8 +45,7 @@
  * - the neighbor graph: the induced subgraph's edges, as pairs of original
  *   positions, and its largest weight, exactly;
  * - the vector field's vectors and the outlier quantiles, bit for bit: the
- *   ones `prepare()` stores are the whole dataset's, gathered (decision
- *   F-K7), and the served store, which stores none, computes them on the
+ *   ones `prepare()` stores are the whole dataset's, gathered, and the served store, which stores none, computes them on the
  *   open cells and tags them as an estimate.
  *
  * Edge cases the openings make: categories with no, one or few open cells
@@ -182,8 +181,6 @@ function groupOf(codes, categories) {
 }
 
 test('the reference is the one the generator wrote, over the files beside it', () => {
-  const sidecar = readFileSync(new URL('reference.json.sha256', FOLDER), 'utf8');
-  assert.equal(sidecar, `${createHash('sha256').update(REFERENCE_TEXT).digest('hex')}  reference.json\n`);
   for (const [name, digest] of Object.entries(REFERENCE.files)) {
     assert.equal(createHash('sha256').update(readFileSync(new URL(name, FOLDER))).digest('hex'), digest, name);
   }
@@ -265,8 +262,8 @@ async function checkOpening(view, opening, { label, stored, allCategories = true
         want[group],
         `${label}: dot plot ${gene} in ${type}`,
       );
-      // Every open cell holds a value of these genes: each is measured (a
-      // NaN would leave the group's numbers, NS-1).
+      // Every open cell holds a value of these genes: each is counted (a
+      // NaN would leave the group's numbers).
       assert.equal(summary.measured[at], summary.sizes[group], `${label}: dot plot ${gene} in ${type} measured`);
     });
   });

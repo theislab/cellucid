@@ -1,6 +1,5 @@
 /**
- * The history stress suite in a real page (`cellucid-private/plans/history-v2.md`
- * §3.15.4, workstream HS; the Node half is `tests/stress/`): on a served
+ * The history stress suite in a real page (the Node half is `tests/stress/`): on a served
  * synthetic dataset of 1 000 000 cells, it measures
  *
  * - the frames during a camera gesture, a slider drag, a highlight of
@@ -24,7 +23,7 @@
  * It runs only when asked (`CELLUCID_HISTORY_STRESS=1`), in Chromium, on the
  * machine's GPU (`scripts/lib/browser-launch.mjs`): a software rasterizer
  * would make every frame time the rasterizer's. A 1M-cell page is a heavy
- * job: on a 16 GB machine, run it alone (`.cellucid-maintenance/heavy.sh`).
+ * job: on a 16 GB machine, run it alone, with no other heavy job at the same time.
  *
  *   CELLUCID_HISTORY_STRESS=1 npx playwright test tests/browser/history-stress.spec.mjs --project=chromium
  */
@@ -324,7 +323,7 @@ async function attributed(cdp, measure) {
 }
 
 /**
- * The State panel's branch graph (virtualised, History v2 §3.9): its first
+ * The State panel's branch graph (virtualised): its first
  * draw when the panel opens (until the row of the step shown is drawn), the
  * frame of one more step (`addStep`: 'setting', a setting changed through
  * the page's dispatcher; 'stand-in', one appended to the stand-in core), and
@@ -406,9 +405,8 @@ test('the branch graph and memory at 1 000 and 10 000 steps', async ({ page }) =
 });
 
 /**
- * The branch graph at 10 000 steps and 100 branches (History v2 §3.15.4:
- * the graph scrolls at the display's frame rate). The tracker is built of
- * History v2 records (`helpers/history-v2-fake.mjs`): 100 branches of 10
+ * The branch graph at 10 000 steps and 100 branches (the graph scrolls at the display's frame rate). The tracker is built of
+ * history records (`helpers/history-v2-fake.mjs`): 100 branches of 10
  * steps each, forking from the first 100 steps, and a main line to 10 000
  * steps, a third of them camera moves; one more step is appended as the core
  * appends one.

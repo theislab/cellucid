@@ -15,18 +15,11 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 
 import {
   CommunityAnnotationSession,
 } from '../assets/js/app/community-annotations/session.js';
-
-const VOTING_MODAL = fileURLToPath(new URL(
-  '../assets/js/app/ui/modules/community-annotation-voting-modal.js',
-  import.meta.url
-));
 
 function createMemoryStorage() {
   const values = new Map();
@@ -165,60 +158,3 @@ test(
     });
   }
 );
-
-test('the voting panel refuses to create against a bucket it did not render', () => {
-  const source = readFileSync(VOTING_MODAL, 'utf8');
-  assert.match(
-    source,
-    /const renderedBucket = bucketKey\(session, fieldKey, catIdx\);/,
-    'the detail panel must pin the bucket it rendered'
-  );
-  const addHandler = source.slice(
-    source.indexOf("addBtn.addEventListener('click'"),
-    source.indexOf('session.addSuggestion(')
-  );
-  assert.ok(
-    addHandler.length > 0 && addHandler.length < 1200,
-    'the add handler should have been located, not guessed'
-  );
-  assert.match(
-    addHandler,
-    /if \(!rendersCurrentBucket\(\)\) \{/,
-    'creating a suggestion must be refused when the rendered bucket moved; ' +
-    'unlike the id-based mutations, creation cannot fail on its own'
-  );
-  assert.match(
-    addHandler,
-    /Suggestion not added: the categories of this field changed/,
-    'the refusal must say what happened and what to do next'
-  );
-});
-
-test('every voting-modal vote call site consumes the recorded outcome', () => {
-  const source = readFileSync(VOTING_MODAL, 'utf8');
-  const lines = source.split('\n');
-  const callSites = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].includes('session.vote(')) {
-      callSites.push({ line: index + 1, text: lines[index] });
-    }
-  }
-  assert.ok(
-    callSites.length > 0,
-    'the voting modal must still cast votes through session.vote()'
-  );
-
-  const discarded = callSites.filter(site => /^\s*session\.vote\(/.test(site.text));
-  assert.deepEqual(
-    discarded,
-    [],
-    'session.vote() returns false when the vote was refused; a call site that ' +
-    'drops that value leaves a live-looking button discarding every click'
-  );
-
-  assert.match(
-    source,
-    /Vote not recorded: this suggestion is no longer part of the/,
-    'a refused vote must tell the user it was refused and what to do next'
-  );
-});

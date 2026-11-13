@@ -152,9 +152,9 @@ function listingFailure(accession, status) {
 /**
  * Whether NCBI's file service is failing, asked before a listing's answer is
  * taken to mean the accession lacks a file: while it fails, NCBI answers its
- * folder listings with no files, or only some (measured 2026-10-31: a
- * series' `suppl/` folder listed empty, or two of its files, while every
- * file of `/geo/`, `filelist.txt` and `geo/README.txt` included, answered
+ * folder listings with no files, or only some (a series' `suppl/` folder
+ * lists empty, or some of its files, while every file of `/geo/`,
+ * `filelist.txt` and `geo/README.txt` included, answers
  * HTTP 500). The refusal that names the failing host, or null when NCBI
  * answers: a series' `filelist.txt` that answered a host-side status says
  * so at once; otherwise `geo/README.txt`, which NCBI keeps beside every

@@ -40,7 +40,7 @@ function requireCacheIdentity(identity) {
 }
 
 /** Bytes the typed arrays of a value hold. */
-export function markerStatisticsBytes(value) {
+function markerStatisticsBytes(value) {
   let bytes = 0;
   const seen = new Set();
   const visit = node => {

@@ -82,7 +82,7 @@ const SYNC_SKIPPED_MESSAGE =
  * nothing new.
  * @param {{mode?: string, prUrl?: string|null}} outcome
  */
-export function describePublished(outcome) {
+function describePublished(outcome) {
   if (outcome.mode === 'fork-pull-request') return `Opened a pull request: ${outcome.prUrl}. The repository has your changes once its authors merge it.`;
   if (outcome.changed === false) return 'Nothing new to publish: GitHub already has your changes.';
   return 'Published.';

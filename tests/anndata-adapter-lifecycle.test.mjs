@@ -1363,8 +1363,8 @@ test('a read nobody waits for any more is cancelled in the loader; one still wan
 });
 
 test('an opening stopped while its first view is read stops that read: initialize answers at once and the read is told to stop', async () => {
-  // Found 2026-11-10 on a 1.6 Mbps link: an Apply superseded by another dataset kept reading
-  // the first view's embedding for ~15 s (the read joined no caller that could stop it).
+  // An Apply superseded by another dataset must not keep reading the first view's embedding
+  // (a read joined by no caller that could stop it would run on, ~15 s on a 1.6 Mbps link).
   let readSignal = null;
   let readStarted;
   const started = new Promise(resolve => { readStarted = resolve; });

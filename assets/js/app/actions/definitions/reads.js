@@ -316,8 +316,8 @@ export const readActions = Object.freeze([
         },
         top: TOP('For a categorical field: at most this many of its categories per group.'),
         visible_only: { type: 'boolean', default: false, description: 'Only the cells the active view shows.' },
-        // Agents hid the person's cells to summarize a subset (6 filter steps in an Opus turn for donors within one
-        // cell type; 4 in a Haiku turn for cell types per age range), then put the view back (live-7 L25-13).
+        // `within` leaves the view as it is: without it an agent summarizes a subset by hiding the person's
+        // cells with filter steps and then putting the view back.
         within: {
           type: 'object', additionalProperties: false, required: ['field'],
           description: 'Only the cells of some categories of another categorical field, or in a range of a continuous field or gene (both ends included), leaving the view as it is: donors within one cell type, cell types per age range.',

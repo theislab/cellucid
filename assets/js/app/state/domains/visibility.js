@@ -28,7 +28,7 @@ const NONE = new Uint32Array(0);
 const CAPTURED = new WeakMap();
 
 /** The cells one view hides by hand, by original position. */
-export function captureViewHidden(owner, identity) {
+function captureViewHidden(owner, identity) {
   const mask = owner.cellVisibilityMask;
   if (!(mask instanceof Uint8Array) || mask.length === 0 || isAllShownCellVisibilityMask(mask)) return NONE;
   const writes = cellVisibilityMaskWrites(mask);
@@ -59,7 +59,7 @@ function sameCells(a, b) {
  */
 export function createVisibilityDomain({ state, viewer, refreshUi }) {
   return {
-    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    // A step read the view it acted in: staleness compares that view's part alone.
     readPart: viewReadPart,
     capture() {
       return { views: viewIdsOf(viewer).map(id => captureViewHidden(viewOwner(state, id), state.cellIdentity)) };

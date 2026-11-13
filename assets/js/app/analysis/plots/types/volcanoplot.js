@@ -53,16 +53,13 @@ const VOLCANO_MARGIN_RIGHT = 20;
 // The band below the x axis, budgeted rather than guessed.
 //
 // Three things want that band: the tick labels, the axis title, and the
-// horizontal legend. Each used to claim it with its own constant — the legend
-// at `y: -0.14`, a fraction of the *plot area's* height, and the axis title
-// wherever Plotly put it inside a fixed 90-pixel margin. Two offsets measured
-// from different origins into one band collide as soon as the box changes size,
-// and they did: `log₂ Fold Change` was drawn across the `Down (n)` legend entry
-// in the sidebar preview and in the expanded overlay alike.
-//
-// The band is now laid out top-down in pixels — tick labels, then the title at
-// a pinned standoff, then the legend below it — and the margin is exactly the
-// total. Nothing is placed by a constant that only holds at one size.
+// horizontal legend. Offsets for them measured from different origins (the
+// legend as a fraction of the *plot area's* height, the axis title wherever
+// Plotly puts it inside a fixed margin) collide as soon as the box changes
+// size, so the band is laid out top-down in pixels — tick labels, then the
+// title at a pinned standoff, then the legend below it — and the margin is
+// exactly the total. Nothing is placed by a constant that only holds at one
+// size.
 const VOLCANO_TICK_LABEL_HEIGHT = 14;
 const VOLCANO_AXIS_TITLE_STANDOFF = 6;
 const VOLCANO_AXIS_TITLE_HEIGHT = 16;
@@ -861,7 +858,7 @@ export function buildVolcanoFigure(deResults, options, viewport) {
 
   if (zeroProbabilityIndices.length > 0) {
     // Round values below the +∞ band (1/2/5 × 10^n), none so close under it that the two labels
-    // meet (found 2026-11-10: quarters of the top read 80.2, 160, 241, 321 and 321 overlapped +∞).
+    // meet (unrounded quarters of the top would crowd the +∞ label).
     const finiteTicks = niceNumbers(0, finiteDomainTop, 4).ticks
       .filter(value => value >= 0 && value <= finiteDomainTop && value <= infinityBoundaryY * 0.9);
     const tickValues = [...finiteTicks, infinityBoundaryY];
@@ -925,7 +922,7 @@ export function buildVolcanoFigure(deResults, options, viewport) {
   //
   // `legend.y` is in paper units — a fraction of the plot area's height — so
   // the pixel offset the band reserved is converted with the plot height this
-  // layout actually produces. That is the whole fix: one origin, one budget.
+  // layout actually produces: one origin, one budget.
   const plotHeight = viewport.height - labelLayout.marginTop - axisBand.marginBottom;
   layout.showlegend = axisBand.showLegend;
   if (axisBand.showLegend) {

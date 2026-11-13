@@ -6,7 +6,7 @@
  * density: 48³", not the slider position 37). A slider's position is not
  * always what it means (the point size is a logarithmic curve, a smoke grid
  * a band of sizes), and the readout element shows only the value it holds
- * now (R9R-3, 2026-11-11).
+ * now.
  *
  * @module app/ui/core/control-readout
  */

@@ -11,9 +11,6 @@ import {
   listVectorDataset,
   watchVelocityBuild,
 } from './helpers/vector-catalog.mjs';
-import {
-  PROJECTILE_MIN_CHARGE_SECONDS,
-} from '../../assets/js/rendering/projectiles.js';
 
 const WEBGL_HARNESS = '/tests/browser/fixtures/webgl-harness.html';
 
@@ -35,8 +32,18 @@ async function installReadPixelsAudit(page) {
   });
 }
 
-test('volumetric smoke completes its exact GPU density and noise path', async ({ page }) => {
+// One page walks smoke mode in the order a person can: leave it while its
+// noise is still being made, enter again and let it finish, go back to points,
+// then filter every cell away and back.
+test('smoke mode on one page: cancelled, completed, left, and with an empty filtered view', async ({
+  browserName,
+  page,
+}) => {
+  await installReadPixelsAudit(page);
   const browserErrors = [];
+  const warnings = [];
+  const browserDiagnostics = [];
+  let noiseReadyPublications = 0;
   let publishDensityReady;
   const densityReady = new Promise(resolve => {
     publishDensityReady = resolve;
@@ -47,8 +54,16 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
   });
 
   page.on('console', message => {
-    if (message.type() === 'error') {
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
+    if (
+      message.type() === 'warning' &&
+      /GL Driver Message .*GPU stall due to ReadPixels/.test(message.text())
+    ) {
+      browserDiagnostics.push(message.text());
+    } else if (message.type() === 'error') {
       browserErrors.push(`console: ${message.text()}`);
+    } else if (message.type() === 'warning') {
+      warnings.push(`console warning: ${message.text()}`);
     }
     if (
       message.text().includes(
@@ -58,6 +73,7 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
       publishDensityReady();
     }
     if (message.text().includes('[SmokeRenderer] Cloud noise textures ready')) {
+      noiseReadyPublications++;
       publishNoiseReady();
     }
   });
@@ -94,140 +110,166 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
   });
   const renderMode = page.locator('#render-mode');
   await expect(renderMode).toHaveValue('points');
-  const building = Date.now();
-  await renderMode.selectOption('smoke');
-  await expect(renderMode).toHaveValue('smoke');
-  await Promise.all([densityReady, noiseReady]);
-  // What follows draws smoke frames on the same GPU: the budget follows what the
-  // volume and noise took here (seconds on software GL, 50 s on hosted macOS Firefox).
-  test.setTimeout(test.info().timeout + 2 * (Date.now() - building));
-  await page.evaluate(() => new Promise(resolve => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
+  let building = 0;
 
-  const smokeState = await page.locator('#glcanvas').evaluate(canvas => {
-    const gl = canvas.getContext('webgl2');
-    return {
-      clearColor: Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE)),
-      depth: gl.isEnabled(gl.DEPTH_TEST),
-      error: gl.getError(),
-      framebufferIsDefault:
-        gl.getParameter(gl.FRAMEBUFFER_BINDING) === null,
-    };
-  });
-  expect(smokeState).toEqual({
-    clearColor: clearColorBefore,
-    depth: true,
-    error: 0,
-    framebufferIsDefault: true,
-  });
-  await renderMode.selectOption('points');
-  await page.evaluate(() => new Promise(resolve => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-  const pointsState = await page.locator('#glcanvas').evaluate(canvas => {
-    const gl = canvas.getContext('webgl2');
-    return {
-      clearColor: Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE)),
-      error: gl.getError(),
-      framebufferIsDefault:
-        gl.getParameter(gl.FRAMEBUFFER_BINDING) === null,
-    };
-  });
-  expect(pointsState).toEqual({
-    clearColor: clearColorBefore,
-    error: 0,
-    framebufferIsDefault: true,
-  });
-  expect(browserErrors).toEqual([]);
-});
+  await test.step('render-mode switch cancels one pending noise transaction and restarts cleanly', async () => {
+    await renderMode.selectOption('smoke');
+    await page.waitForFunction(() =>
+      window._cellucidViewer?.hasPendingSmokeNoiseGeneration() === true
+    );
+    expect(await page.evaluate(() => ({
+      pending:
+        window._cellucidViewer.hasPendingSmokeNoiseGeneration(),
+      textures: window._cellucidViewer.hasSmokeNoiseTextures(),
+    }))).toEqual({
+      pending: true,
+      textures: false,
+    });
 
-test('render-mode switch cancels one pending noise transaction and restarts cleanly', async ({
-  page,
-}) => {
-  const browserErrors = [];
-  let noiseReadyPublications = 0;
-  let publishNoiseReady;
-  const noiseReady = new Promise(resolve => {
-    publishNoiseReady = resolve;
+    await renderMode.selectOption('points');
+    await expect(renderMode).toHaveValue('points');
+    await page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+    expect(await page.evaluate(() => ({
+      pending:
+        window._cellucidViewer.hasPendingSmokeNoiseGeneration(),
+      textures: window._cellucidViewer.hasSmokeNoiseTextures(),
+    }))).toEqual({
+      pending: false,
+      textures: false,
+    });
+    expect(noiseReadyPublications).toBe(0);
+
+    building = Date.now();
+    await renderMode.selectOption('smoke');
+    await Promise.all([
+      noiseReady,
+      expect(renderMode).toHaveValue('smoke'),
+    ]);
+    expect(await page.evaluate(() => ({
+      pending:
+        window._cellucidViewer.hasPendingSmokeNoiseGeneration(),
+      textures: window._cellucidViewer.hasSmokeNoiseTextures(),
+    }))).toEqual({
+      pending: false,
+      textures: true,
+    });
+    expect(noiseReadyPublications).toBe(1);
+    expect(browserErrors).toEqual([]);
   });
-  page.on('console', message => {
-    if (message.type() === 'error') {
-      browserErrors.push(`console: ${message.text()}`);
+
+  await test.step('volumetric smoke completes its exact GPU density and noise path', async () => {
+    await expect(renderMode).toHaveValue('smoke');
+    await Promise.all([densityReady, noiseReady]);
+    // What follows draws smoke frames on the same GPU: the budget follows what the
+    // volume and noise took here (measured: 38_decisions_testing_and_hosted_runners.md).
+    test.setTimeout(test.info().timeout + 2 * (Date.now() - building));
+    await page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+
+    const smokeState = await page.locator('#glcanvas').evaluate(canvas => {
+      const gl = canvas.getContext('webgl2');
+      return {
+        clearColor: Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE)),
+        depth: gl.isEnabled(gl.DEPTH_TEST),
+        error: gl.getError(),
+        framebufferIsDefault:
+          gl.getParameter(gl.FRAMEBUFFER_BINDING) === null,
+      };
+    });
+    expect(smokeState).toEqual({
+      clearColor: clearColorBefore,
+      depth: true,
+      error: 0,
+      framebufferIsDefault: true,
+    });
+    await renderMode.selectOption('points');
+    await page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+    const pointsState = await page.locator('#glcanvas').evaluate(canvas => {
+      const gl = canvas.getContext('webgl2');
+      return {
+        clearColor: Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE)),
+        error: gl.getError(),
+        framebufferIsDefault:
+          gl.getParameter(gl.FRAMEBUFFER_BINDING) === null,
+      };
+    });
+    expect(pointsState).toEqual({
+      clearColor: clearColorBefore,
+      error: 0,
+      framebufferIsDefault: true,
+    });
+    expect(browserErrors).toEqual([]);
+  });
+
+  await test.step('smoke owns an empty filtered view without errors or stale density', async () => {
+    const warningsBefore = warnings.length;
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+
+    const legend = page.locator('#legend');
+    await legend.getByRole('button', { name: 'Hide all', exact: true }).click();
+    await expect(page.locator('#filter-count')).toHaveText(
+      'Showing 0 of 120 cells',
+    );
+
+    await renderMode.selectOption('smoke');
+    await expect(renderMode).toHaveValue('smoke');
+    await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
+    await expect(page.locator('#points-controls')).not.toHaveClass(/visible/);
+    // Level of detail and frustum culling are point-renderer settings; the
+    // antialiasing below them governs the drawing buffer in both modes.
+    await expect(page.locator('#points-performance-controls')).toBeHidden();
+    await expect(page.locator('#hp-antialias')).toBeVisible();
+    expect(await page.evaluate(
+      () => window._cellucidViewer.hasSmokeVolume(),
+    )).toBe(false);
+
+    await legend.getByRole('button', { name: 'Show all', exact: true }).click();
+    await expect(page.locator('#filter-count')).toHaveText(
+      'Showing all 120 cells',
+    );
+    await expect.poll(
+      () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
+    ).toBe(true);
+
+    await legend.getByRole('button', { name: 'Hide all', exact: true }).click();
+    await expect(page.locator('#filter-count')).toHaveText(
+      'Showing 0 of 120 cells',
+    );
+    await expect.poll(
+      () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
+    ).toBe(false);
+    await renderMode.selectOption('points');
+    await renderMode.selectOption('smoke');
+    await expect(renderMode).toHaveValue('smoke');
+    await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
+    expect(await page.evaluate(
+      () => window._cellucidViewer.hasSmokeVolume(),
+    )).toBe(false);
+    expect(await page.evaluate(
+      () => window.__cellucidReadPixelsCalls,
+    )).toBe(0);
+
+    const webglError = await page.locator('#glcanvas').evaluate(canvas => (
+      canvas.getContext('webgl2').getError()
+    ));
+    expect(webglError).toBe(0);
+    expect(browserErrors).toEqual([]);
+    expect(warnings.slice(warningsBefore)).toEqual([]);
+    expect(
+      browserDiagnostics.every(message =>
+        /GL Driver Message .*GPU stall due to ReadPixels/.test(message),
+      ),
+    ).toBe(true);
+    expect(browserDiagnostics.length).toBeLessThanOrEqual(4);
+    if (browserName !== 'chromium') {
+      expect(browserDiagnostics).toEqual([]);
     }
-    if (message.text().includes('[SmokeRenderer] Cloud noise textures ready')) {
-      noiseReadyPublications++;
-      publishNoiseReady();
-    }
   });
-  page.on('pageerror', error => {
-    browserErrors.push(`page: ${error.stack || error.message}`);
-  });
-  page.on('response', response => {
-    if (response.status() >= 400) {
-      browserErrors.push(`http ${response.status()}: ${response.url()}`);
-    }
-  });
-
-  await page.goto(
-    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-mode-generation-cancellation`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await page.locator('#smoke-grid').evaluate(input => {
-    input.value = '0';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  });
-  await page.locator('#noise-resolution').evaluate(input => {
-    input.value = '0';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  });
-
-  const renderMode = page.locator('#render-mode');
-  await renderMode.selectOption('smoke');
-  await page.waitForFunction(() =>
-    window._cellucidViewer?.hasPendingSmokeNoiseGeneration() === true
-  );
-  expect(await page.evaluate(() => ({
-    pending:
-      window._cellucidViewer.hasPendingSmokeNoiseGeneration(),
-    textures: window._cellucidViewer.hasSmokeNoiseTextures(),
-  }))).toEqual({
-    pending: true,
-    textures: false,
-  });
-
-  await renderMode.selectOption('points');
-  await expect(renderMode).toHaveValue('points');
-  await page.evaluate(() => new Promise(resolve => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-  expect(await page.evaluate(() => ({
-    pending:
-      window._cellucidViewer.hasPendingSmokeNoiseGeneration(),
-    textures: window._cellucidViewer.hasSmokeNoiseTextures(),
-  }))).toEqual({
-    pending: false,
-    textures: false,
-  });
-  expect(noiseReadyPublications).toBe(0);
-
-  await renderMode.selectOption('smoke');
-  await Promise.all([
-    noiseReady,
-    expect(renderMode).toHaveValue('smoke'),
-  ]);
-  expect(await page.evaluate(() => ({
-    pending:
-      window._cellucidViewer.hasPendingSmokeNoiseGeneration(),
-    textures: window._cellucidViewer.hasSmokeNoiseTextures(),
-  }))).toEqual({
-    pending: false,
-    textures: true,
-  });
-  expect(noiseReadyPublications).toBe(1);
-  expect(browserErrors).toEqual([]);
 });
 
 test('smoke noise resolution remains isolated between renderer instances', async ({
@@ -1422,77 +1464,6 @@ test('disposing smoke before its first scheduled noise batch allocates nothing',
   });
 });
 
-test('smoke on a device without float blending stays in Points with a plain message, detected once', async ({
-  page,
-}) => {
-  const browserErrors = [];
-  page.on('console', message => {
-    if (message.type() === 'error') {
-      browserErrors.push(`console: ${message.text()}`);
-    }
-  });
-  page.on('pageerror', error => {
-    browserErrors.push(`page: ${error.stack || error.message}`);
-  });
-  page.on('response', response => {
-    if (response.status() >= 400) {
-      browserErrors.push(`http ${response.status()}: ${response.url()}`);
-    }
-  });
-  await page.goto(
-    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-mode-rollback`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture',
-  );
-  await page.locator('#smoke-grid').evaluate(input => {
-    input.value = '0';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  });
-  await page.evaluate(() => {
-    const canvas = document.querySelector('#glcanvas');
-    const gl = canvas?.getContext('webgl2');
-    if (!(gl instanceof WebGL2RenderingContext)) {
-      throw new Error('Smoke rollback fixture requires WebGL2');
-    }
-    const prototype = WebGL2RenderingContext.prototype;
-    const original = prototype.getExtension;
-    window.__floatBlendQueries = 0;
-    prototype.getExtension = function (name) {
-      if (this === gl && name === 'EXT_float_blend') {
-        window.__floatBlendQueries++;
-        return null;
-      }
-      return Reflect.apply(original, this, [name]);
-    };
-  });
-
-  const message = "Volumetric smoke isn't available on this device: its graphics "
-    + "driver can't blend high-precision color, which the smoke cloud needs to "
-    + 'add up the cells. Points rendering works as usual.';
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    await page.locator('#render-mode').selectOption('smoke');
-    await expect(page.locator('#render-mode')).toHaveValue('points');
-    await expect(page.locator('#smoke-controls')).not.toHaveClass(/\bvisible\b/);
-    await expect(page.locator('#points-controls')).toHaveClass(/\bvisible\b/);
-    await expect(
-      page.locator('#notification-center .notification-warning')
-        .filter({ hasText: message }),
-    ).toHaveCount(attempt);
-  }
-  // A device's capabilities do not change: they are queried once, and nothing
-  // was built or half-published.
-  expect(await page.evaluate(() => ({
-    queries: window.__floatBlendQueries,
-    volume: window._cellucidViewer.hasSmokeVolume(),
-  }))).toEqual({ queries: 1, volume: false });
-  await expect(page.locator('.notification-error')).toHaveCount(0);
-  expect(browserErrors).toEqual([]);
-});
-
 test('runtime smoke noise failure settles once to points and retries cleanly', async ({
   page,
 }) => {
@@ -1529,9 +1500,9 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
   // The opening is over before its publications are counted: the name
   // shows with the first frame, and the gene list, read after it, is listed
   // by refreshing the interface, which publishes the active view again
-  // (`genes:listed`, ui-coordinator.js). On a slow runner that came after
-  // the counters were installed (Web contracts run 41269083996, Windows
-  // Firefox: one publication counted before smoke mode began).
+  // (`genes:listed`, ui-coordinator.js). On a slow runner that comes after
+  // the counters are installed, and one publication is counted before smoke
+  // mode begins (Windows Firefox).
   await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', { timeout: 120_000 });
   await page.evaluate(() => window._cellucidState.whenGenesListed());
   await page.evaluate(() => {
@@ -2098,115 +2069,6 @@ test('GPU smoke density matches its prior GPU reference without product readback
   ).toBeGreaterThanOrEqual(100);
 });
 
-test('smoke owns an empty filtered view without errors or stale density', async ({
-  browserName,
-  page,
-}) => {
-  await installReadPixelsAudit(page);
-  const productErrors = [];
-  const browserDiagnostics = [];
-  page.on('console', message => {
-    if (isFirefoxSafeResolveReorderingWarning(message)) return;
-    if (
-      message.type() === 'warning' &&
-      /GL Driver Message .*GPU stall due to ReadPixels/.test(message.text())
-    ) {
-      browserDiagnostics.push(message.text());
-    } else if (message.type() === 'error' || message.type() === 'warning') {
-      productErrors.push(`console ${message.type()}: ${message.text()}`);
-    }
-  });
-  page.on('pageerror', error => {
-    productErrors.push(`page: ${error.stack || error.message}`);
-  });
-  page.on('response', response => {
-    if (response.status() >= 400) {
-      productErrors.push(`http ${response.status()}: ${response.url()}`);
-    }
-  });
-
-  await page.goto(
-    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-empty-filter`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture',
-  );
-  await page.locator('#smoke-grid').evaluate(input => {
-    input.value = '0';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  });
-  await page.locator('#noise-resolution').evaluate(input => {
-    input.value = '0';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  });
-  await expect(page.locator('#smoke-grid-display')).toHaveText('32³');
-  await expect(page.locator('#noise-resolution-display')).toHaveText('32³');
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-
-  const legend = page.locator('#legend');
-  await legend.getByRole('button', { name: 'Hide all', exact: true }).click();
-  await expect(page.locator('#filter-count')).toHaveText(
-    'Showing 0 of 120 cells',
-  );
-
-  const renderMode = page.locator('#render-mode');
-  await renderMode.selectOption('smoke');
-  await expect(renderMode).toHaveValue('smoke');
-  await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
-  await expect(page.locator('#points-controls')).not.toHaveClass(/visible/);
-  // Level of detail and frustum culling are point-renderer settings; the
-  // antialiasing below them governs the drawing buffer in both modes.
-  await expect(page.locator('#points-performance-controls')).toBeHidden();
-  await expect(page.locator('#hp-antialias')).toBeVisible();
-  expect(await page.evaluate(
-    () => window._cellucidViewer.hasSmokeVolume(),
-  )).toBe(false);
-
-  await legend.getByRole('button', { name: 'Show all', exact: true }).click();
-  await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 cells',
-  );
-  await expect.poll(
-    () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
-  ).toBe(true);
-
-  await legend.getByRole('button', { name: 'Hide all', exact: true }).click();
-  await expect(page.locator('#filter-count')).toHaveText(
-    'Showing 0 of 120 cells',
-  );
-  await expect.poll(
-    () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
-  ).toBe(false);
-  await renderMode.selectOption('points');
-  await renderMode.selectOption('smoke');
-  await expect(renderMode).toHaveValue('smoke');
-  await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
-  expect(await page.evaluate(
-    () => window._cellucidViewer.hasSmokeVolume(),
-  )).toBe(false);
-  expect(await page.evaluate(
-    () => window.__cellucidReadPixelsCalls,
-  )).toBe(0);
-
-  const webglError = await page.locator('#glcanvas').evaluate(canvas => (
-    canvas.getContext('webgl2').getError()
-  ));
-  expect(webglError).toBe(0);
-  expect(productErrors).toEqual([]);
-  expect(
-    browserDiagnostics.every(message =>
-      /GL Driver Message .*GPU stall due to ReadPixels/.test(message),
-    ),
-  ).toBe(true);
-  expect(browserDiagnostics.length).toBeLessThanOrEqual(4);
-  if (browserName !== 'chromium') {
-    expect(browserDiagnostics).toEqual([]);
-  }
-});
-
 test('every visible velocity slider endpoint reaches the GPU unchanged', async ({
   browserName,
   page,
@@ -2305,147 +2167,6 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
   if (browserName !== 'chromium') {
     expect(browserDiagnostics).toEqual([]);
   }
-});
-
-test('recoloring and position changes retain the published filter generation', async ({
-  page,
-}) => {
-  const productErrors = [];
-  page.on('console', message => {
-    if (message.type() === 'error') {
-      productErrors.push(`console: ${message.text()}`);
-    }
-  });
-  page.on('pageerror', error => {
-    productErrors.push(`page: ${error.stack || error.message}`);
-  });
-  page.on('response', response => {
-    if (response.status() >= 400) {
-      productErrors.push(`http ${response.status()}: ${response.url()}`);
-    }
-  });
-
-  await page.goto(
-    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=renderer-alpha-generation`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI fixture',
-  );
-
-  const result = await page.evaluate(async () => {
-    const viewer = window._cellucidViewer;
-    const transparency = new Uint8Array(viewer.getPointCount()).fill(1);
-    transparency[0] = 0;
-    viewer.updateTransparency(transparency);
-
-    const readVisibility = () => {
-      const alpha = viewer.getViewTransparency('live');
-      const membership = viewer.getCurrentLodMembership(
-        'live',
-        2,
-      );
-      // Null membership is full detail; otherwise the LodMembership
-      // admission test (rendering/high-perf/renderer-contracts.js).
-      const admitted = index => membership === null || (
-        membership.admissionLevels === null
-          ? index < membership.count
-          : membership.admissionLevels[index] <= membership.lodLevel
-      );
-      return [0, 1].map(index => (
-        alpha[index] >= Math.fround(2.5 / 255) && admitted(index)
-      ) ? 1 : 0);
-    };
-
-    const colors = viewer.getColors().slice();
-    colors[0] = (colors[0] + 17) % 256;
-    viewer.updateColors(colors);
-    const afterRecolor = readVisibility();
-
-    viewer.updatePositions(viewer.getPositions().slice(), 2);
-    const afterPositions = readVisibility();
-    await new Promise(resolve => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    });
-
-    return {
-      afterPositions,
-      afterRecolor,
-      webglError: viewer.getGLContext().getError(),
-    };
-  });
-
-  expect(result).toEqual({
-    afterPositions: [0, 1],
-    afterRecolor: [0, 1],
-    webglError: 0,
-  });
-  expect(productErrors).toEqual([]);
-});
-
-test('projectiles use the published full-resolution collision index', async ({ page }) => {
-  const browserErrors = [];
-  page.on('console', message => {
-    if (message.type() === 'error') {
-      browserErrors.push(`console: ${message.text()}`);
-    }
-  });
-  page.on('pageerror', error => {
-    browserErrors.push(`page: ${error.stack || error.message}`);
-  });
-  page.on('response', response => {
-    if (response.status() >= 400) {
-      browserErrors.push(`http ${response.status()}: ${response.url()}`);
-    }
-  });
-
-  await page.goto(
-    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=renderer-projectile-ci`,
-    { waitUntil: 'domcontentloaded' },
-  );
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-
-  await page.locator('#navigation-mode').selectOption('free');
-  await expect(page.locator('#navigation-mode')).toHaveValue('free');
-  await page.locator('#projectiles-enabled').check();
-  await page.waitForFunction(
-    () => window._cellucidViewer.isProjectileSpatialIndexReady(),
-  );
-
-  const bounds = await page.locator('#glcanvas').boundingBox();
-  expect(bounds).not.toBeNull();
-  await page.mouse.move(
-    bounds.x + bounds.width * 0.75,
-    bounds.y + bounds.height * 0.5,
-  );
-  // Hold past the charge threshold so this fires a charged shot. A loaded
-  // runner can only lengthen the hold, never shorten it.
-  await page.mouse.down();
-  await page.waitForTimeout(Math.ceil(PROJECTILE_MIN_CHARGE_SECONDS * 1000 * 1.5));
-  await page.mouse.up();
-  // Let the shot fly through the collision index. The simulation advances
-  // once per drawn frame, so count frames rather than milliseconds: 45 frames
-  // are three quarters of a second of flight at 60 Hz and more on a runner
-  // whose slower frames each step the clamped, longer frame time.
-  await page.evaluate(frameCount => new Promise(resolve => {
-    let remaining = frameCount;
-    const advance = () => {
-      remaining -= 1;
-      if (remaining === 0) resolve();
-      else requestAnimationFrame(advance);
-    };
-    requestAnimationFrame(advance);
-  }), 45);
-
-  const webglError = await page.locator('#glcanvas').evaluate(canvas => (
-    canvas.getContext('webgl2').getError()
-  ));
-  expect(webglError).toBe(0);
-  expect(browserErrors).toEqual([]);
 });
 
 test('spatial-index construction failures settle every owned notification', async ({

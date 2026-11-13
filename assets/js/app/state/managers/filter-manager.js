@@ -78,8 +78,7 @@ function isContinuousFilterFullRange(filter, stats) {
 }
 
 /*
- * Every filter applies until it is removed, whatever a view is colored by
- * (owner decision 2026-10-28): a gene's range filter and a categorical
+ * Every filter applies until it is removed, whatever a view is colored by: a gene's range filter and a categorical
  * field's outlier filter hide cells exactly as an obs range or category
  * filter does, after the view is colored by another field. The Active
  * filters list shows each, the visibility pass applies each, and "Visible
@@ -346,8 +345,8 @@ export function collectViewFilters(view, { geneSampled = false, geneValues = nul
  * from its R8 alpha texture, so the colors are never written for a filter.
  * They are separate functions so each is compiled for its own loop: inside
  * one large method, a loop that
- * had not run yet was optimized without type feedback and deoptimized on its
- * first real use (a 40 ms first outlier step at 562,000 cells).
+ * has not run yet is optimized without type feedback and deoptimized on its
+ * first real use (measured: 33_decisions_actions_domains_and_history.md).
  */
 
 function publishMaskVisibility(mask, transparency, pointCount) {
@@ -612,6 +611,7 @@ function recordVisibilityResult(transparency, inputs, shown) {
 }
 
 export class DataStateFilterMethods {
+  /** @this {import('../core/data-state.js').DataState} */
   computeGlobalVisibility() {
     // Inside a batch (a filter restore, a session view's filters and active
     // field) the pass runs once, at `endBatch`, from the final state.
@@ -883,12 +883,14 @@ export class DataStateFilterMethods {
     this._notifyVisibilityChange();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   updateFilterSummary() {
     const lines = this.getFilterSummaryLines();
     this.activeFilterLines = lines;
     this._pushActiveViewLabelToViewer(lines);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getFilterSummaryLines() {
     // Human-readable filter summaries (used for view labels + sidebar summary).
     const filters = this.getActiveFiltersStructured();
@@ -896,10 +898,12 @@ export class DataStateFilterMethods {
     return filters.map(f => f.text);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getActiveFiltersStructured() {
     return collectViewFilters(this, { geneSampled: (this.getGeneSample?.() ?? null) !== null, geneValues: this.getShownExpressionTransform?.() ?? null });
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   toggleFilterEnabled(filterId, enabled) {
     if (typeof enabled !== 'boolean') {
       throw new TypeError('Filter enabled state must be exactly true or false.');
@@ -927,6 +931,7 @@ export class DataStateFilterMethods {
     this.computeGlobalVisibility();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   removeFilter(filterId) {
     const { source, type, fieldIndex } = parseExactFilterId(filterId);
     const fields = source === 'obs' ? this.obsData?.fields : this.varData?.fields;
@@ -970,6 +975,7 @@ export class DataStateFilterMethods {
     this.computeGlobalVisibility();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   reapplyCategoryColors(field) {
     if (!field || field.kind !== 'category') {
       throw new TypeError('Category color refresh requires a category field.');
@@ -987,6 +993,7 @@ export class DataStateFilterMethods {
    * The point colors belong to the active field alone. A filter on another
    * field (listed in Active filters, edited in batch, restored from a session)
    * changes only visibility, so its palette must never reach the canvas.
+   * @this {import('../core/data-state.js').DataState}
    */
   _reapplyCategoryColorsNoRecompute(field) {
     if (!field || field.kind !== 'category') {
@@ -1018,24 +1025,29 @@ export class DataStateFilterMethods {
     this._pushColorsToViewer();
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getLegendModel(field) {
     return this.updateLegendState(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getFilterLines() {
     return this.activeFilterLines || [];
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getColorPalette() {
     return COLOR_PICKER_PALETTE;
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   getColorForCategory(field, idx) {
     requireCategoryFieldAndIndex(field, idx);
     this.ensureCategoryMetadata(field);
     return categoryRgbAt(field._categoryColors, idx);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   setColorForCategory(field, idx, color) {
     requireCategoryFieldAndIndex(field, idx);
     requireRgb(color);
@@ -1051,6 +1063,7 @@ export class DataStateFilterMethods {
   }
 
 
+  /** @this {import('../core/data-state.js').DataState} */
   setVisibilityForCategory(field, idx, visible) {
     requireCategoryFieldAndIndex(field, idx);
     if (typeof visible !== 'boolean') {
@@ -1072,6 +1085,7 @@ export class DataStateFilterMethods {
    * session's): each array copied once (`withCategoryChanges`), the field
    * drawn again once.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {Object} field
    * @param {{visibility: Array<{index: number, visible: boolean}>, colors: Array<{index: number, rgb: number[]}>}} changes
    */
@@ -1092,6 +1106,7 @@ export class DataStateFilterMethods {
     if (changes.colors.length > 0) this._notifyColorChange(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   setCellVisibility(cellIndices, visible) {
     if (typeof visible !== 'boolean') {
       throw new TypeError(
@@ -1162,7 +1177,8 @@ export class DataStateFilterMethods {
       // Driving the write from the validated bits reads every input element
       // exactly once, so no value can differ between validation and write. The
       // loop bound is the buffer length so V8 keeps the elided-bounds-check
-      // fast path; a narrower "touched range" bound measured 4x slower here.
+      // fast path (a narrower "touched range" bound is slower: measured:
+      // 33_decisions_actions_domains_and_history.md).
       const mask = writableCellVisibilityMask(this);
       for (let bucket = 0; bucket < selectedBits.length; bucket++) {
         const bits = selectedBits[bucket];
@@ -1183,6 +1199,7 @@ export class DataStateFilterMethods {
    * (the legend's Missing row): a filter like a hidden category, kept in
    * sessions.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field
    * @param {boolean} visible
    */
@@ -1209,6 +1226,7 @@ export class DataStateFilterMethods {
    * cells again. A filter like a hidden category: listed in Active filters,
    * turned off with the field's category filter, kept in sessions.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field - A categorical field
    * @param {number} categoryIndex
    * @param {{count: number, seed: number}|null} limit
@@ -1225,6 +1243,7 @@ export class DataStateFilterMethods {
     }
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   showAllCategories(field, { onlyAvailable = false } = {}) {
     if (typeof onlyAvailable !== 'boolean') {
       throw new TypeError('onlyAvailable must be exactly true or false.');
@@ -1252,6 +1271,7 @@ export class DataStateFilterMethods {
     this.reapplyCategoryColors(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   hideAllCategories(field, { onlyAvailable = false } = {}) {
     if (typeof onlyAvailable !== 'boolean') {
       throw new TypeError('onlyAvailable must be exactly true or false.');
@@ -1278,8 +1298,10 @@ export class DataStateFilterMethods {
     this.reapplyCategoryColors(field);
   }
 
+  /** @this {import('../core/data-state.js').DataState} */
   rgbToCss(color) { return rgbToCss(color); }
 
+  /** @this {import('../core/data-state.js').DataState} */
   clearActiveField() {
     this.activeFieldIndex = -1;
     this.activeVarFieldIndex = -1;
@@ -1315,6 +1337,7 @@ export class DataStateFilterMethods {
    * views diverge. `transparency` is the active view's array, lent for one
    * synchronous publication (`publishSnapshotView`): the viewer copies it,
    * and the new context shares it with this view until either one writes.
+   * @this {import('../core/data-state.js').DataState}
    */
   getSnapshotPayload() {
     const {

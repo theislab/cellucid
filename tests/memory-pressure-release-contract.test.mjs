@@ -1,8 +1,7 @@
 /**
  * What every cache gives back, and when (the memory model,
  * `data/memory-budget.js`): each is a holder of one share, counted where it
- * is held and trimmed there, without stopping or failing work (round-2
- * audit CE-01, MB-1, MB-3, MB-7, MB-12).
+ * is held and trimmed there, without stopping or failing work.
  *
  * - The adapter's cached copies (obs payloads, coordinates, the neighbor
  *   graph) share one `adapterCache` budget; a continuous column handed to

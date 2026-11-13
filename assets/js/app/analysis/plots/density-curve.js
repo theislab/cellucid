@@ -66,7 +66,7 @@ function densityPlan(data, bandwidth = 'auto', nPoints = 100) {
  * than the bound. The sample is then the support as it is — a page's Float32
  * values, which read as the same doubles — rather than a Float64 copy with an
  * array of ones beside it: the analysis workers each receive the support, so
- * it was four times the bytes to copy to every one of them.
+ * it would be four times the bytes to copy to every one of them.
  * @param {ArrayLike<number>} data
  * @returns {{ values: Float64Array|Float32Array, weights: Float64Array|null }}
  */

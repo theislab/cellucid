@@ -58,7 +58,7 @@ function serverBase(url) {
 /**
  * A server address as a link's `remote` gives it (`http://localhost:8765/`,
  * `HTTP://Host:8765`), in the one canonical spelling the address bar
- * connects by (R9E-3: a trailing slash refused the link); text that is no
+ * connects by (a trailing slash would refuse the link); text that is no
  * web address is returned as it is, for the server's validation to refuse.
  *
  * @param {string} text

@@ -14,6 +14,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { expectFloatingSettled, openCollapsedPanels } from './helpers/panels.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -51,21 +52,21 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await waitForPageAtRest(page);
 }
 
 /**
  * Copy one analysis row into a window and wait for its lift to settle.
  *
- * A window opens beside the row it was copied from. Where that row is depends
- * on the sidebar's scroll when it is clicked: the analysis code arrives after
- * the first view, so the panels opened before it move, and a click scrolls a
- * row out of view only to the nearest edge. A row at the foot of the screen
- * opened its window there, and a drag down from its corner left the page,
- * where a synthesized pointer sends neither moves nor the release: the drag
- * never ended, the next press resized the window to its minimum and was not
- * a click (CI run 42872892254, Firefox: 254 x 85, "Expected: 2, Received:
- * 1"). The row is brought to the middle first, so every window opens with
- * room around it.
+ * A window opens beside the row it was copied from, so where that row is
+ * when it is clicked decides whether a drag from the window's corner stays on
+ * the page (a synthesized pointer off the page sends neither moves nor the
+ * release: `dragHandle`). A click scrolls a row out of view only to the
+ * nearest edge, and a click Playwright retries because its row moved (the
+ * State panel drawing the opening's history above it) scrolls the row to the
+ * foot of the sidebar. The page is at rest before the first copy
+ * (`openDataset`), and the row is brought to the middle, so every window
+ * opens with room around it.
  */
 async function copyWindow(page, mode = 'simple') {
   const before = await page.locator(WINDOW).count();
@@ -76,6 +77,16 @@ async function copyWindow(page, mode = 'simple') {
   const frame = page.locator(WINDOW).nth(before);
   await expectFloatingSettled(frame);
   return frame;
+}
+
+/** Closes every window and forgets the sizes given: the next window opens at the default size. */
+async function closeWindows(page) {
+  await page.evaluate(async () => {
+    const manager = window._comparisonModule.getAnalysisWindowManager();
+    await manager.closeAll();
+    manager.importViewSizes({ window: {}, expandedView: {} });
+  });
+  await expect(page.locator(WINDOW)).toHaveCount(0);
 }
 
 function box(frame) {
@@ -110,151 +121,153 @@ async function belowToggle(page) {
   return page.evaluate(() => Math.round(document.getElementById('sidebar-toggle').getBoundingClientRect().bottom) + 8);
 }
 
-test('eight handles resize by mouse; only the dragged edges move; no 500 px cap', async ({ page }) => {
+// One opening. Each step copies its own window; the windows of the step before are closed and
+// their sizes forgotten first, so every window opens as the first one did.
+test('a floating analysis window is resized by mouse, finger and keyboard, snaps to another window, and maximizes', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openDataset(page);
-  const frame = await copyWindow(page);
-  await expect(frame.locator('> .accordion-resize-handle')).toHaveCount(8);
 
-  const start = await box(frame);
-  await dragHandle(page, frame, 'se', 90, 70);
-  const grown = await box(frame);
-  expect(grown.left).toBe(start.left);
-  expect(grown.top).toBe(start.top);
-  expect(grown.width).toBeGreaterThan(start.width + 60);
-  expect(grown.height).toBeGreaterThan(start.height + 40);
+  await test.step('eight handles resize by mouse; only the dragged edges move; no 500 px cap', async () => {
+    const frame = await copyWindow(page);
+    await expect(frame.locator('> .accordion-resize-handle')).toHaveCount(8);
 
-  // The left edge moves left; the right edge stays where it was.
-  const right = grown.left + grown.width;
-  await dragHandle(page, frame, 'w', -50, 0);
-  const left = await box(frame);
-  expect(left.left).toBeLessThan(grown.left - 30);
-  expect(Math.abs(left.left + left.width - right)).toBeLessThanOrEqual(1);
+    const start = await box(frame);
+    await dragHandle(page, frame, 'se', 90, 70);
+    const grown = await box(frame);
+    expect(grown.left).toBe(start.left);
+    expect(grown.top).toBe(start.top);
+    expect(grown.width).toBeGreaterThan(start.width + 60);
+    expect(grown.height).toBeGreaterThan(start.height + 40);
 
-  // Taller than 500 px: the only limit is the viewport. The window first
-  // moves to the top (Alt+Shift+ArrowUp, 64 px a press); a pointer leaving
-  // the page sends no moves, so the drag ends just inside it.
-  await frame.locator('> details > summary').focus();
-  for (let press = 0; press < 12; press++) await page.keyboard.press('Alt+Shift+ArrowUp');
-  // The top of the area is below the sidebar's toggle (no window covers it, F65).
-  expect((await box(frame)).top).toBe(await belowToggle(page));
-  const bottom = await handle(frame, 's').boundingBox();
-  await dragHandle(page, frame, 's', 0, page.viewportSize().height - 2 - (bottom.y + bottom.height / 2));
-  const tall = await box(frame);
-  const viewport = page.viewportSize();
-  expect(tall.height).toBeGreaterThan(500);
-  expect(tall.top + tall.height).toBeLessThanOrEqual(viewport.height - 8);
-  const drawn = await frame.boundingBox();
-  expect(Math.abs(drawn.height - tall.height)).toBeLessThanOrEqual(1);
-  expect(errors).toEqual([]);
-});
+    // The left edge moves left; the right edge stays where it was.
+    const right = grown.left + grown.width;
+    await dragHandle(page, frame, 'w', -50, 0);
+    const left = await box(frame);
+    expect(left.left).toBeLessThan(grown.left - 30);
+    expect(Math.abs(left.left + left.width - right)).toBeLessThanOrEqual(1);
 
-test('a finger resizes from an edge (pointer events, touch-action none)', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  const frame = await copyWindow(page);
-  const start = await box(frame);
-  expect(await handle(frame, 'e').evaluate(element => getComputedStyle(element).touchAction)).toBe('none');
-  await handle(frame, 'e').evaluate(element => {
-    const rect = element.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    const fire = (type, dx) => element.dispatchEvent(new PointerEvent(type, {
-      bubbles: true, cancelable: true, pointerId: 11, pointerType: 'touch', isPrimary: true,
-      button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
-      clientX: x + dx, clientY: y,
-    }));
-    fire('pointerdown', 0);
-    for (let step = 1; step <= 5; step++) fire('pointermove', step * 13);
-    fire('pointerup', 65);
+    // Taller than 500 px: the only limit is the viewport. The window first
+    // moves to the top (Alt+Shift+ArrowUp, 64 px a press); a pointer leaving
+    // the page sends no moves, so the drag ends just inside it.
+    await frame.locator('> details > summary').focus();
+    for (let press = 0; press < 12; press++) await page.keyboard.press('Alt+Shift+ArrowUp');
+    // The top of the area is below the sidebar's toggle (no window covers it).
+    expect((await box(frame)).top).toBe(await belowToggle(page));
+    const bottom = await handle(frame, 's').boundingBox();
+    await dragHandle(page, frame, 's', 0, page.viewportSize().height - 2 - (bottom.y + bottom.height / 2));
+    const tall = await box(frame);
+    const viewport = page.viewportSize();
+    expect(tall.height).toBeGreaterThan(500);
+    expect(tall.top + tall.height).toBeLessThanOrEqual(viewport.height - 8);
+    const drawn = await frame.boundingBox();
+    expect(Math.abs(drawn.height - tall.height)).toBeLessThanOrEqual(1);
+    expect(errors).toEqual([]);
   });
-  await expect.poll(async () => (await box(frame)).width).toBeGreaterThan(start.width + 40);
-  expect(errors).toEqual([]);
-});
 
-test('keyboard: handles join the Tab order inside the window, arrows resize, Alt+Arrow moves', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  const frame = await copyWindow(page);
-  const east = handle(frame, 'e');
-  await expect(east).toHaveAttribute('tabindex', '-1');
-  await frame.locator('> details > summary').focus();
-  await expect(east).toHaveAttribute('tabindex', '0');
-  await expect(east).toHaveAttribute('role', 'separator');
-  await expect(east).toHaveAttribute('aria-label', 'Resize window from its right edge');
+  await test.step('a finger resizes from an edge (pointer events, touch-action none)', async () => {
+    await closeWindows(page);
+    const frame = await copyWindow(page);
+    const start = await box(frame);
+    expect(await handle(frame, 'e').evaluate(element => getComputedStyle(element).touchAction)).toBe('none');
+    await handle(frame, 'e').evaluate(element => {
+      const rect = element.getBoundingClientRect();
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+      const fire = (type, dx) => element.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, pointerId: 11, pointerType: 'touch', isPrimary: true,
+        button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
+        clientX: x + dx, clientY: y,
+      }));
+      fire('pointerdown', 0);
+      for (let step = 1; step <= 5; step++) fire('pointermove', step * 13);
+      fire('pointerup', 65);
+    });
+    await expect.poll(async () => (await box(frame)).width).toBeGreaterThan(start.width + 40);
+    expect(errors).toEqual([]);
+  });
 
-  await east.focus();
-  const start = await box(frame);
-  await page.keyboard.press('ArrowRight');
-  expect((await box(frame)).width).toBe(start.width + 16);
-  await page.keyboard.press('Shift+ArrowRight');
-  expect((await box(frame)).width).toBe(start.width + 80);
-  await expect(east).toHaveAttribute('aria-valuenow', String(start.width + 80));
-  await expect(east).toHaveAttribute('aria-valuetext', `${start.width + 80} × ${start.height} pixels`);
-  // The size shows while it changes.
-  await expect(frame.locator('> .floating-size-readout')).toHaveText(`${start.width + 80} × ${start.height}`);
-  await page.keyboard.press('Home');
-  const least = await box(frame);
-  expect(least.width).toBe(Number(await east.getAttribute('aria-valuemin')));
+  await test.step('keyboard: handles join the Tab order inside the window, arrows resize, Alt+Arrow moves', async () => {
+    await closeWindows(page);
+    const frame = await copyWindow(page);
+    const east = handle(frame, 'e');
+    await expect(east).toHaveAttribute('tabindex', '-1');
+    await frame.locator('> details > summary').focus();
+    await expect(east).toHaveAttribute('tabindex', '0');
+    await expect(east).toHaveAttribute('role', 'separator');
+    await expect(east).toHaveAttribute('aria-label', 'Resize window from its right edge');
 
-  // Alt+Arrow moves the window, 16 px a press.
-  await page.keyboard.press('Alt+ArrowDown');
-  expect((await box(frame)).top).toBe(least.top + 16);
-  expect(await page.evaluate(() => document.getElementById('keyboard-move-live-region')?.textContent))
-    .toContain('Window moved');
-  // Focus leaving the window takes the handles out of the Tab order again.
-  await page.evaluate(() => document.activeElement.blur());
-  await expect(east).toHaveAttribute('tabindex', '-1');
-  expect(errors).toEqual([]);
-});
+    await east.focus();
+    const start = await box(frame);
+    await page.keyboard.press('ArrowRight');
+    expect((await box(frame)).width).toBe(start.width + 16);
+    await page.keyboard.press('Shift+ArrowRight');
+    expect((await box(frame)).width).toBe(start.width + 80);
+    await expect(east).toHaveAttribute('aria-valuenow', String(start.width + 80));
+    await expect(east).toHaveAttribute('aria-valuetext', `${start.width + 80} × ${start.height} pixels`);
+    // The size shows while it changes.
+    await expect(frame.locator('> .floating-size-readout')).toHaveText(`${start.width + 80} × ${start.height}`);
+    await page.keyboard.press('Home');
+    const least = await box(frame);
+    expect(least.width).toBe(Number(await east.getAttribute('aria-valuemin')));
 
-test('an edge snaps to another window and shows a guide; maximize and restore', async ({ page }) => {
-  const errors = observeProductErrors(page);
-  await openDataset(page);
-  const first = await copyWindow(page);
-  const second = await copyWindow(page, 'detailed');
-  // Put the second window to the right of the first, apart from it.
-  const a = await box(first);
-  await second.evaluate((element, x) => element.style.setProperty('--pos-x', `${x}px`), a.left + a.width + 200);
-  await second.evaluate((element, y) => element.style.setProperty('--pos-y', `${y}px`), a.top);
-  const b = await box(second);
+    // Alt+Arrow moves the window, 16 px a press.
+    await page.keyboard.press('Alt+ArrowDown');
+    expect((await box(frame)).top).toBe(least.top + 16);
+    expect(await page.evaluate(() => document.getElementById('keyboard-move-live-region')?.textContent))
+      .toContain('Window moved');
+    // Focus leaving the window takes the handles out of the Tab order again.
+    await page.evaluate(() => document.activeElement.blur());
+    await expect(east).toHaveAttribute('tabindex', '-1');
+    expect(errors).toEqual([]);
+  });
 
-  // Drag the first window's right edge to 7 px short of the second's left.
-  const target = await handle(first, 'e').boundingBox();
-  const x = target.x + target.width / 2;
-  const y = target.y + target.height / 2;
-  await page.mouse.move(x, y);
-  await page.mouse.down();
-  await page.mouse.move(x + (b.left - (a.left + a.width)) - 7, y, { steps: 10 });
-  await expect(page.locator('#floating-panels-root > .floating-snap-guide[data-axis="x"]')).toBeVisible();
-  await page.mouse.up();
-  await expect(page.locator('#floating-panels-root > .floating-snap-guide[data-axis="x"]')).toBeHidden();
-  const snapped = await box(first);
-  expect(snapped.left + snapped.width).toBe(b.left);
+  await test.step('an edge snaps to another window and shows a guide; maximize and restore', async () => {
+    await closeWindows(page);
+    const first = await copyWindow(page);
+    const second = await copyWindow(page, 'detailed');
+    // Put the second window to the right of the first, apart from it.
+    const a = await box(first);
+    await second.evaluate((element, x) => element.style.setProperty('--pos-x', `${x}px`), a.left + a.width + 200);
+    await second.evaluate((element, y) => element.style.setProperty('--pos-y', `${y}px`), a.top);
+    const b = await box(second);
 
-  // Maximize fills the free area beside the sidebar; again restores.
-  const maximize = first.locator('> .accordion-panel-actions > .accordion-maximize-btn');
-  await expect(maximize).toHaveAttribute('aria-pressed', 'false');
-  await maximize.click();
-  await expect(maximize).toHaveAttribute('aria-pressed', 'true');
-  await expect(maximize).toHaveAttribute('aria-label', 'Restore window size');
-  const sidebar = await page.locator('#sidebar').boundingBox();
-  const viewport = page.viewportSize();
-  const full = await box(first);
-  expect(full.left).toBe(Math.round(sidebar.x + sidebar.width + 8));
-  const top = await belowToggle(page);
-  expect(full.top).toBe(top);
-  expect(full.left + full.width).toBe(viewport.width - 8);
-  expect(full.height).toBe(viewport.height - 8 - top);
-  await maximize.click();
-  await expect.poll(() => box(first)).toEqual(snapped);
-  // A double-click on the header does the same.
-  await first.locator('> details > summary').dblclick();
-  await expect(maximize).toHaveAttribute('aria-pressed', 'true');
-  await expect(first.locator('> details')).toHaveAttribute('open', '');
-  await first.locator('> details > summary').dblclick();
-  expect(await box(first)).toEqual(snapped);
-  expect(errors).toEqual([]);
+    // Drag the first window's right edge to 7 px short of the second's left.
+    const target = await handle(first, 'e').boundingBox();
+    const x = target.x + target.width / 2;
+    const y = target.y + target.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + (b.left - (a.left + a.width)) - 7, y, { steps: 10 });
+    await expect(page.locator('#floating-panels-root > .floating-snap-guide[data-axis="x"]')).toBeVisible();
+    await page.mouse.up();
+    await expect(page.locator('#floating-panels-root > .floating-snap-guide[data-axis="x"]')).toBeHidden();
+    const snapped = await box(first);
+    expect(snapped.left + snapped.width).toBe(b.left);
+
+    // Maximize fills the free area beside the sidebar; again restores.
+    const maximize = first.locator('> .accordion-panel-actions > .accordion-maximize-btn');
+    await expect(maximize).toHaveAttribute('aria-pressed', 'false');
+    await maximize.click();
+    await expect(maximize).toHaveAttribute('aria-pressed', 'true');
+    await expect(maximize).toHaveAttribute('aria-label', 'Restore window size');
+    const sidebar = await page.locator('#sidebar').boundingBox();
+    const viewport = page.viewportSize();
+    const full = await box(first);
+    expect(full.left).toBe(Math.round(sidebar.x + sidebar.width + 8));
+    const top = await belowToggle(page);
+    expect(full.top).toBe(top);
+    expect(full.left + full.width).toBe(viewport.width - 8);
+    expect(full.height).toBe(viewport.height - 8 - top);
+    await maximize.click();
+    await expect.poll(() => box(first)).toEqual(snapped);
+    // A double-click on the header does the same.
+    await first.locator('> details > summary').dblclick();
+    await expect(maximize).toHaveAttribute('aria-pressed', 'true');
+    await expect(first.locator('> details')).toHaveAttribute('open', '');
+    await first.locator('> details > summary').dblclick();
+    expect(await box(first)).toEqual(snapped);
+    expect(errors).toEqual([]);
+  });
 });
 
 test('a new window opens at the size the last one of its analysis was given; sessions keep box, open state and sizes, in the order the windows opened', async ({ page }) => {

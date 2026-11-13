@@ -1,10 +1,11 @@
 /**
  * One quoting rule for every CSV the app writes (`compute/csv-export.js`
  * `csvText`): a cell holding a quote, a comma or a line break, `\n` or `\r`,
- * is quoted. The composition and dot plot tables had their own copies, which
- * left a `\r` (a label read from a file with Windows line endings) unquoted,
- * so the row broke in two for every CSV reader; and wrote a missing value as
- * `NA` where every other CSV writes an empty cell (`toCSVCell`).
+ * is quoted. The composition and dot plot tables go through it: a copy of
+ * their own would leave a `\r` (a label read from a file with Windows line
+ * endings) unquoted, so the row would break in two for every CSV reader, and
+ * would write a missing value as `NA` where every other CSV writes an empty
+ * cell (`toCSVCell`).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

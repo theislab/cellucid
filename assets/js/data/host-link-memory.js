@@ -6,17 +6,16 @@
  *
  * **Why.** An opening measures its link on the requests that open the file
  * (its structure: small reads, mostly a round trip each), so its rate is a
- * lower bound of the host's: HLCA from CELLxGENE measured 244 ms and about
- * 640 KB/s when opened, while its gene reads then ran at 1.5-3.4 MB/s.
- * Sized from that lower bound, the gene-time auto-fit
- * (`anndata/subsample-plan.js` `geneTimeFit`) opened two to three times
- * fewer cells than the link reads within its target.
+ * lower bound of the host's. Sized from that lower bound, the gene-time
+ * auto-fit (`anndata/subsample-plan.js` `geneTimeFit`) would open several
+ * times fewer cells than the link reads within its target (measured:
+ * 22_decisions_link_model_and_request_planning.md).
  *
  * **What is kept.** For each origin (`hostOf`: a remote source's scheme,
  * host and port; nothing for a file on this computer), the round trip,
  * the round trip under load (`formats/io/link.js` `loadedLatencyMs`: what
- * a read's time is priced at; S3 answered a small request in 0.35-0.5 s
- * with 42 in flight against 230 ms idle), the rate the reads sustained (bytes delivered over the time any request
+ * a read's time is priced at: a host answers a small request far more slowly
+ * with many in flight than idle), the rate the reads sustained (bytes delivered over the time any request
  * was in flight: `formats/io/link.js` `deliveredBytes`, `busyMs`; never the
  * fastest moment, which overstates what a long read gets) and the bytes it
  * rests on (`evidenceBytes`). A visit's
@@ -58,15 +57,13 @@
  * trip (never its round trip under load) and at no time a request beyond
  * it. What its reads measure past that is this machine's own load, not a
  * network: its opening's small reads, each mostly its fixed cost, measure
- * a fraction of it (a 10M-cell `.h5ad` on a loopback host in Chromium:
- * 45 MB/s from 0.9 MB of metadata reads, its first gene then read for
- * every cell in 5.1 s); a read slowed by the machine's work (another
+ * a fraction of the disk's rate; a read slowed by the machine's work (another
  * browser starting or ending beside it) counts as one that kept the link
- * full (`bandwidthMeasured`) at 0.1-13 MB/s; and requests waiting on it
- * measured a round trip under load of 863 ms. Priced at any of these,
- * genes were read for a sample of a file whose every cell reads within the
- * gene time (5 of 6 openings of 10M-cell stores with the machine busy,
- * 19,779 to 1,947,096 of 10M cells). A tunnel to a remote server (`ssh -L`) is a loopback
+ * full (`bandwidthMeasured`) at a rate far below it; and requests waiting on
+ * it measure a round trip under load far above the usual. Priced at any of
+ * these, genes would be read for only a sample of a file whose every cell
+ * reads within the gene time (measured:
+ * 22_decisions_link_model_and_request_planning.md). A tunnel to a remote server (`ssh -L`) is a loopback
  * address too and is priced so: its first gene is read for every open cell
  * unless that is past the gene time even at a disk's rate. A notebook kernel's host (the widget's,
  * `host-fetch.js` `EMBEDDED_HOST_ORIGIN`) is not one: the kernel may run
@@ -94,7 +91,7 @@ const HOST_PACE_STORAGE_KEY = 'cellucid:host-pace:v1';
 
 /**
  * How long a host that blocked once must go without refusing before its
- * pace loosens (owner, 2026-10-30: "after a day without refusals"), and how
+ * pace loosens (a day without refusals), and how
  * much each later visit loosens it: a fifth less time between requests (a
  * quarter more requests a minute). A refusal at a loosened pace snaps it
  * back to the pace the block taught and marks the host as one that blocks
@@ -212,10 +209,9 @@ export function rememberedHostLink(origin, storage = pageStorage()) {
  * of each), in bytes a millisecond, or null when none was (every asset
  * from the browser's cache, a context with no timeline). A host across the
  * internet delivers at most about this to many requests at once, and on a
- * first visit to it the opening's own small reads measure far less (an
- * 11.4M-cell CELLxGENE atlas: 1 MB/s at its first resolve, 11.5 MB/s on its
- * first gene): what a `blocks` order's rung is sized at until the link is
- * measured (`subsample-plan.js` `blockRung`). Never stored.
+ * first visit to it the opening's own small reads measure far less (measured:
+ * 22_decisions_link_model_and_request_planning.md): what a `blocks` order's
+ * rung is sized at until the link is measured (`subsample-plan.js` `blockRung`). Never stored.
  *
  * @param {{getEntriesByType?: (type: string) => Array<{transferSize?: number, duration?: number}>}|null} [timeline]
  * @returns {number|null}
@@ -340,8 +336,7 @@ function visitPace(origin, storage, now) {
  */
 export function rememberedHostPace(origin, storage = pageStorage()) {
   // A host on this machine blocks no network: silence from it is a server restarting or down,
-  // and a pace learned from it would slow every later visit for a day (found 2026-11-10: Suo from
-  // a local server read at 5-60 KB/s for 95 s after one episode of lost answers).
+  // and a pace learned from it would slow every later visit for a day.
   if (typeof origin !== 'string' || onThisMachine(origin)) return 0;
   const paceMs = readPaces(storage)[origin]?.paceMs;
   return paceMs > 0 && Number.isFinite(paceMs) ? paceMs : 0;
@@ -395,10 +390,9 @@ export function rememberHostLink(origin, measurement, storage = pageStorage()) {
   if (typeof origin !== 'string' || storage === null) return;
   // The rate the visit's reads sustained (bytes over the time any request
   // was in flight), not the link's best moment (`bytesPerMs`, the fastest
-  // delivery seen): what the next opening's reads can count on. HLCA's
-  // fastest delivery was 6.2 MB/s while its gene reads sustained 1.6 MB/s;
-  // sized from the fastest, a later opening's first gene took three times
-  // its target.
+  // delivery seen): what the next opening's reads can count on. Sized from
+  // the fastest, a later opening's first gene would take several times its
+  // target (measured: 22_decisions_link_model_and_request_planning.md).
   const sustained = measurement?.busyMs > 0 && measurement?.deliveredBytes > 0 ? measurement.deliveredBytes / measurement.busyMs : null;
   const visit = recordOf({ latencyMs: measurement?.latencyMs, loadedLatencyMs: measurement?.loadedLatencyMs, bytesPerMs: sustained, evidenceBytes: measurement?.deliveredBytes, at: Date.now() });
   if (visit === null) return;
@@ -488,9 +482,9 @@ export function pricingLink(fresh, seed) {
  * priced as the shortest measured (`latencyMs`), and no time a request on
  * top of it (`requestCostMs`, a remote host's budget or its time a request
  * under load) -- measured or not: what this machine's reads measure past
- * its rest is its own load (another browser starting beside it, Chromium:
- * 0.1-13 MB/s, or an 863 ms round trip under load where 1.5-7 ms is usual),
- * never a network. Prices already as good are kept.
+ * its rest is its own load (another browser starting beside it: a rate far
+ * below a disk's, or a round trip under load far above the usual), never a
+ * network. Prices already as good are kept.
  */
 function thisMachinePricing(link) {
   const rate = !(link.bytesPerMs >= LOCAL_POLICY.bytesPerMs);
@@ -515,7 +509,8 @@ function rememberedPricing(fresh, record) {
   // Round trips compared like with like: the fresh link's on a connection
   // already made (`warmLatencyMs`), never its first requests, whose time
   // holds the connection's set-up (a revisit priced from one cold HEAD and
-  // one GET read GEO at a third of its rate, measured). Until it has one,
+  // one GET reads at a fraction of the rate; measured:
+  // 22_decisions_link_model_and_request_planning.md). Until it has one,
   // the remembered rate stands as it was measured.
   const warm = fresh.warmLatencyMs > 0 && Number.isFinite(fresh.warmLatencyMs) ? fresh.warmLatencyMs : null;
   const latencyMs = warm ?? record.latencyMs;

@@ -1,7 +1,7 @@
 /**
  * Every place the web app's code hands a string to a parser that can run it
  * (HTML, a URL a link or a script opens, code) is listed here with why what
- * reaches it is safe, and no other exists (round 8 security lens). A
+ * reaches it is safe, and no other exists. A
  * dataset's own text (obs and var names, categories, `uns`, file names),
  * session and history text, notes, community annotations and agent replies
  * reach the page as text nodes (`textContent`, `createTextNode`, the chat's
@@ -73,7 +73,6 @@ const ALLOWED = Object.freeze({
   'app/analysis/ui/components/stats-display.js': [CONSTANT, 'legend.innerHTML = `'],
   'app/community-annotations/github-auth.js': [why('the Worker\'s own sign-in address (its origin pinned, getGitHubLoginUrl)'),
     'window.location.assign(url.toString());'],
-  'app/main.js': [why('a picture of the app\'s own canvas'), 'still.src = canvas.toDataURL(\'image/png\');'],
   'app/notification-center.js': [why('title, message, details and action labels escaped (escapeHtml); the icon a constant of CategoryIcons'),
     'el.innerHTML = html;',
     'holder.innerHTML = notificationDetailsHtml(options.details);'],
@@ -134,6 +133,7 @@ const ALLOWED = Object.freeze({
     'b.innerHTML = icon;',
     'session.ui.pause.innerHTML = session.paused ? STATE_ICONS.play : STATE_ICONS.pause;'],
   'app/utils/download.js': [why('a blob address this page made'), 'anchor.href = url;'],
+  'app/viewer-host/host-view.js': [why('a picture of the app\'s own canvas'), 'still.src = canvas.toDataURL(\'image/png\');'],
   'data/sources/auth/google.js': [why('Google\'s sign-in scripts (GIS_SCRIPT_URL, GAPI_SCRIPT_URL constants)'), 'script.src = url;'],
   'data/sources/auth/microsoft.js': [why('Microsoft\'s sign-in page (authorizeUrl: the tenant\'s constant address), in a popup of its own'),
     'const popup = win.open(\'\', SIGN_IN_WINDOW, SIGN_IN_WINDOW_FEATURES);',

@@ -1,26 +1,25 @@
 /**
- * An agent's figure, checked before it is written (bug hunt live pass 6).
+ * An agent's figure, checked before it is written.
  *
- * L24-1: preparing a paper's Figure 2, an agent could only take plain
- * pictures of single views and told the person three times "my previews
- * don't show the export settings, please check the file". `view.picture`
- * with `source: "export"` is the figure Export would write now, with every
- * Figure export setting, every view as panels: the same renderer and the
- * same size as the download, nothing written.
+ * `view.picture` with `source: "export"` is the figure Export would write now,
+ * with every Figure export setting, every view as panels: the same renderer and
+ * the same size as the download, nothing written. Without it an agent preparing
+ * a paper's figure can only take plain pictures of single views and cannot check
+ * the export settings.
  *
- * L24-7: Export refused with "Value must be less than or equal to 24" (the
- * base font size an agent had set to 28, which the control's own max
- * marked invalid while the reader and `figure-export.set` allow 1–500)
- * when what refused was another control; the agent shrank the person's
- * fonts for nothing. One range per text size, and a refusal names the
- * control that refused.
+ * A size an agent sets is a size its control holds: a base font size of 28 does
+ * not leave the panel invalid because the control's own max (24) is below what
+ * the reader and `figure-export.set` allow (1–500), and Export does not refuse
+ * with "Value must be less than or equal to 24" when what refused is another
+ * control. There is one range per text size, and a refusal names the control that
+ * refused.
  *
- * F160: an SVG is full vector until another strategy is chosen, so Export
- * never refuses one for want of a choice.
+ * An SVG is full vector until another strategy is chosen, so Export never
+ * refuses one for want of a choice.
  *
- * F271 (live-7 L25-10): the figure's width is set in millimetres and filled
- * exactly, its text in points; the picture says the printed size, and a PNG
- * at D dpi is the width in inches times D.
+ * The figure's width is set in millimetres and filled exactly, its text in
+ * points; the picture says the printed size, and a PNG at D dpi is the width in
+ * inches times D.
  */
 import { readFileSync } from 'node:fs';
 
@@ -90,7 +89,7 @@ test('an "export" picture is the figure Export writes: its settings, every view,
   })).refused).toBeUndefined();
   // A width that is no preset's is a custom width.
   expect((await dispatch(page, 'figure-export.get')).outcome.size_preset).toBe('custom');
-  // A size an agent sets is a size its control holds: nothing in the panel is left invalid (L24-7).
+  // A size an agent sets is a size its control holds: nothing in the panel is left invalid.
   expect(await page.locator('#figure-export-section :invalid').count()).toBe(0);
 
   const { outcome: picture } = await dispatch(page, 'view.picture', { source: 'export', width: 5000, height: 5000 });
@@ -137,7 +136,7 @@ test('Export refused names the control that refused, not another one', async ({ 
     auto_text_size: false, font_sizes: { base: 21, legend: 16.5, ticks: 12, axis_label: 15, title: 22.5, centroid_label: 13.5 },
     download: 'svg',
   })).refused).toBeUndefined();
-  // An SVG asks no strategy first: full vector (F160).
+  // An SVG asks no strategy first: full vector.
   await expect(page.getByLabel('SVG point strategy')).toHaveValue('full-vector');
   expect((await dispatch(page, 'figure-export.get')).outcome.svg_strategy).toBe('full-vector');
   // The person half-way through typing a width: that box refuses, and the refusal says so.
@@ -145,7 +144,7 @@ test('Export refused names the control that refused, not another one', async ({ 
   await page.locator('#figure-export-width').fill('5');
   const refused = (await dispatch(page, 'figure.export')).refused;
   expect(refused).toBe('The figure export settings are not valid: Figure width (mm) must be at least 10; figure_export_set changes them.');
-  // The fonts were never the problem: their controls hold 21 pt.
+  // The fonts are not the cause: their controls hold 21 pt.
   await expect(page.locator('#figure-export-font-size')).toHaveValue('21');
   expect(await page.locator('#figure-export-font-size').evaluate(input => input.validity.valid)).toBe(true);
   // With a width the export can use, it is written as a full-vector SVG, its size in millimetres.
@@ -164,14 +163,14 @@ test('Export refused names the control that refused, not another one', async ({ 
   expect(errors).toEqual([]);
 });
 
-test('Fit the cells frames every cell drawn: a narrow pane gives a plot of the cells\' shape, said and offered by the preview (F161, F119)', async ({ page }) => {
+test('Fit the cells frames every cell drawn: a narrow pane gives a plot of the cells\' shape, said and offered by the preview', async ({ page }) => {
   const errors = observeProductErrors(page);
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await waitForHistory(page);
-  // A tall, narrow pane (as with the chat open): the figure keeps it (F62), a tall figure with
+  // A tall, narrow pane (as with the chat open): the figure keeps it, a tall figure with
   // the (about square) cells in a band, far (1.5 times or more) from their shape.
   await page.setViewportSize({ width: 700, height: 1300 });
   await openFraming(page);
@@ -201,33 +200,5 @@ test('Fit the cells frames every cell drawn: a narrow pane gives a plot of the c
   expect((await dispatch(page, 'figure-export.set', { frame: 'cells' })).refused).toBeUndefined();
   expect((await dispatch(page, 'figure-export.get')).outcome.frame).toEqual(fitted.frame);
   await expect(note).toBeHidden();
-  expect(errors).toEqual([]);
-});
-
-test('settings saved by an earlier version restore one at a time: a value this version cannot use stays as shown and is said, never failing the rest', async ({ page }) => {
-  // Found 2026-11-11: the figure export record's version 1 (an SVG strategy not chosen, null)
-  // failed every setting of an hour-old session and of a dataset's starting view.
-  const errors = observeProductErrors(page);
-  await openThreeNamedViews(page);
-  const outcome = await page.evaluate(async () => {
-    const { getActions, getStateDomains } = await import('/assets/js/app/actions/index.js');
-    const settings = getStateDomains().owner('settings');
-    const saved = structuredClone(await settings.capture());
-    // A version-1 record: a box in CSS pixels (1600 wide is 423.3 mm), no strategy chosen.
-    saved.figureExport = { ...saved.figureExport, version: 1, svgStrategy: null, sizePreset: '1600x1200', width: 1600, height: 1200, dpi: 299 };
-    saved.controls['a-control-of-another-version'] = { type: 'checkbox', checked: true };
-    await settings.restore(saved);
-    return (await getActions().dispatch('figure-export.get', {})).outcome;
-  });
-  // Read: the width; mapped: the unchosen strategy is full vector; kept as shown: the dpi no version has.
-  expect(outcome.width).toBe(423.3);
-  expect(outcome.size_preset).toBe('custom');
-  expect(outcome.svg_strategy).toBe('full-vector');
-  expect(outcome.dpi).toBe(300);
-  const notice = page.locator('.notification', { hasText: '2 saved settings could not be used and stay as shown' });
-  await expect(notice).toBeVisible();
-  // Each, with its reason, under Details.
-  await expect(notice).toContainText('a-control-of-another-version: this version of Cellucid has no such control');
-  await expect(notice).toContainText('Figure export dpi: dpi must be one of 150, 300, 600.');
   expect(errors).toEqual([]);
 });

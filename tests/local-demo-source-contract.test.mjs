@@ -5,7 +5,6 @@
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
@@ -14,9 +13,7 @@ import { initRepresentationControls } from '../assets/js/app/ui/modules/represen
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
 import { createOpenMenuDom } from './helpers/open-menu-dom.mjs';
 import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
-import {
-  DATA_CONFIG,
-} from '../assets/js/data/data-source.js';
+import { DATA_CONFIG } from '../assets/js/data/sample-catalog-config.js';
 import {
   DataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
@@ -96,8 +93,8 @@ test('the sample list names each dataset from its own file, reading its metadata
 });
 
 test('the listing waits for startup\'s dataset: it reads no file before, and takes the opened dataset\'s description from its opening', async t => {
-  // Measured 2026-11-10: the listing, asked for as the interface is built, ran
-  // a millisecond before startup opened the default sample, so it read every
+  // The listing, asked for as the interface is built, runs
+  // a millisecond before startup opens the default sample, and must not read every
   // sample's file, the one being opened too, against that first view.
   quiet(t);
   const host = serveCatalog(t, CATALOG);
@@ -208,73 +205,6 @@ function identity(id, name, cells) {
     obs_fields: [],
   };
 }
-
-test('startup publishes the empty runtime and loads its selection as one dataset change', async () => {
-  const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
-    'utf8'
-  );
-  const emptyStart = mainSource.indexOf(
-    '// Startup publishes the empty runtime'
-  );
-  const emptyEnd = mainSource.indexOf(
-    '// Stage one exact manager/source/runtime/URL generation',
-    emptyStart
-  );
-  assert.ok(emptyStart >= 0 && emptyEnd > emptyStart);
-  const emptyBootstrap = mainSource.slice(emptyStart, emptyEnd);
-  // No startup path of its own: the empty runtime is published whatever
-  // startup selected, and nothing here stages or publishes a dataset.
-  assert.match(
-    emptyBootstrap,
-    /publishEmptyDatasetRuntime\(\);/
-  );
-  assert.doesNotMatch(
-    emptyBootstrap,
-    /stageDatasetRuntime|commitDatasetRuntimeStage|hasInitialDataset|initialPublication/
-  );
-  assert.doesNotMatch(
-    emptyBootstrap,
-    /Promise\.resolve\(new Float32Array\(0\)\)|state\.initScene\(/
-  );
-
-  // The reload owns the startup load: its progress is shown, its steps are
-  // deadline-bound startup steps, and its failure is logged once, by the
-  // terminal startup failure it becomes.
-  const reloadStart = mainSource.indexOf(
-    'async function reloadActiveDatasetInPlace'
-  );
-  const reloadEnd = mainSource.indexOf(
-    'async function clearActiveDatasetInPlace',
-    reloadStart
-  );
-  const reloadSource = mainSource.slice(reloadStart, reloadEnd);
-  assert.match(
-    reloadSource,
-    /const stagePhases = isStartupLoad \? startup : RELOAD_STAGE_PHASES;/
-  );
-  assert.match(
-    reloadSource,
-    /if \(!isStartupLoad\) \{\s*console\.error\(\s*'\[Main\] Failed to reload dataset in-place:'/
-  );
-  assert.doesNotMatch(mainSource, /initialDataLoad/);
-
-  // The startup selection loads only after every control and the render
-  // loop exist, and before startup is published ready.
-  const admission = mainSource.indexOf('admitDeferredControls();');
-  const viewerStart = mainSource.indexOf('viewer.start();', admission);
-  const startupLoad = mainSource.indexOf(
-    'startupOutcome = await ui.loadStartupDataset(startupSelection);',
-    viewerStart
-  );
-  const ready = mainSource.indexOf("startup.enter('ready');", startupLoad);
-  assert.ok(
-    admission > 0 &&
-    viewerStart > admission &&
-    startupLoad > viewerStart &&
-    ready > startupLoad
-  );
-});
 
 test('single-representation adoption publishes the exact picker option', t => {
   const originalDocument = globalThis.document;

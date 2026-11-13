@@ -286,7 +286,7 @@ import { debounce } from '../utils/debounce.js';
  * Release dataset-sized owners held by a stable per-frame render descriptor.
  *
  * The descriptor identity stays stable so the render loop can reuse it without
- * allocation, while terminal viewer disposal no longer keeps live typed arrays
+ * allocation, while terminal viewer disposal keeps no live typed arrays
  * or camera state reachable through the closed-over record.
  *
  * @param {Object} record
@@ -671,7 +671,7 @@ export function createViewer({
   }
   let backdropLooks = createBackdropLooksOwner();
 
-  // F97 point sprite: the largest sprite this GPU lets every pass draw
+  // Point sprite: the largest sprite this GPU lets every pass draw
   // (rendering/point-sprite.js), read again on a restored context.
   let pointSizeMax = pointSpriteCap(gl);
 
@@ -687,7 +687,7 @@ export function createViewer({
     modelMatrix: gl.getUniformLocation(centroidProgram, 'u_modelMatrix'),
     pointSize: gl.getUniformLocation(centroidProgram, 'u_pointSize'),
     sizeAttenuation: gl.getUniformLocation(centroidProgram, 'u_sizeAttenuation'),
-    // F97 point sprite (rendering/point-sprite.js)
+    // Point sprite (rendering/point-sprite.js)
     pointScale: gl.getUniformLocation(centroidProgram, 'u_pointScale'),
     pointSizeMax: gl.getUniformLocation(centroidProgram, 'u_pointSizeMax'),
   };
@@ -993,9 +993,9 @@ export function createViewer({
   // === GL State ===
   // What the viewer sets on the context itself rather than per pass. A
   // context the browser restores has every value back at its initial one,
-  // so this is set again there (`restoreLostGraphics`): the clear color
-  // was not, and a restored page cleared every frame to transparent black
-  // under a black, white or grid background. The clear color is the
+  // so this is set again there (`restoreLostGraphics`), the clear color
+  // included: left unset, a restored page clears every frame to transparent
+  // black under a black, white or grid background. The clear color is the
   // background's (`setBackground`); until one is set, the context's own
   // initial transparent black.
   let backgroundClearColor = [0, 0, 0, 0];
@@ -1308,9 +1308,9 @@ export function createViewer({
 	    // camera tracking will initialize from it instead of delivering a
 	    // duplicate trailing event for the same change. A camera still
 	    // settling then (a glide after a key or a drag, a zoom easing) settles
-	    // here first, on the view it moved: retiring its burst silently left
-	    // the motion up to this moment unobserved, so the history met it as a
-	    // change made outside an action. Motion that goes on afterwards is a
+	    // here first, on the view it moved: retiring its burst silently would
+	    // leave the motion up to this moment unobserved, so the history would meet
+	    // it as a change made outside an action. Motion that goes on afterwards is a
 	    // burst of its own, from the new baseline.
 	    if (resetFrameBaseline) {
 	      const unsettledViewId = presentedCameraSettlement.isPending()
@@ -1889,7 +1889,7 @@ export function createViewer({
 	        multisampled: false,
 	        autoFog: true,
 	        overrideBounds: null,
-	        // F97 point sprite (rendering/point-sprite.js): set every frame.
+	        // Point sprite (rendering/point-sprite.js): set every frame.
 	        pointSizeMax: 0
 	      };
 	      renderParamsByView.set(vid, renderParams);
@@ -1942,9 +1942,6 @@ export function createViewer({
   mat4.identity(modelMatrix);
 
   const tempVec4 = vec4.create();
-  const tempVec3 = vec3.create();
-  const tempVec3b = vec3.create();
-  const tempVec3c = vec3.create();
   const tempVec3d = vec3.create();  // Scratch for pan forward vector
   const tempVec3e = vec3.create();  // Scratch for pan camRight vector
   const tempVec3f = vec3.create();  // Scratch for pan camUp vector
@@ -2441,7 +2438,7 @@ export function createViewer({
   // The browser has taken the graphics context away: the viewer tells its
   // graphics-reset listeners (`onGraphicsReset`), and the app shows what it
   // means to the person (`app/graphics-reset-session.js`, an app dialog). The
-  // renderer builds no UI of its own (F146).
+  // renderer builds no UI of its own.
   const graphicsResetListeners = createListenerSet('the graphics reset');
 
   /** Tell every graphics-reset listener `phase` (`lost`, `restored`, `failed`). */
@@ -3163,7 +3160,7 @@ export function createViewer({
     // A release ends a gesture the viewer owns: a drag, a look, a charged
     // shot. Anywhere else on the page (a click in the sidebar) it changes
     // nothing drawn, and redrawing the scene for a settle window after every
-    // such click was a full GPU pass per frame for nothing.
+    // such click would be a full GPU pass per frame for nothing.
     if (isDragging || lookActive || projectileSystem.isCharging()) {
       invalidateFrame();
     }
@@ -4552,7 +4549,7 @@ export function createViewer({
     // Make centroids stand out by rendering them much larger than regular points
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
-    // F97 point sprite: the cap of the pane's points.
+    // Point sprite: the cap of the pane's points.
     gl.uniform1f(centroidUniformLocations.pointScale, pointScaleFor(viewportHeight, fov));
     gl.uniform1f(centroidUniformLocations.pointSizeMax, pointSizeMax);
 
@@ -4822,7 +4819,7 @@ export function createViewer({
     gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
-    // F97 point sprite: the cap of the pane's points.
+    // Point sprite: the cap of the pane's points.
     gl.uniform1f(centroidUniformLocations.pointScale, pointScaleFor(viewportHeight, fov));
     gl.uniform1f(centroidUniformLocations.pointSizeMax, pointSizeMax);
 
@@ -5096,7 +5093,7 @@ export function createViewer({
       pointSize: drawnPointSize,
       sizeAttenuation,
       fov: viewport.fov,
-      // F97 point sprite: the cap the pane draws with.
+      // Point sprite: the cap the pane draws with.
       pointSizeMax,
       pointLayers
     });
@@ -5862,18 +5859,9 @@ export function createViewer({
 
   /**
    * Whether a time-driven effect other than the camera's own motion changes
-   * what panes draw this frame (fades, smoke, overlays, the highlight pulse,
-   * projectiles, LOD still converging). While one is, every pane is redrawn.
-   */
-  function sceneWideAnimationActive() {
-    return baseLayerAnimationActive()
-      || (highlightTools !== null && highlightTools.isHighlightAnimating());
-  }
-
-  /**
-   * Whether a time-driven effect changes the base layer of panes this frame
-   * (every one of `sceneWideAnimationActive` but the highlight pulse, which
-   * changes only the layer over it).
+   * the base layer of panes this frame (fades, smoke, overlays, projectiles,
+   * LOD still converging; not the highlight pulse, which changes only the
+   * layer over it).
    */
   function baseLayerAnimationActive() {
     return (
@@ -6073,9 +6061,9 @@ export function createViewer({
       // The loss can also happen *inside* the frame, after the check above
       // passed. The renderer identifies that refusal so this boundary can tell
       // it from a defect: rethrowing here reaches `window.onerror` and reports
-      // a handled loss as a crash, which is what a page-error assertion in the
-      // terminal-disposal contract caught. Anything else is a real failure and
-      // still propagates untouched.
+      // a handled loss as a crash (`viewer-terminal-disposal.spec.mjs` asserts
+      // no page error). Anything else is a real failure and still propagates
+      // untouched.
       if (!isContextLostError(error)) {
         // The canvas holds a partial frame; the next frame redraws it, every
         // pane afresh (nothing drawn this frame can be retained).
@@ -6283,9 +6271,9 @@ export function createViewer({
     projectileSystem.updateChargeUI();
 
     // Backdrop fades move toward their target in either direction: a grid
-    // whose target dropped (Grid light 0.85 to Grid dark 0.75) used to stay
-    // above it, and the scheduler then redrew every frame for good. With
-    // reduced motion requested they complete at once.
+    // whose target drops (Grid light 0.85 to Grid dark 0.75) must come down
+    // too, or it stays above the target and the scheduler redraws every
+    // frame for good. With reduced motion requested they complete at once.
     const fadeStep = prefersReducedMotion() ? Infinity : gridTransitionSpeed * dt;
     gridOpacity = moveToward(gridOpacity, showGrid ? targetGridOpacity : 0, fadeStep);
     // The studio backdrop fades at the grid's rate. Panes still crossing
@@ -6954,7 +6942,7 @@ export function createViewer({
 	    renderParams.fogColor = fogColor;
 	    renderParams.cameraDistance = camDist;
 	    renderParams.dimensionLevel = dimLevel;
-	    // F97 point sprite: the cap (rendering/point-sprite.js).
+	    // Point sprite: the cap (rendering/point-sprite.js).
 	    renderParams.pointSizeMax = pointSizeMax;
 	    renderParams.useAlphaTexture = false;
 	    renderParams.quality = currentShaderQuality;
@@ -8602,8 +8590,8 @@ export function createViewer({
         // cost is measured and a sampled frame's fence is awaited: the loop
         // has stopped, but the measurement asks for its next frame when the
         // fence passes (`full-detail-frame-cost.js`), seconds later on a slow
-        // GPU (Web contracts run 41269083996, macOS Firefox:
-        // idle-frame-scheduling.spec.mjs counted those frames as idle draws);
+        // GPU (`idle-frame-scheduling.spec.mjs` counts those frames as idle
+        // draws);
         // nor while it is armed at all and the loop can draw: it asks for
         // the frames it samples, and its answer can turn level of detail and
         // culling on (`frameCostOwesFrames`).
@@ -11458,8 +11446,8 @@ export function createViewer({
 	      // The checks still waiting for their fence (`deferWebGLErrorCheck`)
 	      // are of the owners retired above: none is read, and none asks for
 	      // another frame to poll in. On a GPU that takes seconds a frame,
-	      // their polls went on after the RAF fence (Web contracts run
-	      // 41269083996, macOS Firefox, viewer-terminal-disposal.spec.mjs).
+	      // their polls would go on after the fence of the last frame
+	      // (`viewer-terminal-disposal.spec.mjs`).
 	      attempt('deferred WebGL error check retirement', () => {
 	        cancelDeferredWebGLErrorChecks(gl);
 	      });

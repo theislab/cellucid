@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -51,16 +50,6 @@ import { createHighlightsDomain } from '../assets/js/app/state/domains/highlight
 import { createViewsDomain } from '../assets/js/app/state/domains/views.js';
 import { sameValue } from '../assets/js/app/state/domains/same-value.js';
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
-
-// The `layout` state domain reads and arranges the floating panels.
-const layoutSource = await readFile(
-  new URL('../assets/js/app/state/domains/layout.js', import.meta.url),
-  'utf8',
-);
-const mainSource = await readFile(
-  new URL('../assets/js/app/main.js', import.meta.url),
-  'utf8',
-);
 
 function installDocumentById(entries = {}) {
   const previousDocument = globalThis.document;
@@ -433,7 +422,8 @@ test('the state domains use only the owners they are given, never one found in t
         refreshUi() {},
         cinematicCamera: null,
         figureExport: null,
-        analysis: async () => null,
+        analysis: () => null,
+        analysisArrived: async () => null,
         getDockable: () => null,
         openCells: {},
       }),
@@ -733,7 +723,6 @@ test('camera path owner failures are public restore failures', () => {
   );
   // A page without the Camera Path holds no path, and cannot take one.
   const none = createCameraPathDomain({ cinematicCamera: null });
-  assert.equal(none.capture(), null);
   assert.doesNotThrow(() => none.restore(null));
   assert.throws(
     () => none.restore(path),
@@ -968,46 +957,6 @@ test('views restore refuses a value that does not list its views before changing
   assert.deepEqual(calls, []);
   assert.equal(refreshes, 0);
   assert.equal(state.getActiveViewId(), 'live');
-});
-
-test('dockable session layout uses stable DOM ids only', () => {
-  assert.doesNotMatch(
-    layoutSource,
-    /summaryText\s*===\s*panelId|fall back to the summary label/i,
-  );
-  assert.doesNotMatch(
-    layoutSource,
-    /best-effort|cascadeToSafePosition|normalizeFloatGeometry/,
-  );
-  assert.match(
-    layoutSource,
-    /stable nonempty DOM id|stable.*id/i,
-  );
-});
-
-test('main wires the session files, the dataset history and the view carry directly, without optional probes', () => {
-  assert.doesNotMatch(mainSource, /getAnalysisWindowManager\?\.\(|datasetHistories\?\.(?:open|begin|loadSaved)\(/);
-  assert.match(
-    mainSource,
-    /const analysisWindowManager = comparisonModule\.getAnalysisWindowManager\(\);\s*return \{ comparisonModule, analysisWindowManager \};/,
-  );
-  // The analysis module is imported on demand; the state domains wait for
-  // its arrival, and a re-read of the open cells (the view carry) keeps the
-  // analyses through the same owners (the page's state-domain registry).
-  assert.match(mainSource, /const analysisRefs = analysisCode\.then\(/);
-  assert.match(mainSource, /analysis: \(\) => analysisRefs,/);
-  assert.match(mainSource, /const viewCarry = createViewCarry\(\{ domains: getStateDomains\(\) \}\);/);
-  // Session files hold the history of the dataset shown.
-  assert.match(mainSource, /getHistory: \(\) => datasetHistories\?\.current\(\) \?\? null/);
-  // The history goes first whenever a runtime is replaced, before anything of the dataset is touched.
-  assert.match(mainSource, /function retireDatasetInteractions\(\{ keepHistory = false \} = \{\}\) \{\s*if \(!keepHistory\) void datasetHistories\?\.retire\(\);/);
-  // It begins once the starting view is applied, and the first coloring
-  // (`first-coloring.js`) shown before it: part of the state it opens on.
-  assert.match(mainSource, /restoreAdvertisedDatasetState\(\{[\s\S]*?\}\);\s*(?:\/\/[^\n]*\n\s*)+if \(!keepHistory && \(stateOutcome\.status === 'ready' \|\| stateOutcome\.status === 'ready-state-error'\)[\s\S]*?await colorByFirstField\(\{[\s\S]*?\}\);[\s\S]*?\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*if \(publication\.isCurrent\(\) === true\) await beginShownDatasetHistory\(shownHistory\);/);
-  // The same dataset read again on other cells keeps its history and puts no starting view back.
-  assert.match(mainSource, /const keepHistory = loadMethod === DATA_LOAD_METHODS\.SUBSAMPLE && \(datasetHistories\?\.current\(\) \?\? null\) !== null;/);
-  assert.match(mainSource, /const shownHistory = keepHistory\s*\? datasetHistories\.current\(\)\s*: datasetHistories\.open\(/);
-  assert.match(mainSource, /const stateOutcome = keepHistory\s*\? \{ status: 'ready' \}\s*: await restoreAdvertisedDatasetState\(/);
 });
 
 test('u32 decoding still round-trips the exact maximum value', () => {

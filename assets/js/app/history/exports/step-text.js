@@ -6,7 +6,7 @@
  * (importable in Node): the timeline, the exports and the agent's history
  * reads say a step the same way.
  *
- * Every function reads History v2 records (`app/history/model.js`): a step's
+ * Every function reads the history's records (`app/history/model.js`): a step's
  * `kind`, `by` and `squashed`, a tracker's `branches`, `groups` and `notes`;
  * never the tracker's recording switch.
  *
@@ -95,8 +95,7 @@ export function actorsOf(step) {
 }
 
 /**
- * What a squashed step stands for, as a sentence opening (History v2
- * §3.15.1-3): "Changes made with recording paused", "3 steps merged into
+ * What a squashed step stands for, as a sentence opening: "Changes made with recording paused", "3 steps merged into
  * one", "A fresh start from the state reached before the history was
  * cleared", "A shared state, received without its history".
  * @param {{cause: string, count: number|null}} squashed - The step's `Squash` record
@@ -128,7 +127,7 @@ export function touchedNames(step) {
 }
 
 /** `all_branches` → "All branches", `fieldKey` → "Field key". */
-export function parameterLabel(key) {
+function parameterLabel(key) {
   const words = String(key)
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/[_-]+/g, ' ')

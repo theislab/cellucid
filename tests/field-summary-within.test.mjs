@@ -1,8 +1,7 @@
 /**
- * `field.summary` `within` (live-7 L25-13): a summary of a subset of the
- * cells, with the view left as it is. Agents hid the person's cells with
- * filters to summarize donors within one cell type (an Opus turn, 6 filter
- * steps) or cell types per age range (a Haiku turn, 4), then put the view
+ * `field.summary` `within`: a summary of a subset of the cells, with the view
+ * left as it is. A summary of donors within one cell type, or of cell types per
+ * age range, needs no filter on the person's cells and no putting the view
  * back; `within` keeps the cells of some categories of another categorical
  * field, or those in a range of a continuous field or gene.
  */
@@ -35,7 +34,7 @@ function reads() {
 
 const signal = new AbortController().signal;
 
-test('donors within one cell type, and cell types per age range, without touching the view (L25-13)', async () => {
+test('donors within one cell type, and cell types per age range, without touching the view', async () => {
   const { fieldSummary } = reads();
   const withinA = await fieldSummary({
     field: { source: 'obs', key: 'total_counts' }, by: { source: 'obs', key: 'donor' }, top: 50, visible_only: false,

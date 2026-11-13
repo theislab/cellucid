@@ -44,6 +44,7 @@ import { CELL_SUBSET_ENTRY_BYTES, subsetRun } from '../../../data/gene-delivery.
 import { analysisRunBudgetBytes } from '../compute/worker-pool.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { throwIfAborted, abortReason, cancelled, onAbort } from '../../../utils/abort.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /** The ledger label of a run's genes read and not yet computed (`memory-budget.js`, `analysis` share). */
 export const GENES_IN_FLIGHT_LABEL = 'analysis genes in flight';
@@ -171,7 +172,7 @@ function requireGeneList(genes) {
  *   each gene's every cell. Every gene must then be read from the source
  *   (`DataLayer.isGeneDeliverable`).
  * @param {string} [options.matrix='mapped'] - The expression matrix read
- * @param {import('../data/data-layer.js').RunValues|null} [options.values] - The
+ * @param {import('../compute/task-values.js').RunValues|null} [options.values] - The
  *   values the genes read here are given in (`DataLayer.runValues`; null: as
  *   stored); the matrix's now when omitted. Delivered genes come as stored:
  *   `dispatch` names the run's values (`taskGenes(task, transform)`)
@@ -268,9 +269,9 @@ export async function runGeneStream({
   // A read over some cells costs its cells whatever its genes (sent to the
   // reader, checked, gathered): it starts once half the gate is free -- the
   // other half's genes computed meanwhile -- or every task left fits. Started
-  // as each task left the gate, a 10M-cell differential expression of two
-  // groups (1.9M cells) made a read every task (15,000 reads; 54 s against
-  // the pushed tree's 4 s, which read a task a worker at a time).
+  // as each task left the gate, a differential expression of two large
+  // groups would make a read of every task, each paying its cells' cost
+  // (measured: 37_decisions_analysis.md).
   const tasksLeftToRead = () => Math.ceil((readAgain.length + (delivered.length - deliveredHead) + (local.length - localHead)) / perTask());
   const roomToRead = () => {
     const room = readAhead() - tasksBeingRead - ready.length;
@@ -478,9 +479,9 @@ export async function runGeneStream({
         startTask(ready.shift());
       }
       if (readsInFlight.size === 0 && ready.length === 0 && tasksInFlight.size === 0 && !genesLeftToRead()) break;
-      await new Promise(resolve => {
-        wakeUp = resolve;
-      });
+      const wake = promiseWithResolvers();
+      wakeUp = wake.resolve;
+      await wake.promise;
     }
   } finally {
     reads.abort(signal?.aborted ? abortReason(signal) : cancelled('superseded', 'The gene streaming run ended.'));
@@ -517,7 +518,7 @@ export async function runGeneStream({
  *   Takes each gene in turn (read only: a dense column may be a view's);
  *   false stops the pass
  * @param {string} [options.matrix='mapped']
- * @param {import('../data/data-layer.js').RunValues|null} [options.values] - The
+ * @param {import('../compute/task-values.js').RunValues|null} [options.values] - The
  *   values the genes are given in (`DataLayer.runValues`); the matrix's now when omitted
  * @param {string|null} [options.owner] - The job the reads are for
  * @param {AbortSignal|null} [options.signal]

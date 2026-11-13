@@ -15,7 +15,7 @@
  *   the history stops recording at once (its recorder and gate leave the
  *   dispatcher) and the autosave finishes writing what changed. The same
  *   dataset read again on other cells is not another dataset: its history
- *   is kept (`main.js`, `keepHistory`), since that reading is one of its
+ *   is kept (`dataset/reload.js`, `keepHistory`), since that reading is one of its
  *   steps (`cells.open`) or one of its steps shown (the `cells` domain).
  * - **Memory**: the bytes of the values the history keeps are part of the
  *   working set (`data/memory-budget.js`, part `'history'`): the person's
@@ -62,7 +62,7 @@ import { NO_DATASET_OPEN, noDatasetOpenTo } from '../ui/no-dataset.js';
  *   now?: () => number,
  *   chrome?: {capture: () => {pressed: Record<string, string>}},
  *   version?: () => string|null,
- * }} options - `chrome`: the page chrome saved states carry outside the history (CEL-0249);
+ * }} options - `chrome`: the page chrome saved states carry outside the history;
  *   `version`: the Cellucid version that writes them; `header`: the open dataset's session header
  *   (`SessionSerializer.captureSessionHeader`); `loadSavedHistory`: load a saved
  *   history into the shown one (`SessionSerializer.loadSavedHistory`);
@@ -155,7 +155,7 @@ export function createDatasetHistories({
       }
       if (loaded || current !== owned || owned.autosave === null) return;
     }
-    // After the welcome, never on top of it (`utils/startup-sequence.js`, R9U-14).
+    // After the welcome, never on top of it (`utils/startup-sequence.js`).
     await afterWelcome();
     if (current !== owned || owned.autosave === null) return;
     await owned.autosave.offerContinue({
@@ -173,8 +173,8 @@ export function createDatasetHistories({
      * A session (a file, a saved state) is being loaded, which may open its
      * dataset first: no "Continue where you left off?" is offered until
      * `settled` settles, and none when the load put a history in place — the
-     * person chose which history to show (found 2026-11-10: the offer showed
-     * mid-load and went once the session landed).
+     * person chose which history to show (the offer would show mid-load and
+     * go once the session landed).
      *
      * @param {Promise<unknown>} settled
      */
@@ -223,7 +223,7 @@ export function createDatasetHistories({
         newTrackerId: () => `t-${createOpaqueId()}`, now,
         // `history.replay` reads a saved state of this browser.
         openSaved: id => openSavedState(id, store),
-        // History settings (§3.15.5): what is recorded, whether a new dataset records, who the person is.
+        // History settings: what is recorded, whether a new dataset records, who the person is.
         offDomains: () => offDomainsOf(historySettings()),
         recordNewTrackers: () => historySettings().recordNewDatasets,
         person: () => historySettings().personName,
@@ -251,14 +251,21 @@ export function createDatasetHistories({
      * The starting view of the dataset `history` is of is applied (or there
      * is none): start its first tracker from what is shown, keep it in this
      * browser, and offer to continue the dataset's latest autosave. Nothing
-     * happens when another dataset has been opened since.
+     * happens when another dataset has been opened since, or the page was
+     * left: a history retired while it starts has nothing to start, and what
+     * its start then fails on (an owner withdrawn with the page) is no failure.
      *
      * @param {ReturnType<typeof createHistory>} history - what `open` returned
      */
     async begin(history) {
       const owned = current;
       if (owned === null || owned.history !== history || history.active !== null) return;
-      await owned.history.startTracker();
+      try {
+        await owned.history.startTracker();
+      } catch (error) {
+        if (current !== owned) return;
+        throw error;
+      }
       if (current !== owned) return;
       accountMemory(owned.history);
       // Shown from now on: the State panel, the keyboard's undo and the agent read it.
@@ -328,7 +335,7 @@ export function createDatasetHistories({
      *
      * `choice`: where it comes from (`saved`, `file`) and the tracker and
      * branch to replay (`replay.js` `replayPlanOf`); `mapping`: the names to
-     * use instead (History v2 §3.10). The source is kept by the tracker made,
+     * use instead. The source is kept by the tracker made,
      * for `replayAgain`, while the dataset is shown.
      *
      * @param {() => Promise<import('../session/session-serializer.js').SavedHistorySource>} open

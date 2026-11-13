@@ -2,8 +2,8 @@
  * The history stress suite (`tests/stress/`, `scripts/history-stress.mjs`)
  * at a size the contract suite runs in seconds: a mixed history of a few
  * hundred steps with branches and trackers, and every kind of step alone.
- * It keeps the suite runnable as the history changes (H1-H3 re-point it at
- * History v2); the figures themselves are measured by `npm run
+ * It keeps the suite runnable as the history changes; the figures themselves
+ * are measured by `npm run
  * stress:history` and recorded in `tests/stress/RESULTS.md`, never asserted
  * here: a timing on a shared runner is not a result.
  */

@@ -28,6 +28,7 @@ import { debug } from '../shared/debug-utils.js';
 import { requireSignalOrNull, throwIfAborted } from '../../../utils/abort.js';
 import { requireClonedRecord, requireKeys } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { loadAppCode } from '../../app-code.js';
 
 let workerPoolModule = null;
 let computeManagerInstance = null;
@@ -112,7 +113,7 @@ export class ComputeManager {
     let pool = null;
     try {
       if (!workerPoolModule) {
-        workerPoolModule = await import('./worker-pool.js');
+        workerPoolModule = await loadAppCode(() => import('./worker-pool.js'));
       }
 
       pool = workerPoolModule.getWorkerPool();

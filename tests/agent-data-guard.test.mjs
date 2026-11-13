@@ -170,7 +170,7 @@ test('a value summary over groups an agent shaped by naming cells is refused und
   done('field.push', { key: 'pushed' }, { name: 'pushed' });
   done('field.push', { key: 'notebook' }, { name: 'notebook' }, 'host');
   assert.deepEqual(['probe', 'renamed', 'pushed', 'mine', 'notebook'].map(tracker.field), [true, true, true, false, false]);
-  // A column made from a shaped one holds its cells: a grouping, a file's column edited into a new one (L7-1).
+  // A column made from a shaped one holds its cells: a grouping, a file's column edited into a new one.
   done('field.group', { field: { source: 'obs', key: 'renamed' }, groups: [{ label: 'G', categories: ['p'] }], rest: null }, { name: 'renamed (grouped)' }, 'user');
   done('category.merge', { field: { source: 'obs', key: 'pushed' }, category: 'a', into: 'b' }, { name: 'pushed (merged)' }, 'user');
   done('category.delete', { field: { source: 'obs', key: 'pushed (merged)' }, category: 'a' }, { name: 'pushed (edited)' }, 'user');

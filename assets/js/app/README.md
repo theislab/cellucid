@@ -12,8 +12,11 @@ The layers, glossary and "where to change X" index are in `assets/js/ARCHITECTUR
 
 ```
 app/
-├── main.js                  # Entry point: bootstrap, dataset load and publication (≈5,700 lines;
-│                            #   split by stage 5e of the reorganization plan)
+├── main.js                  # Entry point: the start-up sequence, in order (≈1,600 lines): every awaited
+│                            #   start-up step, the teardown, and the factories of the parts below
+├── dataset/                 # The dataset shown: publication.js (stage, commit, restore, settle the
+│                            #   interface), reload.js (one dataset change as a transaction, None),
+│                            #   published-state.js (the catalog's starting view) (README.md)
 ├── state/                   # DataState and its managers
 │   ├── core/                # data-state.js (DataState + mixin wiring), base-manager.js, constants.js
 │   ├── managers/            # Mixins: colors, filters, highlights, views, mappings, open cells,
@@ -29,13 +32,16 @@ app/
 │   ├── core/                # ui-coordinator.js (initUI), dom-cache, early classic-script bootstraps, control-availability.js (a control turned off says why), control-readout.js (what a slider's value reads as)
 │   ├── modules/             # Sidebar features (dataset connections, subsample control, Genes read for, legend,
 │   │                        #   kept-stores dialog, my-datasets/ (My datasets and All…), highlight,
-│   │                        #   figure-export/, benchmark/, state/ (the State panel: Share… and Load…,
-│   │                        #   the branch graph, branches, trackers, tour, exports), …)
+│   │                        #   figure-export/, benchmark/ (the harness; benchmark-controls.js: the Benchmark
+│   │                        #   panel and Analyze performance), connectivity-controls.js (the edges and
+│   │                        #   their controls), smoke-density.js (the smoke volume rebuilt),
+│   │                        #   state/ (the State panel: Share… and Load…, the branch graph, branches,
+│   │                        #   trackers, tour, exports), …)
 │   ├── components/          # Reusable controls; app-dialog.js, the one modal dialog
 │   ├── onboarding/          # Welcome dialog; the one shortcut table and the page's key listener
 │   ├── place-names.js       # Names of places in the UI used in sentences
 │   ├── no-dataset.js        # What every part says while no dataset is open (one wording)
-│   └── utils.js             # One re-export of escapeHtml (removal listed in the reorganization plan)
+│   └── utils.js             # One re-export of escapeHtml
 ├── session/                 # .cellucid-session files (format 4, the history): session-serializer.js (save, load,
 │                            #   starting views), history-file.js (the format), published-default.js (starting
 │                            #   views), codecs/, bundle/, session-context.js (dataset fingerprint),
@@ -57,7 +63,10 @@ app/
 ├── library/                 # What this browser keeps of the person's own datasets (README.md):
 │                            #   my-datasets.js (My datasets: the datasets opened here, how each opens
 │                            #   again), local-file-handles.js (one-click reopen of a local file or folder)
-├── viewer-host/             # Python and R viewer hosts: command-handler.js (their actions, dispatched as the host's,
+├── viewer-host/             # Python and R viewer hosts: host-view.js (the view's end: the stopped picture;
+│                            #   hover and click), host-channel.js (session bundles, commands, results,
+│                            #   history events, local agents, wired once the interface exists),
+│                            #   command-handler.js (their actions, dispatched as the host's,
 │                            #   in the notebook's turn; a session file a host pushes, loaded),
 │                            #   pointer-delivery.js (hover/click events), results.js (what the person
 │                            #   made, published to the host), history-events.js (every change of the
@@ -74,12 +83,12 @@ app/
                              #   (gene-lookup.js: which gene a name chooses, or why none), …)
 ```
 
-Loose modules in `app/` by concern (stage 4a of the plan groups them into folders):
+Loose modules in `app/` by concern:
 
 | Concern | Modules |
 | --- | --- |
 | Startup | `startup-phase.js`, `startup-url-intent.js`, `startup-failure.js`, `url-state.js`, `subsample-url.js` (a subsample in a link), `app-code.js`, `asset-url.js`, `optional-analytics.js`, `citation.js` |
-| Dataset publication and open cells | `dataset-reload-outcome.js`, `open-cells-resize.js` (Apply with another share, progressive growth), `cell-subset-carry.js` (highlights and user fields carried to other cells), `view-snapshot-publication.js`, `data-load-methods.js`, `graphics-reset-session.js` |
+| Dataset publication and open cells | `dataset-reload-outcome.js`, `open-cells-resize.js` (Apply with another share, progressive growth), `cell-subset-carry.js` (highlights and user fields carried to other cells), `view-snapshot-publication.js`, `data-load-methods.js`, `graphics-reset-session.js`, `first-coloring.js` (the field a dataset opens colored by), `unkept-work-guard.js` (the question before unkept work is replaced or the page left) |
 | Telling the person | `opening-progress-view.js`, `read-progress-notifications.js`, `matrix-share-notices.js`, `unplaced-cells-notice.js`, `source-sign-in-view.js`, `page-memory.js` (other tabs, hidden/frozen release, shortage notice) |
 | Layout | `sidebar-metrics.js` |
 
@@ -105,7 +114,7 @@ Its methods are manager modules mixed into `DataState` at load time
 ## UI layer (`app/ui/`)
 
 `initUI()` (`ui/core/ui-coordinator.js`) collects DOM references and starts
-the modules in `ui/modules/`; it is about 850 lines of wiring, so new
+the modules in `ui/modules/`; it is about 1,000 lines of wiring, so new
 features go into a module of their own, not into the coordinator.
 
 ## Utilities
@@ -126,4 +135,16 @@ localStorage.removeItem('CELLUCID_DEBUG');        // to turn it off
 ## Decision records
 
 Why this code is the way it is (dated decisions, measurements per engine,
-what was tried and reverted, open items): `cellucid-python/docs/user_guide/web_app/p_developer_docs/23_decisions_partial_reading.md`, `cellucid-python/docs/user_guide/web_app/p_developer_docs/25_decisions_exports.md`, `cellucid-python/docs/user_guide/web_app/p_developer_docs/26_decisions_served_store_and_widgets.md`, `cellucid-python/docs/user_guide/web_app/p_developer_docs/28_decisions_rendering_layers.md`. Update them in the same change as the code.
+what was tried and reverted, open items), in
+`cellucid-python/docs/user_guide/web_app/p_developer_docs/`:
+`22_decisions_link_model_and_request_planning.md` (sources and links),
+`23_decisions_partial_reading.md` (opening and growing cells),
+`24_decisions_graph_edges_at_scale.md` (the connectivity controls),
+`25_decisions_exports.md`, `26_decisions_served_store_and_widgets.md`
+(`viewer-host/`), `27_decisions_memory_model.md` (`page-memory.js`),
+`28_decisions_rendering_layers.md`,
+`33_decisions_actions_domains_and_history.md` (`actions/`, `history/`,
+`session/`, `state/`), `34_decisions_agents.md` (`agent/`),
+`35_decisions_interface.md` (`ui/`, start-up, community annotation),
+`36_decisions_figure_export.md` and `37_decisions_analysis.md`
+(`analysis/`). Update them in the same change as the code.

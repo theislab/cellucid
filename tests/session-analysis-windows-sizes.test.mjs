@@ -1,6 +1,6 @@
 /**
- * An analysis window is split between two state domains (History v2
- * §3.15.5): what it shows (its analysis, settings and result) is the
+ * An analysis window is split between two state domains: what it shows (its
+ * analysis, settings and result) is the
  * `analysis` domain's (`app/state/domains/analysis.js`); where it stands, its
  * size, whether it is folded, and the sizes a person gave each analysis's
  * windows and expanded views are the `layout` domain's (`layout.analysis`,
@@ -76,7 +76,8 @@ function analysisDomainOver(analysisWindowManager) {
       throw new Error('the docked panel is not restored when it is unchanged');
     }
   };
-  return createAnalysisDomain({ analysis: async () => ({ comparisonModule, analysisWindowManager }) });
+  const refs = { comparisonModule, analysisWindowManager };
+  return createAnalysisDomain({ analysis: () => refs, analysisArrived: async () => refs });
 }
 
 test('remembered sizes round-trip exactly and replace the ones held', () => {
@@ -121,10 +122,10 @@ test('an analysis value is the windows\' analyses; their places and the remember
   analysisViewSizes.importSizes(structuredClone(SIZES), isKnown);
   const manager = managerOver(analysisViewSizes, [{ descriptor: GENES, place: AT_1 }, { descriptor: DOTS, place: AT_9 }]);
   const value = await analysisDomainOver(manager).capture();
-  assert.deepEqual(value, { windows: [GENES, DOTS], docked: NOTHING_DOCKED });
-  const layout = createAnalysisWindowLayout(async () => ({ analysisWindowManager: manager }));
+  assert.deepEqual(value, { windows: [GENES, DOTS], docked: null }, 'nothing docked is no docked analysis');
+  const layout = createAnalysisWindowLayout(() => ({ analysisWindowManager: manager }), async () => ({ analysisWindowManager: manager }));
   assert.deepEqual(await layout.capture(), { windows: [AT_1, AT_9], sizes: SIZES });
-  assert.deepEqual(await createAnalysisWindowLayout(async () => null).capture(), { windows: [], sizes: null }, 'no analysis code: no window, no size');
+  assert.deepEqual(await createAnalysisWindowLayout(() => null, async () => null).capture(), { windows: [], sizes: null }, 'no analysis code: no window, no size');
 });
 
 test('reopened windows keep the place the window at their position had; the layout then puts each at its own', async () => {
@@ -136,7 +137,7 @@ test('reopened windows keep the place the window at their position had; the layo
   assert.deepEqual(manager.exportWindowPlaces(), [AT_1, AT_9, DEFAULT_PLACE], 'an analysis restored alone moves no window it kept');
 
   // The layout restored after it: places first (placing remembers sizes), then the sizes exactly.
-  const layout = createAnalysisWindowLayout(async () => ({ analysisWindowManager: manager }));
+  const layout = createAnalysisWindowLayout(() => ({ analysisWindowManager: manager }), async () => ({ analysisWindowManager: manager }));
   manager.events.length = 0;
   const target = { windows: [AT_9, AT_1, AT_1], sizes: SIZES };
   await layout.restore(await layout.capture(), target);
@@ -153,13 +154,13 @@ test('reopened windows keep the place the window at their position had; the layo
 test('the layout of the analysis windows: a wrong shape is refused whole; places for other windows are applied to those both name; no analysis code', async () => {
   analysisViewSizes.clear();
   const manager = managerOver(analysisViewSizes, [{ descriptor: GENES, place: AT_1 }]);
-  const layout = createAnalysisWindowLayout(async () => ({ analysisWindowManager: manager }));
+  const layout = createAnalysisWindowLayout(() => ({ analysisWindowManager: manager }), async () => ({ analysisWindowManager: manager }));
   assert.throws(() => layout.check({ windows: [AT_1] }), /exactly their places and the sizes remembered per analysis/);
   assert.throws(() => layout.check({ windows: [AT_1], sizes: null, extra: 1 }), /exactly their places/);
   // The analysis domain left as it is (its recording off): the places repair what they can, never refuse.
   await layout.restore(await layout.capture(), { windows: [AT_9, AT_1], sizes: null });
   assert.deepEqual(manager.exportWindowPlaces(), [AT_9], 'the one open window took the first place; the extra place is ignored');
-  const none = createAnalysisWindowLayout(async () => null);
+  const none = createAnalysisWindowLayout(() => null, async () => null);
   await none.restore({ windows: [], sizes: null }, { windows: [], sizes: null });
   await assert.rejects(none.restore({ windows: [], sizes: null }, { windows: [AT_1], sizes: null }), /could not load on this page/);
 });

@@ -3,8 +3,7 @@
  * step and after another, part by part (the history's read `history.diff`:
  * the owners of the state describe their own values), for any two steps of
  * the tracker shown, on any branch. Each step is listed once, under its own
- * branch, by its number (History v2 §2.6 item 12: no number twice, every
- * option names its branch).
+ * branch, by its number (no number twice, every option names its branch).
  *
  * @module ui/modules/state/diff-dialog
  */

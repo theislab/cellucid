@@ -25,6 +25,7 @@
  */
 
 import { isCancellation } from '../../utils/abort.js';
+import { promiseWithResolvers } from '../../utils/promise-resolvers.js';
 
 /**
  * @typedef {Object} ActivitySnapshot
@@ -80,7 +81,7 @@ export class ReadActivity {
      * cell export): nothing reads them again, so they are not handed to the
      * page's memory of fetched bytes (`range-cache.js`), where they would
      * only push out what other reads use, and cost a copy and a message
-     * each (the 812 MB of an export of 21,285 cells of HLCA).
+     * each (an export reads hundreds of MB).
      */
     this.readOnce = kind === 'cells';
     this.status = 'running';
@@ -100,7 +101,9 @@ export class ReadActivity {
     this.detail = null;
     this._onUpdate = onUpdate;
     /** Resolves once the operation ends (`finish`): what is held for it may go (`byte-reader.js`, its surplus). */
-    this.finished = new Promise(resolve => { this._resolveFinished = resolve; });
+    const finished = promiseWithResolvers();
+    this.finished = finished.promise;
+    this._resolveFinished = finished.resolve;
   }
 
   /**

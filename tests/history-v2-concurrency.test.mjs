@@ -1,5 +1,5 @@
 /**
- * History v2 §3.7: the history's exclusive operations against everything
+ * The history's exclusive operations against everything
  * else that writes it. A move or an edit runs alone: actions wait at the
  * gate, an edit of the history (squash, group, rename, note, bookmark) waits
  * for the operation running, and a change observed meanwhile (a camera drag

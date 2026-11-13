@@ -6,7 +6,8 @@
  *
  * Plotly's violin `calc` evaluates a Gaussian kernel density at a grid of
  * points spanning the data: one kernel term per value per grid point, about
- * 400 million for a million distinct values and a 2.4 s freeze. Every step is
+ * 400 million for a million distinct values, a freeze of seconds (measured:
+ * 37_decisions_analysis.md). Every step is
  * mirrored here operation for operation — the box `calc` order statistics over
  * the same ascending order, the bandwidth (Silverman's rule as Plotly applies
  * it), the soft span and its range cleaning, the grid accumulation, and the
@@ -14,7 +15,7 @@
  * the same double. The vendored bundle carries a second local patch: `makeKDE`
  * returns these precomputed values for the grid points it is asked for, in
  * order, when the trace carries them and the bandwidth and sample size are the
- * ones Plotly computed itself; any other point (a hover) is summed as before.
+ * ones Plotly computed itself; any other point (a hover) is summed as Plotly does.
  * tests/plotly-violin-kde-contract.test.mjs and
  * tests/browser/analysis-violin-kde-identity.spec.mjs hold it to that.
  *

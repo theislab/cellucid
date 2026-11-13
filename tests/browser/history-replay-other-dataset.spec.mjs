@@ -321,7 +321,7 @@ test('a history recorded on one dataset replays on another, in a new tracker lin
   const load = page.waitForEvent('filechooser');
   await clickLoadSession(page);
   await (await load).setFiles(sessionB);
-  // Loaded beside the page's own trackers (History v2 Q2): the file's three, named apart, its active one shown.
+  // Loaded beside the page's own trackers: the file's three, named apart, its active one shown.
   await expect.poll(async () => (await trackerFacts(page)).trackers.length, { timeout: 60_000 }).toBe(second.trackers.length * 2);
   const reloaded = await trackerFacts(page);
   expect(reloaded.active.id).not.toBe(second.active.id);

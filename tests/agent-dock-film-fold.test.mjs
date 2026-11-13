@@ -1,5 +1,5 @@
 /**
- * F87 (2026-11-11): the rule the chat folds by while a camera path plays
+ * The rule the chat folds by while a camera path plays
  * (`chatFoldsForFilm`, `app/agent/dock.js`); the page wiring is
  * `tests/browser/agent-chat-film-fold.spec.mjs`.
  */

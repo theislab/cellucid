@@ -1,8 +1,7 @@
 /**
  * `analysis.export` writes an analysis's whole result table as the file its
  * expanded view's CSV button writes (`tableFile`), through the browser's
- * download: an agent asked "export that table" could not before (lane-analyst
- * L3-2). Refused, saying why, with no result, with an out-of-date one, and
+ * download, so an agent asked to "export that table" can. Refused, saying why, with no result, with an out-of-date one, and
  * for `all` on an analysis other than marker genes.
  */
 import assert from 'node:assert/strict';

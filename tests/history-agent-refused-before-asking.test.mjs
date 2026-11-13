@@ -1,13 +1,12 @@
 /**
  * What the history would refuse of an agent is refused before the person is
- * asked (live pass 3, L12-9). An Opus turn asked to squash the person's Ins1
- * and Gcg colorings got the card "asks to merge steps into one … It deletes
- * something saved in this browser", the person allowed it, and the squash
- * was then refused: "An agent squashes only its own turn's steps". The
- * history's estimate of a squash or a branch delete runs the same checks
- * as its implementation (`provideEstimate`; an estimate that throws a
- * refusal refuses the action there), so the person is never asked about
- * what will not happen; one that passes is asked, with what it does.
+ * asked. A squash of the person's Ins1 and Gcg colorings must not show the
+ * card "asks to merge steps into one … It deletes something saved in this
+ * browser", be allowed, and then be refused: "An agent squashes only its own
+ * turn's steps". The history's estimate of a squash or a branch delete runs
+ * the same checks as its implementation (`provideEstimate`; an estimate that
+ * throws a refusal refuses the action there), so the person is never asked
+ * about what will not happen; one that passes is asked, with what it does.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -50,7 +49,7 @@ test('deleting a branch that is not there is refused before the person is asked'
   assert.deepEqual(cards, []);
 });
 
-test('replaying a saved state is priced by the time its steps took when recorded, and asked about before it starts (F166)', async () => {
+test('replaying a saved state is priced by the time its steps took when recorded, and asked about before it starts', async () => {
   const source = await makePage();
   await source.step('a.set', { v: 1 });
   await source.step('c.derive');

@@ -11,7 +11,7 @@ the activity line, and the notice of what agents send with the dataset's switch.
 | `activity.js` | pure: the agent turns (acting, done with steps, stopped, undone), fed the dispatcher's events |
 
 **Permissions.** The dispatcher passes every change of an agent to the confirmer (reads never):
-at the start with the owner's estimate of its work (`provideEstimate`) and its `confirm` when that
+at the start with the estimate its implementation provides of its work (`provideEstimate`) and its `confirm` when that
 is asked before it runs, and, for an action whose implementation asks once it knows the cost
 (`confirmAt: 'handler'`, a download), again then with `detail` (what it costs). The kinds are
 `change` (anything in the tab: an undoable step, another dataset opened), `heavy` (estimated at
@@ -71,8 +71,7 @@ in the agent's own app, an MCP elicitation: Allow once or Deny, as if clicked).
 - A card never stays after its question is moot: answered, abandoned, stopped, dataset replaced,
   tab closed.
 - The line is not a live region; one hidden status says each change of state once.
-- No threshold is made up: heavy work is judged from the page's own measurements against
-  `HEAVY_MS`, the attention limit the gene read's time target is set from.
+- No threshold is made up: heavy work is judged against `HEAVY_MS`.
 
 **Tests:** `tests/agent-presence.test.mjs`, `tests/browser/agent-chat.spec.mjs`,
 `tests/browser/agent-chat-features.spec.mjs`, `tests/browser/agent-matrix.spec.mjs`.

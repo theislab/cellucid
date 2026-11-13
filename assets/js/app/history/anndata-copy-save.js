@@ -1,7 +1,6 @@
 /**
- * @fileoverview "Save AnnData with this state…" (History v2 §3.11, P9, owner
- * decision Q3): the action `history.anndata.save`, one path for the History
- * ⋯ menu and for agents. It writes a **new** Cellucid-ready AnnData
+ * @fileoverview "Save AnnData with this state…": the action `history.anndata.save`, one path for the History ⋯
+ * menu and for agents. It writes a **new** Cellucid-ready AnnData
  * `.zarr.zip` of the open dataset with the state shown applied, as
  * cellucid-python and cellucid-r apply a session, and never writes over the
  * dataset's own file.
@@ -11,8 +10,9 @@
  *    opened from this computer, is refused), when the page may open one (the
  *    person's own click, in a browser that has it); else a spool in this
  *    browser's private storage (`app/exports/cell-exports.js` `createSpool`),
- *    downloaded once whole. On a failure or a cancel the file's writable is
- *    aborted (never closed: a closed one would leave a partial file under
+ *    downloaded once whole. Either way each batch is written exactly
+ *    (`utils/file-writable.js`). On a failure or a cancel the file's writable
+ *    is aborted (never closed: a closed one would leave a partial file under
  *    the chosen name) and the spool's files are removed.
  * 2. **What it writes.** What is shown is what is saved: the history's
  *    paused changes become a step first, as Share writes them
@@ -51,9 +51,10 @@ import { failureSentence } from '../../utils/errors.js';
 import { fileFormatOfName } from '../../data/input-formats.js';
 import { sha256Hex } from '../../utils/sha256.js';
 import { safeFileName } from '../utils/download.js';
+import { openFileWritable } from '../../utils/file-writable.js';
 
-/** The ending every copy's file has (owner decision Q3: `.zarr.zip` only). */
-export const ANNDATA_COPY_SUFFIX = '.zarr.zip';
+/** The ending every copy's file has (`.zarr.zip` only: a Zarr writer is small, an HDF5 one is not; 33_decisions_actions_domains_and_history.md). */
+const ANNDATA_COPY_SUFFIX = '.zarr.zip';
 const TITLE = 'Save AnnData with this state';
 
 /** A file name for the copy of a dataset named `name`. */
@@ -98,7 +99,7 @@ async function openDestination({ name, useDialog, sourceHandle, createSpool, dow
       if (own !== null && typeof handle.isSameEntry === 'function' && await handle.isSameEntry(own)) {
         throw new ActionRefused('That is the file this dataset is open from; a copy is always saved as a new file, so choose another name.', { code: 'refused' });
       }
-      const writable = await handle.createWritable();
+      const writable = await openFileWritable(handle);
       return {
         name: handle.name,
         to: 'file',
@@ -139,7 +140,7 @@ function genesOf(state, mapping, varColumns) {
 }
 
 /** What was left out of a copy, in lines: the plan's rows not applied, then the copy's own notes. */
-export function leftOutLines(plan, notes) {
+function leftOutLines(plan, notes) {
   return [
     ...plan.rows.filter(row => row.status === 'not-applied').map(row => `${row.name}: ${row.note}`),
     ...notes,

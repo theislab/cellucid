@@ -1,11 +1,10 @@
 /**
- * A field made from highlight pages over another field's labels (bug hunt
- * L25-3, round 9 close RCA): `field.create-from-pages` `rest` — the cells on
- * no page keep their category of a categorical field, so splitting one label
- * is a page per new label and one call (an agent had made 45 temporary pages,
- * a field of 48 pages, then deleted 56 pages: 101 calls, $3). A page label
- * that is one of the kept field's categories is that category; a cell with no
- * category there takes the uncovered label; every overlap rule keeps it.
+ * A field made from highlight pages over another field's labels:
+ * `field.create-from-pages` `rest` — the cells on no page keep their category
+ * of a categorical field, so splitting one label is a page per new label and
+ * one call. A page label that is one of the kept field's categories is that
+ * category; a cell with no category there takes the uncovered label; every
+ * overlap rule keeps it.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

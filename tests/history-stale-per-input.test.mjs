@@ -1,11 +1,11 @@
 /**
  * Staleness follows the inputs that actually changed, each named with its own
- * cause (F156, live pass 6 L24-11): a test was "stale since step 4 ("Showed
+ * cause: a test must not read "stale since step 4 ("Showed
  * UMAP · 2D in View 1"): Filters changed … Hidden cells changed … Views
- * changed" when step 4 only kept a view: every reason cited the first change
- * of any input, and keeping a view changes the per-view domains' values
+ * changed" when step 4 only kept a view (every reason citing the first change
+ * of any input: keeping a view changes the per-view domains' values
  * (`filters`, `visibility`, `views` gain an entry) though no cell the test
- * used changed. Now a per-view input is compared at the view the step acted
+ * used changed). A per-view input is compared at the view the step acted
  * in (its owner's `readPart`), and each reason names its own input's step.
  */
 import test from 'node:test';
@@ -110,7 +110,7 @@ test('a result is stale when the view it ran in changes, each input with the ste
   assert.equal(found[0].step, ran.id);
   assert.equal(found[0].cause.step, hid.id, 'stale since the first of them');
   assert.deepEqual(found[0].reasons, [
-    // Two views open: each step names the view it changed (F157).
+    // Two views open: each step names the view it changed.
     `Filters changed at step ${hid.id.slice(1)} ("Hid 2 in View 1").`,
     `Hidden cells changed at step ${cell.id.slice(1)} ("Hid cell 9 in View 1").`,
     `Highlights changed at step ${page2.id.slice(1)} ("Highlighted 5").`,

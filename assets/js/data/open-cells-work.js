@@ -25,6 +25,7 @@
  */
 
 import { awaitWithSignal, throwIfAborted } from '../utils/abort.js';
+import { promiseWithResolvers } from '../utils/promise-resolvers.js';
 
 const running = new Set();
 let change = null;
@@ -108,8 +109,7 @@ export async function beginCellsChangeOnceSettled(signal = null) {
  */
 export function beginCellsChange() {
   if (change !== null) throw new Error('The open cells are already being changed.');
-  let release;
-  const promise = new Promise(resolve => { release = resolve; });
+  const { promise, resolve: release } = promiseWithResolvers();
   const own = { promise };
   change = own;
   return () => {

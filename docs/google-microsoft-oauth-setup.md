@@ -17,12 +17,12 @@ anywhere**: Google shows one for a Web client, and it is never used. While a
 value is empty the app says "not configured on this site yet" for what needs
 it; public Figshare items need nothing.
 
-The design, with the facts it rests on, is
-`cellucid-private/plans/drive-onedrive-figshare-2026-10-23.md`. The user-facing
-page is `docs/user_guide/web_app/b_data_loading/16_private_drive_onedrive.md`
-in `cellucid-python`; the privacy policy is `privacy.html` and the terms of use
-`terms.html`, both linked from the home page's footer. The same setup, click by click for the site owner, is
-`cellucid-private/guides/google-drive-and-onedrive-setup.md`.
+The user-facing page is
+`docs/user_guide/web_app/b_data_loading/16_private_drive_onedrive.md` in
+`cellucid-python`; the privacy policy is `privacy.html` and the terms of use
+`terms.html`, both linked from the home page's footer. The registration below
+is the setup, step by step, for the site owner; the owner's accounts and
+consoles are the owner's to open.
 
 ## Current registration (2026-10-25)
 
@@ -175,9 +175,10 @@ signs in in a hidden window and closes it before the callback is reached
 3. If the real Picker needs a host the fakes did not (a `gstatic.com` script, a
    frame host), add it to the `Content-Security-Policy` in `index.html` and to
    `tests/seo-head-contract.test.mjs` in the same change.
-4. Record in `cellucid-private/plans/measurements/` the measured OneDrive
-   download-URL lifetime, the Drive quota units per range read, and the
-   cold-open round trips.
+4. Write down the measured OneDrive download-URL lifetime, the Drive quota
+   units per range read and the cold-open round trips in the data-loading
+   developer page (`09_data_loading_pipeline_and_caching.md` under
+   `docs/user_guide/web_app/p_developer_docs/` in `cellucid-python`).
 
 ## Checks only real accounts can make
 
@@ -229,5 +230,5 @@ signs in in a hidden window and closes it before the callback is reached
     checked 2026-10-25), another port, a notebook viewer on 8765 (its
     default) and on the next free port when 8765 is held, from a notebook at
     `localhost` and at `127.0.0.1`; each refusal is the message `google.js` /
-    `microsoft.js` give for that page. The owner's run of these checks is
-    `cellucid-private/guides/drive-onedrive-owner-checklist.md`.
+    `microsoft.js` give for that page. The site owner runs these checks with
+    real accounts; no test can.

@@ -33,8 +33,8 @@
  *
  * The GPU's share is read with the best instrument the browser offers:
  * - **A GPU timer** (`EXT_disjoint_timer_query_webgl2`: Chromium on a
- *   hardware GPU; measured, not in Chromium's software GL, Firefox or
- *   WebKit, on an Apple M1 Pro, 2026-11-01): a `TIME_ELAPSED` query around
+ *   hardware GPU; not offered by Chromium's software GL, Firefox or WebKit):
+ *   a `TIME_ELAPSED` query around
  *   the frame's commands gives the GPU's time exactly, whenever the page
  *   reads it. A sample the GPU reports as disjoint (its clock reset, the
  *   GPU switched) says nothing and another frame is asked for.
@@ -43,12 +43,12 @@
  *   unsignaled (or the fence itself, when the first poll found it
  *   signaled) and the poll that found it signaled. The polls are as far
  *   apart as the browser runs tasks (nested timeouts are clamped, a busy
- *   page runs them late): 6 to 10 ms in WebKit and 4 to 6 ms in Chromium on
- *   an idle Apple M1 Pro, and up to 150 ms on a loaded hosted runner (Web
- *   contracts run 41307458156, Linux Chromium). So from its start, the frame
- *   was done after `t.lo` and by `t.hi`; the GPU's share is at most `t.hi`
- *   and, the page's share having taken `cpu` of it, at least `t.lo - cpu`.
- *   The bounds are measured, not guessed: no constant is added for noise.
+ *   page runs them late): a few milliseconds on an idle machine, and up to
+ *   150 ms on a loaded hosted runner (28_decisions_rendering_layers.md). So
+ *   from its start, the frame was done after `t.lo` and by `t.hi`; the GPU's
+ *   share is at most `t.hi` and, the page's share having taken `cpu` of it,
+ *   at least `t.lo - cpu`. The bounds are measured, not guessed: no constant
+ *   is added for noise.
  *
  * **Samples and answers.** Each measurement takes `SAMPLES` frames
  * (`answerOf`). Its answer bounds the cheapest frame: the least of the
@@ -65,13 +65,11 @@
  * when even the frames of every cell's upper bound is not above their lower
  * bound by more than it; otherwise `unresolved` (the bounds overlap: the
  * instrument cannot tell the frames apart here), which no exact instrument
- * reaches. Before these bounds the rule added the larger of the spread and
- * the poll interval to the cheapest sample: a late poll on a busy runner
- * made that 150 ms and called a frame measured 150 ms faster "no faster"
- * (174 ms against 324 ms, Web contracts run 41307458156); and three samples'
- * spread alone, without the resolution, had called frames 2 to 8 ms apart
- * within one poll interval faster (culling kept for 120 cells, 67 against
- * 61 ms, macOS WebKit, Web contracts run 41255961977).
+ * reaches. No term is added to the cheapest sample for the poll interval: a
+ * late poll on a busy runner would make it 150 ms and call a frame measured
+ * 150 ms faster "no faster"; and the spread of three samples alone, without
+ * the resolution, would call frames a poll interval apart faster
+ * (28_decisions_rendering_layers.md).
  *
  * **When.** Once per opening: the viewer arms the measurement once it has
  * published a dataset's cells or another representation of them (a
@@ -96,8 +94,8 @@
  * stops there (`disarm`) and asks for no frame; the viewer says so
  * (`nothing-fewer`), and the next framing is looked at afresh. Culling is
  * tried only where a cell may lie outside its pane's view. On a GPU that
- * takes seconds a frame (macOS Firefox on the hosted runners), the frames a
- * measurement asked for were most of an opening's time.
+ * takes seconds a frame the frames a measurement asks for would be most of an
+ * opening's time.
  *
  * @module rendering/full-detail-frame-cost
  */

@@ -1,5 +1,5 @@
 /**
- * Camera path captions (F110, `app/ui/modules/cinematic-camera/captions.js`):
+ * Camera path captions (`app/ui/modules/cinematic-camera/captions.js`):
  * which keyframe's label is the caption at each moment of a path, that only
  * a name someone gave is a caption, and the overlay: up while the film plays
  * or is paused and captions are on, faded between captions, at once under
@@ -166,7 +166,7 @@ test('captions are a playback setting of the path: on by default, set by camera-
     await getActions().dispatch('camera-path.keyframe.add', { camera: camera(0), label: 'Overview' });
     await getActions().dispatch('camera-path.keyframe.add', { camera: camera(1), label: 'Beta cells' });
     assert.equal((await getActions().dispatch('camera-path.get', {})).outcome.playback.captions, true);
-    // On is the value a record saved before captions means: it is left out (R9R-13).
+    // On is the value a record without the key means: it is left out.
     assert.equal(Object.hasOwn(module.camera.exportPath(), 'captions'), false);
     await getActions().dispatch('camera-path.playback.set', { captions: false });
     assert.equal(module.dom.captionsCheckbox.checked, false);

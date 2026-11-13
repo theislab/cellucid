@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
+import { DOMAIN_OWNED_IDS, createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
 import { SessionSerializer } from '../assets/js/app/session/session-serializer.js';
 
 class FakeControl {
@@ -216,6 +216,26 @@ test('UI capture omits controls owned by exact domain restorers', () => {
   }
 });
 
+test('UI capture omits every control id a domain owner holds, whatever its type', () => {
+  const theme = new FakeControl({
+    id: 'theme-select',
+    tagName: 'SELECT',
+    value: 'light',
+    options: ['light', 'dark'],
+  });
+  const owned = [...DOMAIN_OWNED_IDS].map(id => new FakeControl({ id, type: 'checkbox', checked: true }));
+  assert.ok(owned.length > 0);
+  const fixture = installDocument([...owned, theme]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    assert.deepEqual(serializer.collectUIControls(), {
+      'theme-select': { type: 'select', value: 'light' },
+    });
+  } finally {
+    fixture.restore();
+  }
+});
+
 test('UI capture requires a stable id for every serialized accordion', () => {
   const details = new FakeControl({
     id: '',
@@ -407,7 +427,7 @@ test('a control whose choices follow the embedding is checked and applied only o
   }
 });
 
-test('the restored choice is applied before the switch that shows it (R9V-1)', () => {
+test('the restored choice is applied before the switch that shows it', () => {
   // A session saved with the drift overlay on, restored over a page showing
   // velocity: switched on first, the overlay began loading velocity and the
   // field change that followed left it stuck "loading". The field goes first.

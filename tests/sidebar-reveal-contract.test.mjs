@@ -8,8 +8,8 @@
  * toggle has no listener yet, so clicking it would do nothing. The mark is
  * dropped instead, so the panel starts open. Afterwards the toggle opens it,
  * through an action, so the sidebar opens later: the promise resolves once it
- * is shown, when a control in it can take focus (`?` focused nothing with the
- * sidebar hidden, lens-a11y LF-4).
+ * is shown, when a control in it can take focus (`?` would focus nothing with
+ * the sidebar hidden).
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -85,7 +85,7 @@ test('once wired, a closed sidebar opens through its toggle, and an open one is 
   assert.deepEqual(closed.observers.map(observer => observer.on), [false]);
 });
 
-test('every way into the sidebar opens it first and its sections after, through revealInSidebar (R9K-2)', async () => {
+test('every way into the sidebar opens it first and its sections after, through revealInSidebar', async () => {
   for (const file of ['ui/modules/data-mapping-controls.js', 'ui/modules/gene-read-control.js', 'ui/onboarding/keyboard-shortcuts.js']) {
     const source = await readFile(new URL(`../assets/js/app/${file}`, import.meta.url), 'utf8');
     assert.match(source, /revealInSidebar\(ownerDocument, /, file);

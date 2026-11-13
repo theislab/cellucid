@@ -1,6 +1,5 @@
 import { InternalError } from './errors.js';
 import { webStorage } from './web-storage.js';
-// @ts-check
 
 /**
  * ThemeManager
@@ -24,8 +23,7 @@ const VALID_THEMES = new Set(['light', 'dark']);
  */
 function requireTheme(value) {
   if (typeof value === 'string' && VALID_THEMES.has(value)) {
-    // @ts-ignore - runtime validation above.
-    return value;
+    return /** @type {ThemeName} */ (value);
   }
   throw new TypeError('Theme must be exactly "light" or "dark".');
 }
@@ -41,7 +39,7 @@ function requireDocumentRoot() {
 }
 
 /**
- * @param {unknown} options
+ * @param {{persist?: unknown, withTransition?: unknown}} [options] - Checked here: any other value is refused
  * @returns {{ persist: boolean; withTransition: boolean }}
  */
 function requireOptions(options) {
@@ -58,9 +56,7 @@ function requireOptions(options) {
     throw new TypeError('Theme options must contain only the exact keys "persist" and "withTransition".');
   }
 
-  // @ts-ignore - the object shape is validated immediately below.
   const persist = options.persist === undefined ? true : options.persist;
-  // @ts-ignore - the object shape is validated immediately below.
   const withTransition = options.withTransition === undefined ? true : options.withTransition;
   if (typeof persist !== 'boolean') {
     throw new TypeError('Theme option "persist" must be a boolean.');

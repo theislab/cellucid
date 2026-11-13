@@ -402,11 +402,12 @@ export function fDistributionPValue(f, df1, df2) {
 // Linear-time Ordering
 // ============================================================================
 //
-// Every order statistic, rank and sorted copy in the analysis layer used to come
-// from a comparison sort: the engine's native numeric sort for a sorted copy,
-// and an index sort driven by a JavaScript comparator for ranks. Both are
-// O(n log n), and the comparator form runs a callback per comparison — about a
-// second for the ranks of one million distinct values.
+// A comparison sort (the engine's native numeric sort for a sorted copy, an
+// index sort driven by a JavaScript comparator for ranks) is O(n log n), and
+// the comparator form runs a callback per comparison — seconds for the ranks of
+// a million distinct values (measured: 37_decisions_analysis.md). So every
+// order statistic, rank and sorted copy in the analysis layer comes from a
+// radix pass instead.
 //
 // An IEEE-754 number maps to an unsigned key whose unsigned order is the
 // number's numeric order (flip every bit of a negative, set the sign bit of a
@@ -425,7 +426,8 @@ const RADIX_MIN_LENGTH = 1024;
  * Below this many values the engine's native numeric sort (compiled code,
  * O(n log n)) produces a sorted copy, or the few order statistics a caller
  * needs, faster than a radix pass that has not been optimized yet: they cross
- * near 200,000 values on a first call.
+ * at a length of the order of 100,000 values on a first call (measured:
+ * 37_decisions_analysis.md).
  */
 const NATIVE_SORT_MAX_LENGTH = 131072;
 
@@ -862,8 +864,9 @@ const hashWords = new Uint32Array(hashScratch.buffer);
  *
  * This is the lookup every tabulating kernel performs once per cell, so it is
  * an open-addressing table over the value's IEEE-754 bits rather than a `Map`:
- * a `Map` keyed by heap numbers spent roughly 45 ns per lookup, which made the
- * lookup — not the statistic — the cost of a rank test on a 500,000-cell gene.
+ * a `Map` keyed by heap numbers spends tens of nanoseconds per lookup, which
+ * makes the lookup — not the statistic — the cost of a rank test on a large
+ * gene (measured: 37_decisions_analysis.md).
  * Keys are compared with `===`, and `+0` and `-0` hash alike, so two values
  * share a number exactly when `Map` (SameValueZero) would have given them one
  * key. Callers pass finite values only.

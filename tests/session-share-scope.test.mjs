@@ -1,7 +1,7 @@
 /**
  * What a Save or a Share chose, written (`assets/js/app/session/share-scope.js`
- * through `history-file.js`), History v2 §3.11, §3.15.3, §6 test 11: each
- * file holds exactly what was chosen, and reads back.
+ * through `history-file.js`): each file holds exactly what was chosen, and
+ * reads back.
  *
  * - Share: the tracker shown with its main and shown branches; a branch it
  *   forks from comes along to its fork step; the head stays shown.

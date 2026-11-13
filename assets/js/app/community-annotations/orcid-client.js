@@ -56,7 +56,7 @@ function createResponseError(message, code, cause = undefined) {
  * @param {string} label
  * @returns {any}
  */
-export function decodeOrcidJson(bytes, label) {
+function decodeOrcidJson(bytes, label) {
   if (bytes.byteLength > ORCID_RESPONSE_MAX_UTF8_BYTES) {
     throw createResponseError(
       `${label} exceeds ${ORCID_RESPONSE_MAX_UTF8_BYTES} bytes`,

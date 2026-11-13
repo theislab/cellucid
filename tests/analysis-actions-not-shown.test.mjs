@@ -89,10 +89,10 @@ test('options alone draw nothing, so they are set on an analysis that is not sho
 
 /**
  * The panel shows one analysis at a time. An agent that set up Differential
- * expression and then Composition with `show` (which replaced it) was refused
- * "not shown" on running Differential expression (lane-analyst L3-6): Run in
- * the panel shows the analysis it runs when another is shown, and puts the
- * shown one back when it still cannot draw, so a refusal changes nothing.
+ * expression and then Composition with `show` (which replaced it) is not
+ * refused "not shown" on running Differential expression: Run in the panel
+ * shows the analysis it runs when another is shown, and puts the shown one
+ * back when it still cannot draw, so a refusal changes nothing.
  */
 function panelOfTwo({ drawable }) {
   let open = 'composition';
@@ -159,10 +159,9 @@ test('run where nothing can draw (the section or the sidebar closed) is refused 
 });
 
 /**
- * The same for options (lane-scientist L5-4): an agent that had run
- * Differential expression and then Marker genes was refused "not shown" on
- * setting Differential expression's groups, with `show: true` and without.
- * Changing the options of an analysis with a result shows it, as a person
+ * The same for options: an agent that has run Differential expression and
+ * then Marker genes is not refused "not shown" on setting Differential
+ * expression's groups, with `show: true` and without. Changing the options of an analysis with a result shows it, as a person
  * opens it to change them; refused (nothing can draw, or the options are
  * refused) it leaves the panel showing what it showed.
  */

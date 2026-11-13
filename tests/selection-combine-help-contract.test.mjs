@@ -1,9 +1,9 @@
 /**
- * R9F-13 (fields-legend lane, 2026-11-11): with Select mode on, each tool's
- * step line still said "Alt to intersect, Shift+Alt to add, Ctrl+Alt to
- * subtract" while the switch's Intersect / Add / Subtract chose the combine.
- * The sentence was typed in four tools; it is one helper, and the line shown
- * follows the switch at once (CSS on the section's switch, no new gesture).
+ * With Select mode on, each tool's step line follows the switch's Intersect /
+ * Add / Subtract and never says "Alt to intersect, Shift+Alt to add, Ctrl+Alt
+ * to subtract" while the switch has chosen the combine. The sentence is one
+ * helper, not typed in each tool, and the line shown follows the switch at
+ * once (CSS on the section's switch, no new gesture).
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';

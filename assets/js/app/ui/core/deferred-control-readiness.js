@@ -8,12 +8,13 @@
  * bootstrap reaches their listener, and on a slow link much longer. A click in
  * that window is discarded without a request, a message or a record.
  *
- * The benchmark controls are wired near the end of `main.js`, after `initUI`,
+ * The benchmark controls are wired near the end of start-up (`main.js` makes
+ * `benchmark-controls.js`), after `initUI`,
  * and are admitted before the startup dataset starts loading, so a benchmark
  * run can replace that load like any other dataset choice. The renderer
  * controls are wired earlier, by `initRenderControls` inside `initUI`, because
  * a restored session publishes them by dispatching their own events and cannot
- * wait for the bootstrap tail (CEL-0129) — but `initUI` still runs several
+ * wait for the bootstrap tail — but `initUI` still runs several
  * awaits deep (sign-in, health, catalog), so they too are offered long before
  * they do anything.
  *
@@ -36,7 +37,7 @@
  *
  * `<details id="benchmark-section">` is deliberately absent from this list. It
  * is a disclosure rather than a control, it cannot be disabled, and opening it
- * is harmless — `main.js` reconciles its open state at the moment it attaches
+ * is harmless — `benchmark-controls.js` reconciles its open state at the moment it attaches
  * the `toggle` listener, so a summary click during startup loads the panel
  * instead of revealing an empty one.
  */

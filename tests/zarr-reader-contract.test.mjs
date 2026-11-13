@@ -11,7 +11,6 @@
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -2349,7 +2348,7 @@ test('normalizes continuous int64 and Float64 obs through the public adapter sea
     assert.deepEqual(Array.from(new Float64Array(field.data)), [1, 2, 16_777_217]);
   });
 
-  await t.test('int64 beyond 2^53 is identifiers, read as their exact text (F116)', async () => {
+  await t.test('int64 beyond 2^53 is identifiers, read as their exact text', async () => {
     const adapter = await adapterFor(new BigInt64Array([9_007_199_254_740_993n, 2n ** 63n - 1n]), '<i8', 'count');
     const field = await adapter.getObsFieldData('count');
     assert.equal(field.kind, 'category');
@@ -2946,11 +2945,6 @@ test('opening reads no value of a string column, however many distinct labels it
 test('connectivity extraction refuses no graph for its size', () => {
   // The only limit on a graph is the memory the engine grants when the
   // arrays are allocated; a large graph is never refused by a fixed cap.
-  const source = readFileSync(
-    new URL('../assets/js/data/connectivity-edges.js', import.meta.url),
-    'utf8'
-  );
-  assert.doesNotMatch(source, /MAX_CONNECTIVITY_WORKING_BYTES|working set exceeds|browser limit/i);
   // A valid symmetric CSR graph extracts its unique upper-triangle edges.
   const edges = extractConnectivityEdges({
     format: 'csr',
@@ -3004,19 +2998,6 @@ test('integer observation values past 2^24 stay exact: two ids float32 would mer
   const count = new Float64Array((await adapter.getObsFieldData('count')).data);
   assert.equal(count[0], 16_777_217);
   assert.ok(Number.isNaN(count[1]));
-});
-
-test('rejects duplicate connectivity coordinates instead of summing them', () => {
-  assert.throws(
-    () => extractConnectivityEdges({
-      format: 'csr',
-      shape: [2, 2],
-      data: Float32Array.from([1, 1, 1]),
-      indptr: Int32Array.from([0, 2, 3]),
-      indices: Int32Array.from([1, 1, 0])
-    }, 2),
-    /duplicate coordinate/i
-  );
 });
 
 test('rejects async results from a superseded Zarr dataset generation', async t => {

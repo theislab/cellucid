@@ -7,9 +7,10 @@
  * A spec that measures how long the page's main thread is held serves its
  * dataset this way, never through `page.route`. WebKit's Playwright delivers
  * a fulfilled body through the page's own process, on its main thread: a
- * worker's fetch of a routed 16 MiB body holds the page for about 250 ms,
- * with no application code involved, while the same file served over HTTP
- * holds it for none. A routed dataset makes the harness, not the
+ * worker's fetch of a routed 16 MiB body holds the page for a quarter of a
+ * second, with no application code involved, while the same file served
+ * over HTTP holds it for none (measured:
+ * 38_decisions_testing_and_hosted_runners.md). A routed dataset makes the harness, not the
  * application, the long task such a spec reports.
  */
 import { mkdirSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';

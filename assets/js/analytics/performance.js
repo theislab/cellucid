@@ -12,8 +12,7 @@
  * leisure (Chromium runs it at low priority): on the first hide each
  * observer's queued entries are taken (`takeRecords`) before it is
  * disconnected, which would drop them. A busy page hidden right after its
- * largest paint otherwise reported no LCP (Web contracts run 41269083996,
- * macOS Chromium).
+ * largest paint would otherwise report no LCP.
  *
  * @module analytics/performance
  */

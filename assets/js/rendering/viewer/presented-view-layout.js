@@ -117,7 +117,7 @@ function assertPositiveFinite(value, label) {
  * shape: the arrangement whose panes are largest where it counts, their
  * shorter side (a plot is fitted by it), so three panes stand side by side
  * on a wide screen and one above the other on a phone held upright, never
- * three slivers (found 2026-11-11: a 390 px phone laid three panes of about
+ * three slivers (a 390 px phone would lay three panes of about
  * 120 px in one row). Ties go to the fewest empty cells, then to the wider
  * arrangement (panes side by side). The one rule of the viewer's grid and of
  * a figure's (`computeGridDims` in figure export).
@@ -327,8 +327,8 @@ export function resolvePresentedLayout(options) {
         cssTop,
         cssWidth: paneCssWidth,
         // Each pane's own shape: two views side by side make portrait panes,
-        // which the presented area's (landscape) field of view cut off at
-        // both sides (a kept view cropped Pancreas's 2-D UMAP, 2026-11-11).
+        // which the presented area's (landscape) field of view would cut off at
+        // both sides.
         fov: paneFieldOfView(paneCssWidth, paneCssHeight),
         projectionCenterNdcX: 0,
         row,

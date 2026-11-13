@@ -115,7 +115,7 @@ test('turns: one connection\'s calls are one turn until someone else acts or tim
 test('an unknown tool and a refusal are tool errors of one sentence; nothing runs', async () => {
   const { calls, sent } = setup();
   await calls.run({ id: 'a1', tool: 'no_such_tool', args: {}, agent: 'Cursor', connection: CONNECTION });
-  // The sentence; the person's settings follow it, as after a connection's first result (L26-9).
+  // The sentence; the person's settings follow it, as after a connection's first result.
   assert.equal(sent.results.get('a1').isError, true);
   assert.equal(sent.results.get('a1').content[0].text.split('\n')[0], 'Cellucid has no tool <cellucid-data>"no_such_tool"</cellucid-data>.');
   await calls.run({ id: 'a2', tool: 'color_by', args: { field: 'nope' }, agent: 'Cursor', connection: CONNECTION });
@@ -157,7 +157,7 @@ test('a call the app gave up on is stopped in the tab, and a stop answers it', a
   assert.deepEqual(calls.running(), []);
 });
 
-test('L26-9: one tool list whatever the settings; the settings are told after a connection\'s first result and after any result once they changed', async () => {
+test('one tool list whatever the settings; the settings are told after a connection\'s first result and after any result once they changed', async () => {
   let writes = 'ask';
   const asked = [];
   const { calls, sent } = setup({
@@ -200,7 +200,7 @@ test('destroyed: a call is answered at once and nothing runs', async () => {
   assert.equal(sent.results.get('a1').isError, true);
 });
 
-test('F270: what the person did since a connection\'s last call is told with its next result, once; kept for the tab across a reload; another history shown is said', async () => {
+test('what the person did since a connection\'s last call is told with its next result, once; kept for the tab across a reload; another history shown is said', async () => {
   const { makePage } = await import('./history-fake-page.mjs');
   const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
   const { dispatcher, history, step } = await makePage();

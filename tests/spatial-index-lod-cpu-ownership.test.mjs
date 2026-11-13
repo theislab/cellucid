@@ -349,16 +349,16 @@ const walkCamera = index => {
 };
 
 test('adaptive selection is bounded by a budget and a ratio, not a ratio alone', () => {
-  // A fixed reduction ratio is what made a large dataset unusable on `Auto`:
+  // A fixed reduction ratio makes a large dataset unusable on `Auto`:
   // the coarsest ladder step is 44x whatever the cell count, so pulling the
-  // camera back on 18.1M cells discarded 97.7% of them whether or not the frame
-  // needed it.
+  // camera back on 18.1M cells would discard 97.7% of them whether or not the
+  // frame needs it.
   //
-  // An absolute budget alone broke the other end. No level of a 200k cloud
-  // holds two million points, so the floor landed on full detail and `Auto`
-  // answered full detail at every camera distance -- on every dataset most
-  // people open, the level readout never moved and the forced-level slider was
-  // the only control that did anything.
+  // An absolute budget alone breaks the other end. No level of a 200k cloud
+  // holds two million points, so the floor would land on full detail and `Auto`
+  // would answer full detail at every camera distance -- on every dataset most
+  // people open, the level readout would never move and the forced-level
+  // slider would be the only control that did anything.
   assert.equal(ADAPTIVE_LOD_POINT_BUDGET, 2_000_000);
   assert.equal(ADAPTIVE_LOD_MAXIMUM_REDUCTION, 8);
 

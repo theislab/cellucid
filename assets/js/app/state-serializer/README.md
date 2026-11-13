@@ -43,7 +43,7 @@ event: a change heard then is the app putting a value back, never a person's, an
 
 The selection tool (Annotation, KNN drag, Proximity drag, Lasso: `#highlight-mode`) decides what
 the next drag on the canvas does, so a session reopened in another tool would do something the
-person did not ask for (CEL-0249). It is **page chrome kept outside the history**: no setting, no
+person did not ask for. It is **page chrome kept outside the history**: no setting, no
 domain, never a step, never moved by undo or a jump, yet kept by a save and the autosave. A group
 of buttons marked `data-state-serializer-pressed-group`, exactly one of them `aria-pressed="true"`,
 is one such control: `capturePageChrome()` gives `{pressed: {[groupId]: buttonId}}`, and
@@ -52,8 +52,7 @@ session reader checks too), leaves out a group or a button the page lacks and sa
 its `apply()` clicks each button as a person would (its owner's listener tells the viewer); a load
 takes the plan before the history is replaced and applies it once the head is shown
 (`applyPageChrome` does both at once). The session file's manifest and each saved state carry it as `chrome`; a load or Continue
-applies it after the head is shown. Select mode, like the phone sheet open or closed (History v2
-§3.3.8), is not kept at all. A button group is never in the settings inventory: a control that is
+applies it after the head is shown. Select mode, like the phone sheet open or closed, is not kept at all. A button group is never in the settings inventory: a control that is
 state is an `input`, a `select` or a section.
 
 ## How a restored control reaches the thing it controls
@@ -67,8 +66,8 @@ control leads.
 
 - **The owner's listener must already be attached when a restore runs.** A dispatch with no
   listener does nothing, silently. Every control in the inventory is wired by `initUI` before the
-  dataset's starting view is put back (CEL-0129: the renderer controls, now
-  `ui/modules/render-controls.js`, were once wired after it). Accordions are the one exception:
+  dataset's starting view is put back (the renderer controls,
+  `ui/modules/render-controls.js`, included). Accordions are the one exception:
   setting `open` needs no owner.
 - **A control that refuses its restored value fails the restore.** After dispatching, the control
   is re-read; an owner that rolled the value back leaves a mismatch, which is raised (the history
@@ -86,12 +85,12 @@ checked and applied only by the returned function, after the embeddings and the 
 back. The `views` domain is restored before `settings` (domain order), so a settings restore
 applies them in the same call. `embeddingDependentControlIds()` lists them. The returned function
 restores selects before checkboxes (the choice, then the switch that shows it): `Show overlay`
-switched on before `Vector field` began showing the field the page had (R9V-1).
+switched on before `Vector field` holds its choice would show the field the page had.
 
 A slider marked `data-session-preference` saves a **preference its owner keeps**, not the value it
 shows. `#connectivity-limit` (Max edges) is the one in the interface today: its range follows the
 visible edges of the graph, which is read only when edges are switched on. The owner writes the
-preference into the attribute whenever it changes (`setUserEdgeLimit` in `main.js`); capture saves
+preference into the attribute whenever it changes (`setUserEdgeLimit` in `ui/modules/connectivity-controls.js`); capture saves
 the attribute; validation checks the record in full (a positive whole number a person can choose);
 restore writes the attribute and dispatches `session-preference`, and the owner shows what the
 graph allows of it once the graph is read. An owner that does not take the preference fails the
@@ -117,9 +116,9 @@ restore, as for every other control.
   domain's, the State, Camera path, Figure export, Community annotation and Benchmark sections
   included.
 - The ids of `DOMAIN_OWNED_IDS`, whose state another domain's owner reads from the state it
-  shows, or which are not a preference at all. This is the complete list;
-  `tests/session-docs-current-contract.test.mjs` reads the set out of `ui-controls.js` and fails
-  when an id is missing here:
+  shows, or which are not a preference at all. This is the complete list
+  (`tests/session-ui-controls-exact-contract.test.mjs` holds that capture omits every id of the
+  set):
   - Active field selectors: `categorical-field`, `continuous-field`, `gene-expression-search`
     (the `active-field` domain)
   - Outlier slider: `outlier-filter` (the `filters` domain)
@@ -131,7 +130,7 @@ restore, as for every other control.
     is loaded)
   - Pointer capture: `pointer-lock` is put back by nothing. It mirrors the browser's live
     pointer-lock state (`ui/modules/camera-controls.js` forces it unchecked on init and writes it
-    from `pointerlockchange`); restoring it would either lie about the pointer or grab it without
+    from the pointer-lock state the viewer publishes); restoring it would either lie about the pointer or grab it without
     a user gesture, which browsers refuse.
 
 **Tests:** `tests/session-ui-controls-exact-contract.test.mjs`,

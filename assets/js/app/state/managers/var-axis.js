@@ -35,6 +35,7 @@ import { loadGeneList } from '../../../data/data-loaders.js';
 import { cellsSteady, trackCellWork } from '../../../data/open-cells-work.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { cancelled } from '../../../utils/abort.js';
+import { promiseWithResolvers } from '../../../utils/promise-resolvers.js';
 
 /**
  * Each gene field of a replaced gene list, to its gene's field on the list
@@ -110,6 +111,7 @@ export class DataStateVarAxisMethods {
    * earlier dataset still under way is superseded (its waiters reject), and
    * the new one is pending until `listPublishedGenes` installs it.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {boolean} hasGenes
    */
   beginGeneListing(hasGenes) {
@@ -122,12 +124,7 @@ export class DataStateVarAxisMethods {
       this._geneListing = null;
       return;
     }
-    let resolve;
-    let reject;
-    const promise = new Promise((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
+    const { promise, resolve, reject } = promiseWithResolvers();
     // A failure is reported where it happens; waiting is optional.
     promise.catch(() => {});
     this._geneListing = { promise, resolve, reject, state: 'pending', failure: null, started: false };
@@ -136,6 +133,7 @@ export class DataStateVarAxisMethods {
   /**
    * Whether the published dataset's gene names are still being read: its
    * gene list is empty until they are (`listPublishedGenes`).
+   * @this {import('../core/data-state.js').DataState}
    * @returns {boolean}
    */
   areGenesPending() {
@@ -144,6 +142,7 @@ export class DataStateVarAxisMethods {
 
   /**
    * Why the published dataset's gene list could not be read, or null.
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Error|null}
    */
   getGeneListFailure() {
@@ -154,6 +153,7 @@ export class DataStateVarAxisMethods {
    * Resolves once the published dataset's gene list is installed (at once
    * when it is, or when the dataset has none); rejects with its failure, or
    * when the dataset is replaced first.
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Promise<void>}
    */
   whenGenesListed() {
@@ -172,6 +172,7 @@ export class DataStateVarAxisMethods {
    * by another dataset); rejects with the failure, which stays readable
    * (`getGeneListFailure`).
    *
+   * @this {import('../core/data-state.js').DataState}
    * @returns {Promise<void>}
    */
   async listPublishedGenes() {
@@ -215,6 +216,7 @@ export class DataStateVarAxisMethods {
    * Install the read gene list of the published dataset. Nothing was
    * colored by a gene, renamed or restored while it was pending: no view
    * changes.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _installListedGenes(geneList) {
@@ -235,6 +237,7 @@ export class DataStateVarAxisMethods {
    * colored view's gene is (by position on the same var axis, by name on
    * another). -1 when the list in use has no such gene.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {object} field - A gene field of this list or of one it replaced
    * @returns {number}
    */
@@ -249,6 +252,7 @@ export class DataStateVarAxisMethods {
 
   /**
    * How many times the var axis was replaced since the dataset was published.
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number}
    */
   getVarAxisGeneration() {
@@ -258,6 +262,7 @@ export class DataStateVarAxisMethods {
   /**
    * The number of genes on the gene list in use (user-defined copies are not
    * counted).
+   * @this {import('../core/data-state.js').DataState}
    * @returns {number}
    */
   getVarAxisGeneCount() {
@@ -267,6 +272,7 @@ export class DataStateVarAxisMethods {
 
   /**
    * The gene each view is colored by: its view id, the field and the name.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _viewsColoredByGenes() {
@@ -291,6 +297,7 @@ export class DataStateVarAxisMethods {
    * Read everything a new var axis needs before it replaces the current one,
    * and return the steps that publish it and restore the current one.
    *
+   * @this {import('../core/data-state.js').DataState}
    * @param {{
    *   geneList: Object,
    *   varFieldLoader: Function|null,
@@ -426,6 +433,7 @@ export class DataStateVarAxisMethods {
 
   /**
    * Publish a staged var axis to the state and every view.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _publishVarAxis({ geneList, loader, staged, resolveView }) {
@@ -457,6 +465,7 @@ export class DataStateVarAxisMethods {
    * Give every view the new list, then recolor each view colored by a gene.
    * The focused view is recolored in place; any other view is focused in
    * turn (the same switch a person makes), and focus returns at the end.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _applyVarAxisToViews(plan) {
@@ -498,6 +507,7 @@ export class DataStateVarAxisMethods {
   /**
    * Put back every view's var state as it was before a replacement, and
    * recolor the views that were colored by a gene.
+   * @this {import('../core/data-state.js').DataState}
    * @private
    */
   _restoreViewsVarState(views) {

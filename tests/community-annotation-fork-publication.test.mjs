@@ -2,7 +2,7 @@
  * Publishing a contributor's file without write access: the contributor's
  * own fork (made on GitHub; Cellucid only finds it), one head
  * branch per contributor and base branch, reset to the upstream tip before
- * every write, one pull request carrying every dataset (B1). And the
+ * every write, one pull request carrying every dataset. And the
  * direct-mode create race (two devices creating the file at once).
  */
 import assert from 'node:assert/strict';

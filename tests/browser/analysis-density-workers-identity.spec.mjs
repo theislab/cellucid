@@ -8,8 +8,8 @@
  *
  * The curve is cut into one slice per analysis worker, and the pool has one
  * worker per core less the page's and the reader worker's
- * (`analysisPoolSize`): a 3-core runner has one, so its curve is one slice
- * (Web contracts run 41269083996, macOS Chromium and Firefox). Each point is
+ * (`analysisPoolSize`): a 3-core runner has one, so its curve is one slice.
+ * Each point is
  * summed whole in one worker, in the same order whatever the slice it falls
  * in, so the identity holds at any slice count; the count the pool's size
  * plans is what is required.

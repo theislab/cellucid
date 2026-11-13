@@ -1,18 +1,17 @@
 /**
- * A conversation a save or a share takes during a turn (live pass 3, L12-5).
- * An agent's `history_share` wrote a session file "with our conversations";
- * the student who opened it read, on that very call, "The page closed before
- * this call finished; nothing was applied" and "The page closed during this
- * turn", and an agent continuing a named save told the person the save had
- * "reported that nothing was applied". A save and a share now keep such a
+ * A conversation a save or a share takes during a turn. A session file an
+ * agent's `history_share` writes "with our conversations" must not make the
+ * person who opens it read, on that very call, "The page closed before this
+ * call finished; nothing was applied" and "The page closed during this
+ * turn", nor make an agent continuing a named save tell the person the save
+ * had "reported that nothing was applied". A save and a share keep such a
  * turn as it was when saved, said so (`transcriptForSave`, applied by
  * `session/share-scope.js`); a conversation kept whole is kept as it is.
  *
- * A conversation a save or a share holds is **received** where it is opened
- * (the coordinator's F142, from the wording lens LH-2): the sender's own
- * failure notes offered Try again, which sent the sender's message to this
- * page's agent and acted again on what the history it came with holds. The
- * transcript names the turns it brought (`received`), and no note of those
+ * A conversation a save or a share holds is **received** where it is opened:
+ * the sender's own failure notes must not offer Try again, which would send
+ * the sender's message to this page's agent and act again on what the history
+ * it came with holds. The transcript names the turns it brought (`received`), and no note of those
  * turns offers Try again (`offersRetry`), nor does a question of theirs offer
  * its choices (`ask.js` `pendingQuestion`); turns sent after are this page's.
  */
@@ -47,7 +46,7 @@ test('a turn the save was made in ends as saved: its running call answered so, a
     { role: 'assistant', turn: 't2', parts: [{ type: 'text', text: 'Writing the file.' }, call('c2', 'history_share')], epoch: null },
   ]));
   const shared = saved.messages.slice(DONE.length + 2);
-  // The share call made the file itself: said so, never "still running … not in this save" (L25-14).
+  // The share call made the file itself: said so, never "still running … not in this save".
   assert.deepEqual(shared[0].results.map(each => [each.name, each.isError, each.content[0].text]), [['history_share', false, SAVED_BY_CALL_TEXT]]);
   assert.deepEqual(shared[1], { role: 'note', turn: 't2', kind: 'saved', text: SAVED_MID_TURN_TEXT });
   // A saved note says what the file holds: it offers no Try again, which in a received file would
@@ -62,7 +61,7 @@ test('a turn the save was made in ends as saved: its running call answered so, a
   assert.ok(!JSON.stringify(continued.messages).includes(INTERRUPTED_LEAD));
 });
 
-test('another call still running when the person saved is answered as running; the saving calls as the save (L25-14)', () => {
+test('another call still running when the person saved is answered as running; the saving calls as the save', () => {
   const saved = transcriptForSave(transcript([
     ...DONE,
     { role: 'user', text: 'Run markers and save', turn: 't3', at: 3 },
@@ -126,8 +125,8 @@ test('a received conversation offers no Try again on the sender\'s notes; turns 
 });
 
 test('a model continuing a received conversation is told its turns were another person\'s and their agent\'s', () => {
-  // L24-10 (live pass 6): a colleague opened a shared session and asked "what did my colleague find?";
-  // the model answered "all 37 earlier steps were taken by me (Claude) at your request".
+  // A colleague opens a shared session and asks "what did my colleague find?"; the model must not
+  // answer "all 37 earlier steps were taken by me (Claude) at your request".
   const received = conversationFrom(transcriptForSave(transcript(DONE)));
   appendMessage(received, { role: 'user', text: 'What did my colleague find?', turn: 't2', at: 3 });
   const sent = modelMessages(received).filter(message => message.role === 'user');

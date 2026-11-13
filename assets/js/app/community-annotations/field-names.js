@@ -31,9 +31,8 @@ export function annotationFieldKey(field) {
  * The field's categories in the shared repository: the dataset's labels as
  * text, as the legend shows them (a Loom `ClusterID` of numbers is "0",
  * "1", …; a boolean "true"), in the same positions as `field.categories` (a
- * rename keeps each position). The repository keys categories by name; the
- * numbers themselves made the session refuse the field, and coloring by it
- * failed (bug hunt live pass 5, L18-8).
+ * rename keeps each position). The repository keys categories by name, so
+ * numbers as such would make the session refuse the field.
  * @param {{categories?: unknown[], _originalCategories?: unknown[]}} field
  * @returns {string[]}
  */

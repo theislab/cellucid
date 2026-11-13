@@ -497,8 +497,8 @@ test('a cell table\'s clustering columns are categories even when their labels a
 });
 
 test('a cell table longer than the engine\'s argument limit is read whole', async () => {
-  // Math.max(...rows) over a 500,000-cell projection.csv exceeded the
-  // argument limit, so the table was dropped and the folder refused as
+  // Math.max(...rows) over a 500,000-cell projection.csv would exceed the
+  // argument limit, so the table would be dropped and the folder refused as
   // having no embedding.
   const { readTable } = await import('../assets/js/data/anndata/transcode/tables.js');
   const rows = 300_000;

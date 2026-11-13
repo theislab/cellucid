@@ -33,7 +33,7 @@ export function unplacedCellsText({ kind, label, count, names, added = false }) 
  * The notice of a vector field that shows no motion at all: every vector of
  * it, on the embedding it is drawn on, is shorter than the overlay draws
  * (`VELOCITY_STILL_SPEED`), so turning the overlay on changes nothing on the
- * screen (R9V-6). Said once, when the field is read.
+ * screen. Said once, when the field is read.
  *
  * @param {{label: string, embedding: string, longest: number}} notice -
  *   `longest`: the longest vector's length as drawn

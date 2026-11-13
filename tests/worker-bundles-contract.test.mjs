@@ -2,14 +2,19 @@
 // starts, and every module a worker imports by URL, ships as one file named by
 // its bytes, and the page starts each from that file when it is a deployed
 // site. These contracts keep the committed bundles exactly what the sources
-// build, keep every worker start going through the generated scripts.js, and
-// keep a bundle one file.
+// build, keep every worker start going through the generated scripts.js, keep
+// a bundle one file, and keep the page out of every worker: a worker has no
+// document, so its code names none of the page's globals and none of its
+// modules reaches the page's notices.
 
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { join, posix, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+
+import { transformSync } from 'esbuild';
+import ts from 'typescript';
 
 import {
   BUNDLE_FILE,
@@ -48,6 +53,202 @@ function codeOf(text) {
     .replace(/(^|[^:\\])\/\/.*$/gm, '$1')
     .replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"/g, "''");
 }
+
+/**
+ * Globals a page has and a worker does not, or that mean another place in a
+ * worker (`location` is the worker script's address, never the page's). A
+ * worker that reaches one throws a ReferenceError or reads the wrong
+ * address; a worker module may only test for its absence (`typeof`), which
+ * is how a module shared with the page knows it runs in a worker. Reaching
+ * one as a member of the global object (`globalThis.document`,
+ * `self['document']`) is reaching it.
+ */
+const PAGE_ONLY = [
+  'document', 'window', 'location', 'localStorage', 'sessionStorage', 'customElements', 'matchMedia',
+  'devicePixelRatio', 'getComputedStyle', 'alert', 'confirm', 'prompt', 'HTMLElement',
+];
+
+/** The names a worker's global object goes by. */
+const GLOBAL_OBJECTS = ['globalThis', 'self'];
+
+const pageMarker = name => `__cellucid_page_global_${name}__`;
+
+/** The page-only globals `code` references other than in a `typeof`, as `name:line` strings. */
+function pageGlobals(code) {
+  const define = {};
+  for (const name of PAGE_ONLY) {
+    define[name] = pageMarker(name);
+    for (const object of GLOBAL_OBJECTS) define[`${object}.${name}`] = pageMarker(name);
+  }
+  const { code: marked } = transformSync(code, { format: 'esm', loader: 'js', logLevel: 'silent', define });
+  const found = [];
+  marked.split('\n').forEach((line, index) => {
+    for (const name of PAGE_ONLY) {
+      // A member of the global object is printed as `(0, marker)`: the optional parenthesis keeps `typeof` in front of it.
+      for (const match of line.matchAll(new RegExp(`(typeof\\s*(?:\\(0,\\s*)?)?${pageMarker(name)}`, 'g'))) {
+        if (match[1] === undefined) found.push(`${name}:${index + 1}`);
+      }
+      // A computed member of the global object: `globalThis['document']`.
+      for (const match of line.matchAll(new RegExp(`(typeof\\s+)?\\b(?:${GLOBAL_OBJECTS.join('|')})\\s*\\[\\s*["'\`]${name}["'\`]\\s*\\]`, 'g'))) {
+        if (match[1] === undefined) found.push(`${name}:${index + 1}`);
+      }
+    }
+  });
+  return found;
+}
+
+/** A URL that names its own scheme, so no base is needed to resolve it. */
+const ABSOLUTE_URL = /^[a-z][a-z0-9+.-]*:/i;
+
+/**
+ * The relative URLs `code` gives to `fetch` or to `new URL` without a base,
+ * as `text:line` strings. A worker resolves a relative URL against its own
+ * script, never against the page, so the file it names is not found. Only
+ * a URL whose start the code states is judged (a string, or a template
+ * that opens with text); one wholly computed is the caller's.
+ */
+function relativeUrls(code) {
+  const source = ts.createSourceFile('worker.js', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const found = [];
+  const named = (node, name) => (
+    ts.isIdentifier(node) ? node.text === name
+      : ts.isPropertyAccessExpression(node) && node.name.text === name
+        && ts.isIdentifier(node.expression) && GLOBAL_OBJECTS.includes(node.expression.text)
+  );
+  const start = node => {
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (ts.isTemplateExpression(node)) return node.head.text;
+    return null;
+  };
+  const visit = node => {
+    const call = ts.isCallExpression(node) && named(node.expression, 'fetch') && node.arguments.length >= 1;
+    const make = ts.isNewExpression(node) && named(node.expression, 'URL') && node.arguments?.length === 1;
+    if (call || make) {
+      const text = start(node.arguments[0]);
+      if (text !== null && text !== '' && !ABSOLUTE_URL.test(text)) {
+        found.push(`${text}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+/**
+ * The page's notices and dialogs: the notification center and the interface's
+ * components. The page tells the person; a worker reports to the page.
+ */
+const PAGE_NOTICES = /^assets\/js\/app\/(?:notification-center(?:\.js$|\/)|ui\/components\/)/;
+
+/**
+ * Every module of the app each of `sources` reaches, as the type checker
+ * resolves them: static and dynamic imports, and the JSDoc `import('…')`
+ * types, so a worker's types do not hang on the page's modules either.
+ */
+function moduleClosures(sources) {
+  const config = ts.getParsedCommandLineOfConfigFile(join(ROOT, 'tsconfig.json'), {}, {
+    ...ts.sys,
+    onUnRecoverableConfigFileDiagnostic: diagnostic => {
+      throw new Error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+    },
+  });
+  // Resolution only: no library files, nothing checked.
+  const options = { ...config.options, noLib: true, types: [] };
+  const host = ts.createCompilerHost(options);
+  const closures = new Map();
+  let previous;
+  for (const source of sources) {
+    const program = ts.createProgram({ rootNames: [join(ROOT, ...source.split('/'))], options, host, oldProgram: previous });
+    previous = program;
+    closures.set(source, program.getSourceFiles()
+      .map(file => relative(ROOT, file.fileName).split(sep).join('/'))
+      .filter(path => path.startsWith('assets/js/')));
+  }
+  return closures;
+}
+
+test('the page-global detector finds what a worker cannot reach and nothing else', () => {
+  for (const code of [
+    'document.body.append(1);',
+    'export const url = new URL("x", window.location.href);',
+    'export function f() { return localStorage.getItem("k"); }',
+    'export const ratio = typeof window !== "undefined" ? window.devicePixelRatio : 1;',
+    // A member of the global object is the global.
+    'export const body = globalThis.document.body;',
+    'export const store = self.localStorage;',
+    'export const ratio = globalThis["devicePixelRatio"];',
+    'export const page = self[`window`];',
+    'export const guarded = typeof document === "undefined" ? 1 : globalThis.document.title;',
+    // The page's address, which a worker's `location` is not.
+    'export const here = location.href;',
+    'export const origin = self.location.origin;',
+  ]) {
+    assert.notEqual(pageGlobals(code).length, 0, code);
+  }
+  for (const code of [
+    'export const inWorker = typeof window === "undefined" && typeof self !== "undefined";',
+    'export const inWorker = typeof globalThis.document === "undefined" && typeof self.location === "undefined";',
+    'export function f(document) { return document.root; }',
+    'export function g(location) { return location.href; }',
+    'export const parser = { document() { return 1; } }.document();',
+    'export const handle = { location: 1 }.location + globalThis.setTimeout.length + self.postMessage.length;',
+    '// document.body\nexport const text = "window.location and document";',
+  ]) {
+    assert.deepEqual(pageGlobals(code), [], code);
+  }
+});
+
+test('the relative-URL detector finds a URL a worker would resolve against its own script and nothing else', () => {
+  for (const code of [
+    'export const reply = fetch("data/genes.json");',
+    'export const reply = fetch("./genes.json", { cache: "no-store" });',
+    'export const reply = globalThis.fetch(`/assets/genes.json`);',
+    'export const reply = self.fetch(`genes/${name}.json`);',
+    'export const url = new URL("../glb/model.glb");',
+    'export const url = new URL(`/model.glb`);',
+  ]) {
+    assert.notEqual(relativeUrls(code).length, 0, code);
+  }
+  for (const code of [
+    'export const reply = fetch("https://example.org/genes.json");',
+    'export const reply = fetch("blob:https://example.org/1");',
+    'export const reply = fetch(`https://example.org/${name}.json`);',
+    'export const reply = fetch(url);',
+    'export const url = new URL("../model.glb", import.meta.url);',
+    'export const url = new URL("/model.glb", "https://example.org/");',
+    'export const url = new URL("https://example.org/model.glb");',
+    'export const url = new URL(text);',
+    'export const reply = other.fetch("data/genes.json");',
+    '// fetch("data/genes.json")\nexport const text = "fetch(\'data/genes.json\')";',
+  ]) {
+    assert.deepEqual(relativeUrls(code), [], code);
+  }
+});
+
+test('the code a worker runs names no global only a page has', () => {
+  for (const { source, path } of built.bundles) {
+    assert.deepEqual(pageGlobals(built.files.get(path).toString('utf8')), [], `${source} (${path})`);
+  }
+});
+
+test('the code a worker runs gives no relative URL to fetch or to new URL without a base', () => {
+  for (const { source, path } of built.bundles) {
+    assert.deepEqual(relativeUrls(built.files.get(path).toString('utf8')), [], `${source} (${path})`);
+  }
+});
+
+test('no worker reaches the page\'s notices or dialogs, not even for a type', () => {
+  const PAGE_ENTRY = 'assets/js/app/main.js';
+  const closures = moduleClosures([...WORKER_ENTRIES.map(({ source }) => source), PAGE_ENTRY]);
+  // What the check rests on: the page's own entry does reach them.
+  assert.ok(closures.get(PAGE_ENTRY).some(path => PAGE_NOTICES.test(path)), 'the page reaches its notices');
+  closures.delete(PAGE_ENTRY);
+  for (const [source, modules] of closures) {
+    assert.ok(modules.includes(source), `${source} is resolved`);
+    assert.deepEqual(modules.filter(path => PAGE_NOTICES.test(path)), [], `${source} reaches the page's notices`);
+  }
+});
 
 test('the committed worker bundles are exactly what the worker sources build', async () => {
   assert.deepEqual(

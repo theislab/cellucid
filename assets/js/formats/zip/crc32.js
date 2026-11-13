@@ -4,9 +4,8 @@
  * Every entry read is checked against it, so it runs over every byte read
  * from an archive, on the reader's thread: the table-driven "slicing by 16"
  * form consumes sixteen bytes per step, read as four 32-bit words on a
- * little-endian host (every host a browser runs on today), and runs about
- * 1.6 times faster than slicing by 8 (2.2 against 1.4 GB/s, measured on an
- * Apple M1 Pro) and some ten times faster than the one-byte loop.
+ * little-endian host (every host a browser runs on today), and runs faster
+ * than slicing by 8 and the one-byte loop (measured: 21_decisions_decoders_and_codecs.md).
  *
  * @module formats/zip/crc32
  */

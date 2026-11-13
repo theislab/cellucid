@@ -525,8 +525,8 @@ function zenodoBlocking(time, bytes, { blockAt = 20, lockoutMs = 300_000, roundT
 }
 
 test('a host on this machine that goes silent (a local server restarting) learns no pace and keeps none', async () => {
-  // Found 2026-11-10: lost answers from the local catalog server taught it a block pace, kept for a
-  // day: Suo then read at 5-60 KB/s for 95 s on every visit.
+  // Lost answers from the local catalog server must not teach it a block pace kept for a
+  // day (Suo would read at 5-60 KB/s for 95 s on every visit).
   const { rememberHostPace, rememberedHostPace, hostLinkSeed } = await import('../assets/js/data/host-link-memory.js');
   const time = virtualTime();
   const bytes = pattern(100_000);
@@ -604,10 +604,10 @@ test('a host that blocks this network (Zenodo\'s "unusual traffic", within the b
   assert.equal(rememberedHostPace('https://zenodo.org', storage), 0);
 });
 
-// Round 9, R9P-5: a link that dropped for a few seconds while Suo opened from GitHub Pages
-// (requests failing at once: net::ERR_INTERNET_DISCONNECTED) taught theislab.github.io a block
-// pace; Suo then grew at 70 KB/s over a fast link ("limits how many requests it answers: the next
-// go in 2.4 s"), and the pace was kept for a day.
+// A link that drops for a few seconds while Suo opens from GitHub Pages
+// (requests failing at once: net::ERR_INTERNET_DISCONNECTED) must not teach theislab.github.io a block
+// pace (Suo would grow at 70 KB/s over a fast link: "limits how many requests it answers: the next
+// go in 2.4 s"), kept for a day.
 function droppingLink(time, bytes, { dropAt = 20, dropMs = 5_000, roundTripMs = 100, failAfterMs = 0 } = {}) {
   let downUntil = -Infinity;
   const link = { times: [], drops: 0, isDown: () => time.now() < downUntil };
@@ -651,9 +651,9 @@ test('requests lost on this side of the link (an instant failure, or this comput
   }
 });
 
-// Round 9, R9P-7: after an 18 s outage (this computer offline), Suo's opening waited up to 20 s
-// more before asking again: the read's back-off and the address's quiet were a host's, and the
-// read said the host "may be refusing requests from this network".
+// After an outage (this computer offline), an opening must not wait more
+// before asking again: the read's back-off and the address's quiet are not a host's, and the
+// read must not say the host "may be refusing requests from this network".
 test('a read that loses requests while this computer is offline waits for the connection, says so, and asks again the moment it is back', async () => {
   const time = virtualTime();
   const bytes = pattern(100_000);

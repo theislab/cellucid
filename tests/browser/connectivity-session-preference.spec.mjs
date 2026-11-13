@@ -3,13 +3,13 @@
  * graph is not read yet, and shows the edge count it recorded.
  *
  * The Max edges slider's range is the graph's visible edges, which are read
- * only when edges are switched on; until then it spans 0..0. A session that
- * recorded the slider's *value* was checked against that range before any
- * control was applied, so every session saved with edges shown was refused
- * on load (`Session UI control "connectivity-limit" value is above its current
- * maximum`). The session now records the person's preference
- * (`data-session-preference`, `state-serializer/ui-controls.js`), and the
- * slider shows what the graph allows of it once the graph is read.
+ * only when edges are switched on; until then it spans 0..0. A session
+ * records the person's preference (`data-session-preference`,
+ * `state-serializer/ui-controls.js`), not the slider's *value*: a value would
+ * be checked against that range before any control is applied, and every
+ * session saved with edges shown would be refused on load (`Session UI
+ * control "connectivity-limit" value is above its current maximum`). The
+ * slider shows what the graph allows of the preference once the graph is read.
  *
  * Fixture: `data-mapping-full.h5ad` (300 cells, three graphs).
  */

@@ -2,7 +2,7 @@
  * @fileoverview What wrote a session file: the Cellucid version and the
  * action catalog it was written with (`app`), and the parameter schema of
  * each action its steps use (`actions`), so a reader knows which steps it can
- * replay (History v2 §3.8).
+ * replay.
  *
  * - `app.catalog` is the SHA-256 of the catalog document's canonical text
  *   ({@link canonicalCatalogText}), the same text
@@ -34,7 +34,7 @@ export function sortedKeys(value) {
 }
 
 /** The catalog document's canonical text: keys sorted, two-space indent, a final newline. */
-export function canonicalCatalogText(catalog) {
+function canonicalCatalogText(catalog) {
   return `${JSON.stringify(sortedKeys(catalogDocument(catalog)), null, 2)}\n`;
 }
 
@@ -63,7 +63,7 @@ export async function appStamp({ catalog, version }) {
 }
 
 /** `a` against `b` as release versions (`0.9.8`, `0.10.0rc1`): numbers compared as numbers, -1, 0 or 1. */
-export function compareVersions(a, b) {
+function compareVersions(a, b) {
   const parts = text => String(text).match(/\d+|[A-Za-z]+/g) ?? [];
   const [x, y] = [parts(a), parts(b)];
   for (let i = 0; i < Math.max(x.length, y.length); i++) {
@@ -82,7 +82,7 @@ export function compareVersions(a, b) {
 /**
  * Whether a saved history (a session file, a saved state of this browser)
  * was written by another version of Cellucid than this page, from its `app`
- * stamp (F155): `'earlier'` when it names an earlier version, or this
+ * stamp: `'earlier'` when it names an earlier version, or this
  * version with another action catalog (a build of it before this one),
  * `'newer'` when it names a later version, null when it was written by
  * this version and catalog, or names none. A part such a history holds
@@ -102,7 +102,7 @@ export async function writtenByOtherVersion(app, { catalog, version }) {
 }
 
 /** The SHA-256 of one action's parameters shape (`actionParamsShape` of its schema) as canonical JSON. */
-export function paramsDigest(definition) {
+function paramsDigest(definition) {
   if (!paramDigests.has(definition)) paramDigests.set(definition, textDigest(JSON.stringify(sortedKeys(actionParamsShape(definition.params)))));
   return paramDigests.get(definition);
 }

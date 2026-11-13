@@ -279,7 +279,7 @@ test('automatic categorical inference keeps chi-square only when expected counts
     { pageName: 'Second', values: [...Array(5).fill('A'), ...Array(15).fill('B')] }
   ], 'categorical_obs')[0];
   // A 2 x 2 table takes Yates's correction, as SciPy chi2_contingency and R
-  // chisq.test do and Composition does (audit NS-5): 8.1, p 0.004426525857919832.
+  // chisq.test do and Composition does: 8.1, p 0.004426525857919832.
   assert.equal(dense.testName, "Chi-squared test (Yates's correction)");
   assertClose(dense.statistic, 8.1);
   assertClose(dense.pValue, 0.004426525857919832);
@@ -934,8 +934,8 @@ test('rank inference is invariant to a strictly increasing affine map of its val
 });
 
 test('every non-empty Mann-Whitney comparison reports a probability, never "undefined"', () => {
-  // The wrapper used to carry a branch for "inference is undefined because all
-  // values are tied". No such state exists: `mannWhitneyU` filters to finite
+  // The wrapper carries no branch for "inference is undefined because all
+  // values are tied", for no such state exists: `mannWhitneyU` filters to finite
   // values and returns early when either sample is empty, and for two non-empty
   // samples the exact branch is a ratio of permutation counts while the
   // asymptotic branch has a strictly positive tie-corrected variance unless the
@@ -1085,8 +1085,8 @@ test('the marker worker publishes probabilities, scores and effects, never U its
   //   scipy.stats.mannwhitneyu(group, rest, alternative='two-sided',
   //                            method='asymptotic', use_continuity=True)
   // is U1 = 16,777,559 and U2 = 16,832,941, so U = min = 16,777,559 — an odd
-  // integer above 2^24 that Float32 cannot hold. It used to be stored in one
-  // and shipped to the engine, which validated it and threw it away.
+  // integer above 2^24 that Float32 cannot hold: stored in one and shipped to
+  // the engine, it would be validated and thrown away.
   const exactU = 16777559;
   assert.ok(exactU > 2 ** 24);
   assert.notEqual(Math.fround(exactU), exactU);

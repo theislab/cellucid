@@ -2,8 +2,8 @@
  * `npm test` (`scripts/run-web-tests.mjs`) fails a test file that hangs, by
  * name and with the last test it finished, and never one that is slow but
  * finishing tests: the bound is on progress (`CELLUCID_TEST_STALL_MS`), not on
- * a file's whole time, which failed four files on a runner five times slower
- * than its peers (Web contracts run 42334181105).
+ * a file's whole time, which would fail files on a runner several times
+ * slower than its peers.
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
